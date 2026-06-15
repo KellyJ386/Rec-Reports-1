@@ -1,0 +1,19 @@
+# Supabase local development config.
+#
+# NOTE ON MIGRATION LOCATION: the authoritative migrations live in /db/migrations and the
+# pgTAP tests in /db/tests (CLAUDE.md §10), NOT in supabase/migrations. To run them against
+# the local stack, either symlink them into supabase/migrations and supabase/tests, or apply
+# /db/migrations with psql and run tests with `supabase test db` pointed at /db/tests.
+# See README.md → "Database".
+
+project_id = "recreports"
+
+[db]
+port = 54322
+major_version = 15
+
+[api]
+port = 54321
+
+[studio]
+port = 54323
