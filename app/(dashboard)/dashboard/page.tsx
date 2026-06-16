@@ -1,9 +1,12 @@
+import Link from "next/link";
 import { getActiveFacilityId, getMemberships, getRoleAt } from "@/lib/auth/session";
+import { roleAtLeast } from "@/lib/auth/roles";
 
 export default async function DashboardPage() {
   const facilityId = await getActiveFacilityId();
   const memberships = await getMemberships();
   const role = facilityId ? await getRoleAt(facilityId) : null;
+  const isManager = roleAtLeast(role, "facility_manager");
 
   return (
     <div className="space-y-6">
@@ -13,6 +16,14 @@ export default async function DashboardPage() {
           Your role here:{" "}
           <span className="font-medium text-forest">{role ?? "—"}</span>
         </p>
+        {isManager && (
+          <Link
+            href="/admin"
+            className="mt-3 inline-block rounded-md bg-forest px-4 py-2 text-sm font-medium text-white hover:bg-forest-700 focus:outline-none focus:ring-2 focus:ring-forest focus:ring-offset-2"
+          >
+            Admin Control Center
+          </Link>
+        )}
       </div>
 
       <section className="rounded-xl border border-gray-200 bg-white p-6">

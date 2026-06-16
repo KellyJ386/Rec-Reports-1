@@ -21,7 +21,21 @@ compliance reporting, and employee scheduling in one operations layer.
       `facility_id` resolution, Dexie offline queue with manager-surfaced conflict flag and a
       visible sync-status indicator.
 
+**Phase 1 — Admin Control Center**:
+
+- [x] 1.1 Config framework & schema: 13 uniform catalog tables (area, categories, count
+      types, form/sop/erp catalogs, work-order/asset/position types, recipient groups) +
+      `severity_level` (per-module, weighted); `facility.settings`; RLS on all; per-facility
+      seed via `provision_facility_defaults()` (MODULE_SPEC.md §5.1 defaults).
+- [x] 1.2 Config CRUD screens: one reusable `ConfigList` + generic facility_manager-gated
+      server actions (create/edit/reorder/disable); admin pages grouped by module.
+- [x] 1.3 User management: invite by email (Resend/Auth admin), assign role, multi-facility
+      membership, deactivate/archive (soft, history preserved), SSO toggle (placeholder);
+      no privilege escalation, every role change audited.
+
 No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
+`provision_facility_defaults(facility_id)` is invoked during facility onboarding (the
+facility-creation UI is wired when org/facility provisioning is built).
 
 ## Tech stack
 

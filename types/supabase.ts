@@ -50,6 +50,7 @@ type FacilityRow = {
   operating_hours: Record<string, unknown>;
   logo_url: string | null;
   status: LifecycleStatus;
+  settings: Record<string, unknown>;
 } & Timestamps & Authored;
 type FacilityInsert = {
   id?: string;
@@ -60,6 +61,7 @@ type FacilityInsert = {
   operating_hours?: Record<string, unknown>;
   logo_url?: string | null;
   status?: LifecycleStatus;
+  settings?: Record<string, unknown>;
   created_by?: string | null;
 };
 
@@ -149,6 +151,65 @@ type AuditEventInsert = {
   request_id?: string | null;
 };
 
+// --- uniform config catalog tables (MODULE_SPEC.md §5.1) ---
+type CatalogRow = {
+  id: string;
+  facility_id: string;
+  name: string;
+  description: string | null;
+  display_order: number;
+  active: boolean;
+} & Timestamps & Authored;
+type CatalogInsert = {
+  id?: string;
+  facility_id: string;
+  name: string;
+  description?: string | null;
+  display_order?: number;
+  active?: boolean;
+  created_by?: string | null;
+};
+type CatalogTable = { Row: CatalogRow; Insert: CatalogInsert; Update: Partial<CatalogInsert>; Relationships: [] };
+
+/** Names of the uniform (same-shape) config catalog tables. */
+export const CATALOG_TABLES = [
+  "area",
+  "incident_category",
+  "task_category",
+  "count_type",
+  "count_area",
+  "form_category",
+  "sop_category",
+  "erp_scenario_type",
+  "erp_response_level",
+  "work_order_category",
+  "position_type",
+  "asset_type",
+  "recipient_group",
+] as const;
+export type CatalogTableName = (typeof CATALOG_TABLES)[number];
+
+// --- severity_level (per-module, weighted) ---
+type SeverityLevelRow = {
+  id: string;
+  facility_id: string;
+  module: string;
+  name: string;
+  weight: number;
+  display_order: number;
+  active: boolean;
+} & Timestamps & Authored;
+type SeverityLevelInsert = {
+  id?: string;
+  facility_id: string;
+  module?: string;
+  name: string;
+  weight?: number;
+  display_order?: number;
+  active?: boolean;
+  created_by?: string | null;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -160,6 +221,20 @@ export type Database = {
       cert_type: { Row: CertTypeRow; Insert: CertTypeInsert; Update: Partial<CertTypeInsert>; Relationships: [] };
       job_area_required_cert: { Row: JarcRow; Insert: JarcInsert; Update: Partial<JarcInsert>; Relationships: [] };
       audit_event: { Row: AuditEventRow; Insert: AuditEventInsert; Update: Partial<AuditEventInsert>; Relationships: [] };
+      severity_level: { Row: SeverityLevelRow; Insert: SeverityLevelInsert; Update: Partial<SeverityLevelInsert>; Relationships: [] };
+      area: CatalogTable;
+      incident_category: CatalogTable;
+      task_category: CatalogTable;
+      count_type: CatalogTable;
+      count_area: CatalogTable;
+      form_category: CatalogTable;
+      sop_category: CatalogTable;
+      erp_scenario_type: CatalogTable;
+      erp_response_level: CatalogTable;
+      work_order_category: CatalogTable;
+      position_type: CatalogTable;
+      asset_type: CatalogTable;
+      recipient_group: CatalogTable;
     };
     Views: { [_ in never]: never };
     Functions: {
@@ -167,6 +242,7 @@ export type Database = {
       has_facility_role: { Args: { p_facility_id: string; p_min_role: FacilityRole }; Returns: boolean };
       is_facility_member: { Args: { p_facility_id: string }; Returns: boolean };
       role_rank: { Args: { p_role: FacilityRole }; Returns: number };
+      provision_facility_defaults: { Args: { p_facility_id: string }; Returns: undefined };
     };
     Enums: {
       facility_role: FacilityRole;
