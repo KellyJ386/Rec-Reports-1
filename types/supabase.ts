@@ -210,6 +210,97 @@ type SeverityLevelInsert = {
   created_by?: string | null;
 };
 
+// --- Workforce (Stream A): certifications + scheduling ---
+type StaffCertRow = {
+  id: string; facility_id: string; user_id: string; cert_type_id: string;
+  issued_on: string | null; expires_on: string | null; document_url: string | null; notes: string | null;
+} & Timestamps & Authored;
+type StaffCertInsert = {
+  id?: string; facility_id: string; user_id: string; cert_type_id: string;
+  issued_on?: string | null; expires_on?: string | null; document_url?: string | null; notes?: string | null; created_by?: string | null;
+};
+type StaffCertStatusRow = StaffCertRow & {
+  cert_type_name: string; renewal_window_days: number;
+  status: "active" | "expiring" | "expired"; days_to_expiry: number | null;
+};
+
+type SchedulePeriodRow = {
+  id: string; facility_id: string; week_start_date: string; week_end_date: string;
+  status: "draft" | "published" | "locked"; publish_version: number;
+} & Timestamps & Authored;
+type SchedulePeriodInsert = {
+  id?: string; facility_id: string; week_start_date: string; week_end_date: string;
+  status?: "draft" | "published" | "locked"; publish_version?: number; created_by?: string | null;
+};
+
+type ShiftTemplateRow = {
+  id: string; facility_id: string; job_area_id: string; area_id: string | null;
+  days_of_week: number[]; start_time_local: string; end_time_local: string; required_count: number; active: boolean;
+} & Timestamps & Authored;
+type ShiftTemplateInsert = {
+  id?: string; facility_id: string; job_area_id: string; area_id?: string | null;
+  days_of_week?: number[]; start_time_local: string; end_time_local: string; required_count?: number; active?: boolean; created_by?: string | null;
+};
+
+type ShiftRow = {
+  id: string; facility_id: string; schedule_period_id: string; job_area_id: string; area_id: string | null;
+  starts_at: string; ends_at: string;
+  status: "draft" | "open" | "assigned" | "published" | "cancelled";
+  source: "template" | "manual"; required_count: number; notes: string | null;
+} & Timestamps & Authored;
+type ShiftInsert = {
+  id?: string; facility_id: string; schedule_period_id: string; job_area_id: string; area_id?: string | null;
+  starts_at: string; ends_at: string;
+  status?: "draft" | "open" | "assigned" | "published" | "cancelled";
+  source?: "template" | "manual"; required_count?: number; notes?: string | null; created_by?: string | null;
+};
+
+type ShiftAssignmentRow = {
+  id: string; facility_id: string; shift_id: string; user_id: string;
+  assignment_type: "primary" | "cover"; status: "pending" | "approved" | "declined" | "cancelled"; assigned_by: string | null;
+} & Timestamps & Authored;
+type ShiftAssignmentInsert = {
+  id?: string; facility_id: string; shift_id: string; user_id: string;
+  assignment_type?: "primary" | "cover"; status?: "pending" | "approved" | "declined" | "cancelled"; assigned_by?: string | null; created_by?: string | null;
+};
+
+type AvailabilityRow = {
+  id: string; facility_id: string; user_id: string; weekday: number; unavailable: boolean;
+  available_start: string | null; available_end: string | null;
+  max_hours_per_day: number | null; max_hours_per_week: number | null; doubles_allowed: boolean;
+  effective_from: string; effective_to: string | null;
+} & Timestamps & Authored;
+type AvailabilityInsert = {
+  id?: string; facility_id: string; user_id: string; weekday: number; unavailable?: boolean;
+  available_start?: string | null; available_end?: string | null;
+  max_hours_per_day?: number | null; max_hours_per_week?: number | null; doubles_allowed?: boolean;
+  effective_from?: string; effective_to?: string | null; created_by?: string | null;
+};
+
+type SwapRequestRow = {
+  id: string; facility_id: string; offered_assignment_id: string; requested_assignment_id: string | null;
+  requester_user_id: string; target_user_id: string | null;
+  swap_type: "direct" | "drop_pickup"; status: "pending" | "approved" | "denied" | "cancelled" | "expired";
+  reason: string | null; decided_by: string | null;
+} & Timestamps & Authored;
+type SwapRequestInsert = {
+  id?: string; facility_id: string; offered_assignment_id: string; requested_assignment_id?: string | null;
+  requester_user_id: string; target_user_id?: string | null;
+  swap_type?: "direct" | "drop_pickup"; status?: "pending" | "approved" | "denied" | "cancelled" | "expired";
+  reason?: string | null; decided_by?: string | null; created_by?: string | null;
+};
+
+type ScheduleDeliveryRow = {
+  id: string; facility_id: string; schedule_period_id: string; recipient_user_id: string;
+  channel: "email" | "in_app"; status: "queued" | "sent" | "failed";
+  provider_message_id: string | null; sent_at: string | null;
+} & Timestamps;
+type ScheduleDeliveryInsert = {
+  id?: string; facility_id: string; schedule_period_id: string; recipient_user_id: string;
+  channel?: "email" | "in_app"; status?: "queued" | "sent" | "failed";
+  provider_message_id?: string | null; sent_at?: string | null;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -235,14 +326,25 @@ export type Database = {
       position_type: CatalogTable;
       asset_type: CatalogTable;
       recipient_group: CatalogTable;
+      staff_certification: { Row: StaffCertRow; Insert: StaffCertInsert; Update: Partial<StaffCertInsert>; Relationships: [] };
+      schedule_period: { Row: SchedulePeriodRow; Insert: SchedulePeriodInsert; Update: Partial<SchedulePeriodInsert>; Relationships: [] };
+      shift_template: { Row: ShiftTemplateRow; Insert: ShiftTemplateInsert; Update: Partial<ShiftTemplateInsert>; Relationships: [] };
+      shift: { Row: ShiftRow; Insert: ShiftInsert; Update: Partial<ShiftInsert>; Relationships: [] };
+      shift_assignment: { Row: ShiftAssignmentRow; Insert: ShiftAssignmentInsert; Update: Partial<ShiftAssignmentInsert>; Relationships: [] };
+      availability: { Row: AvailabilityRow; Insert: AvailabilityInsert; Update: Partial<AvailabilityInsert>; Relationships: [] };
+      swap_request: { Row: SwapRequestRow; Insert: SwapRequestInsert; Update: Partial<SwapRequestInsert>; Relationships: [] };
+      schedule_delivery: { Row: ScheduleDeliveryRow; Insert: ScheduleDeliveryInsert; Update: Partial<ScheduleDeliveryInsert>; Relationships: [] };
     };
-    Views: { [_ in never]: never };
+    Views: {
+      staff_certification_status: { Row: StaffCertStatusRow; Relationships: [] };
+    };
     Functions: {
       current_user_role_at: { Args: { p_facility_id: string }; Returns: FacilityRole | null };
       has_facility_role: { Args: { p_facility_id: string; p_min_role: FacilityRole }; Returns: boolean };
       is_facility_member: { Args: { p_facility_id: string }; Returns: boolean };
       role_rank: { Args: { p_role: FacilityRole }; Returns: number };
       provision_facility_defaults: { Args: { p_facility_id: string }; Returns: undefined };
+      cert_computed_status: { Args: { p_expires_on: string | null; p_renewal_window_days: number }; Returns: string };
     };
     Enums: {
       facility_role: FacilityRole;

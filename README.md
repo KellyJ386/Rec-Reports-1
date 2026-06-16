@@ -33,9 +33,23 @@ compliance reporting, and employee scheduling in one operations layer.
       membership, deactivate/archive (soft, history preserved), SSO toggle (placeholder);
       no privilege escalation, every role change audited.
 
+**Stream A — Workforce** (the differentiator):
+
+- [x] A.1 Staff Certifications: `staff_certification` + `cert_computed_status()` +
+      `staff_certification_status` view (auto active/expiring/expired); self-service add +
+      optional Storage document; manager expiring view; 60/30/7-day alert cron
+      (`/api/cron/cert-alerts`, Resend).
+- [x] A.2 Scheduling core: `schedule_period`, `shift`, `shift_template`, `shift_assignment`,
+      `availability`, `swap_request`, `schedule_delivery` (+ RLS); Draft→Published→Locked;
+      create-week + publish UI. (react-big-calendar drag UI is the next increment.)
+- [x] A.3 Conflict detection engine: pure, fully unit-tested module (`npm test` — 18 tests
+      covering every rule + the publish gate); cert three-hop join; publish blocked on any
+      Block conflict, with all blockers surfaced.
+
 No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
 `provision_facility_defaults(facility_id)` is invoked during facility onboarding (the
-facility-creation UI is wired when org/facility provisioning is built).
+facility-creation UI is wired when org/facility provisioning is built). The
+`certifications` Storage bucket must exist for document uploads.
 
 ## Tech stack
 

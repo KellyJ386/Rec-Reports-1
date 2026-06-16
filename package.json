@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "db:types": "supabase gen types typescript --local > types/supabase.ts"
   },
   "dependencies": {
@@ -35,7 +36,8 @@
     "eslint-config-next": "15.5.19",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   },
   "engines": {
     "node": ">=20.0.0"
