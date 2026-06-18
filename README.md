@@ -46,10 +46,23 @@ compliance reporting, and employee scheduling in one operations layer.
       covering every rule + the publish gate); cert three-hop join; publish blocked on any
       Block conflict, with all blockers surfaced.
 
+**Stream B — Operations Core**:
+
+- [x] B.1 Injury/Illness: `injury_report` + polymorphic `report_person`/`report_witness`
+      (facility derived from parent by trigger; access follows parent). Draft→Submitted→
+      Reviewed→Closed with lock-on-submit, manager-only reopen, and audit on every
+      create/edit/status-change (centralized `guard_report_state` trigger). No photos; no
+      hard-delete (≥7yr retention). Create + person/witness + status-action UI.
+- [x] B.2 Incident: `incident_report` reusing the same pattern + trigger; category/severity
+      from config; `follow_up_required`/`follow_up_task_id` stub (wired in Phase 5).
+- [x] B.3 Daily Log (shared log + tagging), Memo Board (post + recipient groups + read
+      receipts/unread), EOD (one per facility/day, save/submit, lock-ready).
+
 No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
 `provision_facility_defaults(facility_id)` is invoked during facility onboarding (the
 facility-creation UI is wired when org/facility provisioning is built). The
-`certifications` Storage bucket must exist for document uploads.
+`certifications` Storage bucket must exist for document uploads. PII columns rely on
+platform at-rest encryption for now; column-level encryption is a Phase 6 hardening item.
 
 ## Tech stack
 

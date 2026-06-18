@@ -301,6 +301,96 @@ type ScheduleDeliveryInsert = {
   provider_message_id?: string | null; sent_at?: string | null;
 };
 
+// --- Operations Core (Stream B) ---
+type ReportStatus = "draft" | "submitted" | "reviewed" | "closed";
+type ReportStampFields = {
+  submitted_by: string | null; submitted_at: string | null;
+  reviewed_by: string | null; reviewed_at: string | null; closed_at: string | null;
+};
+
+type InjuryReportRow = {
+  id: string; facility_id: string; incident_no: string; report_type: "injury" | "illness";
+  severity_level_id: string | null; area_id: string | null;
+  occurred_at: string | null; reported_at: string; summary: string | null; immediate_actions: string | null;
+  status: ReportStatus; legal_hold: boolean;
+} & ReportStampFields & Timestamps & Authored;
+type InjuryReportInsert = {
+  id?: string; facility_id: string; incident_no: string; report_type?: "injury" | "illness";
+  severity_level_id?: string | null; area_id?: string | null;
+  occurred_at?: string | null; reported_at?: string; summary?: string | null; immediate_actions?: string | null;
+  status?: ReportStatus; legal_hold?: boolean; created_by?: string | null;
+};
+
+type IncidentReportRow = {
+  id: string; facility_id: string; incident_no: string; incident_category_id: string | null;
+  severity_level_id: string | null; area_id: string | null;
+  occurred_at: string | null; reported_at: string; summary: string | null; immediate_actions: string | null;
+  status: ReportStatus; legal_hold: boolean; follow_up_required: boolean; follow_up_task_id: string | null;
+} & ReportStampFields & Timestamps & Authored;
+type IncidentReportInsert = {
+  id?: string; facility_id: string; incident_no: string; incident_category_id?: string | null;
+  severity_level_id?: string | null; area_id?: string | null;
+  occurred_at?: string | null; reported_at?: string; summary?: string | null; immediate_actions?: string | null;
+  status?: ReportStatus; legal_hold?: boolean; follow_up_required?: boolean; follow_up_task_id?: string | null; created_by?: string | null;
+};
+
+type ReportPersonRow = {
+  id: string; facility_id: string; parent_id: string; parent_type: "injury_report" | "incident_report";
+  person_role: "injured" | "involved" | "completing"; full_name: string;
+  contact: Record<string, unknown>; details: Record<string, unknown>;
+} & Timestamps & Authored;
+type ReportPersonInsert = {
+  id?: string; facility_id?: string; parent_id: string; parent_type: "injury_report" | "incident_report";
+  person_role?: "injured" | "involved" | "completing"; full_name: string;
+  contact?: Record<string, unknown>; details?: Record<string, unknown>; created_by?: string | null;
+};
+
+type ReportWitnessRow = {
+  id: string; facility_id: string; parent_id: string; parent_type: "injury_report" | "incident_report";
+  full_name: string; contact: Record<string, unknown>; statement: string | null;
+} & Timestamps & Authored;
+type ReportWitnessInsert = {
+  id?: string; facility_id?: string; parent_id: string; parent_type: "injury_report" | "incident_report";
+  full_name: string; contact?: Record<string, unknown>; statement?: string | null; created_by?: string | null;
+};
+
+type DailyLogEntryRow = {
+  id: string; facility_id: string; log_date: string; area_id: string | null; task_category_id: string | null;
+  body: string; entry_at: string;
+} & Timestamps & Authored;
+type DailyLogEntryInsert = {
+  id?: string; facility_id: string; log_date?: string; area_id?: string | null; task_category_id?: string | null;
+  body: string; entry_at?: string; created_by?: string | null;
+};
+
+type DailyLogTagRow = { id: string; facility_id: string; daily_log_entry_id: string; user_id: string; created_at: string };
+type DailyLogTagInsert = { id?: string; facility_id: string; daily_log_entry_id: string; user_id: string };
+
+type MemoRow = {
+  id: string; facility_id: string; to_group_id: string | null; from_user_id: string;
+  subject: string; body_richtext: string | null; priority: "low" | "normal" | "high";
+  optional_email: boolean; posted_at: string;
+} & Timestamps & Authored;
+type MemoInsert = {
+  id?: string; facility_id: string; to_group_id?: string | null; from_user_id: string;
+  subject: string; body_richtext?: string | null; priority?: "low" | "normal" | "high";
+  optional_email?: boolean; posted_at?: string; created_by?: string | null;
+};
+
+type MemoReceiptRow = { id: string; facility_id: string; memo_id: string; user_id: string; read_at: string | null; created_at: string };
+type MemoReceiptInsert = { id?: string; facility_id: string; memo_id: string; user_id: string; read_at?: string | null };
+
+type EodReportRow = {
+  id: string; facility_id: string; report_date: string; summary: string | null; fields: Record<string, unknown>;
+  incidents_occurred: boolean; equipment_issues: boolean; status: "draft" | "submitted" | "locked";
+  submitted_by: string | null; submitted_at: string | null; locked_at: string | null;
+} & Timestamps & Authored;
+type EodReportInsert = {
+  id?: string; facility_id: string; report_date?: string; summary?: string | null; fields?: Record<string, unknown>;
+  incidents_occurred?: boolean; equipment_issues?: boolean; status?: "draft" | "submitted" | "locked";
+  submitted_by?: string | null; submitted_at?: string | null; locked_at?: string | null; created_by?: string | null;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -334,6 +424,15 @@ export type Database = {
       availability: { Row: AvailabilityRow; Insert: AvailabilityInsert; Update: Partial<AvailabilityInsert>; Relationships: [] };
       swap_request: { Row: SwapRequestRow; Insert: SwapRequestInsert; Update: Partial<SwapRequestInsert>; Relationships: [] };
       schedule_delivery: { Row: ScheduleDeliveryRow; Insert: ScheduleDeliveryInsert; Update: Partial<ScheduleDeliveryInsert>; Relationships: [] };
+      injury_report: { Row: InjuryReportRow; Insert: InjuryReportInsert; Update: Partial<InjuryReportInsert>; Relationships: [] };
+      incident_report: { Row: IncidentReportRow; Insert: IncidentReportInsert; Update: Partial<IncidentReportInsert>; Relationships: [] };
+      report_person: { Row: ReportPersonRow; Insert: ReportPersonInsert; Update: Partial<ReportPersonInsert>; Relationships: [] };
+      report_witness: { Row: ReportWitnessRow; Insert: ReportWitnessInsert; Update: Partial<ReportWitnessInsert>; Relationships: [] };
+      daily_log_entry: { Row: DailyLogEntryRow; Insert: DailyLogEntryInsert; Update: Partial<DailyLogEntryInsert>; Relationships: [] };
+      daily_log_entry_tag: { Row: DailyLogTagRow; Insert: DailyLogTagInsert; Update: Partial<DailyLogTagInsert>; Relationships: [] };
+      memo: { Row: MemoRow; Insert: MemoInsert; Update: Partial<MemoInsert>; Relationships: [] };
+      memo_receipt: { Row: MemoReceiptRow; Insert: MemoReceiptInsert; Update: Partial<MemoReceiptInsert>; Relationships: [] };
+      eod_report: { Row: EodReportRow; Insert: EodReportInsert; Update: Partial<EodReportInsert>; Relationships: [] };
     };
     Views: {
       staff_certification_status: { Row: StaffCertStatusRow; Relationships: [] };
