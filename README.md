@@ -85,14 +85,22 @@ compliance reporting, and employee scheduling in one operations layer.
       (filed injury/incident report, postable weekly schedule via pdf-lib). Exports
       RLS-scoped. No BI dashboards — exports only.
 
-All module streams (A/B/C) and integration (Phase 5) are complete. Next: Phase 6 (security
-& NFR audit).
+**Phase 6 — Security & NFR audit**:
 
-No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
-`provision_facility_defaults(facility_id)` is invoked during facility onboarding (the
-facility-creation UI is wired when org/facility provisioning is built). The
-`certifications` Storage bucket must exist for document uploads. PII columns rely on
-platform at-rest encryption for now; column-level encryption is a Phase 6 hardening item.
+- [x] 6.1 Security audit: full RLS review of every table, `SECURITY DEFINER` inventory, and
+      `facility_id`-trust verification. Findings + status in
+      [`SECURITY_AUDIT.md`](./SECURITY_AUDIT.md). Fixed: view RLS bypass (High), `sop_version`
+      visibility (Med), mutable `search_path` (Med). Module-level isolation, report lock, and
+      SOP visibility proven by `db/tests/0002`.
+- [x] 6.2 NFR pass: audit logging (incident/injury/EOD/role), retention (no hard-delete for
+      injury/incident), offline conflict-flag, WCAG basics, PII-at-rest reviewed — residual
+      items tracked in `SECURITY_AUDIT.md` §6.
+
+The phased build (0 → 6) is complete. No live services are provisioned (code-only); wire
+credentials in `.env.local` to run. `provision_facility_defaults(facility_id)` runs during
+facility onboarding (facility-creation UI is wired when org/facility provisioning is built).
+The `certifications` Storage bucket must exist for document uploads. PII columns rely on
+platform at-rest encryption for now (column-level encryption is a tracked residual).
 
 ## Tech stack
 
