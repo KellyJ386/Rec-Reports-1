@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { ReportKind } from "@/lib/operations/report-actions";
 import { ReportStatusBadge } from "@/components/operations/ReportStatusBadge";
 import { ReportStatusActions, AddPersonForm, AddWitnessForm } from "@/components/operations/ReportControls";
@@ -12,6 +13,7 @@ type ReportRow = {
   summary: string | null;
   immediate_actions: string | null;
   follow_up_required?: boolean;
+  follow_up_task_id?: string | null;
 };
 type Person = { id: string; full_name: string; person_role: string };
 type Witness = { id: string; full_name: string; statement: string | null };
@@ -45,7 +47,15 @@ export function ReportDetail({
             {new Date(report.reported_at).toLocaleString()}
           </p>
         </div>
-        <ReportStatusBadge status={report.status} />
+        <div className="flex items-center gap-3">
+          <a
+            href={`/api/export/report-pdf?kind=${kind}&id=${report.id}`}
+            className="rounded-md border border-forest px-3 py-1.5 text-sm font-medium text-forest hover:bg-forest-50"
+          >
+            Export PDF
+          </a>
+          <ReportStatusBadge status={report.status} />
+        </div>
       </div>
 
       <ReportStatusActions
@@ -70,7 +80,15 @@ export function ReportDetail({
         {kind === "incident" && (
           <div>
             <dt className="text-xs font-medium text-gray-500">Follow-up required</dt>
-            <dd className="text-sm text-gray-900">{report.follow_up_required ? "Yes" : "No"}</dd>
+            <dd className="text-sm text-gray-900">
+              {report.follow_up_required ? "Yes" : "No"}
+              {report.follow_up_task_id && (
+                <Link href="/facility/tasks" className="ml-2 text-forest underline">task created ✓</Link>
+              )}
+              {report.follow_up_required && !report.follow_up_task_id && (
+                <span className="ml-2 text-xs text-gray-400">(task is created on review)</span>
+              )}
+            </dd>
           </div>
         )}
         <div className="sm:col-span-2">

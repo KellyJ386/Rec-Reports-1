@@ -8,8 +8,17 @@ import { DISPLAY_ONLY, type FormField } from "@/lib/facility/form-schema";
 const input =
   "mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-forest focus:outline-none focus:ring-2 focus:ring-forest";
 
-export function FormRenderer({ formId, fields }: { formId: string; fields: FormField[] }) {
+export function FormRenderer({
+  formId,
+  fields,
+  assets,
+}: {
+  formId: string;
+  fields: FormField[];
+  assets?: { id: string; name: string }[];
+}) {
   const [values, setValues] = useState<Record<string, unknown>>({});
+  const [assetId, setAssetId] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [done, setDone] = useState(false);
   const [pending, start] = useTransition();
@@ -20,7 +29,7 @@ export function FormRenderer({ formId, fields }: { formId: string; fields: FormF
   function submit() {
     setErrors({});
     start(async () => {
-      const r = await submitFormResponse(formId, values);
+      const r = await submitFormResponse(formId, values, assetId || null);
       if (r.ok) { setDone(true); setValues({}); router.refresh(); }
       else if (r.errors) setErrors(r.errors);
       else setErrors({ _form: r.error ?? "Submission failed" });
@@ -70,6 +79,17 @@ export function FormRenderer({ formId, fields }: { formId: string; fields: FormF
           </div>
         );
       })}
+      {assets && assets.length > 0 && (
+        <div>
+          <label htmlFor="_asset" className="block text-xs font-medium text-gray-600">
+            Link to asset (optional — records an inspection)
+          </label>
+          <select id="_asset" className={input} value={assetId} onChange={(e) => setAssetId(e.target.value)}>
+            <option value="">None</option>
+            {assets.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        </div>
+      )}
       {errors._form && <p role="alert" className="text-sm text-amber-700">{errors._form}</p>}
       <button type="button" onClick={submit} disabled={pending} className="rounded-md bg-forest px-4 py-2 text-sm font-medium text-white hover:bg-forest-700 disabled:opacity-60">
         {pending ? "Submitting…" : "Submit"}

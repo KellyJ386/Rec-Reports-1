@@ -73,8 +73,20 @@ compliance reporting, and employee scheduling in one operations layer.
       `work_order_photo` — photos allowed here only), `asset` (+ `asset_inspection_history`
       auto-populated from PM form responses in Phase 5).
 
-All three module streams (A/B/C) are complete. Next: Phase 5 (cross-module links,
-compliance dashboard, reporting/export) then Phase 6 (security & NFR audit).
+**Phase 5 — Integration, Dashboard, Reporting**:
+
+- [x] 5.1 Cross-module links: Incident "Follow-Up Required" → auto-creates a linked Task on
+      review (via `createTask()`, idempotent); completed PM/Inspection form responses → link
+      to an asset's inspection history; EOD surfaces the day's injury/incident reports and a
+      work-order entry point.
+- [x] 5.2 Compliance Dashboard (`/compliance`, supervisor+): open incidents, overdue tasks,
+      cert expirations, unfilled shifts — cross-module, RLS-safe, color + label.
+- [x] 5.3 Reporting & Export (`/reporting`): CSV (incidents, tasks, form responses) and PDF
+      (filed injury/incident report, postable weekly schedule via pdf-lib). Exports
+      RLS-scoped. No BI dashboards — exports only.
+
+All module streams (A/B/C) and integration (Phase 5) are complete. Next: Phase 6 (security
+& NFR audit).
 
 No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
 `provision_facility_defaults(facility_id)` is invoked during facility onboarding (the

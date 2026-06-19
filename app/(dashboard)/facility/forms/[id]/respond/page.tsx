@@ -14,6 +14,8 @@ export default async function RespondPage({ params }: { params: Promise<{ id: st
   if (!form) notFound();
 
   const { fields } = parseFormSchema(form.schema_json);
+  const { data: assets } = await supabase
+    .from("asset").select("id, name").eq("facility_id", facilityId).is("deleted_at", null).order("name");
 
   return (
     <div className="space-y-4">
@@ -22,7 +24,7 @@ export default async function RespondPage({ params }: { params: Promise<{ id: st
       {form.status !== "published" ? (
         <p className="text-sm text-amber-700">This form is not published yet.</p>
       ) : (
-        <FormRenderer formId={id} fields={fields} />
+        <FormRenderer formId={id} fields={fields} assets={assets ?? []} />
       )}
     </div>
   );

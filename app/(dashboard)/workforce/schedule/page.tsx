@@ -53,7 +53,12 @@ export default async function SchedulePage() {
                 {p.publish_version > 0 ? ` · v${p.publish_version}` : ""}
               </span>
             </div>
-            {canManage && p.status === "draft" && <PublishButton periodId={p.id} />}
+            <div className="mt-2 flex items-center gap-3">
+              {canManage && p.status === "draft" && <PublishButton periodId={p.id} />}
+              <a href={`/api/export/schedule-pdf?period_id=${p.id}`} className="text-sm text-forest underline">
+                Weekly PDF
+              </a>
+            </div>
           </li>
         ))}
       </ul>

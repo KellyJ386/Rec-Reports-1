@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { requireUser, requireFacilityId } from "@/lib/auth/session";
+import { createTask } from "@/lib/facility/task-actions";
 
 export type ReportKind = "injury" | "incident";
 export type ReportActionState = { error?: string; ok?: boolean };
@@ -91,6 +92,35 @@ export async function setReportStatus(
       .eq("id", id)
       .eq("facility_id", facilityId);
     if (error) return { error: error.message };
+
+    // Cross-module link (Phase 5.1): when an incident flagged for follow-up is reviewed,
+    // create a linked task once (idempotent via follow_up_task_id). The reviewer is
+    // supervisor+, satisfying createTask()'s role requirement.
+    if (kind === "incident" && target === "reviewed") {
+      const { data: inc } = await supabase
+        .from("incident_report")
+        .select("incident_no, follow_up_required, follow_up_task_id")
+        .eq("id", id)
+        .eq("facility_id", facilityId)
+        .maybeSingle();
+      if (inc?.follow_up_required && !inc.follow_up_task_id) {
+        const res = await createTask({
+          facilityId,
+          title: `Follow-up: incident ${inc.incident_no}`,
+          description: "Auto-created from an incident marked Follow-Up Required.",
+          sourceType: "incident",
+          sourceRefId: id,
+        });
+        if (res.ok && res.id) {
+          await supabase
+            .from("incident_report")
+            .update({ follow_up_task_id: res.id })
+            .eq("id", id)
+            .eq("facility_id", facilityId);
+        }
+      }
+    }
+
     revalidatePath(`/operations/${kind}/${id}`);
     return { ok: true };
   } catch (e) {

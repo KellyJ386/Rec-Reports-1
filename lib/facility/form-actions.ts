@@ -95,6 +95,7 @@ export type SubmitResult = { ok: boolean; errors?: AnswerErrors; error?: string 
 export async function submitFormResponse(
   formId: string,
   answers: Record<string, unknown>,
+  assetId?: string | null,
 ): Promise<SubmitResult> {
   try {
     const user = await requireUser();
@@ -111,15 +112,30 @@ export async function submitFormResponse(
     const result = validateAnswers(fields, answers);
     if (!result.ok) return { ok: false, errors: result.errors };
 
-    const { error } = await supabase.from("form_response").insert({
-      facility_id: facilityId,
-      form_id: formId,
-      form_version_no: form.version_no,
-      answers_json: result.value,
-      created_by: user.id,
-      submitted_by: user.id,
-    });
+    const { data: response, error } = await supabase
+      .from("form_response")
+      .insert({
+        facility_id: facilityId,
+        form_id: formId,
+        form_version_no: form.version_no,
+        answers_json: result.value,
+        created_by: user.id,
+        submitted_by: user.id,
+      })
+      .select("id")
+      .single();
     if (error) return { ok: false, error: error.message };
+
+    // Cross-module link (Phase 5.1): a PM/Inspection response tied to an asset feeds the
+    // asset's inspection history (MODULE_SPEC.md §3.6).
+    if (assetId) {
+      await supabase.from("asset_inspection_history").insert({
+        facility_id: facilityId,
+        asset_id: assetId,
+        form_response_id: response.id,
+      });
+    }
+
     revalidatePath(`/facility/forms/${formId}/respond`);
     return { ok: true };
   } catch (e) {
