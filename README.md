@@ -58,6 +58,24 @@ compliance reporting, and employee scheduling in one operations layer.
 - [x] B.3 Daily Log (shared log + tagging), Memo Board (post + recipient groups + read
       receipts/unread), EOD (one per facility/day, save/submit, lock-ready).
 
+**Stream C — Facility Management**:
+
+- [x] C.1 Forms & Inspections: `form`/`form_response`; dynamic schema builder (all field
+      types) + **server-side answer validation** against the form's own schema (10 unit
+      tests); fill UI; **CSV export** (`/api/export/form-responses`, RLS-scoped).
+- [x] C.2 Tasks & Utilization Counts: `task` (recurrence, priority, assignment, completion)
+      with reusable `createTask()` seam for the Phase 5 incident link; `utilization_count`
+      quick entry + daily total.
+- [x] C.3 SOPs & ERPs: `sop`/`sop_version`/`sop_acknowledgment` (visibility-role-gated,
+      acknowledgments, versions retained); `erp` (+ role assignments/contacts), always
+      readable per facility.
+- [x] C.4 Work Orders & Assets: `work_order` (Open→…→Closed, manager-only assignment,
+      `work_order_photo` — photos allowed here only), `asset` (+ `asset_inspection_history`
+      auto-populated from PM form responses in Phase 5).
+
+All three module streams (A/B/C) are complete. Next: Phase 5 (cross-module links,
+compliance dashboard, reporting/export) then Phase 6 (security & NFR audit).
+
 No live services are provisioned (code-only). Wire credentials in `.env.local` to run.
 `provision_facility_defaults(facility_id)` is invoked during facility onboarding (the
 facility-creation UI is wired when org/facility provisioning is built). The

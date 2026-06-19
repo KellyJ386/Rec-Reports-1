@@ -68,8 +68,14 @@ export default async function DashboardPage() {
               <p className="text-xs text-gray-500">Injury/incident, daily log, memos, EOD</p>
             </Link>
           </li>
-          <li className="rounded-lg border border-dashed border-gray-200 p-4 text-sm text-gray-400">
-            Facility Mgmt <span className="block text-xs">(Stream C — next)</span>
+          <li>
+            <Link
+              href="/facility"
+              className="block rounded-lg border border-gray-200 bg-white p-4 hover:border-forest focus:outline-none focus:ring-2 focus:ring-forest"
+            >
+              <span className="font-medium text-gray-900">Facility Mgmt</span>
+              <p className="text-xs text-gray-500">Forms, tasks, counts, SOPs, ERPs, work orders, assets</p>
+            </Link>
           </li>
         </ul>
       </section>

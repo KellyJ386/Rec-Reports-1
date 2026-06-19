@@ -391,6 +391,107 @@ type EodReportInsert = {
   submitted_by?: string | null; submitted_at?: string | null; locked_at?: string | null; created_by?: string | null;
 };
 
+// --- Facility Management (Stream C) ---
+type FormRow = {
+  id: string; facility_id: string; form_category_id: string | null; name: string;
+  schema_json: unknown; schedule: "ad_hoc" | "daily" | "weekly" | "event";
+  status: "draft" | "published" | "archived"; version_no: number;
+} & Timestamps & Authored;
+type FormInsert = {
+  id?: string; facility_id: string; form_category_id?: string | null; name: string;
+  schema_json?: unknown; schedule?: "ad_hoc" | "daily" | "weekly" | "event";
+  status?: "draft" | "published" | "archived"; version_no?: number; created_by?: string | null;
+};
+type FormResponseRow = {
+  id: string; facility_id: string; form_id: string; form_version_no: number;
+  answers_json: Record<string, unknown>; source: "web" | "mobile" | "offline_sync";
+  submitted_by: string | null; submitted_at: string;
+} & Timestamps & Authored;
+type FormResponseInsert = {
+  id?: string; facility_id: string; form_id: string; form_version_no: number;
+  answers_json?: Record<string, unknown>; source?: "web" | "mobile" | "offline_sync";
+  submitted_by?: string | null; submitted_at?: string; created_by?: string | null;
+};
+
+type TaskRow = {
+  id: string; facility_id: string; task_category_id: string | null; title: string; description: string | null;
+  priority: "low" | "normal" | "high" | "urgent"; assigned_to: string | null; due_at: string | null;
+  recurrence: "one_time" | "daily" | "weekly" | "custom"; recurrence_rule: string | null;
+  status: "open" | "in_progress" | "done" | "cancelled"; completion_notes: string | null;
+  completion_signature_path: string | null; source_type: string | null; source_ref_id: string | null;
+} & Timestamps & Authored;
+type TaskInsert = {
+  id?: string; facility_id: string; task_category_id?: string | null; title: string; description?: string | null;
+  priority?: "low" | "normal" | "high" | "urgent"; assigned_to?: string | null; due_at?: string | null;
+  recurrence?: "one_time" | "daily" | "weekly" | "custom"; recurrence_rule?: string | null;
+  status?: "open" | "in_progress" | "done" | "cancelled"; completion_notes?: string | null;
+  completion_signature_path?: string | null; source_type?: string | null; source_ref_id?: string | null; created_by?: string | null;
+};
+
+type CountRow = {
+  id: string; facility_id: string; count_area_id: string | null; count_type_id: string | null;
+  counted_at: string; count_value: number;
+} & Timestamps & Authored;
+type CountInsert = {
+  id?: string; facility_id: string; count_area_id?: string | null; count_type_id?: string | null;
+  counted_at?: string; count_value?: number; created_by?: string | null;
+};
+
+type SopRow = {
+  id: string; facility_id: string; sop_category_id: string | null; title: string; current_version_no: number;
+  acknowledgment_required: boolean; visibility_role: "staff" | "supervisor" | "facility_manager" | "org_admin";
+} & Timestamps & Authored;
+type SopInsert = {
+  id?: string; facility_id: string; sop_category_id?: string | null; title: string; current_version_no?: number;
+  acknowledgment_required?: boolean; visibility_role?: "staff" | "supervisor" | "facility_manager" | "org_admin"; created_by?: string | null;
+};
+type SopVersionRow = {
+  id: string; facility_id: string; sop_id: string; version_no: number; body_richtext: string | null;
+  effective_at: string; change_summary: string | null; published_by: string | null; created_at: string;
+};
+type SopVersionInsert = {
+  id?: string; facility_id: string; sop_id: string; version_no: number; body_richtext?: string | null;
+  effective_at?: string; change_summary?: string | null; published_by?: string | null;
+};
+type SopAckRow = { id: string; facility_id: string; sop_version_id: string; user_id: string; acknowledged_at: string };
+type SopAckInsert = { id?: string; facility_id: string; sop_version_id: string; user_id: string; acknowledged_at?: string };
+
+type ErpRow = {
+  id: string; facility_id: string; erp_scenario_type_id: string | null; erp_response_level_id: string | null;
+  title: string; protocol_steps_json: unknown; evacuation_ref: string | null; aed_ref: string | null;
+} & Timestamps & Authored;
+type ErpInsert = {
+  id?: string; facility_id: string; erp_scenario_type_id?: string | null; erp_response_level_id?: string | null;
+  title: string; protocol_steps_json?: unknown; evacuation_ref?: string | null; aed_ref?: string | null; created_by?: string | null;
+};
+type ErpRoleRow = { id: string; facility_id: string; erp_id: string; role_label: string; responsibility: string | null };
+type ErpRoleInsert = { id?: string; facility_id: string; erp_id: string; role_label: string; responsibility?: string | null };
+type ErpContactRow = { id: string; facility_id: string; erp_id: string; name: string; phone: string | null; org: string | null; display_order: number };
+type ErpContactInsert = { id?: string; facility_id: string; erp_id: string; name: string; phone?: string | null; org?: string | null; display_order?: number };
+
+type AssetRow = {
+  id: string; facility_id: string; asset_type_id: string | null; area_id: string | null; name: string;
+  asset_tag: string | null; pm_schedule_json: Record<string, unknown>; active: boolean;
+} & Timestamps & Authored;
+type AssetInsert = {
+  id?: string; facility_id: string; asset_type_id?: string | null; area_id?: string | null; name: string;
+  asset_tag?: string | null; pm_schedule_json?: Record<string, unknown>; active?: boolean; created_by?: string | null;
+};
+type WorkOrderRow = {
+  id: string; facility_id: string; work_order_category_id: string | null; asset_id: string | null;
+  title: string; description: string | null; priority: "low" | "normal" | "high" | "urgent";
+  status: "open" | "assigned" | "in_progress" | "completed" | "closed"; assigned_to: string | null; due_at: string | null;
+} & Timestamps & Authored;
+type WorkOrderInsert = {
+  id?: string; facility_id: string; work_order_category_id?: string | null; asset_id?: string | null;
+  title: string; description?: string | null; priority?: "low" | "normal" | "high" | "urgent";
+  status?: "open" | "assigned" | "in_progress" | "completed" | "closed"; assigned_to?: string | null; due_at?: string | null; created_by?: string | null;
+};
+type WorkOrderPhotoRow = { id: string; facility_id: string; work_order_id: string; storage_path: string; checksum: string | null; created_at: string; created_by: string | null };
+type WorkOrderPhotoInsert = { id?: string; facility_id: string; work_order_id: string; storage_path: string; checksum?: string | null; created_by?: string | null };
+type AssetInspectionRow = { id: string; facility_id: string; asset_id: string; form_response_id: string | null; performed_at: string; created_at: string };
+type AssetInspectionInsert = { id?: string; facility_id: string; asset_id: string; form_response_id?: string | null; performed_at?: string };
+
 export type Database = {
   public: {
     Tables: {
@@ -433,6 +534,20 @@ export type Database = {
       memo: { Row: MemoRow; Insert: MemoInsert; Update: Partial<MemoInsert>; Relationships: [] };
       memo_receipt: { Row: MemoReceiptRow; Insert: MemoReceiptInsert; Update: Partial<MemoReceiptInsert>; Relationships: [] };
       eod_report: { Row: EodReportRow; Insert: EodReportInsert; Update: Partial<EodReportInsert>; Relationships: [] };
+      form: { Row: FormRow; Insert: FormInsert; Update: Partial<FormInsert>; Relationships: [] };
+      form_response: { Row: FormResponseRow; Insert: FormResponseInsert; Update: Partial<FormResponseInsert>; Relationships: [] };
+      task: { Row: TaskRow; Insert: TaskInsert; Update: Partial<TaskInsert>; Relationships: [] };
+      utilization_count: { Row: CountRow; Insert: CountInsert; Update: Partial<CountInsert>; Relationships: [] };
+      sop: { Row: SopRow; Insert: SopInsert; Update: Partial<SopInsert>; Relationships: [] };
+      sop_version: { Row: SopVersionRow; Insert: SopVersionInsert; Update: Partial<SopVersionInsert>; Relationships: [] };
+      sop_acknowledgment: { Row: SopAckRow; Insert: SopAckInsert; Update: Partial<SopAckInsert>; Relationships: [] };
+      erp: { Row: ErpRow; Insert: ErpInsert; Update: Partial<ErpInsert>; Relationships: [] };
+      erp_role_assignment: { Row: ErpRoleRow; Insert: ErpRoleInsert; Update: Partial<ErpRoleInsert>; Relationships: [] };
+      erp_emergency_contact: { Row: ErpContactRow; Insert: ErpContactInsert; Update: Partial<ErpContactInsert>; Relationships: [] };
+      asset: { Row: AssetRow; Insert: AssetInsert; Update: Partial<AssetInsert>; Relationships: [] };
+      work_order: { Row: WorkOrderRow; Insert: WorkOrderInsert; Update: Partial<WorkOrderInsert>; Relationships: [] };
+      work_order_photo: { Row: WorkOrderPhotoRow; Insert: WorkOrderPhotoInsert; Update: Partial<WorkOrderPhotoInsert>; Relationships: [] };
+      asset_inspection_history: { Row: AssetInspectionRow; Insert: AssetInspectionInsert; Update: Partial<AssetInspectionInsert>; Relationships: [] };
     };
     Views: {
       staff_certification_status: { Row: StaffCertStatusRow; Relationships: [] };
