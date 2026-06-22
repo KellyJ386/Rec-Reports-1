@@ -3,7 +3,12 @@ name: CI
 on:
   pull_request:
   push:
-    branches: ["claude/**", "main"]
+    branches: ["main"]
+
+# One run per ref; cancel superseded runs so a new push doesn't double up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
