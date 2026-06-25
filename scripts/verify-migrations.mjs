@@ -1,0 +1,48 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+const migrationDir = new URL("../supabase/migrations", import.meta.url);
+const files = readdirSync(migrationDir).filter((file) => file.endsWith(".sql")).sort();
+
+if (files.length === 0) {
+  throw new Error("No Supabase migrations found.");
+}
+
+const combinedSql = files
+  .map((file) => readFileSync(join(migrationDir.pathname, file), "utf8"))
+  .join("\n");
+
+const requiredRlsTables = [
+  "facilities",
+  "memberships",
+  "roles",
+  "departments",
+  "report_templates",
+  "report_template_versions",
+  "report_submissions",
+  "report_submission_attachments",
+  "audit_events",
+  "outbox_events",
+  "employees",
+  "certification_types",
+  "employee_certifications",
+  "schedule_periods",
+  "shift_templates",
+  "schedule_shifts",
+  "shift_assignments",
+  "schedule_publications"
+];
+
+for (const table of requiredRlsTables) {
+  if (!combinedSql.includes(`alter table ${table} enable row level security`)) {
+    throw new Error(`Migrations do not enable RLS for ${table}.`);
+  }
+}
+
+for (const helper of ["current_facility_ids", "has_permission"]) {
+  if (!combinedSql.includes(`function ${helper}`)) {
+    throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+console.log(`Verified ${files.length} migration file(s) include tenant-scoped RLS requirements.`);
