@@ -1,0 +1,21 @@
+{
+  "name": "rec-reports",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-grade recreation operations SaaS platform.",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/dev-server.mjs dist",
+    "lint": "node scripts/lint.mjs",
+    "typecheck": "node scripts/typecheck.mjs",
+    "test": "node --test",
+    "format:check": "node scripts/format-check.mjs",
+    "db:verify": "node scripts/verify-migrations.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
