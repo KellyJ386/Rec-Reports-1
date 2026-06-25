@@ -55,6 +55,8 @@ const requiredRlsTables = [
   "training_progress",
   "training_completions",
   "certification_events"
+  "incident_amendments"
+  "schedule_publications"
 ];
 
 for (const table of requiredRlsTables) {
