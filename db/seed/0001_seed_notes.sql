@@ -1,0 +1,13 @@
+-- =============================================================================
+-- db/seed/0001_seed_notes.sql
+-- Phase 0 placeholder. Admin-configurable defaults (severity levels, categories, areas,
+-- cert types, job areas, count types, etc.) are SEEDED in PHASE 1 — never hardcoded in
+-- app code (CLAUDE.md §3.2). Per-facility config defaults are seeded when a facility is
+-- provisioned, not globally here.
+--
+-- The illustrative default catalogs live in MODULE_SPEC.md §5.1 and will be turned into
+-- real seed statements in Phase 1.1. This file intentionally seeds nothing yet so that
+-- tenancy migration + tests can run against an empty, well-isolated database.
+-- =============================================================================
+
+-- (no-op)
