@@ -62,6 +62,9 @@ const requiredRlsTables = [
   "department_settings",
   "branding_profiles",
   "admin_change_requests"
+  "certification_events"
+  "incident_amendments"
+  "schedule_publications"
 ];
 
 for (const table of requiredRlsTables) {
