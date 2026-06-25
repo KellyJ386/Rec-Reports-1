@@ -37,6 +37,24 @@ const requiredRlsTables = [
   "incident_escalations",
   "incident_followup_actions",
   "incident_audit_events",
+  "incident_amendments",
+  "assets",
+  "work_orders",
+  "work_order_updates",
+  "work_order_attachments",
+  "communication_channels",
+  "messages",
+  "message_audiences",
+  "message_receipts",
+  "message_acknowledgements",
+  "notification_jobs",
+  "notification_deliveries",
+  "courses",
+  "course_modules",
+  "training_assignments",
+  "training_progress",
+  "training_completions",
+  "certification_events"
   "incident_amendments"
   "schedule_publications"
 ];

@@ -96,3 +96,39 @@ button.primary {
 .incident-card span {
   color: #663333;
 }
+.work-order-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #9ec5a9;
+  border-radius: 14px;
+  background: #effaf2;
+  padding: 16px;
+}
+
+.work-order-card span {
+  color: #315a3a;
+}
+.message-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #b8a7f5;
+  border-radius: 14px;
+  background: #f5f1ff;
+  padding: 16px;
+}
+
+.message-card span {
+  color: #44336d;
+}
+.training-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #7ab7c7;
+  border-radius: 14px;
+  background: #eefbff;
+  padding: 16px;
+}
+
+.training-card span {
+  color: #285766;
+}
