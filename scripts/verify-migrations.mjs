@@ -54,6 +54,14 @@ const requiredRlsTables = [
   "training_assignments",
   "training_progress",
   "training_completions",
+  "certification_events",
+  "modules",
+  "organization_module_settings",
+  "facility_module_overrides",
+  "facility_settings",
+  "department_settings",
+  "branding_profiles",
+  "admin_change_requests"
   "certification_events"
   "incident_amendments"
   "schedule_publications"

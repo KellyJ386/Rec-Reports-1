@@ -132,3 +132,15 @@ button.primary {
 .training-card span {
   color: #285766;
 }
+.admin-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d1b06f;
+  border-radius: 14px;
+  background: #fff8e8;
+  padding: 16px;
+}
+
+.admin-card span {
+  color: #6a4b12;
+}

@@ -149,3 +149,25 @@ on conflict (id) do nothing;
 insert into training_progress (id, facility_id, assignment_id, module_id, state) values
   ('00000000-0000-0000-0000-000000002701', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000002601', '00000000-0000-0000-0000-000000002501', 'not_started')
 on conflict (id) do nothing;
+
+
+insert into modules (id, code, name, category, default_enabled) values
+  ('00000000-0000-0000-0000-000000002801', 'daily_reports', 'Daily Reports', 'operations', true),
+  ('00000000-0000-0000-0000-000000002802', 'scheduling', 'Scheduling', 'operations', true),
+  ('00000000-0000-0000-0000-000000002803', 'incidents', 'Incidents', 'risk', true),
+  ('00000000-0000-0000-0000-000000002804', 'work_orders', 'Work Orders', 'maintenance', true),
+  ('00000000-0000-0000-0000-000000002805', 'communications', 'Communications', 'engagement', true),
+  ('00000000-0000-0000-0000-000000002806', 'training', 'Training', 'compliance', true)
+on conflict (id) do nothing;
+
+insert into facility_settings (id, facility_id, settings_jsonb, version, published_at) values
+  ('00000000-0000-0000-0000-000000002901', '00000000-0000-0000-0000-000000000201', '{"locale":"en-US","reporting":{"dailyReportDueHour":18},"notifications":{"quietHoursStart":"22:00","quietHoursEnd":"06:00"}}'::jsonb, 1, now())
+on conflict (id) do nothing;
+
+insert into branding_profiles (id, facility_id, name, theme_jsonb, is_default) values
+  ('00000000-0000-0000-0000-000000003001', '00000000-0000-0000-0000-000000000201', 'North Arena Default', '{"primary":"#1c6dd0","accent":"#9ec5a9"}'::jsonb, true)
+on conflict (id) do nothing;
+
+insert into admin_change_requests (id, facility_id, entity_table, entity_id, change_summary, after_jsonb, status) values
+  ('00000000-0000-0000-0000-000000003101', '00000000-0000-0000-0000-000000000201', 'facility_settings', '00000000-0000-0000-0000-000000002901', 'Publish initial facility operating defaults.', '{"version":1}'::jsonb, 'published')
+on conflict (id) do nothing;
