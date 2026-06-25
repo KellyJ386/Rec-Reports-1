@@ -38,6 +38,7 @@ const requiredRlsTables = [
   "incident_followup_actions",
   "incident_audit_events",
   "incident_amendments"
+  "schedule_publications"
 ];
 
 for (const table of requiredRlsTables) {
