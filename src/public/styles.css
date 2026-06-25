@@ -84,3 +84,15 @@ button.primary {
   border-color: #f2c36b;
   background: #fff8e8;
 }
+.incident-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #f0a0a0;
+  border-radius: 14px;
+  background: #fff1f1;
+  padding: 16px;
+}
+
+.incident-card span {
+  color: #663333;
+}

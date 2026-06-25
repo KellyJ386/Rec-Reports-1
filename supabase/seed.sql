@@ -6,6 +6,7 @@ insert into permissions (code, description) values
   ('schedule.read', 'Read schedules'),
   ('schedule.manage', 'Manage schedules'),
   ('training.read', 'Read training and certifications'),
+  ('incidents.read', 'Read incidents'),
   ('incidents.manage', 'Manage incidents'),
   ('admin.manage', 'Manage facility configuration'),
   ('reports.template.manage', 'Manage report templates')
@@ -70,4 +71,21 @@ on conflict (id) do nothing;
 
 insert into shift_assignments (id, facility_id, shift_id, employee_id, status) values
   ('00000000-0000-0000-0000-000000001101', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000001001', '00000000-0000-0000-0000-000000000601', 'approved')
+on conflict (id) do nothing;
+
+
+insert into incident_reports (id, facility_id, department_id, incident_no, report_type, status, severity, occurred_at, location_text, summary, immediate_actions, requires_osha_review) values
+  ('00000000-0000-0000-0000-000000001201', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'INC-2026-0001', 'accident', 'escalated', 'high', '2026-07-06 10:15:00-04', 'North pool deck', 'Guest slipped on wet pool deck near lane 3.', 'Area closed, first aid provided, supervisor notified.', true)
+on conflict (id) do nothing;
+
+insert into incident_people (id, facility_id, incident_id, person_role, full_name, injury_json, statement_text) values
+  ('00000000-0000-0000-0000-000000001301', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000001201', 'injured_party', 'Demo Guest', '{"body_part":"ankle","first_aid":true}'::jsonb, 'I slipped while walking near the pool deck.')
+on conflict (id) do nothing;
+
+insert into incident_escalations (id, facility_id, incident_id, reason_code, target_role, due_at) values
+  ('00000000-0000-0000-0000-000000001401', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000001201', 'high_severity', 'facility_manager', '2026-07-06 12:15:00-04')
+on conflict (id) do nothing;
+
+insert into incident_followup_actions (id, facility_id, incident_id, action_type, status, due_at, description) values
+  ('00000000-0000-0000-0000-000000001501', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000001201', 'corrective_action', 'open', '2026-07-07 17:00:00-04', 'Review pool deck mats and wet floor signage placement.')
 on conflict (id) do nothing;

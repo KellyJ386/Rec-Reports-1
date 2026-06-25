@@ -30,6 +30,14 @@ const requiredRlsTables = [
   "shift_templates",
   "schedule_shifts",
   "shift_assignments",
+  "schedule_publications",
+  "incident_reports",
+  "incident_people",
+  "incident_attachments",
+  "incident_escalations",
+  "incident_followup_actions",
+  "incident_audit_events",
+  "incident_amendments"
   "schedule_publications"
 ];
 
