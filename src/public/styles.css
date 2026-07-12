@@ -144,3 +144,20 @@ button.primary {
 .admin-card span {
   color: #6a4b12;
 }
+a.primary {
+  display: inline-block;
+  border: 1px solid #b9c7d9;
+  border-radius: 10px;
+  padding: 10px 16px;
+  background: #1c6dd0;
+  color: #ffffff;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+  width: fit-content;
+}
+
+a.primary:focus-visible {
+  outline: 3px solid #0b57d0;
+  outline-offset: 2px;
+}

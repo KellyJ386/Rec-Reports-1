@@ -159,12 +159,20 @@ function serveStatic(request, response) {
     response.end("Not found");
     return;
   }
-  const filePath = join(root, requestedPath === "/" ? "index.html" : requestedPath);
+  let filePath = join(root, requestedPath === "/" ? "index.html" : requestedPath);
   let stats;
   try {
     stats = existsSync(filePath) ? statSync(filePath) : null;
   } catch {
     stats = null;
+  }
+  if (stats && stats.isDirectory()) {
+    filePath = join(filePath, "index.html");
+    try {
+      stats = existsSync(filePath) ? statSync(filePath) : null;
+    } catch {
+      stats = null;
+    }
   }
   if (!stats || !stats.isFile()) {
     response.writeHead(404, securityHeaders);
