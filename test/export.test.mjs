@@ -77,6 +77,24 @@ test("buildExportPackage supports json and falls back to csv for unknown formats
 
   const fallbackPkg = buildExportPackage(rows, "xml", { namePrefix: "widgets-export" });
   assert.equal(fallbackPkg.contentType, "text/csv");
+  assert.match(fallbackPkg.filename, /\.csv$/);
+});
+
+test("buildExportPackage supports pdf with a base64-encoded body", () => {
+  const rows = [{ id: "1", note: "has (paren) and back\\slash" }];
+  const pkg = buildExportPackage(rows, "pdf", { namePrefix: "widgets-export", columns: ["id", "note"] });
+  assert.equal(pkg.contentType, "application/pdf");
+  assert.match(pkg.filename, /^widgets-export-.+\.pdf$/);
+  assert.equal(pkg.encoding, "base64");
+  const decoded = Buffer.from(pkg.body, "base64").toString("latin1");
+  assert.ok(decoded.startsWith("%PDF-"));
+  assert.ok(decoded.includes("has \\(paren\\) and back\\\\slash"));
+});
+
+test("buildExportPackage leaves csv/json envelopes without an encoding key", () => {
+  const rows = [{ id: "1" }];
+  assert.equal("encoding" in buildExportPackage(rows, "csv"), false);
+  assert.equal("encoding" in buildExportPackage(rows, "json"), false);
 });
 
 test("buildExportPackage defaults namePrefix to 'export' when omitted", () => {

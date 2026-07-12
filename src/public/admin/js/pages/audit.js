@@ -1,7 +1,7 @@
 import { api } from "../api.js";
 import { el, clearChildren, errorBanner, emptyState, tableScroll, toast, formatDateTime } from "../ui.js";
 import { getContext } from "../state.js";
-import { buildDataExportPanel } from "./export.js";
+import { buildDataExportPanel, decodeExportBody } from "./export.js";
 
 // Tables fn_audit_admin_change (0010/0012) writes 'config.changed' rows for.
 // Mirrors the trigger attachment list; kept here rather than fetched so the
@@ -280,18 +280,22 @@ function buildToolsPanel({ facilityId, statusRegion, getFilters }) {
 
   const csvButton = el("button", { type: "button", class: "ghost-button" }, ["Export CSV"]);
   const jsonButton = el("button", { type: "button", class: "ghost-button" }, ["Export JSON"]);
+  const pdfButton = el("button", { type: "button", class: "ghost-button" }, ["Export PDF"]);
   csvButton.addEventListener("click", () =>
     downloadExport({ facilityId, format: "csv", filters: getFilters(), statusRegion, button: csvButton })
   );
   jsonButton.addEventListener("click", () =>
     downloadExport({ facilityId, format: "json", filters: getFilters(), statusRegion, button: jsonButton })
   );
+  pdfButton.addEventListener("click", () =>
+    downloadExport({ facilityId, format: "pdf", filters: getFilters(), statusRegion, button: pdfButton })
+  );
 
   panel.append(
     el("p", { class: "detail-subhead" }, [
       "Recompute the hash chain against the stored rows, or export the current timeline filters."
     ]),
-    el("div", { class: "row-actions" }, [verifyButton, csvButton, jsonButton]),
+    el("div", { class: "row-actions" }, [verifyButton, csvButton, jsonButton, pdfButton]),
     verifyResult
   );
   return panel;
@@ -302,8 +306,9 @@ function buildToolsPanel({ facilityId, statusRegion, getFilters }) {
 // already attaches that header; the server (constrained to the same JSON
 // sendJson primitive every other route uses) hands back
 // {contentType, filename, body} rather than a raw file response, so the
-// download itself is completed here: wrap `body` in a same-typed Blob and
-// click a throwaway object-URL anchor.
+// download itself is completed here: wrap `body` in a same-typed Blob (via
+// decodeExportBody, which base64-decodes binary formats like PDF) and click a
+// throwaway object-URL anchor.
 async function downloadExport({ facilityId, format, filters, statusRegion, button }) {
   button.disabled = true;
   try {
@@ -312,7 +317,7 @@ async function downloadExport({ facilityId, format, filters, statusRegion, butto
     const pkg = await api.get(
       `/facilities/${encodeURIComponent(facilityId)}/audit/export${query}${separator}format=${format}`
     );
-    const blob = new Blob([pkg.body], { type: pkg.contentType });
+    const blob = new Blob([decodeExportBody(pkg)], { type: pkg.contentType });
     const url = URL.createObjectURL(blob);
     const anchor = el("a", { href: url, download: pkg.filename });
     document.body.append(anchor);

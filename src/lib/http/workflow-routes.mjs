@@ -170,7 +170,7 @@ export function registerWorkflowRoutes(router, { authenticate, sendJson, readBod
   );
 
   // --- Generic data export --------------------------------------------------
-  // GET /facilities/:facilityId/export/:table?format=csv|json. `table` must be
+  // GET /facilities/:facilityId/export/:table?format=csv|json|pdf. `table` must be
   // in export.mjs's EXPORTABLE_TABLES allow-list; the caller needs either that
   // table's mapped permission code or admin.manage. Response envelope matches
   // registerAuditRoutes' export route ({contentType, filename, body,
@@ -191,7 +191,8 @@ export function registerWorkflowRoutes(router, { authenticate, sendJson, readBod
           return sendJson(response, 403, { error: tableGuard.reason });
         }
         const search = queryParams(request);
-        const format = (search.get("format") || "csv").toLowerCase() === "json" ? "json" : "csv";
+        const requested = (search.get("format") || "csv").toLowerCase();
+        const format = requested === "json" || requested === "pdf" ? requested : "csv";
         const rows = await pgSelect(auth.client, params.table, {
           filters: { facility_id: params.facilityId },
           limit: EXPORT_LIMIT

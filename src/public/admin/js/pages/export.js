@@ -33,7 +33,8 @@ export function buildDataExportPanel({ facilityId, statusRegion }) {
     { id: "export-format", "aria-label": "Export format" },
     [
       el("option", { value: "csv" }, ["CSV"]),
-      el("option", { value: "json" }, ["JSON"])
+      el("option", { value: "json" }, ["JSON"]),
+      el("option", { value: "pdf" }, ["PDF"])
     ]
   );
   const downloadButton = el("button", { type: "button", class: "primary-button" }, ["Download export"]);
@@ -54,6 +55,19 @@ export function buildDataExportPanel({ facilityId, statusRegion }) {
   return panel;
 }
 
+// Turns an export envelope's body into the Blob part to download. Binary
+// formats (PDF) arrive base64-encoded (encoding: "base64") because the
+// envelope travels inside a JSON response; decode with atob into raw bytes so
+// the Blob holds the real binary. csv/json bodies are plain text and pass
+// through unchanged. Shared with pages/audit.js's downloadExport.
+export function decodeExportBody(pkg) {
+  if (pkg.encoding !== "base64") return pkg.body;
+  const binary = atob(pkg.body);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 // Same Blob-download pattern as pages/audit.js's downloadExport: the export
 // endpoint requires the same Bearer auth header as every other admin API
 // call, so a bare <a href> can't hit it directly -- api.get already attaches
@@ -65,7 +79,7 @@ async function downloadExport({ facilityId, table, format, statusRegion, downloa
     const pkg = await api.get(
       `/facilities/${encodeURIComponent(facilityId)}/export/${encodeURIComponent(table)}?format=${format}`
     );
-    const blob = new Blob([pkg.body], { type: pkg.contentType });
+    const blob = new Blob([decodeExportBody(pkg)], { type: pkg.contentType });
     const url = URL.createObjectURL(blob);
     const anchor = el("a", { href: url, download: pkg.filename });
     document.body.append(anchor);

@@ -92,7 +92,7 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
     })
   );
 
-  // GET /facilities/:facilityId/audit/export?format=csv|json
+  // GET /facilities/:facilityId/audit/export?format=csv|json|pdf
   //
   // The shared sendJson primitive (scripts/server.mjs) always serializes its
   // payload as application/json -- registerAuditRoutes only receives that one
@@ -109,7 +109,8 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
       if (!requireAuditAccess(auth, params.facilityId, response)) return;
       if (!(await requireExportEntitlement(auth, params.facilityId, response))) return;
       const search = queryParams(request);
-      const format = (search.get("format") || "csv").toLowerCase() === "json" ? "json" : "csv";
+      const requested = (search.get("format") || "csv").toLowerCase();
+      const format = requested === "json" || requested === "pdf" ? requested : "csv";
       const rows = await queryAuditTimeline(auth.client, {
         facilityId: params.facilityId,
         entityTable: search.get("entityTable") || undefined,

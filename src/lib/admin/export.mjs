@@ -1,9 +1,13 @@
-// Generic CSV/JSON export helpers shared by every facility-scoped data-export
-// surface: audit-export.mjs's audit timeline (which re-exports toCsv/toJson
-// from here so its public API is unchanged) and the generic
+// Generic CSV/JSON/PDF export helpers shared by every facility-scoped
+// data-export surface: audit-export.mjs's audit timeline (which re-exports
+// toCsv/toJson from here so its public API is unchanged) and the generic
 // GET /facilities/:facilityId/export/:table route (workflow-routes.mjs).
 // This module owns the actual escaping/shaping so the two surfaces can never
-// drift apart on RFC 4180 quoting rules.
+// drift apart on RFC 4180 quoting rules. PDF rendering itself lives in
+// pdf.mjs; this module only shapes its envelope.
+
+import { Buffer } from "node:buffer";
+import { renderPdfDocument } from "./pdf.mjs";
 
 // Escape a single CSV field per RFC 4180: wrap in quotes (doubling any
 // embedded quotes) whenever the value contains a comma, quote, or newline.
@@ -48,15 +52,37 @@ function timestampSlug() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+// Human-readable document title derived from a filename prefix, e.g.
+// "audit-export" -> "Audit Export", "incident_reports-export" ->
+// "Incident Reports Export". Used as the PDF's page-1 heading.
+function titleFromPrefix(namePrefix) {
+  const words = String(namePrefix).split(/[-_]+/).filter(Boolean);
+  if (words.length === 0) return "Export";
+  return words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+}
+
 // Shapes the exportable file for a set of rows -- { contentType, filename,
 // body }. `namePrefix` becomes the leading segment of the filename (e.g.
 // "audit-export", "incident_reports-export"); `columns` fixes the CSV column
-// order when the caller has one.
+// order (and the PDF's label order) when the caller has one. Formats:
+// json | pdf | csv (default, also the fallback for unknown formats). The pdf
+// branch additionally sets `encoding: "base64"` -- this envelope travels
+// inside a JSON response (see the export routes), so binary bytes must be
+// base64-encoded; csv/json envelopes stay plain text with no encoding key.
 export function buildExportPackage(rows, format, { namePrefix = "export", columns } = {}) {
-  const normalized = format === "json" ? "json" : "csv";
+  const normalized = format === "json" || format === "pdf" ? format : "csv";
   const filename = `${namePrefix}-${timestampSlug()}.${normalized}`;
   if (normalized === "json") {
     return { contentType: "application/json", filename, body: toJson(rows) };
+  }
+  if (normalized === "pdf") {
+    const document = renderPdfDocument({ title: titleFromPrefix(namePrefix), columns, rows: rows ?? [] });
+    return {
+      contentType: "application/pdf",
+      filename,
+      body: Buffer.from(document).toString("base64"),
+      encoding: "base64"
+    };
   }
   return { contentType: "text/csv", filename, body: toCsv(rows, columns) };
 }
@@ -83,7 +109,8 @@ export function permissionForTable(tableName) {
   return EXPORTABLE_TABLES[tableName] ?? null;
 }
 
-// Exports `rows` from `tableName` (must be in EXPORTABLE_TABLES) as csv/json.
+// Exports `rows` from `tableName` (must be in EXPORTABLE_TABLES) as
+// csv/json/pdf.
 // Returns { error } for an unknown table instead of throwing, so the route
 // layer can map it to a 400 without a try/catch.
 export function exportTable(rows, format, tableName) {

@@ -64,8 +64,9 @@ export function toCsv(rows) {
 
 export { toJson };
 
-// Shapes the exportable file for a set of audit rows. Returns
-// { contentType, filename, body } -- the caller (audit-routes.mjs) is
+// Shapes the exportable file for a set of audit rows (csv/json/pdf). Returns
+// { contentType, filename, body } (plus `encoding: "base64"` for the binary
+// pdf format) -- the caller (audit-routes.mjs) is
 // responsible for how that gets to the client, since it also has to survive
 // the Bearer-token auth header the export endpoint requires (see
 // src/public/admin/js/pages/audit.js, which turns this into a Blob download

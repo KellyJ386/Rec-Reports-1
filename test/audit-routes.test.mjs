@@ -200,6 +200,30 @@ test("GET .../audit/export honors format=json", async (t) => {
   assert.deepEqual(JSON.parse(result.payload.body), [row]);
 });
 
+test("GET .../audit/export honors format=pdf with a base64 envelope", async (t) => {
+  const row = { id: "a", event_type: "config.changed" };
+  stubFetch(t, exportRespond([row]));
+  const { call } = mount();
+  const result = await call("GET", "/facilities/fac-1/audit/export?format=pdf");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.contentType, "application/pdf");
+  assert.match(result.payload.filename, /^audit-export-.+\.pdf$/);
+  assert.match(result.payload.contentDisposition, /^attachment; filename="audit-export-.+\.pdf"$/);
+  assert.equal(result.payload.encoding, "base64");
+  const decoded = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.ok(decoded.startsWith("%PDF-1.4"));
+});
+
+test("GET .../audit/export falls back to csv for an unknown format", async (t) => {
+  const row = { id: "a", event_type: "config.changed" };
+  stubFetch(t, exportRespond([row]));
+  const { call } = mount();
+  const result = await call("GET", "/facilities/fac-1/audit/export?format=xlsx");
+  assert.equal(result.payload.contentType, "text/csv");
+  assert.match(result.payload.filename, /\.csv$/);
+  assert.equal("encoding" in result.payload, false);
+});
+
 test("GET .../audit/export denies a non-admin with 403", async (t) => {
   stubFetch(t, () => []);
   const { call } = mount({ memberships: READER_ON_FAC1 });
