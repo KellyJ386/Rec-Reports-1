@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rec Reports Admin Control Center</title>
+    <meta
+      name="description"
+      content="Admin control center for Rec Reports: modules, facilities, permissions, and compliance"
+    />
+    <link rel="stylesheet" href="/admin/admin.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#page-content">Skip to content</a>
+    <div class="admin-shell">
+      <header class="topbar">
+        <div class="topbar-brand">
+          <button
+            type="button"
+            id="sidebar-toggle"
+            class="icon-button"
+            aria-expanded="false"
+            aria-controls="sidebar"
+            aria-label="Toggle navigation menu"
+          >
+            <span aria-hidden="true">&#9776;</span>
+          </button>
+          <span class="brand-name">Rec Reports</span>
+          <span class="brand-tag">Admin control center</span>
+        </div>
+        <div class="topbar-context">
+          <label class="context-field">
+            <span>Organization ID</span>
+            <input
+              type="text"
+              id="org-input"
+              name="org-id"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="paste organization id"
+            />
+          </label>
+          <label class="context-field">
+            <span>Facility</span>
+            <select id="facility-select" aria-label="Active facility" disabled>
+              <option value="">All facilities</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            id="token-drawer-toggle"
+            class="ghost-button"
+            aria-expanded="false"
+            aria-controls="token-drawer"
+          >
+            Session token
+          </button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <nav id="sidebar" class="sidebar" aria-label="Admin sections">
+          <ul id="nav-list" class="nav-list"></ul>
+        </nav>
+
+        <main id="page-content" class="content" tabindex="-1" aria-label="Admin page content"></main>
+      </div>
+
+      <aside id="token-drawer" class="token-drawer" hidden aria-label="Session token settings">
+        <div class="drawer-header">
+          <h2>Session token</h2>
+          <button type="button" id="token-drawer-close" class="icon-button" aria-label="Close session token panel">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+        <p>
+          Paste a Supabase access token to authenticate admin API requests. The token is stored
+          only in this browser's local storage and sent as a Bearer token.
+        </p>
+        <label class="drawer-field">
+          <span>Bearer token</span>
+          <textarea id="token-input" rows="4" spellcheck="false"></textarea>
+        </label>
+        <div class="drawer-actions">
+          <button type="button" id="token-save" class="primary-button">Save token</button>
+          <button type="button" id="token-clear" class="ghost-button">Clear token</button>
+        </div>
+        <p id="token-status" class="drawer-status" role="status" aria-live="polite"></p>
+      </aside>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <noscript>This admin control center requires JavaScript to be enabled.</noscript>
+    <script type="module" src="/admin/js/app.js"></script>
+  </body>
+</html>
