@@ -47,10 +47,27 @@ function sendJson(response, status, payload) {
   response.end(body);
 }
 
-function readBody(request) {
+export const maxBodyBytes = 1024 * 1024;
+
+export function readBody(request) {
   return new Promise((resolve, reject) => {
+    const declaredLength = Number(request.headers["content-length"] ?? 0);
+    if (declaredLength > maxBodyBytes) {
+      request.destroy();
+      reject(new Error("request body too large"));
+      return;
+    }
     const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
+    let received = 0;
+    request.on("data", (chunk) => {
+      received += chunk.length;
+      if (received > maxBodyBytes) {
+        request.destroy();
+        reject(new Error("request body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
     request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     request.on("error", reject);
   });

@@ -163,6 +163,25 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
         errors.push("rolloutPercentage must be an integer between 0 and 100");
       }
       if (errors.length > 0) return sendJson(response, 400, { errors });
+      if (body.payload.scopeType === "organization" && body.payload.scopeId !== params.orgId) {
+        return sendJson(response, 400, {
+          errors: ["organization-scoped rules must target the organization in the path"]
+        });
+      }
+      if (body.payload.scopeType === "facility") {
+        const facilityRow = (
+          await pgSelect(auth.client, "facilities", {
+            filters: { id: body.payload.scopeId },
+            select: "id,organization_id",
+            limit: 1
+          })
+        )?.[0];
+        if (!facilityRow || facilityRow.organization_id !== params.orgId) {
+          return sendJson(response, 400, {
+            errors: ["facility-scoped rules must target a facility of the organization in the path"]
+          });
+        }
+      }
       const facilityIds = await orgFacilities(auth.client, params.orgId);
       if (!guardRuleWrite(auth, body.payload.scopeType, body.payload.scopeId, facilityIds, response)) return;
       const row = {
@@ -191,7 +210,10 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
         })
       )?.[0];
       if (!existing) return sendJson(response, 404, { error: "feature flag rule not found" });
-      const facilityIds = await orgFacilities(auth.client, params.orgId);
+      // Authorize against the rule's ACTUAL scope, not the path org: for
+      // org-scoped rules the admin check runs on the org the rule targets.
+      const guardOrgId = existing.scope_type === "organization" ? existing.scope_id : params.orgId;
+      const facilityIds = await orgFacilities(auth.client, guardOrgId);
       if (!guardRuleWrite(auth, existing.scope_type, existing.scope_id, facilityIds, response)) return;
       const patch = {};
       if (body.payload.state !== undefined) patch.state = Boolean(body.payload.state);

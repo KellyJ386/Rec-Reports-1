@@ -154,3 +154,52 @@ test("POST feature-flag-rules rejects an out-of-range rollout percentage", async
   });
   assert.equal(result.status, 400);
 });
+
+test("POST feature-flag-rules rejects an org-scoped rule targeting a different org than the path", async (t) => {
+  stubFetch(t, (table, method) => orgFacilities(table, method) ?? []);
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("POST", "/org/org-1/feature-flag-rules", {
+    featureFlagId: "flag-1",
+    scopeType: "organization",
+    scopeId: "org-2"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.errors[0], /must target the organization in the path/);
+});
+
+test("POST feature-flag-rules rejects a facility-scoped rule whose facility belongs to another org", async (t) => {
+  stubFetch(t, (table, method, parsed) => {
+    if (table === "facilities" && method === "GET") {
+      if ((parsed.searchParams.get("id") ?? "").includes("fac-9")) {
+        return [{ id: "fac-9", organization_id: "org-2" }];
+      }
+      return [{ id: "fac-1", organization_id: "org-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("POST", "/org/org-1/feature-flag-rules", {
+    featureFlagId: "flag-1",
+    scopeType: "facility",
+    scopeId: "fac-9"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.errors[0], /facility of the organization in the path/);
+});
+
+test("PATCH feature-flag-rules authorizes against the rule's actual org, not the path org", async (t) => {
+  stubFetch(t, (table, method, parsed) => {
+    if (table === "feature_flag_rules" && method === "GET") {
+      return [{ id: "rule-9", scope_type: "organization", scope_id: "org-2" }];
+    }
+    if (table === "facilities" && method === "GET") {
+      const orgFilter = parsed.searchParams.get("organization_id") ?? "";
+      if (orgFilter.includes("org-2")) return [{ id: "fac-2" }];
+      return [{ id: "fac-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("PATCH", "/org/org-1/feature-flag-rules/rule-9", { state: false });
+  assert.equal(result.status, 403);
+});
