@@ -13,7 +13,8 @@
     "test": "node --test",
     "format:check": "node scripts/format-check.mjs",
     "db:verify": "node scripts/verify-migrations.mjs",
-    "db:verify:seed": "node scripts/verify-seed.mjs"
+    "db:verify:seed": "node scripts/verify-seed.mjs",
+    "db:test:rls": "node scripts/run-rls-tests.mjs"
   },
   "engines": {
     "node": ">=20.0.0",

@@ -61,7 +61,8 @@ const requiredRlsTables = [
   "facility_settings",
   "department_settings",
   "branding_profiles",
-  "admin_change_requests"
+  "admin_change_requests",
+  "organization_admins"
 ];
 
 for (const table of requiredRlsTables) {
@@ -70,9 +71,44 @@ for (const table of requiredRlsTables) {
   }
 }
 
-for (const helper of ["current_facility_ids", "has_permission"]) {
+for (const helper of [
+  "current_facility_ids",
+  "has_permission",
+  "fn_assert_same_facility",
+  "is_organization_admin"
+]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+// From 0009 onward every `create policy` must be immediately preceded (in the
+// same file) by a matching `drop policy if exists` for the same name+table, so
+// every policy stays idempotent and re-runnable. Historical files are exempt.
+const dropCreatePattern = /(drop policy if exists|create policy)\s+"([^"]+)"\s+on\s+(\w+)/g;
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 9) {
+    continue;
+  }
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  const statements = [...fileSql.matchAll(dropCreatePattern)];
+  for (let index = 0; index < statements.length; index += 1) {
+    const [, kind, name, table] = statements[index];
+    if (kind !== "create policy") {
+      continue;
+    }
+    const previous = statements[index - 1];
+    if (
+      !previous ||
+      previous[1] !== "drop policy if exists" ||
+      previous[2] !== name ||
+      previous[3] !== table
+    ) {
+      throw new Error(
+        `${file}: create policy "${name}" on ${table} is not immediately preceded by a matching drop policy if exists.`
+      );
+    }
   }
 }
 

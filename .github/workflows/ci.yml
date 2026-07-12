@@ -22,3 +22,4 @@ jobs:
       - run: npm run build
       - run: npm run db:verify
       - run: npm run db:verify:seed
+      - run: npm run db:test:rls
