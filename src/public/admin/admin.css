@@ -836,3 +836,145 @@ button:disabled {
   gap: 0.75rem;
   flex-wrap: wrap;
 }
+
+/* --- Form builder canvas (drag & drop, additive) --------------------------- */
+.builder-layout {
+  display: grid;
+  grid-template-columns: minmax(14rem, 18rem) 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .builder-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.field-palette {
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  padding: 0.75rem;
+}
+
+.field-palette h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.palette-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.palette-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  width: 100%;
+  padding: 0.5rem 0.65rem;
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  cursor: grab;
+  text-align: left;
+  font: inherit;
+}
+
+.palette-item:hover,
+.palette-item:focus-visible {
+  border-color: var(--rr-accent);
+}
+
+.palette-item-used {
+  opacity: 0.55;
+}
+
+.palette-item-label {
+  font-weight: 600;
+}
+
+.palette-item-meta,
+.palette-hint,
+.drop-hint {
+  color: var(--rr-text-muted);
+  font-size: 0.85rem;
+}
+
+.palette-hint {
+  margin: 0.6rem 0 0;
+}
+
+.builder-canvas {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.builder-section {
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  padding: 0.75rem;
+}
+
+.builder-section-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
+.builder-section-title {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--rr-text-muted);
+}
+
+.builder-fields {
+  min-height: 3rem;
+  border: 1px dashed var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  padding: 0.35rem 0.6rem;
+}
+
+.builder-fields.drag-over {
+  border-color: var(--rr-accent);
+  background: var(--rr-surface-muted);
+}
+
+.drop-hint {
+  margin: 0.6rem 0;
+  text-align: center;
+}
+
+.canvas-row {
+  cursor: grab;
+  border-top: 2px solid transparent;
+  border-bottom: 2px solid transparent;
+}
+
+.canvas-row.drag-ghost {
+  opacity: 0.4;
+}
+
+.canvas-row.drag-over-top {
+  border-top-color: var(--rr-accent);
+}
+
+.canvas-row.drag-over-bottom {
+  border-bottom-color: var(--rr-accent);
+}
+
+.drag-handle {
+  color: var(--rr-text-muted);
+  letter-spacing: -2px;
+  user-select: none;
+}
