@@ -62,9 +62,6 @@ const requiredRlsTables = [
   "department_settings",
   "branding_profiles",
   "admin_change_requests"
-  "certification_events"
-  "incident_amendments"
-  "schedule_publications"
 ];
 
 for (const table of requiredRlsTables) {
@@ -76,6 +73,19 @@ for (const table of requiredRlsTables) {
 for (const helper of ["current_facility_ids", "has_permission"]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+const policyTables = new Set();
+const policyPattern = /create policy\s+"[^"]*"\s+on\s+(\w+)/g;
+let policyMatch;
+while ((policyMatch = policyPattern.exec(combinedSql)) !== null) {
+  policyTables.add(policyMatch[1]);
+}
+
+for (const table of requiredRlsTables) {
+  if (!policyTables.has(table)) {
+    throw new Error(`Migrations do not define a create policy statement for ${table}.`);
   }
 }
 

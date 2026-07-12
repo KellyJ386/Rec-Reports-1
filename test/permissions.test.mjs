@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { canAccessFacility, hasPermission } from "../src/lib/permissions.mjs";
+import { readFileSync } from "node:fs";
+import { canAccessFacility, hasPermission, permissions } from "../src/lib/permissions.mjs";
 
 const memberships = [
   {
     facilityId: "north-arena",
     role: "Supervisor",
+    status: "active",
     permissions: ["reports.read", "reports.submit", "schedule.read"]
   }
 ];
@@ -22,4 +24,40 @@ test("tenant helpers block cross-facility access", () => {
 test("tenant helpers require the exact permission in the active facility", () => {
   assert.equal(hasPermission(memberships, "north-arena", "reports.submit"), true);
   assert.equal(hasPermission(memberships, "north-arena", "admin.manage"), false);
+});
+
+test("hasPermission returns false for a membership that is not active", () => {
+  const invited = [
+    {
+      facilityId: "north-arena",
+      role: "Supervisor",
+      status: "invited",
+      permissions: ["reports.read", "reports.submit", "schedule.read"]
+    }
+  ];
+  const disabled = [
+    {
+      facilityId: "north-arena",
+      role: "Supervisor",
+      status: "disabled",
+      permissions: ["reports.read", "reports.submit", "schedule.read"]
+    }
+  ];
+  assert.equal(hasPermission(invited, "north-arena", "reports.read"), false);
+  assert.equal(hasPermission(disabled, "north-arena", "reports.read"), false);
+});
+
+test("canAccessFacility returns false for a membership that is not active", () => {
+  const invited = [{ facilityId: "north-arena", role: "Supervisor", status: "invited", permissions: [] }];
+  assert.equal(canAccessFacility(invited, "north-arena"), false);
+});
+
+test("permissions array matches the permission codes seeded in supabase/seed.sql", () => {
+  const seedSql = readFileSync(new URL("../supabase/seed.sql", import.meta.url), "utf8");
+  const insertMatch = seedSql.match(/insert into permissions \(code, description\) values([\s\S]*?)\non conflict \(code\) do nothing;/);
+  assert.ok(insertMatch, "expected a permissions insert block in seed.sql");
+  const codeMatches = [...insertMatch[1].matchAll(/\(\s*'([^']+)'\s*,/g)].map((match) => match[1]);
+  const seedCodes = [...new Set(codeMatches)].sort();
+  const libCodes = [...permissions].sort();
+  assert.deepEqual(libCodes, seedCodes);
 });

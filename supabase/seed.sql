@@ -15,10 +15,6 @@ insert into permissions (code, description) values
   ('reports.template.manage', 'Manage report templates'),
   ('communications.read', 'Read communications'),
   ('communications.publish', 'Publish communications')
-  ('incidents.read', 'Read incidents'),
-  ('incidents.manage', 'Manage incidents'),
-  ('admin.manage', 'Manage facility configuration'),
-  ('reports.template.manage', 'Manage report templates')
 on conflict (code) do nothing;
 
 insert into organizations (id, name) values
