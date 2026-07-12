@@ -94,6 +94,150 @@ export async function renderModules(container) {
   }
 
   container.append(tableScroll(table));
+
+  // --- Per-module settings (generic, registry-driven) ---------------------
+  let registryDefinitions = [];
+  try {
+    const registry = (await api.get("/settings-registry")) ?? {};
+    registryDefinitions = Array.isArray(registry.definitions) ? registry.definitions : [];
+  } catch (error) {
+    container.append(errorBanner(`Could not load the settings registry: ${error.message}`));
+  }
+
+  if (registryDefinitions.length > 0) {
+    const settingsSection = el("section", { class: "module-settings-section" }, [
+      el("h2", {}, ["Module settings"])
+    ]);
+    if (!context.facilityId) {
+      settingsSection.append(
+        emptyState("Select a facility in the top bar to view and edit per-module settings.")
+      );
+    }
+    for (const module of modules) {
+      const definitions = registryDefinitions.filter((definition) => definition.module === module.code);
+      if (definitions.length === 0) continue;
+      settingsSection.append(
+        buildModuleSettingsPanel({ module, definitions, context, statusRegion })
+      );
+    }
+    container.append(settingsSection);
+  }
+}
+
+// A collapsible, generically-rendered settings form for one module. On expand
+// it fetches the resolved per-key {value, source} for the current facility and
+// renders one input per registry definition (boolean->checkbox, integer->number,
+// enum->select, string/timeRange->text). Save PATCHes the changed keys.
+function buildModuleSettingsPanel({ module, definitions, context, statusRegion }) {
+  const details = el("details", { class: "module-settings" }, [
+    el("summary", {}, [`${module.name || module.code} settings`])
+  ]);
+  const body = el("div", { class: "module-settings-body" }, []);
+  details.append(body);
+
+  let loaded = false;
+  details.addEventListener("toggle", async () => {
+    if (!details.open || loaded) return;
+    if (!context.facilityId) {
+      body.append(emptyState("Select a facility to edit these settings."));
+      loaded = true;
+      return;
+    }
+    loaded = true;
+    body.append(el("p", { class: "cell-muted" }, ["Loading settings..."]));
+    let resolved = {};
+    try {
+      const config = await api.get(
+        `/facilities/${encodeURIComponent(context.facilityId)}/modules/${encodeURIComponent(module.code)}/config`
+      );
+      resolved = config?.settings ?? {};
+    } catch (error) {
+      body.textContent = "";
+      body.append(errorBanner(`Could not load ${module.code} settings: ${error.message}`));
+      return;
+    }
+    body.textContent = "";
+    renderSettingsForm({ module, definitions, resolved, context, body, statusRegion });
+  });
+
+  return details;
+}
+
+function renderSettingsForm({ module, definitions, resolved, context, body, statusRegion }) {
+  const inputs = new Map();
+  const form = el("form", { class: "settings-form" }, []);
+  for (const definition of definitions) {
+    const entry = resolved[definition.key] ?? { value: definition.default, source: "default" };
+    const inputId = `setting-${definition.key.replace(/[^a-z0-9]/gi, "-")}`;
+    const input = buildSettingInput(definition, entry.value, inputId);
+    inputs.set(definition.key, { definition, input });
+    form.append(
+      el("div", { class: "settings-field" }, [
+        el("label", { for: inputId }, [definition.label]),
+        input,
+        el("span", { class: `badge source-${entry.source}` }, [entry.source])
+      ])
+    );
+  }
+
+  const saveButton = el("button", { type: "submit", class: "btn btn-primary" }, ["Save settings"]);
+  form.append(saveButton);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const settings = collectSettings(inputs);
+    saveButton.disabled = true;
+    try {
+      await api.patch(
+        `/facilities/${encodeURIComponent(context.facilityId)}/modules/${encodeURIComponent(module.code)}/config`,
+        { settings }
+      );
+      statusRegion.textContent = `Saved ${module.name || module.code} settings.`;
+      toast(`Saved ${module.name || module.code} settings.`, { tone: "success" });
+    } catch (error) {
+      statusRegion.textContent = `Could not save ${module.code} settings: ${error.message}`;
+      toast(`Failed to save ${module.code} settings: ${error.message}`, { tone: "error" });
+    } finally {
+      saveButton.disabled = false;
+    }
+  });
+  body.append(form);
+}
+
+function buildSettingInput(definition, value, inputId) {
+  if (definition.dataType === "boolean") {
+    return el("input", { type: "checkbox", id: inputId, checked: Boolean(value) });
+  }
+  if (definition.dataType === "integer") {
+    const attrs = { type: "number", id: inputId, step: "1", value: value ?? "" };
+    if (definition.validation && definition.validation.min !== undefined) attrs.min = String(definition.validation.min);
+    if (definition.validation && definition.validation.max !== undefined) attrs.max = String(definition.validation.max);
+    return el("input", attrs);
+  }
+  if (definition.dataType === "enum") {
+    const options = (definition.validation && definition.validation.values ? definition.validation.values : []).map(
+      (option) => el("option", { value: option, selected: option === value }, [option])
+    );
+    return el("select", { id: inputId }, options);
+  }
+  const attrs = { type: "text", id: inputId, value: value ?? "" };
+  if (definition.validation && definition.validation.pattern) attrs.pattern = definition.validation.pattern;
+  return el("input", attrs);
+}
+
+function collectSettings(inputs) {
+  const settings = {};
+  for (const [key, { definition, input }] of inputs) {
+    if (definition.dataType === "boolean") {
+      settings[key] = input.checked;
+    } else if (definition.dataType === "integer") {
+      if (input.value === "") continue;
+      settings[key] = Number(input.value);
+    } else {
+      if (input.value === "") continue;
+      settings[key] = input.value;
+    }
+  }
+  return settings;
 }
 
 function buildModuleRow({ module, orgByModule, overrideByModule, context, statusRegion }) {

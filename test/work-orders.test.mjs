@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createWorkOrderFromIncident, isWorkOrderOverdue, sortWorkOrdersForDashboard } from "../src/lib/work-orders.mjs";
+import {
+  createWorkOrderFromIncident,
+  isWorkOrderOverdue,
+  sortWorkOrdersForDashboard,
+  slaHoursForPriority
+} from "../src/lib/work-orders.mjs";
 
 test("isWorkOrderOverdue only flags open work past its due date", () => {
   const now = new Date("2026-07-08T12:00:00Z");
@@ -19,6 +24,22 @@ test("sortWorkOrdersForDashboard prioritizes overdue and urgent work", () => {
     now
   );
   assert.deepEqual(sorted.map((workOrder) => workOrder.id), ["overdue", "urgent", "routine"]);
+});
+
+test("workOrders.defaultPriority overrides the medium fallback for non-high/critical incidents", () => {
+  const base = { id: "i-1", facilityId: "f-1", incidentNo: "INC-1", severity: "low", summary: "x" };
+  assert.equal(createWorkOrderFromIncident(base).priority, "medium");
+  assert.equal(
+    createWorkOrderFromIncident(base, {}, { "workOrders.defaultPriority": "high" }).priority,
+    "high"
+  );
+});
+
+test("slaHoursForPriority honors configured urgent/routine SLAs", () => {
+  assert.equal(slaHoursForPriority("urgent"), 24); // default
+  assert.equal(slaHoursForPriority("low"), 72); // default routine
+  assert.equal(slaHoursForPriority("urgent", { "workOrders.slaHoursUrgent": 6 }), 6);
+  assert.equal(slaHoursForPriority("medium", { "workOrders.slaHoursRoutine": 120 }), 120);
 });
 
 test("createWorkOrderFromIncident maps high severity incident context into maintenance work", () => {

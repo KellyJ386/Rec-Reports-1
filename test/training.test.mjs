@@ -18,6 +18,20 @@ test("trainingAssignmentState tracks not started, in progress, overdue, and comp
   assert.equal(trainingAssignmentState({ completedAt: "2026-06-30T12:00:00Z" }, now), "complete");
 });
 
+test("training.recertWindowDays widens the expiring window when the cert omits its own", () => {
+  const now = new Date("2026-07-01T12:00:00Z");
+  const cert = { expiresAt: "2026-08-01T12:00:00Z" }; // 31 days out, no renewalWindowDays
+  // default 30-day window -> still active
+  assert.equal(certificationStatus(cert, now), "active");
+  // configured 45-day window -> now inside the expiring window
+  assert.equal(certificationStatus(cert, now, { "training.recertWindowDays": 45 }), "expiring");
+  // the cert's own renewalWindowDays still wins over config when present
+  assert.equal(
+    certificationStatus({ ...cert, renewalWindowDays: 10 }, now, { "training.recertWindowDays": 45 }),
+    "active"
+  );
+});
+
 test("certificationBlocksSchedule blocks expired or revoked credentials", () => {
   const now = new Date("2026-07-01T12:00:00Z");
   assert.equal(certificationBlocksSchedule({ expiresAt: "2026-06-01T12:00:00Z" }, now), true);

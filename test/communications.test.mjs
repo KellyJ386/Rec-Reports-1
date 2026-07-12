@@ -25,6 +25,24 @@ test("acknowledgementState tracks pending, overdue, and complete required acknow
   assert.equal(acknowledgementState(message, [{ acknowledgedAt: "now" }, { acknowledgedAt: "now" }]), "complete");
 });
 
+test("communications.requireAckDefault applies when a message omits isRequiredAck", () => {
+  const message = { requiredRecipientCount: 1 };
+  // default false -> not required
+  assert.equal(acknowledgementState(message, []), "not_required");
+  // config true -> now the ack is required and pending until acknowledged
+  assert.equal(
+    acknowledgementState(message, [], new Date(), { "communications.requireAckDefault": true }),
+    "pending"
+  );
+  // an explicit flag on the message still wins over the config default
+  assert.equal(
+    acknowledgementState({ ...message, isRequiredAck: false }, [], new Date(), {
+      "communications.requireAckDefault": true
+    }),
+    "not_required"
+  );
+});
+
 test("shouldBypassQuietHours allows urgent and emergency messages", () => {
   assert.equal(shouldBypassQuietHours({ priority: "normal" }), false);
   assert.equal(shouldBypassQuietHours({ priority: "urgent" }), true);

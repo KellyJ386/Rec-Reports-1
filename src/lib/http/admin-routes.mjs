@@ -3,9 +3,15 @@ import { requirePermission, requireOrgAdmin } from "./guard.mjs";
 import {
   validateModuleTogglePayload,
   validateMembershipInput,
-  validateMembershipPatch
+  validateMembershipPatch,
+  validateModuleSettingsPatch
 } from "./validate.mjs";
 import { mergeSettings } from "../admin-config.mjs";
+import {
+  settingsRegistry,
+  settingsForModule,
+  resolveEffectiveSettings
+} from "../settings-registry.mjs";
 import {
   validateFacilityInput,
   validateDepartmentInput,
@@ -480,6 +486,118 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
           return { permission, allowed, reason };
         });
         return sendJson(response, 200, matrix);
+      })
+  );
+
+  // --- Settings registry (public catalog) ----------------------------------
+  // Any authenticated user may read the registry so the admin UI can render the
+  // per-module settings forms generically from a single source of truth.
+  router.register("GET", "/settings-registry", (request, response, { env }) =>
+    withAuth(request, response, env, () =>
+      sendJson(response, 200, { definitions: settingsRegistry })
+    )
+  );
+
+  // --- Per-module configuration -------------------------------------------
+  async function loadModuleByCode(client, code) {
+    const rows = await pgSelect(client, "modules", {
+      filters: { code },
+      select: "id,code",
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadFacilityOrgId(client, facilityId) {
+    const rows = await pgSelect(client, "facilities", {
+      filters: { id: facilityId },
+      select: "id,organization_id",
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // Resolve the effective per-key {value, source} for one module at a facility.
+  // Org layer = organization_module_settings.config_jsonb (by organization_id +
+  // module_id); facility layer = facility_module_overrides.config_patch_jsonb.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/modules/:moduleCode/config",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+        const module = await loadModuleByCode(auth.client, params.moduleCode);
+        if (!module) return sendJson(response, 404, { error: "module not found" });
+        const facility = await loadFacilityOrgId(auth.client, params.facilityId);
+        if (!facility) return sendJson(response, 404, { error: "facility not found" });
+
+        let orgLayer = {};
+        if (facility.organization_id) {
+          const orgRows = await pgSelect(auth.client, "organization_module_settings", {
+            filters: { organization_id: facility.organization_id, module_id: module.id },
+            select: "config_jsonb",
+            limit: 1
+          });
+          orgLayer = (orgRows ?? [])[0]?.config_jsonb ?? {};
+        }
+        const facRows = await pgSelect(auth.client, "facility_module_overrides", {
+          filters: { facility_id: params.facilityId, module_id: module.id },
+          select: "config_patch_jsonb",
+          limit: 1
+        });
+        const facilityLayer = (facRows ?? [])[0]?.config_patch_jsonb ?? {};
+
+        const definitions = settingsForModule(params.moduleCode);
+        const settings = resolveEffectiveSettings({ orgLayer, facilityLayer, definitions });
+        return sendJson(response, 200, { moduleCode: params.moduleCode, settings });
+      })
+  );
+
+  // Merge a validated { settings: { key: value } } patch into the facility's
+  // module override config_patch_jsonb. Unknown key / invalid value -> 400.
+  router.register(
+    "PATCH",
+    "/facilities/:facilityId/modules/:moduleCode/config",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const settings = body.payload.settings;
+        const { valid, errors } = validateModuleSettingsPatch(params.moduleCode, settings);
+        if (!valid) return sendJson(response, 400, { errors });
+        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+        const module = await loadModuleByCode(auth.client, params.moduleCode);
+        if (!module) return sendJson(response, 404, { error: "module not found" });
+
+        const existing = await pgSelect(auth.client, "facility_module_overrides", {
+          filters: { facility_id: params.facilityId, module_id: module.id },
+          select: "config_patch_jsonb",
+          limit: 1
+        });
+        const currentPatch = (existing ?? [])[0]?.config_patch_jsonb ?? {};
+        const mergedPatch = { ...currentPatch, ...settings };
+        const rows = await pgInsert(
+          auth.client,
+          "facility_module_overrides",
+          [
+            {
+              facility_id: params.facilityId,
+              module_id: module.id,
+              config_patch_jsonb: mergedPatch,
+              updated_by: auth.claims.sub
+            }
+          ],
+          { onConflict: "facility_id,module_id", merge: true, returning: true }
+        );
+        const definitions = settingsForModule(params.moduleCode);
+        const resolved = resolveEffectiveSettings({ facilityLayer: mergedPatch, definitions });
+        return sendJson(response, 200, {
+          moduleCode: params.moduleCode,
+          settings: resolved,
+          override: (rows ?? [])[0] ?? null
+        });
       })
   );
 

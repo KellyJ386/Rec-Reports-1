@@ -1,3 +1,5 @@
+import { getDefinition, validateSettingValue } from "../settings-registry.mjs";
+
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -49,6 +51,31 @@ export function validateMembershipPatch(payload) {
   const hasStatus = MEMBERSHIP_STATUSES.includes(payload.status);
   if (!hasRole && !hasStatus) {
     errors.push("at least one of roleId or status is required");
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+// Validate a per-module config patch ({ key: value, ... }) against the Setting
+// Registry: every key must be a known setting belonging to `moduleCode`, and
+// every value must pass its setting's dataType/validation. Unknown key and
+// invalid value both surface as errors (the caller returns 400 for either).
+export function validateModuleSettingsPatch(moduleCode, settings) {
+  if (!isPlainObject(settings)) {
+    return { valid: false, errors: ["settings must be an object of key/value pairs"] };
+  }
+  const entries = Object.entries(settings);
+  if (entries.length === 0) {
+    return { valid: false, errors: ["settings must contain at least one key"] };
+  }
+  const errors = [];
+  for (const [key, value] of entries) {
+    const definition = getDefinition(key);
+    if (!definition || definition.module !== moduleCode) {
+      errors.push(`unknown setting for module ${moduleCode}: ${key}`);
+      continue;
+    }
+    const result = validateSettingValue(key, value);
+    if (!result.valid) errors.push(...result.errors);
   }
   return { valid: errors.length === 0, errors };
 }

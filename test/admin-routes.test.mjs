@@ -204,3 +204,115 @@ test("POST department happy path inserts into departments", async (t) => {
   const insert = captured.find((c) => c.table === "departments" && c.method === "POST");
   assert.deepEqual(insert.body, [{ facility_id: "fac-1", name: "Maintenance" }]);
 });
+
+// --- Settings registry + per-module config -------------------------------
+
+test("GET /settings-registry returns the definitions to any authenticated user", async () => {
+  const { call } = mount({ memberships: READER_ON_FAC1 });
+  const result = await call("GET", "/settings-registry");
+  assert.equal(result.status, 200);
+  assert.ok(Array.isArray(result.payload.definitions));
+  assert.ok(result.payload.definitions.some((d) => d.key === "scheduling.certEnforcementMode"));
+});
+
+test("GET module config resolves per-key value + source from org and facility layers", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "modules" && method === "GET") return [{ id: "mod-sched", code: "scheduling" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings" && method === "GET") {
+      return [{ config_jsonb: { "scheduling.publishCadenceDays": 14 } }];
+    }
+    if (table === "facility_module_overrides" && method === "GET") {
+      return [{ config_patch_jsonb: { "scheduling.certEnforcementMode": "warning" } }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("GET", "/facilities/fac-1/modules/scheduling/config");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.moduleCode, "scheduling");
+  assert.deepEqual(result.payload.settings["scheduling.certEnforcementMode"], {
+    value: "warning",
+    source: "facility"
+  });
+  assert.deepEqual(result.payload.settings["scheduling.publishCadenceDays"], {
+    value: 14,
+    source: "organization"
+  });
+  assert.deepEqual(result.payload.settings["scheduling.conflictCheckEnabled"], {
+    value: true,
+    source: "default"
+  });
+});
+
+test("GET module config denies a non-admin with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER_ON_FAC1 });
+  const result = await call("GET", "/facilities/fac-1/modules/scheduling/config");
+  assert.equal(result.status, 403);
+});
+
+test("PATCH module config rejects an unknown key with 400 before any DB call", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1/modules/scheduling/config", {
+    settings: { "scheduling.bogusKey": 1 }
+  });
+  assert.equal(result.status, 400);
+  assert.ok(Array.isArray(result.payload.errors));
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH module config rejects an invalid value with 400", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1/modules/scheduling/config", {
+    settings: { "scheduling.certEnforcementMode": "soft" }
+  });
+  assert.equal(result.status, 400);
+});
+
+test("PATCH module config denies a non-admin with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1/modules/scheduling/config", {
+    settings: { "scheduling.certEnforcementMode": "warning" }
+  });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH module config merges the validated patch into config_patch_jsonb", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "modules" && method === "GET") return [{ id: "mod-sched", code: "scheduling" }];
+    if (table === "facility_module_overrides" && method === "GET") {
+      return [{ config_patch_jsonb: { "scheduling.publishCadenceDays": 14 } }];
+    }
+    if (table === "facility_module_overrides" && method === "POST") {
+      return [{ id: "ovr-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1/modules/scheduling/config", {
+    settings: { "scheduling.certEnforcementMode": "warning" }
+  });
+  assert.equal(result.status, 200);
+  const write = captured.find((c) => c.table === "facility_module_overrides" && c.method === "POST");
+  assert.ok(write, "expected an upsert into facility_module_overrides");
+  assert.deepEqual(write.body, [
+    {
+      facility_id: "fac-1",
+      module_id: "mod-sched",
+      config_patch_jsonb: {
+        "scheduling.publishCadenceDays": 14,
+        "scheduling.certEnforcementMode": "warning"
+      },
+      updated_by: "user-1"
+    }
+  ]);
+  assert.equal(write.url.searchParams.get("on_conflict"), "facility_id,module_id");
+  assert.deepEqual(result.payload.settings["scheduling.certEnforcementMode"], {
+    value: "warning",
+    source: "facility"
+  });
+});
