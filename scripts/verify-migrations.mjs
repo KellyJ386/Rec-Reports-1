@@ -78,7 +78,8 @@ for (const helper of [
   "is_organization_admin",
   "fn_block_audit_mutation",
   "fn_audit_admin_change",
-  "fn_protect_system_role"
+  "fn_protect_system_role",
+  "fn_audit_chain_link"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
@@ -92,6 +93,13 @@ for (const auditTable of ["audit_events", "incident_audit_events"]) {
   if (!lowerSql.includes(`before update or delete on ${auditTable}`)) {
     throw new Error(`Migrations do not define an append-only (before update or delete) trigger on ${auditTable}.`);
   }
+}
+
+// Hash chain (0013): audit_events must carry a BEFORE INSERT trigger that
+// stamps prev_hash/row_hash on every row, so a later "verify chain integrity"
+// pass has something trustworthy to recompute against.
+if (!lowerSql.includes("before insert on audit_events")) {
+  throw new Error("Migrations do not define a hash-chain (before insert) trigger on audit_events.");
 }
 
 // From 0009 onward every `create policy` must be immediately preceded (in the
