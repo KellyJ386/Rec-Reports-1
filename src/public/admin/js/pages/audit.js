@@ -1,6 +1,7 @@
 import { api } from "../api.js";
 import { el, clearChildren, errorBanner, emptyState, tableScroll, toast, formatDateTime } from "../ui.js";
 import { getContext } from "../state.js";
+import { buildDataExportPanel } from "./export.js";
 
 // Tables fn_audit_admin_change (0010/0012) writes 'config.changed' rows for.
 // Mirrors the trigger attachment list; kept here rather than fetched so the
@@ -40,6 +41,12 @@ export async function renderAudit(container) {
   ]);
   container.append(toolsSection);
   toolsSection.append(buildToolsPanel({ facilityId, statusRegion, getFilters: () => filters }));
+
+  const exportSection = el("section", { class: "panel", "aria-labelledby": "audit-export-heading" }, [
+    el("h2", { id: "audit-export-heading" }, ["Data Export"])
+  ]);
+  container.append(exportSection);
+  exportSection.append(buildDataExportPanel({ facilityId, statusRegion }));
 
   const timelineSection = el("section", { class: "panel", "aria-labelledby": "audit-timeline-heading" }, [
     el("h2", { id: "audit-timeline-heading" }, ["Timeline"])

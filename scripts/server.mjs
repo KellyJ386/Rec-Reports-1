@@ -9,6 +9,7 @@ import { requireOrgAdmin } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
+import { registerWorkflowRoutes } from "../src/lib/http/workflow-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -156,6 +157,11 @@ registerAdminRoutes(router, { authenticate, sendJson, readBody });
 // Phase 5 Audit & Compliance routes (timeline, hash-chain verify, export).
 // Same auth/guard pipeline as above; logic lives in src/lib/admin/audit-export.mjs.
 registerAuditRoutes(router, { authenticate, sendJson, readBody });
+
+// Phase 6 workflow routes (change requests, branding, generic data export).
+// Same auth/guard pipeline as above; logic lives in src/lib/admin/change-requests.mjs,
+// src/lib/admin/branding.mjs, and src/lib/admin/export.mjs.
+registerWorkflowRoutes(router, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);

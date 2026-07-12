@@ -478,6 +478,55 @@ button:disabled {
   margin-top: 12px;
 }
 
+.color-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.color-field input[type="color"] {
+  width: 40px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  background: none;
+}
+
+.color-field input[type="text"] {
+  width: 100px;
+}
+
+.branding-swatch {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 48px;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.branding-swatch-block {
+  flex: 1;
+  height: 100%;
+}
+
+.branding-swatch-label {
+  flex: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  font-weight: 700;
+  background: var(--rr-surface);
+}
+
+.data-export .inline-form {
+  align-items: end;
+}
+
 .create-fieldset {
   border: 1px dashed var(--rr-border);
   border-radius: var(--rr-radius-md);

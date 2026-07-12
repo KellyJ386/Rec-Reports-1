@@ -1,4 +1,5 @@
 import { pgSelect } from "../supabase-rest.mjs";
+import { toCsv as genericToCsv, toJson, buildExportPackage as genericBuildExportPackage } from "./export.mjs";
 
 // Columns returned/exported for every audit timeline row. Order here is the
 // column order in the CSV export.
@@ -52,34 +53,15 @@ export async function queryAuditTimeline(
   return rows ?? [];
 }
 
-// Escape a single CSV field per RFC 4180: wrap in quotes (doubling any
-// embedded quotes) whenever the value contains a comma, quote, or newline.
-// Nested jsonb (event_payload) is stringified first so it round-trips as one
-// field rather than exploding the row.
-function csvEscape(value) {
-  if (value === null || value === undefined) return "";
-  const text = typeof value === "object" ? JSON.stringify(value) : String(value);
-  if (/[",\r\n]/.test(text)) {
-    return `"${text.replace(/"/g, '""')}"`;
-  }
-  return text;
-}
-
+// Escaping/JSON-shaping now lives in export.mjs (shared with the generic
+// facility-scoped table export in workflow-routes.mjs); these wrappers keep
+// this module's public API (toCsv(rows), toJson(rows), buildExportPackage)
+// unchanged for existing callers/tests.
 export function toCsv(rows) {
-  const lines = [AUDIT_COLUMNS.join(",")];
-  for (const row of rows ?? []) {
-    lines.push(AUDIT_COLUMNS.map((column) => csvEscape(row[column])).join(","));
-  }
-  return lines.join("\r\n");
+  return genericToCsv(rows, AUDIT_COLUMNS);
 }
 
-export function toJson(rows) {
-  return JSON.stringify(rows ?? [], null, 2);
-}
-
-function timestampSlug() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
-}
+export { toJson };
 
 // Shapes the exportable file for a set of audit rows. Returns
 // { contentType, filename, body } -- the caller (audit-routes.mjs) is
@@ -88,10 +70,5 @@ function timestampSlug() {
 // src/public/admin/js/pages/audit.js, which turns this into a Blob download
 // rather than a bare href).
 export function buildExportPackage(rows, format) {
-  const normalized = format === "json" ? "json" : "csv";
-  const filename = `audit-export-${timestampSlug()}.${normalized}`;
-  if (normalized === "json") {
-    return { contentType: "application/json", filename, body: toJson(rows) };
-  }
-  return { contentType: "text/csv", filename, body: toCsv(rows) };
+  return genericBuildExportPackage(rows, format, { namePrefix: "audit-export", columns: AUDIT_COLUMNS });
 }

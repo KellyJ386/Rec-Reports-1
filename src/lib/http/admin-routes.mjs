@@ -50,10 +50,15 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     return handler(auth);
   }
 
-  // Read-modify-write of a facility's settings_jsonb: merge the validated patch
-  // onto the current settings (mergeSettings), updating the latest version row
-  // in place, or inserting a first row when none exists yet.
-  async function applyFacilitySettingsPatch(client, facilityId, patch) {
+  // Read-then-append of a facility's settings_jsonb: merge the validated patch
+  // onto the current (highest-version) settings, then INSERT a new row at
+  // version = latest + 1 rather than updating the latest row in place. This
+  // keeps every prior settings_jsonb immutable and queryable (the
+  // (facility_id, version) unique constraint from 0008 backs it), and stamps
+  // published_at/published_by on the new row so "who published what, when" is
+  // never ambiguous. GET .../settings already reads by version.desc limit 1,
+  // so it transparently picks up the new row.
+  async function applyFacilitySettingsPatch(client, facilityId, patch, actorUserId) {
     const rows = await pgSelect(client, "facility_settings", {
       filters: { facility_id: facilityId },
       select: "id,settings_jsonb,version",
@@ -62,20 +67,19 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     });
     const current = (rows ?? [])[0];
     const merged = mergeSettings(current?.settings_jsonb ?? {}, patch);
-    if (current) {
-      const updated = await pgUpdate(
-        client,
-        "facility_settings",
-        { id: current.id },
-        { settings_jsonb: merged },
-        { returning: true }
-      );
-      return (updated ?? [])[0] ?? null;
-    }
+    const nextVersion = (current?.version ?? 0) + 1;
     const inserted = await pgInsert(
       client,
       "facility_settings",
-      [{ facility_id: facilityId, settings_jsonb: merged, version: 1 }],
+      [
+        {
+          facility_id: facilityId,
+          settings_jsonb: merged,
+          version: nextVersion,
+          published_at: new Date().toISOString(),
+          published_by: actorUserId ?? null
+        }
+      ],
       { returning: true }
     );
     return (inserted ?? [])[0] ?? null;
@@ -165,7 +169,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const rows = await pgInsert(auth.client, "facilities", [row], { returning: true });
       const facility = (rows ?? [])[0] ?? null;
       if (facility && body.payload.locale) {
-        await applyFacilitySettingsPatch(auth.client, facility.id, { locale: body.payload.locale });
+        await applyFacilitySettingsPatch(auth.client, facility.id, { locale: body.payload.locale }, auth.claims.sub);
       }
       return sendJson(response, 201, facility);
     })
@@ -202,7 +206,12 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
         updated = (rows ?? [])[0] ?? facility;
       }
       if (body.payload.locale) {
-        await applyFacilitySettingsPatch(auth.client, params.facilityId, { locale: body.payload.locale });
+        await applyFacilitySettingsPatch(
+          auth.client,
+          params.facilityId,
+          { locale: body.payload.locale },
+          auth.claims.sub
+        );
       }
       return sendJson(response, 200, updated);
     })
@@ -290,7 +299,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       if (!valid) return sendJson(response, 400, { errors });
       const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
-      const row = await applyFacilitySettingsPatch(auth.client, params.facilityId, patch);
+      const row = await applyFacilitySettingsPatch(auth.client, params.facilityId, patch, auth.claims.sub);
       return sendJson(response, 200, row);
     })
   );

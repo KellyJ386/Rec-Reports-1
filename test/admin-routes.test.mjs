@@ -167,13 +167,13 @@ test("PATCH department denies a non-admin on the resolved facility", async (t) =
   assert.equal(result.status, 403);
 });
 
-test("PATCH facility settings merges the patch onto the current settings_jsonb", async (t) => {
+test("PATCH facility settings merges the patch onto the current settings_jsonb and inserts a new version", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "facility_settings" && method === "GET") {
       return [{ id: "fs-1", settings_jsonb: { locale: "en-US" }, version: 1 }];
     }
-    if (table === "facility_settings" && method === "PATCH") {
-      return [{ id: "fs-1" }];
+    if (table === "facility_settings" && method === "POST") {
+      return [{ id: "fs-2", version: 2 }];
     }
     return [];
   });
@@ -182,10 +182,22 @@ test("PATCH facility settings merges the patch onto the current settings_jsonb",
     settingsPatch: { reporting: { dailyReportDueHour: 9 } }
   });
   assert.equal(result.status, 200);
-  const update = captured.find((c) => c.table === "facility_settings" && c.method === "PATCH");
-  assert.deepEqual(update.body, {
-    settings_jsonb: { locale: "en-US", reporting: { dailyReportDueHour: 9 } }
+  // The latest version is never updated in place -- a new row is inserted at
+  // version = latest + 1, so facility_settings history stays immutable.
+  assert.ok(
+    !captured.some((c) => c.table === "facility_settings" && c.method === "PATCH"),
+    "facility_settings must never be updated in place"
+  );
+  const insert = captured.find((c) => c.table === "facility_settings" && c.method === "POST");
+  assert.ok(insert, "expected an insert into facility_settings");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].version, 2);
+  assert.deepEqual(insert.body[0].settings_jsonb, {
+    locale: "en-US",
+    reporting: { dailyReportDueHour: 9 }
   });
+  assert.equal(insert.body[0].published_by, "user-1");
+  assert.ok(insert.body[0].published_at, "expected published_at to be stamped");
 });
 
 test("PATCH facility settings rejects an invalid patch with 400", async () => {

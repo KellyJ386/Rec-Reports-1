@@ -1,8 +1,37 @@
 import { api, getToken, setToken, hasToken } from "./api.js";
-import { getContext, setContext, setFacilities } from "./state.js";
+import { getContext, setContext, setFacilities, subscribe } from "./state.js";
 import { toast, clearChildren, el } from "./ui.js";
 import { loadMe } from "./session.js";
 import { initRouter, closeSidebarOnNavigate } from "./nav.js";
+
+// Top-bar "N unpublished changes" indicator: counts this facility's
+// admin_change_requests rows whose status isn't 'published' yet. Refreshed on
+// every hash navigation (page switch) and every shared-state change (facility
+// switch, /me resolving), so it never shows a stale count for the wrong
+// facility.
+async function refreshUnpublishedBadge() {
+  const badge = document.getElementById("unpublished-badge");
+  if (!badge) return;
+  const context = getContext();
+  if (!context.facilityId) {
+    badge.hidden = true;
+    return;
+  }
+  try {
+    const rows = (await api.get(`/facilities/${encodeURIComponent(context.facilityId)}/change-requests`)) ?? [];
+    const count = rows.filter((row) => row.status !== "published").length;
+    if (count > 0) {
+      badge.hidden = false;
+      badge.textContent = `${count} unpublished change${count === 1 ? "" : "s"}`;
+    } else {
+      badge.hidden = true;
+    }
+  } catch {
+    // Best-effort indicator: a failed lookup (no token yet, no permission on
+    // this facility, network error) just hides the badge rather than erroring.
+    badge.hidden = true;
+  }
+}
 
 function wireSidebarToggle() {
   const toggle = document.getElementById("sidebar-toggle");
@@ -112,10 +141,17 @@ function wireContextControls() {
   refreshFacilitySelect();
 }
 
+function wireUnpublishedBadge() {
+  window.addEventListener("hashchange", () => refreshUnpublishedBadge());
+  subscribe(() => refreshUnpublishedBadge());
+  refreshUnpublishedBadge();
+}
+
 async function bootstrap() {
   wireSidebarToggle();
   wireTokenDrawer();
   wireContextControls();
+  wireUnpublishedBadge();
   await loadMe();
   initRouter();
 }

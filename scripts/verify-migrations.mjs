@@ -62,7 +62,9 @@ const requiredRlsTables = [
   "department_settings",
   "branding_profiles",
   "admin_change_requests",
-  "organization_admins"
+  "organization_admins",
+  "pdf_templates",
+  "pdf_template_bindings"
 ];
 
 for (const table of requiredRlsTables) {
@@ -79,7 +81,8 @@ for (const helper of [
   "fn_block_audit_mutation",
   "fn_audit_admin_change",
   "fn_protect_system_role",
-  "fn_audit_chain_link"
+  "fn_audit_chain_link",
+  "fn_enforce_change_request_transition"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
