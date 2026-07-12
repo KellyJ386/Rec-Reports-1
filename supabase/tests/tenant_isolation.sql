@@ -169,4 +169,82 @@ end;
 $$;
 
 reset role;
+
+-- ---------------------------------------------------------------------------
+-- Necessity of reports.submit: the draft->submitted transition above ran as an
+-- all-permissions fixture, so it did not prove reports.submit is required. Here
+-- a member holding reports.create + reports.read but NOT reports.submit must be
+-- able to create a draft yet be DENIED moving it to submitted (the update
+-- policy's WITH CHECK is gated on reports.submit).
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('33300000-0000-0000-0000-000000000001', 'no-submit@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('33300000-0000-0000-0000-000000000001', 'No Submit', 'no-submit@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('a0000000-0000-0000-0000-0000000000a9', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Creator No Submit')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('a0000000-0000-0000-0000-0000000000a9', 'reports.create'),
+  ('a0000000-0000-0000-0000-0000000000a9', 'reports.read')
+on conflict do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('a1000000-0000-0000-0000-0000000000a9', '33300000-0000-0000-0000-000000000001', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a0000000-0000-0000-0000-0000000000a9', 'active')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"33300000-0000-0000-0000-000000000001","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  no_submit_id uuid := 'a5000000-0000-0000-0000-0000000000b9';
+begin
+  -- Allowed: reports.create holder inserts a draft.
+  insert into report_submissions (id, facility_id, template_id, template_version_id, report_date, status)
+  values (no_submit_id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a2000000-0000-0000-0000-0000000000a2', 'a3000000-0000-0000-0000-0000000000a3', current_date, 'draft');
+  -- Denied: without reports.submit the update policy's USING clause
+  -- (has_permission reports.submit) filters the row out, so the UPDATE matches
+  -- zero rows silently -- no exception, and the status must remain 'draft'.
+  -- Assert the outcome (RLS denies by row-invisibility here, not by raising).
+  update report_submissions set status = 'submitted' where id = no_submit_id;
+  if exists (select 1 from report_submissions where id = no_submit_id and status = 'submitted') then
+    raise exception 'ISOLATION FAIL: a member without reports.submit moved draft -> submitted';
+  end if;
+end;
+$$;
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 0021 regression: a member holding ONLY reports.export (not reports.read) can
+-- read report_submissions, so the export route's reports.export guard and the
+-- SELECT RLS agree and exports are not silently empty.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('33300000-0000-0000-0000-000000000002', 'export-only@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('33300000-0000-0000-0000-000000000002', 'Export Only', 'export-only@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('a0000000-0000-0000-0000-0000000000ae', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Export Only')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('a0000000-0000-0000-0000-0000000000ae', 'reports.export')
+on conflict do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('a1000000-0000-0000-0000-0000000000ae', '33300000-0000-0000-0000-000000000002', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'a0000000-0000-0000-0000-0000000000ae', 'active')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"33300000-0000-0000-0000-000000000002","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  if not exists (select 1 from report_submissions where facility_id = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') then
+    raise exception 'ISOLATION FAIL: a reports.export holder could not read any report_submissions (export would be silently empty)';
+  end if;
+end;
+$$;
+reset role;
+
 rollback;

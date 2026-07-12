@@ -159,4 +159,81 @@ end;
 $$;
 
 reset role;
+
+-- ---------------------------------------------------------------------------
+-- Cross-code necessity: prove reports.template.manage and communications.publish
+-- each gate ONLY their own tables (a code-swap regression must fail here). Two
+-- users, one code each, in Facility A.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('88800000-0000-0000-0000-000000000001', 'tmpl-only@test'),
+  ('88800000-0000-0000-0000-000000000002', 'pub-only@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('88800000-0000-0000-0000-000000000001', 'Template Only', 'tmpl-only@test'),
+  ('88800000-0000-0000-0000-000000000002', 'Publish Only', 'pub-only@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('8c000000-0000-0000-0000-0000000000c2', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Template Only Role'),
+  ('8c000000-0000-0000-0000-0000000000c3', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Publish Only Role')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('8c000000-0000-0000-0000-0000000000c2', 'reports.template.manage'),
+  ('8c000000-0000-0000-0000-0000000000c3', 'communications.publish')
+on conflict do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('8d000000-0000-0000-0000-0000000000d2', '88800000-0000-0000-0000-000000000001', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '8c000000-0000-0000-0000-0000000000c2', 'active'),
+  ('8d000000-0000-0000-0000-0000000000d3', '88800000-0000-0000-0000-000000000002', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '8c000000-0000-0000-0000-0000000000c3', 'active')
+on conflict (id) do nothing;
+
+-- Template-only user: CAN write a custom field, but is DENIED a notification route.
+select set_config('request.jwt.claims', '{"sub":"88800000-0000-0000-0000-000000000001","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  insert into custom_fields (id, facility_id, entity_type, key, label, data_type) values
+    ('8c100000-0000-0000-0000-000000000010', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'report', 'tmpl_only_key', 'K', 'text');
+exception
+  when insufficient_privilege then
+    raise exception 'P7 FAIL: reports.template.manage holder was denied a custom field (code no longer sufficient)';
+end;
+$$;
+do $$
+begin
+  begin
+    insert into notification_routes (id, facility_id, event_code, priority, route_jsonb) values
+      ('8a100000-0000-0000-0000-000000000010', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'p7.test_event', 20, '{}'::jsonb);
+    raise exception 'P7 FAIL: reports.template.manage holder created a notification route (should require communications.publish)';
+  exception
+    when insufficient_privilege then null; -- expected: not a publisher
+  end;
+end;
+$$;
+reset role;
+
+-- Publish-only user: CAN write a notification route, but is DENIED a custom field.
+select set_config('request.jwt.claims', '{"sub":"88800000-0000-0000-0000-000000000002","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  insert into notification_routes (id, facility_id, event_code, priority, route_jsonb) values
+    ('8a100000-0000-0000-0000-000000000011', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'p7.test_event', 30, '{"channels":["in_app"]}'::jsonb);
+exception
+  when insufficient_privilege then
+    raise exception 'P7 FAIL: communications.publish holder was denied a notification route (code no longer sufficient)';
+end;
+$$;
+do $$
+begin
+  begin
+    insert into custom_fields (id, facility_id, entity_type, key, label, data_type) values
+      ('8c100000-0000-0000-0000-000000000011', '8aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'report', 'pub_only_key', 'K', 'text');
+    raise exception 'P7 FAIL: communications.publish holder created a custom field (should require reports.template.manage)';
+  exception
+    when insufficient_privilege then null; -- expected: not a template manager
+  end;
+end;
+$$;
+reset role;
+
 rollback;

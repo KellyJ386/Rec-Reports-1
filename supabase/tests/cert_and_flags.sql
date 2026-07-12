@@ -174,4 +174,42 @@ end;
 $$;
 
 reset role;
+
+-- ---------------------------------------------------------------------------
+-- Necessity of training.manage: a member holding admin.manage but NOT
+-- training.manage must be DENIED cert-requirement writes (proves the cert
+-- policies are gated on training.manage specifically, not on admin.manage or
+-- on "any permission"). Separate single-code user in Facility A.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('99900000-0000-0000-0000-000000000001', 'admin-only@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('99900000-0000-0000-0000-000000000001', 'Admin Only', 'admin-only@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('9c000000-0000-0000-0000-0000000000c9', '9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Admin Only Role')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('9c000000-0000-0000-0000-0000000000c9', 'admin.manage')
+on conflict do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('9d000000-0000-0000-0000-0000000000d9', '99900000-0000-0000-0000-000000000001', '9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '9c000000-0000-0000-0000-0000000000c9', 'active')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"99900000-0000-0000-0000-000000000001","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    insert into certification_role_requirements (id, facility_id, certification_type_id, role_id, enforcement_mode) values
+      ('9a100000-0000-0000-0000-000000000009', '9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '9e000000-0000-0000-0000-0000000000e1', '9c000000-0000-0000-0000-0000000000c1', 'hard-block');
+    raise exception 'P7C FAIL: an admin.manage-only member created a cert requirement (should require training.manage)';
+  exception
+    when insufficient_privilege then null; -- expected: no training.manage
+  end;
+end;
+$$;
+reset role;
+
 rollback;
