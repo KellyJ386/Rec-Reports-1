@@ -75,10 +75,21 @@ for (const helper of [
   "current_facility_ids",
   "has_permission",
   "fn_assert_same_facility",
-  "is_organization_admin"
+  "is_organization_admin",
+  "fn_block_audit_mutation",
+  "fn_audit_admin_change"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+// Audit backbone: both audit tables must carry an append-only guard, i.e. a
+// BEFORE UPDATE OR DELETE trigger, so audit rows can never be mutated in place.
+const lowerSql = combinedSql.toLowerCase();
+for (const auditTable of ["audit_events", "incident_audit_events"]) {
+  if (!lowerSql.includes(`before update or delete on ${auditTable}`)) {
+    throw new Error(`Migrations do not define an append-only (before update or delete) trigger on ${auditTable}.`);
   }
 }
 

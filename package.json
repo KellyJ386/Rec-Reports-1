@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node scripts/dev-server.mjs",
     "build": "node scripts/build.mjs",
-    "start": "node scripts/dev-server.mjs dist",
+    "start": "node scripts/server.mjs dist",
     "lint": "node scripts/lint.mjs",
     "typecheck": "node scripts/typecheck.mjs",
     "test": "node --test",
