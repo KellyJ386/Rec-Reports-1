@@ -10,6 +10,7 @@ import { hasAdminAccess, subscribe } from "./state.js";
 import { renderDashboard } from "./pages/dashboard.js";
 import { renderModules } from "./pages/modules.js";
 import { renderFacilities } from "./pages/facilities.js";
+import { renderIdentity } from "./pages/identity.js";
 import { renderStub } from "./pages/stub.js";
 
 // id -> { label, phase } for stub pages; pages already implemented are
@@ -17,7 +18,7 @@ import { renderStub } from "./pages/stub.js";
 const GROUP_META = {
   dashboard: { label: "Dashboard" },
   modules: { label: "Modules & Features" },
-  identity: { label: "Identity & Permissions", phase: 4 },
+  identity: { label: "Identity & Permissions" },
   forms: { label: "Forms & Fields", phase: 7 },
   notifications: { label: "Notifications", phase: 7 },
   facilities: { label: "Facilities & Departments" },
@@ -30,6 +31,7 @@ const GROUP_META = {
 const PAGE_RENDERERS = {
   dashboard: renderDashboard,
   modules: renderModules,
+  identity: renderIdentity,
   facilities: renderFacilities
 };
 

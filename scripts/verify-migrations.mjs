@@ -77,7 +77,8 @@ for (const helper of [
   "fn_assert_same_facility",
   "is_organization_admin",
   "fn_block_audit_mutation",
-  "fn_audit_admin_change"
+  "fn_audit_admin_change",
+  "fn_protect_system_role"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

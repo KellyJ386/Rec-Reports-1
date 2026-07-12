@@ -395,6 +395,59 @@ button:disabled {
   color: var(--rr-warning);
 }
 
+.badge-system,
+.badge-allowed {
+  background: var(--rr-success-bg);
+  border: 1px solid var(--rr-success-border);
+  color: var(--rr-success-text);
+}
+
+.badge-custom {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.badge-denied {
+  background: var(--rr-error-bg, #fdecea);
+  border: 1px solid var(--rr-error-border, #f5c6cb);
+  color: var(--rr-error, #b71c1c);
+}
+
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 16px;
+  margin: 8px 0;
+}
+
+.permission-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  font-size: 0.85rem;
+}
+
+.permission-editor {
+  padding: 8px 0;
+}
+
+.stacked-form {
+  display: block;
+}
+
+.stacked-form > label,
+.stacked-form > .field-label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.field-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
 .row-actions {
   display: flex;
   gap: 8px;

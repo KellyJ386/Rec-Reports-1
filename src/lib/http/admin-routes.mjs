@@ -1,12 +1,18 @@
-import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
 import { requirePermission, requireOrgAdmin } from "./guard.mjs";
-import { validateModuleTogglePayload } from "./validate.mjs";
+import {
+  validateModuleTogglePayload,
+  validateMembershipInput,
+  validateMembershipPatch
+} from "./validate.mjs";
 import { mergeSettings } from "../admin-config.mjs";
 import {
   validateFacilityInput,
   validateDepartmentInput,
   validateFacilitySettingsPatch
 } from "../admin/facilities.mjs";
+import { validateRoleGrant, simulateAccess } from "../admin/rbac.mjs";
+import { permissions } from "../permissions.mjs";
 
 // Registers the org-tree/admin API routes on a router. All request/response
 // primitives are injected so the same registration is unit-testable with stubs:
@@ -281,6 +287,200 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const row = await applyFacilitySettingsPatch(auth.client, params.facilityId, patch);
       return sendJson(response, 200, row);
     })
+  );
+
+  // --- Roles ---------------------------------------------------------------
+  function mapRole(row) {
+    return {
+      id: row.id,
+      facilityId: row.facility_id,
+      name: row.name,
+      isSystemRole: row.is_system_role ?? false,
+      active: row.active ?? true,
+      createdAt: row.created_at,
+      permissionCodes: (row.role_permissions ?? []).map((entry) => entry.permission_code)
+    };
+  }
+
+  // Replace a role's permission set with `codes` by deleting the current rows and
+  // inserting the new ones. Bulk-set semantics keep the API idempotent.
+  async function replaceRolePermissions(client, roleId, codes) {
+    await pgDelete(client, "role_permissions", { role_id: roleId });
+    if (codes.length > 0) {
+      await pgInsert(
+        client,
+        "role_permissions",
+        codes.map((code) => ({ role_id: roleId, permission_code: code })),
+        { returning: false }
+      );
+    }
+  }
+
+  router.register("GET", "/facilities/:facilityId/roles", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      const rows = await pgSelect(auth.client, "roles", {
+        filters: { facility_id: params.facilityId },
+        select: "id,facility_id,name,is_system_role,active,created_at,role_permissions(permission_code)",
+        order: "name.asc"
+      });
+      return sendJson(response, 200, (rows ?? []).map(mapRole));
+    })
+  );
+
+  router.register("POST", "/facilities/:facilityId/roles", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+      const codes = body.payload.permissionCodes ?? [];
+      const { valid, errors } = validateRoleGrant({ name: body.payload.name }, codes);
+      if (!valid) return sendJson(response, 400, { errors });
+      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      const roleRows = await pgInsert(
+        auth.client,
+        "roles",
+        [{ facility_id: params.facilityId, name: body.payload.name.trim() }],
+        { returning: true }
+      );
+      const role = (roleRows ?? [])[0] ?? null;
+      if (role) {
+        await replaceRolePermissions(auth.client, role.id, codes);
+      }
+      return sendJson(response, 201, role ? { ...mapRole(role), permissionCodes: codes } : null);
+    })
+  );
+
+  router.register("PUT", "/roles/:roleId/permissions", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+      const found = await pgSelect(auth.client, "roles", {
+        filters: { id: params.roleId },
+        select: "id,facility_id,name",
+        limit: 1
+      });
+      const role = (found ?? [])[0];
+      if (!role) return sendJson(response, 404, { error: "role not found" });
+      const codes = body.payload.permissionCodes ?? [];
+      const { valid, errors } = validateRoleGrant({ name: role.name }, codes);
+      if (!valid) return sendJson(response, 400, { errors });
+      const guard = requirePermission(auth.memberships, role.facility_id, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      await replaceRolePermissions(auth.client, params.roleId, codes);
+      return sendJson(response, 200, { roleId: params.roleId, permissionCodes: codes });
+    })
+  );
+
+  // --- Memberships ---------------------------------------------------------
+  function mapMembership(row) {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      facilityId: row.facility_id,
+      roleId: row.role_id,
+      status: row.status,
+      createdAt: row.created_at,
+      userName: row.app_users?.full_name ?? null,
+      userEmail: row.app_users?.email ?? null,
+      roleName: row.roles?.name ?? null
+    };
+  }
+
+  router.register("GET", "/facilities/:facilityId/memberships", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      const rows = await pgSelect(auth.client, "memberships", {
+        filters: { facility_id: params.facilityId },
+        select: "id,user_id,facility_id,role_id,status,created_at,app_users(full_name,email),roles(name)",
+        order: "created_at.asc"
+      });
+      return sendJson(response, 200, (rows ?? []).map(mapMembership));
+    })
+  );
+
+  router.register("POST", "/facilities/:facilityId/memberships", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+      const { valid, errors } = validateMembershipInput(body.payload);
+      if (!valid) return sendJson(response, 400, { errors });
+      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      const rows = await pgInsert(
+        auth.client,
+        "memberships",
+        [
+          {
+            facility_id: params.facilityId,
+            user_id: body.payload.userId,
+            role_id: body.payload.roleId,
+            status: body.payload.status ?? "active"
+          }
+        ],
+        { returning: true }
+      );
+      return sendJson(response, 201, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  router.register("PATCH", "/memberships/:membershipId", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+      const { valid, errors } = validateMembershipPatch(body.payload);
+      if (!valid) return sendJson(response, 400, { errors });
+      const found = await pgSelect(auth.client, "memberships", {
+        filters: { id: params.membershipId },
+        select: "id,facility_id",
+        limit: 1
+      });
+      const membership = (found ?? [])[0];
+      if (!membership) return sendJson(response, 404, { error: "membership not found" });
+      const guard = requirePermission(auth.memberships, membership.facility_id, "admin.manage");
+      if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+      const patch = {};
+      if (body.payload.roleId !== undefined) patch.role_id = body.payload.roleId;
+      if (body.payload.status !== undefined) patch.status = body.payload.status;
+      const rows = await pgUpdate(
+        auth.client,
+        "memberships",
+        { id: params.membershipId },
+        patch,
+        { returning: true }
+      );
+      return sendJson(response, 200, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  // --- Access simulator ----------------------------------------------------
+  router.register(
+    "GET",
+    "/facilities/:facilityId/access-simulator",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
+        const url = new URL(request.url ?? "/", "http://localhost");
+        const userId = url.searchParams.get("userId");
+        if (!userId) return sendJson(response, 400, { error: "userId query parameter is required" });
+        const rows = await pgSelect(auth.client, "memberships", {
+          filters: { user_id: userId, facility_id: params.facilityId },
+          select: "id,facility_id,status,role_id,roles(role_permissions(permission_code))"
+        });
+        const memberships = (rows ?? []).map((row) => ({
+          facilityId: row.facility_id,
+          status: row.status,
+          permissions: (row.roles?.role_permissions ?? []).map((entry) => entry.permission_code)
+        }));
+        const matrix = permissions.map((permission) => {
+          const { allowed, reason } = simulateAccess(memberships, params.facilityId, permission);
+          return { permission, allowed, reason };
+        });
+        return sendJson(response, 200, matrix);
+      })
   );
 
   return router;

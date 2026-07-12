@@ -27,6 +27,66 @@ insert into facilities (id, organization_id, name, timezone) values
 on conflict (id) do nothing;
 
 
+-- System roles: shared, deletion-protected scaffolding (is_system_role=true).
+-- Tenant Owner holds the full 16-code catalog; Compliance Admin owns
+-- reporting/incident/training/comms governance plus admin.manage; Ops Admin runs
+-- day-to-day scheduling/work-orders/incidents/reports; Read-Only Auditor gets
+-- every *.read plus reports.export for evidence gathering. Any additional roles
+-- an admin creates through the UI stay custom (is_system_role=false).
+insert into roles (id, facility_id, name, is_system_role, active) values
+  ('00000000-0000-0000-0000-000000003201', '00000000-0000-0000-0000-000000000201', 'Tenant Owner', true, true),
+  ('00000000-0000-0000-0000-000000003202', '00000000-0000-0000-0000-000000000201', 'Compliance Admin', true, true),
+  ('00000000-0000-0000-0000-000000003203', '00000000-0000-0000-0000-000000000201', 'Ops Admin', true, true),
+  ('00000000-0000-0000-0000-000000003204', '00000000-0000-0000-0000-000000000201', 'Read-Only Auditor', true, true)
+on conflict (id) do nothing;
+
+insert into role_permissions (role_id, permission_code) values
+  ('00000000-0000-0000-0000-000000003201', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.create'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.submit'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'training.read'),
+  ('00000000-0000-0000-0000-000000003201', 'training.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003201', 'work_orders.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'admin.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003201', 'communications.publish'),
+  ('00000000-0000-0000-0000-000000003202', 'admin.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'training.read'),
+  ('00000000-0000-0000-0000-000000003202', 'training.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003202', 'communications.publish'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.create'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.submit'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003203', 'work_orders.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003204', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003204', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003204', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003204', 'training.read'),
+  ('00000000-0000-0000-0000-000000003204', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003204', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003204', 'communications.read')
+on conflict (role_id, permission_code) do nothing;
+
+
 insert into departments (id, facility_id, name, code) values
   ('00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000201', 'Aquatics', 'aquatics'),
   ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-000000000201', 'Arena Operations', 'arena_ops')
