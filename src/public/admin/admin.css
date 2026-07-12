@@ -656,3 +656,64 @@ button:disabled {
     display: none;
   }
 }
+
+/* Audit & Compliance page (Phase 5). Additive only -- reuses .panel,
+   .subpanel, .data-table, .table-scroll, .badge, .row-actions, .inline-form,
+   .detail-subhead, .cell-hint, .cell-muted from the rules above. */
+
+.audit-tools .row-actions {
+  margin-top: 10px;
+}
+
+.audit-verify-result {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 1.5em;
+}
+
+.audit-diff-row td {
+  background: var(--rr-surface-muted);
+  padding: 14px;
+}
+
+.diff-table {
+  min-width: 480px;
+}
+
+.diff-table td,
+.diff-table th {
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
+.diff-badge-added {
+  background: var(--rr-success-bg);
+  border: 1px solid var(--rr-success-border);
+  color: var(--rr-success-text);
+}
+
+.diff-badge-removed {
+  background: var(--rr-danger-bg);
+  border: 1px solid var(--rr-danger-border);
+  color: var(--rr-danger);
+}
+
+.diff-badge-changed {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.diff-badge-unchanged {
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
+  color: var(--rr-text-muted);
+}
+
+.diff-row.diff-added td,
+.diff-row.diff-removed td,
+.diff-row.diff-changed td {
+  font-weight: 600;
+}

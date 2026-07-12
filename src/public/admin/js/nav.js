@@ -11,6 +11,7 @@ import { renderDashboard } from "./pages/dashboard.js";
 import { renderModules } from "./pages/modules.js";
 import { renderFacilities } from "./pages/facilities.js";
 import { renderIdentity } from "./pages/identity.js";
+import { renderAudit } from "./pages/audit.js";
 import { renderStub } from "./pages/stub.js";
 
 // id -> { label, phase } for stub pages; pages already implemented are
@@ -24,7 +25,7 @@ const GROUP_META = {
   facilities: { label: "Facilities & Departments" },
   certifications: { label: "Certifications", phase: 7 },
   branding: { label: "Branding & Documents", phase: 6 },
-  audit: { label: "Audit & Compliance", phase: 5 },
+  audit: { label: "Audit & Compliance" },
   billing: { label: "Billing & Subscription", phase: 7 }
 };
 
@@ -32,7 +33,8 @@ const PAGE_RENDERERS = {
   dashboard: renderDashboard,
   modules: renderModules,
   identity: renderIdentity,
-  facilities: renderFacilities
+  facilities: renderFacilities,
+  audit: renderAudit
 };
 
 function currentRouteId() {
