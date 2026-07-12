@@ -71,7 +71,14 @@ const requiredRlsTables = [
   "notification_events",
   "distribution_lists",
   "distribution_list_members",
-  "notification_routes"
+  "notification_routes",
+  "certification_role_requirements",
+  "certification_policies",
+  "feature_flags",
+  "feature_flag_rules",
+  "subscription_plans",
+  "tenant_subscriptions",
+  "usage_counters"
 ];
 
 for (const table of requiredRlsTables) {

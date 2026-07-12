@@ -2,8 +2,10 @@ import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
 import { requirePermission } from "./guard.mjs";
 import { canAccessFacility } from "../permissions.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
+import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
 const PUBLISH = "communications.publish";
+const ENTITLEMENT = "notification_routing";
 
 const LIST_COLUMNS = "id,facility_id,name,description,active,created_at,updated_at";
 const MEMBER_COLUMNS = "id,facility_id,distribution_list_id,member_type,member_ref_id,created_at";
@@ -41,6 +43,27 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
     const guard = requirePermission(auth.memberships, facilityId, PUBLISH);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
+      return false;
+    }
+    return true;
+  }
+
+  async function facilityOrgId(client, facilityId) {
+    const rows = await pgSelect(client, "facilities", {
+      filters: { id: facilityId },
+      select: "organization_id",
+      limit: 1
+    });
+    return (rows ?? [])[0]?.organization_id ?? null;
+  }
+
+  // 402-gate a write on the notification_routing entitlement. Loaded once per
+  // request. Missing subscription -> empty entitlements -> denied (fail closed).
+  async function requireEntitled(auth, facilityId, response) {
+    const orgId = await facilityOrgId(auth.client, facilityId);
+    const { entitlements } = await loadEntitlements(auth.client, orgId);
+    if (!isEntitled(entitlements, ENTITLEMENT)) {
+      sendJson(response, 402, { error: `plan does not include ${ENTITLEMENT}` });
       return false;
     }
     return true;
@@ -88,6 +111,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
           return sendJson(response, 400, { errors: ["name is required"] });
         }
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const row = {
           facility_id: params.facilityId,
           name: body.payload.name.trim(),
@@ -106,6 +130,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const patch = {};
         if (body.payload.name !== undefined) {
           if (typeof body.payload.name !== "string" || body.payload.name.trim().length === 0) {
@@ -162,6 +187,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const row = {
           facility_id: params.facilityId,
           distribution_list_id: params.id,
@@ -179,6 +205,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         await pgDelete(auth.client, "distribution_list_members", {
           id: params.memberId,
           facility_id: params.facilityId,
@@ -223,6 +250,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const row = {
           facility_id: params.facilityId,
           event_code: body.payload.eventCode,
@@ -243,6 +271,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const patch = {};
         if (body.payload.priority !== undefined) {
           if (!Number.isInteger(body.payload.priority)) {
@@ -277,6 +306,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
         if (!requirePublish(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const route = (
           await pgSelect(auth.client, "notification_routes", {
             filters: { id: params.id, facility_id: params.facilityId },

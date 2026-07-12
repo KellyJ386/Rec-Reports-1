@@ -12,6 +12,8 @@ import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
 import { registerWorkflowRoutes } from "../src/lib/http/workflow-routes.mjs";
 import { registerFormsRoutes } from "../src/lib/http/forms-routes.mjs";
 import { registerNotificationRoutes } from "../src/lib/http/notification-routes.mjs";
+import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
+import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -173,6 +175,16 @@ registerFormsRoutes(router, { authenticate, sendJson, readBody });
 // members, routes, and the test-notification sandbox). Logic lives in
 // src/lib/admin/notifications.mjs.
 registerNotificationRoutes(router, { authenticate, sendJson, readBody });
+
+// Phase 7 Certification policy routes (role requirements, policies, gaps report).
+// Writes require training.manage AND the cert_policies plan entitlement (402).
+// Logic lives in src/lib/admin/cert-policy.mjs + src/lib/admin/entitlements.mjs.
+registerCertPolicyRoutes(router, { authenticate, sendJson, readBody });
+
+// Phase 7 Billing & Subscription + feature-flag routes (subscription/plan,
+// usage meters, feature-flag catalog + effective state, scope-gated rule
+// writes). Logic lives in src/lib/admin/entitlements.mjs.
+registerBillingRoutes(router, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);

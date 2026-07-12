@@ -51,7 +51,10 @@ export const settingsRegistry = Object.freeze(
       scopes: ["organization", "facility"],
       default: "hard-block", // scheduling.mjs summarizeScheduleReadiness blocks publish on missing certs
       validation: { values: ["hard-block", "warning"] },
-      permission: "admin.manage"
+      permission: "admin.manage",
+      // Cert-policy controls are gated behind the cert_policies entitlement
+      // (0018): a plan without it hides this key from resolveEffectiveSettings.
+      entitlement: "cert_policies"
     },
     {
       key: "scheduling.openShiftClaimWindowHours",
@@ -137,7 +140,9 @@ export const settingsRegistry = Object.freeze(
       scopes: ["organization", "facility"],
       default: "22:00", // supabase/seed.sql:220 notifications.quietHoursStart
       validation: { pattern: TIME_OF_DAY_PATTERN },
-      permission: "admin.manage"
+      permission: "admin.manage",
+      // Quiet-hours routing is part of the notification_routing entitlement (0018).
+      entitlement: "notification_routing"
     },
     {
       key: "reports.quietHoursEnd",
@@ -147,7 +152,8 @@ export const settingsRegistry = Object.freeze(
       scopes: ["organization", "facility"],
       default: "06:00", // supabase/seed.sql:220 notifications.quietHoursEnd
       validation: { pattern: TIME_OF_DAY_PATTERN },
-      permission: "admin.manage"
+      permission: "admin.manage",
+      entitlement: "notification_routing"
     },
 
     // --- Communications (module code: communications) ----------------------
@@ -231,10 +237,23 @@ export function validateSettingValue(key, value) {
 // as stored in organization_module_settings.config_jsonb and
 // facility_module_overrides.config_patch_jsonb). Generalizes mergeSettings:
 // facility overrides win, then organization, then the registry default.
-export function resolveEffectiveSettings({ orgLayer = {}, facilityLayer = {}, definitions = settingsRegistry } = {}) {
+// The optional `entitlements` argument (a flat map of entitlement-key -> true,
+// e.g. from entitlements.mjs entitlementsFor) filters out any definition that
+// carries an `entitlement` field the tenant is not entitled to. Passing no
+// entitlements argument performs NO filtering, so every existing caller is
+// fully backward compatible.
+export function resolveEffectiveSettings({
+  orgLayer = {},
+  facilityLayer = {},
+  definitions = settingsRegistry,
+  entitlements = undefined
+} = {}) {
   const resolved = {};
   for (const definition of definitions) {
     const { key } = definition;
+    if (entitlements !== undefined && definition.entitlement && entitlements[definition.entitlement] !== true) {
+      continue;
+    }
     if (hasValue(facilityLayer, key)) {
       resolved[key] = { value: facilityLayer[key], source: "facility" };
     } else if (hasValue(orgLayer, key)) {
@@ -248,8 +267,8 @@ export function resolveEffectiveSettings({ orgLayer = {}, facilityLayer = {}, de
 
 // Convenience for the module libs: collapse a resolved map (or the layers) into
 // a plain key -> value config object, filling defaults for anything unset.
-export function effectiveConfig({ orgLayer = {}, facilityLayer = {}, definitions = settingsRegistry } = {}) {
-  const resolved = resolveEffectiveSettings({ orgLayer, facilityLayer, definitions });
+export function effectiveConfig({ orgLayer = {}, facilityLayer = {}, definitions = settingsRegistry, entitlements = undefined } = {}) {
+  const resolved = resolveEffectiveSettings({ orgLayer, facilityLayer, definitions, entitlements });
   const config = {};
   for (const [key, entry] of Object.entries(resolved)) config[key] = entry.value;
   return config;

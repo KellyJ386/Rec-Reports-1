@@ -246,3 +246,41 @@ insert into notification_events (id, code, severity, module_code, default_channe
   ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
   ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb)
 on conflict (code) do nothing;
+
+-- Subscription plans (0018). feature_entitlements_jsonb names the entitlement
+-- keys each plan unlocks; the admin API's entitlement guard (entitlements.mjs)
+-- and resolveEffectiveSettings both key off these. Tiers layer additively:
+-- professional adds notification_routing + cert_policies over essentials;
+-- enterprise adds advanced_flags + audit_export + custom_forms.
+insert into subscription_plans (id, code, name, base_price_cents, billing_period, feature_entitlements_jsonb) values
+  ('00000000-0000-0000-0000-000000003401', 'essentials', 'Essentials', 0, 'monthly', '{}'::jsonb),
+  ('00000000-0000-0000-0000-000000003402', 'professional', 'Professional', 49900, 'monthly', '{"notification_routing":true,"cert_policies":true}'::jsonb),
+  ('00000000-0000-0000-0000-000000003403', 'enterprise', 'Enterprise', 149900, 'monthly', '{"notification_routing":true,"cert_policies":true,"advanced_flags":true,"audit_export":true,"custom_forms":true}'::jsonb)
+on conflict (id) do nothing;
+
+-- The demo organization runs on an active Enterprise subscription, so every
+-- entitlement-gated admin surface (cert policy, notification routing) is
+-- exercisable out of the box.
+insert into tenant_subscriptions (id, organization_id, plan_id, status, renews_at, seat_limit, usage_limits_jsonb) values
+  ('00000000-0000-0000-0000-000000003501', '00000000-0000-0000-0000-000000000100', '00000000-0000-0000-0000-000000003403', 'active', now() + interval '30 days', 50, '{"active_employees":100,"monthly_reports":5000}'::jsonb)
+on conflict (id) do nothing;
+
+-- A small feature-flag catalog (0018). Boolean flags flip on/off per scope;
+-- percentage flags roll out gradually via feature_flag_rules.rollout_percentage.
+insert into feature_flags (id, key, description, rollout_type, default_state) values
+  ('00000000-0000-0000-0000-000000003601', 'admin.new_dashboard', 'New admin dashboard layout', 'boolean', false),
+  ('00000000-0000-0000-0000-000000003602', 'scheduling.auto_fill', 'Automatic open-shift fill suggestions', 'boolean', false),
+  ('00000000-0000-0000-0000-000000003603', 'reports.pdf_export', 'PDF export for daily reports', 'percentage', false),
+  ('00000000-0000-0000-0000-000000003604', 'incidents.ai_summary', 'AI-assisted incident summaries', 'boolean', true)
+on conflict (id) do nothing;
+
+-- A demo rule: turn the new dashboard on for the whole demo organization.
+insert into feature_flag_rules (id, feature_flag_id, scope_type, scope_id, state, rollout_percentage) values
+  ('00000000-0000-0000-0000-000000003701', '00000000-0000-0000-0000-000000003601', 'organization', '00000000-0000-0000-0000-000000000100', true, null)
+on conflict (id) do nothing;
+
+-- A usage counter for the current period so the usage meters render with data.
+insert into usage_counters (id, organization_id, metric_code, period_start, period_end, value) values
+  ('00000000-0000-0000-0000-000000003801', '00000000-0000-0000-0000-000000000100', 'active_employees', date_trunc('month', now())::date, (date_trunc('month', now()) + interval '1 month - 1 day')::date, 84),
+  ('00000000-0000-0000-0000-000000003802', '00000000-0000-0000-0000-000000000100', 'monthly_reports', date_trunc('month', now())::date, (date_trunc('month', now()) + interval '1 month - 1 day')::date, 4650)
+on conflict (id) do nothing;
