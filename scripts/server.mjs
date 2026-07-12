@@ -7,6 +7,7 @@ import { createRouter } from "../src/lib/http/router.mjs";
 import { verifySupabaseJwt, loadMemberships } from "../src/lib/http/auth.mjs";
 import { requireOrgAdmin } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
+import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -145,6 +146,11 @@ router.register("PUT", "/org/:id/module-settings/:moduleId", async (request, res
   );
   sendJson(response, 200, (rows ?? [])[0] ?? null);
 });
+
+// Phase 3 org-tree/admin routes (identity, module overrides, facilities,
+// departments, facility settings). Registered with the same auth/guard pipeline
+// used by the endpoints above; logic lives in the admin lib modules.
+registerAdminRoutes(router, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
