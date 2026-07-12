@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { requirePermission, requireOrgAdmin } from "../src/lib/http/guard.mjs";
+import {
+  requirePermission,
+  requireOrgAdmin,
+  requireAuthPermission,
+  authCanAccessFacility,
+  requireAuthOrgAdmin
+} from "../src/lib/http/guard.mjs";
 
 const activeAdmin = [
   { facilityId: "facility-a", status: "active", permissions: ["admin.manage", "reports.read"] }
@@ -50,4 +56,40 @@ test("requireOrgAdmin allows a membership holding admin.manage in any org facili
 
 test("requireOrgAdmin denies an organization with no facilities", () => {
   assert.equal(requireOrgAdmin(activeAdmin, []).allowed, false);
+});
+
+test("requireAuthPermission honors the platform super-admin bypass", () => {
+  const auth = { memberships: [], platformAdmin: true };
+  const result = requireAuthPermission(auth, "facility-z", "admin.manage");
+  assert.deepEqual(result, { allowed: true, reason: null });
+});
+
+test("requireAuthPermission falls back to membership scoping without the flag", () => {
+  const auth = { memberships: activeAdmin };
+  assert.equal(requireAuthPermission(auth, "facility-a", "admin.manage").allowed, true);
+  assert.equal(requireAuthPermission(auth, "facility-b", "admin.manage").allowed, false);
+  assert.equal(requireAuthPermission({ memberships: [] }, "facility-a", "admin.manage").allowed, false);
+});
+
+test("requireAuthPermission still requires a facility id and code for platform admins", () => {
+  const auth = { memberships: [], platformAdmin: true };
+  assert.equal(requireAuthPermission(auth, null, "admin.manage").allowed, false);
+  assert.equal(requireAuthPermission(auth, "facility-a", null).allowed, false);
+});
+
+test("requireAuthPermission ignores a non-boolean platformAdmin value", () => {
+  const auth = { memberships: [], platformAdmin: "yes" };
+  assert.equal(requireAuthPermission(auth, "facility-a", "admin.manage").allowed, false);
+});
+
+test("authCanAccessFacility honors the bypass and falls back to memberships", () => {
+  assert.equal(authCanAccessFacility({ memberships: [], platformAdmin: true }, "facility-z"), true);
+  assert.equal(authCanAccessFacility({ memberships: activeAdmin }, "facility-a"), true);
+  assert.equal(authCanAccessFacility({ memberships: activeAdmin }, "facility-b"), false);
+});
+
+test("requireAuthOrgAdmin honors the bypass even with no facilities", () => {
+  assert.equal(requireAuthOrgAdmin({ memberships: [], platformAdmin: true }, []).allowed, true);
+  assert.equal(requireAuthOrgAdmin({ memberships: activeAdmin }, ["facility-a"]).allowed, true);
+  assert.equal(requireAuthOrgAdmin({ memberships: activeAdmin }, ["facility-b"]).allowed, false);
 });

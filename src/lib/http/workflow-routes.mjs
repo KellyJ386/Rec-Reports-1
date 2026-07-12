@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
 import {
   createChangeRequest,
   advanceChangeRequest,
@@ -49,7 +49,7 @@ export function registerWorkflowRoutes(router, { authenticate, sendJson, readBod
   }
 
   function requireAdmin(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, "admin.manage");
+    const guard = requireAuthPermission(auth, facilityId, "admin.manage");
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;
@@ -185,8 +185,8 @@ export function registerWorkflowRoutes(router, { authenticate, sendJson, readBod
           return sendJson(response, 400, { error: `table is not exportable: ${params.table}` });
         }
         const requiredCode = permissionForTable(params.table);
-        const tableGuard = requirePermission(auth.memberships, params.facilityId, requiredCode);
-        const adminGuard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        const tableGuard = requireAuthPermission(auth, params.facilityId, requiredCode);
+        const adminGuard = requireAuthPermission(auth, params.facilityId, "admin.manage");
         if (!tableGuard.allowed && !adminGuard.allowed) {
           return sendJson(response, 403, { error: tableGuard.reason });
         }

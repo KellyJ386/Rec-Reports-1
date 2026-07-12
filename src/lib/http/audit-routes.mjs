@@ -1,5 +1,5 @@
 import { pgSelect } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
 import { queryAuditTimeline, buildExportPackage } from "../admin/audit-export.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 import { verifyDbChain } from "../audit.mjs";
@@ -25,7 +25,7 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireAuditAccess(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, "admin.manage");
+    const guard = requireAuthPermission(auth, facilityId, "admin.manage");
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;

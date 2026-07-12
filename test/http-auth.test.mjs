@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { verifySupabaseJwt, loadMemberships } from "../src/lib/http/auth.mjs";
+import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
 
 const secret = "test-jwt-secret";
 
@@ -94,6 +94,44 @@ test("loadMemberships flattens the role/permission embed from PostgREST", async 
         permissions: ["admin.manage", "reports.read"]
       }
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("loadPlatformAdmin is true when the roster has a row for the user", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.match(String(url), /\/rest\/v1\/platform_admins\?/);
+    return { ok: true, status: 200, text: async () => JSON.stringify([{ id: "pa-1" }]) };
+  };
+  try {
+    const result = await loadPlatformAdmin({ url: "https://example.supabase.co", key: "key" }, "user-1");
+    assert.equal(result, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("loadPlatformAdmin is false for an empty roster lookup", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => "[]" });
+  try {
+    const result = await loadPlatformAdmin({ url: "https://example.supabase.co", key: "key" }, "user-1");
+    assert.equal(result, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("loadPlatformAdmin fails closed when the lookup throws", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("network down");
+  };
+  try {
+    const result = await loadPlatformAdmin({ url: "https://example.supabase.co", key: "key" }, "user-1");
+    assert.equal(result, false);
   } finally {
     globalThis.fetch = originalFetch;
   }

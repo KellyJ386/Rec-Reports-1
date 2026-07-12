@@ -1,6 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
-import { canAccessFacility } from "../permissions.mjs";
+import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import {
   validateRequirementInput,
   validatePolicyInput,
@@ -38,7 +37,7 @@ export function registerCertPolicyRoutes(router, { authenticate, sendJson, readB
   }
 
   function requireMember(auth, facilityId, response) {
-    if (!canAccessFacility(auth.memberships, facilityId)) {
+    if (!authCanAccessFacility(auth, facilityId)) {
       sendJson(response, 403, { error: "not a member of this facility" });
       return false;
     }
@@ -46,7 +45,7 @@ export function registerCertPolicyRoutes(router, { authenticate, sendJson, readB
   }
 
   function requireManage(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, MANAGE);
+    const guard = requireAuthPermission(auth, facilityId, MANAGE);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;

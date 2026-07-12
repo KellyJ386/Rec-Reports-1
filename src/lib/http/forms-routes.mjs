@@ -1,6 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
-import { canAccessFacility } from "../permissions.mjs";
+import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import {
   validateCustomFieldInput,
   validateFormDefinition,
@@ -42,7 +41,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireMember(auth, facilityId, response) {
-    if (!canAccessFacility(auth.memberships, facilityId)) {
+    if (!authCanAccessFacility(auth, facilityId)) {
       sendJson(response, 403, { error: "not a member of this facility" });
       return false;
     }
@@ -50,7 +49,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireManage(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, TEMPLATE_MANAGE);
+    const guard = requireAuthPermission(auth, facilityId, TEMPLATE_MANAGE);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;

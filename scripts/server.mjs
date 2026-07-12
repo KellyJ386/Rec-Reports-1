@@ -4,8 +4,8 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
-import { verifySupabaseJwt, loadMemberships } from "../src/lib/http/auth.mjs";
-import { requireOrgAdmin } from "../src/lib/http/guard.mjs";
+import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
+import { requireAuthOrgAdmin } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
@@ -99,7 +99,8 @@ async function authenticate(request, env) {
   }
   const client = buildClient(env, token);
   const memberships = await loadMemberships(client, claims.sub);
-  return { claims, client, memberships, error: null };
+  const platformAdmin = await loadPlatformAdmin(client, claims.sub);
+  return { claims, client, memberships, platformAdmin, error: null };
 }
 
 async function orgFacilityIds(client, organizationId) {
@@ -126,7 +127,7 @@ router.register("GET", "/org/:id/module-settings", async (request, response, { e
   const auth = await authenticate(request, env);
   if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
   const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireOrgAdmin(auth.memberships, facilityIds);
+  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
   const rows = await pgSelect(auth.client, "organization_module_settings", {
     filters: { organization_id: params.id },
@@ -150,7 +151,7 @@ router.register("PUT", "/org/:id/module-settings/:moduleId", async (request, res
   if (!valid) return sendJson(response, 422, { errors });
 
   const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireOrgAdmin(auth.memberships, facilityIds);
+  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
 
   const rows = await pgInsert(
