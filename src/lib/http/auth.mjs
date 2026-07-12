@@ -59,11 +59,12 @@ export async function loadPlatformAdmin(client, userId) {
 export async function loadMemberships(client, userId) {
   const rows = await pgSelect(client, "memberships", {
     filters: { user_id: userId },
-    select: "id,facility_id,status,role_id,roles(role_permissions(permission_code))"
+    select: "id,facility_id,department_id,status,role_id,roles(role_permissions(permission_code))"
   });
   return (rows ?? []).map((row) => ({
     id: row.id,
     facilityId: row.facility_id,
+    departmentId: row.department_id ?? null,
     status: row.status,
     roleId: row.role_id,
     permissions: (row.roles?.role_permissions ?? []).map((entry) => entry.permission_code)

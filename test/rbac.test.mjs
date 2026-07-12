@@ -123,3 +123,33 @@ test("simulateAccess.allowed equals hasPermission for every catalog code and fix
     }
   }
 });
+
+// --- Department scoping (0023) ---------------------------------------------
+
+test("computeEffectivePermissions skips department-scoped memberships", () => {
+  const memberships = [
+    { facilityId: "fac-1", status: "active", permissions: ["reports.read"] },
+    { facilityId: "fac-1", departmentId: "dept-1", status: "active", permissions: ["admin.manage"] }
+  ];
+  assert.deepEqual(computeEffectivePermissions(memberships, "fac-1"), ["reports.read"]);
+});
+
+test("simulateAccess reports department-scoped when only a scoped membership holds the code", () => {
+  const memberships = [
+    { facilityId: "fac-1", departmentId: "dept-1", status: "active", permissions: ["admin.manage"] }
+  ];
+  const result = simulateAccess(memberships, "fac-1", "admin.manage");
+  assert.deepEqual(result, { allowed: false, reason: "department-scoped" });
+  assert.equal(result.allowed, hasPermission(memberships, "fac-1", "admin.manage"));
+});
+
+test("simulateAccess still grants when a facility-wide membership also holds the code", () => {
+  const memberships = [
+    { facilityId: "fac-1", departmentId: "dept-1", status: "active", permissions: ["admin.manage"] },
+    { facilityId: "fac-1", status: "active", permissions: ["admin.manage"] }
+  ];
+  assert.deepEqual(simulateAccess(memberships, "fac-1", "admin.manage"), {
+    allowed: true,
+    reason: "granted"
+  });
+});

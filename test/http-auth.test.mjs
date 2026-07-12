@@ -89,6 +89,7 @@ test("loadMemberships flattens the role/permission embed from PostgREST", async 
       {
         id: "membership-1",
         facilityId: "facility-a",
+        departmentId: null,
         status: "active",
         roleId: "role-1",
         permissions: ["admin.manage", "reports.read"]

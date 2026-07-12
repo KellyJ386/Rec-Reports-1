@@ -93,6 +93,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
         platformAdmin: auth.platformAdmin === true,
         memberships: (auth.memberships ?? []).map((m) => ({
           facilityId: m.facilityId,
+          departmentId: m.departmentId ?? null,
           status: m.status,
           permissions: m.permissions ?? []
         }))
@@ -395,6 +396,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       id: row.id,
       userId: row.user_id,
       facilityId: row.facility_id,
+      departmentId: row.department_id ?? null,
       roleId: row.role_id,
       status: row.status,
       createdAt: row.created_at,
@@ -410,7 +412,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "memberships", {
         filters: { facility_id: params.facilityId },
-        select: "id,user_id,facility_id,role_id,status,created_at,app_users(full_name,email),roles(name)",
+        select: "id,user_id,facility_id,department_id,role_id,status,created_at,app_users(full_name,email),roles(name)",
         order: "created_at.asc"
       });
       return sendJson(response, 200, (rows ?? []).map(mapMembership));
@@ -433,7 +435,8 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
             facility_id: params.facilityId,
             user_id: body.payload.userId,
             role_id: body.payload.roleId,
-            status: body.payload.status ?? "active"
+            status: body.payload.status ?? "active",
+            department_id: body.payload.departmentId ?? null
           }
         ],
         { returning: true }
@@ -460,6 +463,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const patch = {};
       if (body.payload.roleId !== undefined) patch.role_id = body.payload.roleId;
       if (body.payload.status !== undefined) patch.status = body.payload.status;
+      if (body.payload.departmentId !== undefined) patch.department_id = body.payload.departmentId;
       const rows = await pgUpdate(
         auth.client,
         "memberships",
