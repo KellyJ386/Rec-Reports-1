@@ -558,21 +558,36 @@ button:disabled {
   color: var(--rr-text-muted);
 }
 
-.stub-panel {
-  background: var(--rr-surface);
-  border: 1px solid var(--rr-border);
-  border-radius: var(--rr-radius-lg);
-  padding: 32px;
-  margin-top: 20px;
+/* Billing & Certifications (Phase 7). Additive -- reuses .panel, .subpanel,
+   .data-table, .badge, .row-actions, .inline-form. */
+.entitlement-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
 }
 
-.stub-message {
+.entitlement-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  margin: 8px 0 0;
+}
+
+.detail-grid dt {
   font-weight: 700;
-  font-size: 1.1rem;
+  color: var(--rr-text-muted);
 }
 
-.stub-detail {
-  color: var(--rr-text-muted);
+.detail-grid dd {
+  margin: 0;
 }
 
 .empty-state {

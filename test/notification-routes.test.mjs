@@ -8,6 +8,18 @@ const PUBLISHER = [{ facilityId: "fac-1", status: "active", permissions: ["commu
 const MEMBER = [{ facilityId: "fac-1", status: "active", permissions: ["communications.read"] }];
 const OUTSIDER = [{ facilityId: "fac-2", status: "active", permissions: ["communications.publish"] }];
 
+// Grants the notification_routing entitlement to the facility's org so the write
+// handlers' 402 guard passes. Returns null for any table it does not own, so the
+// per-test responder can supply the rest.
+function entitled(table, method) {
+  if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+  if (table === "tenant_subscriptions" && method === "GET") return [{ id: "sub-1", plan_id: "plan-1" }];
+  if (table === "subscription_plans" && method === "GET") {
+    return [{ id: "plan-1", feature_entitlements_jsonb: { notification_routing: true } }];
+  }
+  return null;
+}
+
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -23,6 +35,11 @@ function stubFetch(t, respond) {
     globalThis.fetch = original;
   });
   return captured;
+}
+
+// Wraps a per-test responder so entitlement lookups always succeed.
+function withEntitlement(respond) {
+  return (table, method, url) => entitled(table, method) ?? respond(table, method, url);
 }
 
 function mount({ memberships = PUBLISHER, userId = "user-1" } = {}) {
@@ -73,6 +90,20 @@ test("POST distribution-lists validates name before guarding", async (t) => {
   assert.equal(captured.length, 0);
 });
 
+test("POST distribution-lists rejects with 402 when the plan lacks notification_routing", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    // No subscription -> loadEntitlements returns empty entitlements (fail closed).
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/distribution-lists", { name: "Managers" });
+  assert.equal(result.status, 402);
+  // Never reached the insert.
+  assert.ok(!captured.some((c) => c.table === "distribution_lists" && c.method === "POST"));
+});
+
 test("POST distribution list member validates member_type", async (t) => {
   const captured = stubFetch(t, () => []);
   const { call } = mount();
@@ -85,7 +116,13 @@ test("POST distribution list member validates member_type", async (t) => {
 });
 
 test("POST distribution list member happy path inserts the shaped row", async (t) => {
-  const captured = stubFetch(t, () => [{ id: "m-1" }]);
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "distribution_list_members" && method === "POST") return [{ id: "m-1" }];
+      return [];
+    })
+  );
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/distribution-lists/list-1/members", {
     memberType: "role",
@@ -112,7 +149,13 @@ test("POST notification-routes denies a member without communications.publish", 
 });
 
 test("POST notification-routes happy path inserts the shaped row", async (t) => {
-  const captured = stubFetch(t, () => [{ id: "route-1" }]);
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "notification_routes" && method === "POST") return [{ id: "route-1" }];
+      return [];
+    })
+  );
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/notification-routes", {
     eventCode: "incident.escalated",
@@ -127,21 +170,24 @@ test("POST notification-routes happy path inserts the shaped row", async (t) => 
 });
 
 test("POST route test inserts a notification_jobs row with a test marker", async (t) => {
-  const captured = stubFetch(t, (table, method) => {
-    if (table === "notification_routes" && method === "GET") {
-      return [
-        {
-          id: "route-1",
-          facility_id: "fac-1",
-          event_code: "incident.escalated",
-          priority: 5,
-          route_jsonb: { channels: ["in_app"] }
-        }
-      ];
-    }
-    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
-    return [];
-  });
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "notification_routes" && method === "GET") {
+        return [
+          {
+            id: "route-1",
+            facility_id: "fac-1",
+            event_code: "incident.escalated",
+            priority: 5,
+            route_jsonb: { channels: ["in_app"] }
+          }
+        ];
+      }
+      if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+      return [];
+    })
+  );
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/notification-routes/route-1/test");
   assert.equal(result.status, 201);
@@ -153,7 +199,7 @@ test("POST route test inserts a notification_jobs row with a test marker", async
 });
 
 test("POST route test 404s for an unknown route", async (t) => {
-  stubFetch(t, () => []);
+  stubFetch(t, withEntitlement(() => []));
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/notification-routes/missing/test");
   assert.equal(result.status, 404);

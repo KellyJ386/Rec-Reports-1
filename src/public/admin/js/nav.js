@@ -15,10 +15,11 @@ import { renderAudit } from "./pages/audit.js";
 import { renderBranding } from "./pages/branding.js";
 import { renderForms } from "./pages/forms.js";
 import { renderNotifications } from "./pages/notifications.js";
-import { renderStub } from "./pages/stub.js";
+import { renderCertifications } from "./pages/certifications.js";
+import { renderBilling } from "./pages/billing.js";
 
-// id -> { label, phase } for stub pages; pages already implemented are
-// omitted from PAGE_RENDERERS lookup below instead of here.
+// id -> { label } for every nav group. Every group now has a real renderer in
+// PAGE_RENDERERS below (Phase 7 completed the last stubs: certifications, billing).
 const GROUP_META = {
   dashboard: { label: "Dashboard" },
   modules: { label: "Modules & Features" },
@@ -26,10 +27,10 @@ const GROUP_META = {
   forms: { label: "Forms & Fields" },
   notifications: { label: "Notifications" },
   facilities: { label: "Facilities & Departments" },
-  certifications: { label: "Certifications", phase: 7 },
+  certifications: { label: "Certifications" },
   branding: { label: "Branding & Documents" },
   audit: { label: "Audit & Compliance" },
-  billing: { label: "Billing & Subscription", phase: 7 }
+  billing: { label: "Billing & Subscription" }
 };
 
 const PAGE_RENDERERS = {
@@ -40,7 +41,9 @@ const PAGE_RENDERERS = {
   audit: renderAudit,
   branding: renderBranding,
   forms: renderForms,
-  notifications: renderNotifications
+  notifications: renderNotifications,
+  certifications: renderCertifications,
+  billing: renderBilling
 };
 
 function currentRouteId() {
@@ -89,14 +92,9 @@ async function renderRoute() {
   clearChildren(container);
   container.focus();
 
-  if (meta.phase) {
-    renderStub(container, { title: meta.label, phase: meta.phase });
-    return;
-  }
-
   const renderer = PAGE_RENDERERS[id];
   if (!renderer) {
-    renderStub(container, { title: meta.label, phase: "a later phase" });
+    container.append(errorBanner(`No page is registered for ${meta.label}.`));
     return;
   }
 
