@@ -227,3 +227,22 @@ on conflict (id) do nothing;
 insert into admin_change_requests (id, facility_id, entity_table, entity_id, change_summary, after_jsonb, status) values
   ('00000000-0000-0000-0000-000000003101', '00000000-0000-0000-0000-000000000201', 'facility_settings', '00000000-0000-0000-0000-000000002901', 'Publish initial facility operating defaults.', '{"version":1}'::jsonb, 'published')
 on conflict (id) do nothing;
+
+-- Notification event catalog (0016). Each code is grounded in an existing
+-- module surface: incident escalations (0004 incident_escalations /
+-- incidents.mjs), schedule publication (0003 schedule_publications /
+-- scheduling.mjs), work-order SLAs (work-orders.mjs + workOrders.slaHours*
+-- registry keys), the daily-report due hour (reports.dailyReportDueHour), cert
+-- expiry (training.mjs recertWindowDays + COMMUNICATION_TRAINING_SYSTEM_DESIGN
+-- cert.expiring), required-ack escalation (0006 message_acknowledgements
+-- 'overdue' + design 3.3), and training assignment due dates (0007
+-- training_assignments).
+insert into notification_events (id, code, severity, module_code, default_channels_jsonb) values
+  ('00000000-0000-0000-0000-000000003301', 'incident.escalated', 'critical', 'incidents', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003302', 'schedule.published', 'info', 'scheduling', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003303', 'work_order.overdue', 'warning', 'work_orders', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003304', 'report.missing', 'warning', 'daily_reports', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003305', 'cert.expiring', 'warning', 'training', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb)
+on conflict (code) do nothing;

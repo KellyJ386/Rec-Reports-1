@@ -11,6 +11,15 @@ const allowedFieldTypes = new Set([
   "signature"
 ]);
 
+// The shared set of supported field/data types, exported so the Forms & Fields
+// builder (src/lib/admin/forms.mjs) validates custom-field data types against
+// exactly the same vocabulary the runtime submission validator enforces.
+export const supportedFieldTypes = Object.freeze([...allowedFieldTypes]);
+
+export function isSupportedFieldType(type) {
+  return allowedFieldTypes.has(type);
+}
+
 export function validateReportTemplateSchema(schema) {
   const errors = [];
   if (!schema || typeof schema !== "object") {

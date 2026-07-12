@@ -10,6 +10,8 @@ import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
 import { registerWorkflowRoutes } from "../src/lib/http/workflow-routes.mjs";
+import { registerFormsRoutes } from "../src/lib/http/forms-routes.mjs";
+import { registerNotificationRoutes } from "../src/lib/http/notification-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -162,6 +164,15 @@ registerAuditRoutes(router, { authenticate, sendJson, readBody });
 // Same auth/guard pipeline as above; logic lives in src/lib/admin/change-requests.mjs,
 // src/lib/admin/branding.mjs, and src/lib/admin/export.mjs.
 registerWorkflowRoutes(router, { authenticate, sendJson, readBody });
+
+// Phase 7 Forms & Fields (lite) routes (custom fields, versioned form
+// definitions, publish/retire). Logic lives in src/lib/admin/forms.mjs.
+registerFormsRoutes(router, { authenticate, sendJson, readBody });
+
+// Phase 7 Notifications routing routes (event catalog, distribution lists +
+// members, routes, and the test-notification sandbox). Logic lives in
+// src/lib/admin/notifications.mjs.
+registerNotificationRoutes(router, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);

@@ -766,3 +766,58 @@ button:disabled {
 .diff-row.diff-changed td {
   font-weight: 600;
 }
+
+/* --- Phase 7: Forms & Fields + Notifications (additive) ------------------- */
+.json-preview {
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  max-height: 20rem;
+  font-size: 0.85rem;
+  white-space: pre;
+}
+
+.field-binding-row,
+.field-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0;
+}
+
+.field-binding-key {
+  min-width: 10rem;
+}
+
+.field-binding-required {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.version-list,
+.member-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+}
+
+.version-row,
+.member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--rr-border);
+}
+
+.inline-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}

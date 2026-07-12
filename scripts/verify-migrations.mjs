@@ -64,7 +64,14 @@ const requiredRlsTables = [
   "admin_change_requests",
   "organization_admins",
   "pdf_templates",
-  "pdf_template_bindings"
+  "pdf_template_bindings",
+  "custom_fields",
+  "form_definitions",
+  "form_field_bindings",
+  "notification_events",
+  "distribution_lists",
+  "distribution_list_members",
+  "notification_routes"
 ];
 
 for (const table of requiredRlsTables) {
