@@ -290,10 +290,12 @@ Deliver the remaining design domains on the fully hardened, audited, API-gated b
 3. **Certification policy** — `0017_cert_policy.sql`: `certification_role_requirements`, `certification_policies` with `enforcement_mode`; gives the Phase 5 `certEnforcementMode` registry key a real backing table; `scheduling.mjs`/`training.mjs` consume it.
 4. **Feature flags & Entitlements/Billing** — `0018_flags_entitlements.sql`: `feature_flags`, `feature_flag_rules` (design 3.2); minimal `subscription_plans`, `tenant_subscriptions`, `subscription_addons`, `tenant_addons`, `usage_counters` (design 3.9). `src/lib/admin/entitlements.mjs` — `entitlementsFor(plan, addons)`, `isEntitled`, `usageStatus` (80/90/100 soft limits, design 10.3); `resolveEffectiveSettings` gains an `entitlements` argument that filters gated keys. A runtime entitlement guard invoked before privileged actions. **Last** because it gates everything else and is safest added once the surfaces it gates exist.
 
-### Deferred (explicit, not silently dropped)
-- Full drag/drop form-builder canvas and PDF rendering engine (require a real dependency decision — separate proposal).
-- Platform-level cross-organization super-admin scope (`is_platform_admin` + a few policies) — worth doing only with more than one paying tenant.
-- Department-level scope in `has_permission`/`memberships` — highest-risk schema change (touches every policy); a called-out decision point, deferred unless department-level delegation is actually required.
+### Deferred (explicit, not silently dropped) — since delivered in a follow-up
+All four items landed after Phases 0–7 shipped, each resolved without taking on a runtime dependency:
+- ~~Full drag/drop form-builder canvas~~ — delivered: native HTML5 drag-and-drop palette + multi-section canvas in `src/public/admin/js/pages/forms.js`, with in-place draft editing via `PATCH /forms/:id` (`buildFormDraftUpdate`); no dependency needed.
+- ~~PDF rendering engine~~ — delivered: `src/lib/admin/pdf.mjs`, a zero-dependency PDF 1.4 renderer wired into `buildExportPackage` as a third export format (`csv|json|pdf`, base64 envelope); the "dependency decision" resolved as hand-rolled, consistent with the repo's zero-dep constraint.
+- ~~Platform-level cross-organization super-admin scope~~ — delivered in `0022_platform_admin.sql`: `platform_admins` roster + `is_platform_admin`, folded into `current_facility_ids` and `has_permission` in place (signatures unchanged, so all dependent policies inherit it), plus auth-level JS guards.
+- ~~Department-level scope in `has_permission`/`memberships`~~ — delivered in `0023_department_scope.sql`: nullable `memberships.department_id` (null = facility-wide, so no existing row changes behavior), a 4-arg `has_permission` overload for department-carrying rows, and `department_settings` switched to it; JS mirror kept in lockstep.
 
 ### Tests & acceptance (per sub-item)
 - One `test/admin/*.test.mjs` per new lib module + a `supabase/tests/*.sql` RLS proof per new table set, following the Phase 2–5 pattern.
