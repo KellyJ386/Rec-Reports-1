@@ -15,10 +15,6 @@ insert into permissions (code, description) values
   ('reports.template.manage', 'Manage report templates'),
   ('communications.read', 'Read communications'),
   ('communications.publish', 'Publish communications')
-  ('incidents.read', 'Read incidents'),
-  ('incidents.manage', 'Manage incidents'),
-  ('admin.manage', 'Manage facility configuration'),
-  ('reports.template.manage', 'Manage report templates')
 on conflict (code) do nothing;
 
 insert into organizations (id, name) values
@@ -29,6 +25,66 @@ insert into facilities (id, organization_id, name, timezone) values
   ('00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000100', 'North Arena', 'America/New_York'),
   ('00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000100', 'Riverfront Aquatics', 'America/New_York')
 on conflict (id) do nothing;
+
+
+-- System roles: shared, deletion-protected scaffolding (is_system_role=true).
+-- Tenant Owner holds the full 16-code catalog; Compliance Admin owns
+-- reporting/incident/training/comms governance plus admin.manage; Ops Admin runs
+-- day-to-day scheduling/work-orders/incidents/reports; Read-Only Auditor gets
+-- every *.read plus reports.export for evidence gathering. Any additional roles
+-- an admin creates through the UI stay custom (is_system_role=false).
+insert into roles (id, facility_id, name, is_system_role, active) values
+  ('00000000-0000-0000-0000-000000003201', '00000000-0000-0000-0000-000000000201', 'Tenant Owner', true, true),
+  ('00000000-0000-0000-0000-000000003202', '00000000-0000-0000-0000-000000000201', 'Compliance Admin', true, true),
+  ('00000000-0000-0000-0000-000000003203', '00000000-0000-0000-0000-000000000201', 'Ops Admin', true, true),
+  ('00000000-0000-0000-0000-000000003204', '00000000-0000-0000-0000-000000000201', 'Read-Only Auditor', true, true)
+on conflict (id) do nothing;
+
+insert into role_permissions (role_id, permission_code) values
+  ('00000000-0000-0000-0000-000000003201', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.create'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.submit'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'training.read'),
+  ('00000000-0000-0000-0000-000000003201', 'training.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003201', 'work_orders.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'admin.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003201', 'communications.publish'),
+  ('00000000-0000-0000-0000-000000003202', 'admin.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'training.read'),
+  ('00000000-0000-0000-0000-000000003202', 'training.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003202', 'communications.publish'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.create'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.submit'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003203', 'work_orders.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'communications.read'),
+  ('00000000-0000-0000-0000-000000003204', 'reports.read'),
+  ('00000000-0000-0000-0000-000000003204', 'reports.export'),
+  ('00000000-0000-0000-0000-000000003204', 'schedule.read'),
+  ('00000000-0000-0000-0000-000000003204', 'training.read'),
+  ('00000000-0000-0000-0000-000000003204', 'incidents.read'),
+  ('00000000-0000-0000-0000-000000003204', 'work_orders.read'),
+  ('00000000-0000-0000-0000-000000003204', 'communications.read')
+on conflict (role_id, permission_code) do nothing;
 
 
 insert into departments (id, facility_id, name, code) values
@@ -170,4 +226,61 @@ on conflict (id) do nothing;
 
 insert into admin_change_requests (id, facility_id, entity_table, entity_id, change_summary, after_jsonb, status) values
   ('00000000-0000-0000-0000-000000003101', '00000000-0000-0000-0000-000000000201', 'facility_settings', '00000000-0000-0000-0000-000000002901', 'Publish initial facility operating defaults.', '{"version":1}'::jsonb, 'published')
+on conflict (id) do nothing;
+
+-- Notification event catalog (0016). Each code is grounded in an existing
+-- module surface: incident escalations (0004 incident_escalations /
+-- incidents.mjs), schedule publication (0003 schedule_publications /
+-- scheduling.mjs), work-order SLAs (work-orders.mjs + workOrders.slaHours*
+-- registry keys), the daily-report due hour (reports.dailyReportDueHour), cert
+-- expiry (training.mjs recertWindowDays + COMMUNICATION_TRAINING_SYSTEM_DESIGN
+-- cert.expiring), required-ack escalation (0006 message_acknowledgements
+-- 'overdue' + design 3.3), and training assignment due dates (0007
+-- training_assignments).
+insert into notification_events (id, code, severity, module_code, default_channels_jsonb) values
+  ('00000000-0000-0000-0000-000000003301', 'incident.escalated', 'critical', 'incidents', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003302', 'schedule.published', 'info', 'scheduling', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003303', 'work_order.overdue', 'warning', 'work_orders', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003304', 'report.missing', 'warning', 'daily_reports', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003305', 'cert.expiring', 'warning', 'training', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb)
+on conflict (code) do nothing;
+
+-- Subscription plans (0018). feature_entitlements_jsonb names the entitlement
+-- keys each plan unlocks; the admin API's entitlement guard (entitlements.mjs)
+-- and resolveEffectiveSettings both key off these. Tiers layer additively:
+-- professional adds notification_routing + cert_policies over essentials;
+-- enterprise adds advanced_flags + audit_export + custom_forms.
+insert into subscription_plans (id, code, name, base_price_cents, billing_period, feature_entitlements_jsonb) values
+  ('00000000-0000-0000-0000-000000003401', 'essentials', 'Essentials', 0, 'monthly', '{}'::jsonb),
+  ('00000000-0000-0000-0000-000000003402', 'professional', 'Professional', 49900, 'monthly', '{"notification_routing":true,"cert_policies":true}'::jsonb),
+  ('00000000-0000-0000-0000-000000003403', 'enterprise', 'Enterprise', 149900, 'monthly', '{"notification_routing":true,"cert_policies":true,"advanced_flags":true,"audit_export":true,"custom_forms":true}'::jsonb)
+on conflict (id) do nothing;
+
+-- The demo organization runs on an active Enterprise subscription, so every
+-- entitlement-gated admin surface (cert policy, notification routing) is
+-- exercisable out of the box.
+insert into tenant_subscriptions (id, organization_id, plan_id, status, renews_at, seat_limit, usage_limits_jsonb) values
+  ('00000000-0000-0000-0000-000000003501', '00000000-0000-0000-0000-000000000100', '00000000-0000-0000-0000-000000003403', 'active', now() + interval '30 days', 50, '{"active_employees":100,"monthly_reports":5000}'::jsonb)
+on conflict (id) do nothing;
+
+-- A small feature-flag catalog (0018). Boolean flags flip on/off per scope;
+-- percentage flags roll out gradually via feature_flag_rules.rollout_percentage.
+insert into feature_flags (id, key, description, rollout_type, default_state) values
+  ('00000000-0000-0000-0000-000000003601', 'admin.new_dashboard', 'New admin dashboard layout', 'boolean', false),
+  ('00000000-0000-0000-0000-000000003602', 'scheduling.auto_fill', 'Automatic open-shift fill suggestions', 'boolean', false),
+  ('00000000-0000-0000-0000-000000003603', 'reports.pdf_export', 'PDF export for daily reports', 'percentage', false),
+  ('00000000-0000-0000-0000-000000003604', 'incidents.ai_summary', 'AI-assisted incident summaries', 'boolean', true)
+on conflict (id) do nothing;
+
+-- A demo rule: turn the new dashboard on for the whole demo organization.
+insert into feature_flag_rules (id, feature_flag_id, scope_type, scope_id, state, rollout_percentage) values
+  ('00000000-0000-0000-0000-000000003701', '00000000-0000-0000-0000-000000003601', 'organization', '00000000-0000-0000-0000-000000000100', true, null)
+on conflict (id) do nothing;
+
+-- A usage counter for the current period so the usage meters render with data.
+insert into usage_counters (id, organization_id, metric_code, period_start, period_end, value) values
+  ('00000000-0000-0000-0000-000000003801', '00000000-0000-0000-0000-000000000100', 'active_employees', date_trunc('month', now())::date, (date_trunc('month', now()) + interval '1 month - 1 day')::date, 84),
+  ('00000000-0000-0000-0000-000000003802', '00000000-0000-0000-0000-000000000100', 'monthly_reports', date_trunc('month', now())::date, (date_trunc('month', now()) + interval '1 month - 1 day')::date, 4650)
 on conflict (id) do nothing;

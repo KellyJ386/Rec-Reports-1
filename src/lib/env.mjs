@@ -1,6 +1,11 @@
 const urlFields = new Set(["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_APP_URL", "OBSERVABILITY_DSN"]);
 const requiredClientFields = ["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"];
-const optionalServerFields = ["SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL", "OBSERVABILITY_DSN"];
+const optionalServerFields = [
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "SUPABASE_JWT_SECRET",
+  "DATABASE_URL",
+  "OBSERVABILITY_DSN"
+];
 
 function assertUrl(name, value) {
   try {

@@ -8,6 +8,22 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rec_reports_rls
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/rec_reports_rls
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,3 +37,26 @@ jobs:
       - run: npm run test
       - run: npm run build
       - run: npm run db:verify
+      - run: npm run db:verify:seed
+      # The postgres:16 service above is a bare Postgres, not a Supabase
+      # project, so it's missing the `authenticated` role, the `auth` schema,
+      # and any applied schema. These steps recreate just enough of that
+      # (scripts/ci/rls-bootstrap-*.sql) and load the real migrations/seed
+      # before db:test:rls runs supabase/tests/*.sql against it. This is
+      # CI-only scaffolding -- it never runs against a real Supabase project,
+      # and scripts/run-rls-tests.mjs still skips cleanly for local devs
+      # without a DATABASE_URL/SUPABASE_DB_URL set.
+      - name: Bootstrap Supabase-style auth schema/role
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci/rls-bootstrap-pre.sql
+      - name: Apply migrations (supabase/migrations/*.sql, in order)
+        run: |
+          set -e
+          for f in supabase/migrations/*.sql; do
+            echo "Applying $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: Grant table privileges to the authenticated role
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci/rls-bootstrap-post.sql
+      - name: Load seed data
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/seed.sql
+      - run: npm run db:test:rls

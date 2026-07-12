@@ -1,0 +1,838 @@
+/* Admin control center styles. Extends the palette used in src/public/styles.css
+   (accent #1c6dd0, ink #172033, surface #ffffff, border #dce5f2, bg #f4f7fb)
+   with CSS custom properties so light/dark themes share one set of rules. */
+
+:root {
+  --rr-bg: #f4f7fb;
+  --rr-surface: #ffffff;
+  --rr-surface-muted: #eef4ff;
+  --rr-border: #dce5f2;
+  --rr-text: #172033;
+  --rr-text-muted: #52647a;
+  --rr-accent: #1c6dd0;
+  --rr-accent-contrast: #ffffff;
+  --rr-accent-strong: #173b72;
+  --rr-danger: #b3261e;
+  --rr-danger-bg: #fff1f1;
+  --rr-danger-border: #f0a0a0;
+  --rr-warning: #6a4b12;
+  --rr-warning-bg: #fff8e8;
+  --rr-warning-border: #d1b06f;
+  --rr-success-bg: #effaf2;
+  --rr-success-border: #9ec5a9;
+  --rr-success-text: #285a34;
+  --rr-focus: #0b57d0;
+  --rr-shadow: 0 18px 50px rgba(23, 32, 51, 0.08);
+  --rr-radius-lg: 20px;
+  --rr-radius-md: 14px;
+  --rr-radius-sm: 10px;
+  --rr-sidebar-width: 260px;
+  --rr-topbar-height: 72px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --rr-bg: #0e1420;
+    --rr-surface: #161e2e;
+    --rr-surface-muted: #1c2740;
+    --rr-border: #2a3552;
+    --rr-text: #e8edf7;
+    --rr-text-muted: #a7b3c9;
+    --rr-accent: #5b9bf0;
+    --rr-accent-contrast: #051225;
+    --rr-accent-strong: #bcd7ff;
+    --rr-danger: #ff8a80;
+    --rr-danger-bg: #3a1414;
+    --rr-danger-border: #6b2323;
+    --rr-warning: #f2c36b;
+    --rr-warning-bg: #362a0d;
+    --rr-warning-border: #6a4b12;
+    --rr-success-bg: #10291a;
+    --rr-success-border: #2f5f3d;
+    --rr-success-text: #8fd6a4;
+    --rr-focus: #8ab4ff;
+    --rr-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+    color-scheme: dark;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--rr-bg);
+  color: var(--rr-text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow-x: hidden;
+}
+
+a {
+  color: var(--rr-accent);
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+  padding: 10px 16px;
+  border-radius: 0 0 10px 0;
+  z-index: 100;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+:focus-visible {
+  outline: 3px solid var(--rr-focus);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.admin-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  min-height: var(--rr-topbar-height);
+  padding: 12px 20px;
+  background: var(--rr-surface);
+  border-bottom: 1px solid var(--rr-border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-name {
+  font-weight: 800;
+  font-size: 1.1rem;
+}
+
+.brand-tag {
+  color: var(--rr-text-muted);
+  font-size: 0.85rem;
+}
+
+.topbar-context {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.context-field {
+  display: grid;
+  gap: 4px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--rr-text-muted);
+}
+
+.context-field input,
+.context-field select {
+  min-width: 200px;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+select,
+textarea {
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  padding: 9px 10px;
+  background: var(--rr-surface);
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.6;
+}
+
+button {
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  padding: 9px 14px;
+  cursor: pointer;
+  background: var(--rr-surface-muted);
+  font-weight: 700;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.primary-button {
+  background: var(--rr-accent);
+  border-color: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+}
+
+.ghost-button {
+  background: transparent;
+}
+
+.icon-button {
+  background: transparent;
+  border-color: transparent;
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 6px 10px;
+}
+
+.layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.sidebar {
+  width: var(--rr-sidebar-width);
+  flex-shrink: 0;
+  background: var(--rr-surface);
+  border-right: 1px solid var(--rr-border);
+  padding: 16px 10px;
+  overflow-y: auto;
+}
+
+.nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.nav-link {
+  display: block;
+  padding: 10px 12px;
+  border-radius: var(--rr-radius-sm);
+  text-decoration: none;
+  color: var(--rr-text);
+  font-weight: 600;
+}
+
+.nav-link:hover {
+  background: var(--rr-surface-muted);
+}
+
+.nav-link.active {
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  padding: 24px 28px 48px;
+  overflow-y: auto;
+}
+
+.content h1 {
+  margin-top: 0;
+}
+
+.panel {
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-lg);
+  padding: 24px;
+  margin-top: 20px;
+  box-shadow: var(--rr-shadow);
+}
+
+.subpanel {
+  border-top: 1px solid var(--rr-border);
+  padding-top: 18px;
+  margin-top: 18px;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.stat-tile {
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  padding: 18px;
+  display: grid;
+  gap: 6px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stat-tile-link:hover {
+  border-color: var(--rr-accent);
+}
+
+.stat-value {
+  font-size: 2rem;
+  font-weight: 800;
+}
+
+.stat-label {
+  color: var(--rr-text-muted);
+  font-weight: 600;
+}
+
+.quick-links {
+  display: grid;
+  gap: 8px;
+  padding-left: 20px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+}
+
+.data-table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 560px;
+}
+
+.data-table th,
+.data-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--rr-border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.data-table thead th {
+  background: var(--rr-surface-muted);
+  position: sticky;
+  top: 0;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.cell-hint {
+  margin: 4px 0 0;
+  font-size: 0.75rem;
+  color: var(--rr-text-muted);
+}
+
+.cell-muted {
+  color: var(--rr-text-muted);
+  font-size: 0.85rem;
+}
+
+.impact-text {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: var(--rr-text-muted);
+}
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.badge-on {
+  background: var(--rr-success-bg);
+  border: 1px solid var(--rr-success-border);
+  color: var(--rr-success-text);
+}
+
+.badge-off {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.badge-system,
+.badge-allowed {
+  background: var(--rr-success-bg);
+  border: 1px solid var(--rr-success-border);
+  color: var(--rr-success-text);
+}
+
+.badge-custom {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.badge-denied {
+  background: var(--rr-error-bg, #fdecea);
+  border: 1px solid var(--rr-error-border, #f5c6cb);
+  color: var(--rr-error, #b71c1c);
+}
+
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px 16px;
+  margin: 8px 0;
+}
+
+.permission-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  font-size: 0.85rem;
+}
+
+.permission-editor {
+  padding: 8px 0;
+}
+
+.stacked-form {
+  display: block;
+}
+
+.stacked-form > label,
+.stacked-form > .field-label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.field-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.inline-form label,
+.settings-form label {
+  display: grid;
+  gap: 4px;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.settings-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  align-items: end;
+  margin-top: 12px;
+}
+
+.color-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.color-field input[type="color"] {
+  width: 40px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  background: none;
+}
+
+.color-field input[type="text"] {
+  width: 100px;
+}
+
+.branding-swatch {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 48px;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.branding-swatch-block {
+  flex: 1;
+  height: 100%;
+}
+
+.branding-swatch-label {
+  flex: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  font-weight: 700;
+  background: var(--rr-surface);
+}
+
+.data-export .inline-form {
+  align-items: end;
+}
+
+.create-fieldset {
+  border: 1px dashed var(--rr-border);
+  border-radius: var(--rr-radius-md);
+  padding: 14px;
+  margin: 0 0 12px;
+}
+
+.create-fieldset legend {
+  font-weight: 700;
+  padding: 0 6px;
+}
+
+.department-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.department-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-subhead {
+  font-weight: 700;
+  color: var(--rr-text-muted);
+}
+
+/* Billing & Certifications (Phase 7). Additive -- reuses .panel, .subpanel,
+   .data-table, .badge, .row-actions, .inline-form. */
+.entitlement-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.entitlement-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  margin: 8px 0 0;
+}
+
+.detail-grid dt {
+  font-weight: 700;
+  color: var(--rr-text-muted);
+}
+
+.detail-grid dd {
+  margin: 0;
+}
+
+.empty-state {
+  color: var(--rr-text-muted);
+  font-style: italic;
+}
+
+.banner {
+  border-radius: var(--rr-radius-md);
+  padding: 14px 16px;
+  margin-top: 16px;
+  font-weight: 600;
+}
+
+.banner-error {
+  background: var(--rr-danger-bg);
+  border: 1px solid var(--rr-danger-border);
+  color: var(--rr-danger);
+}
+
+.banner-warning {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.status-region:empty {
+  display: none;
+}
+
+.token-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: min(360px, 100%);
+  background: var(--rr-surface);
+  border-left: 1px solid var(--rr-border);
+  box-shadow: var(--rr-shadow);
+  padding: 20px;
+  overflow-y: auto;
+  z-index: 40;
+}
+
+.drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.drawer-field {
+  display: grid;
+  gap: 6px;
+  font-weight: 700;
+  margin: 16px 0;
+}
+
+.drawer-field textarea {
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.drawer-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.drawer-status {
+  color: var(--rr-text-muted);
+  min-height: 1.2em;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translate(-50%, 12px);
+  background: var(--rr-text);
+  color: var(--rr-bg);
+  padding: 12px 20px;
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  max-width: min(520px, calc(100vw - 32px));
+  text-align: center;
+  z-index: 50;
+}
+
+.toast.visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    position: fixed;
+    top: var(--rr-topbar-height);
+    bottom: 0;
+    left: 0;
+    width: min(280px, 80vw);
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    z-index: 30;
+    box-shadow: var(--rr-shadow);
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .content {
+    padding: 18px;
+  }
+
+  .topbar-context {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .context-field input,
+  .context-field select {
+    min-width: 140px;
+  }
+}
+
+@media (min-width: 901px) {
+  #sidebar-toggle {
+    display: none;
+  }
+}
+
+/* Audit & Compliance page (Phase 5). Additive only -- reuses .panel,
+   .subpanel, .data-table, .table-scroll, .badge, .row-actions, .inline-form,
+   .detail-subhead, .cell-hint, .cell-muted from the rules above. */
+
+.audit-tools .row-actions {
+  margin-top: 10px;
+}
+
+.audit-verify-result {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 1.5em;
+}
+
+.audit-diff-row td {
+  background: var(--rr-surface-muted);
+  padding: 14px;
+}
+
+.diff-table {
+  min-width: 480px;
+}
+
+.diff-table td,
+.diff-table th {
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
+.diff-badge-added {
+  background: var(--rr-success-bg);
+  border: 1px solid var(--rr-success-border);
+  color: var(--rr-success-text);
+}
+
+.diff-badge-removed {
+  background: var(--rr-danger-bg);
+  border: 1px solid var(--rr-danger-border);
+  color: var(--rr-danger);
+}
+
+.diff-badge-changed {
+  background: var(--rr-warning-bg);
+  border: 1px solid var(--rr-warning-border);
+  color: var(--rr-warning);
+}
+
+.diff-badge-unchanged {
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
+  color: var(--rr-text-muted);
+}
+
+.diff-row.diff-added td,
+.diff-row.diff-removed td,
+.diff-row.diff-changed td {
+  font-weight: 600;
+}
+
+/* --- Phase 7: Forms & Fields + Notifications (additive) ------------------- */
+.json-preview {
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  max-height: 20rem;
+  font-size: 0.85rem;
+  white-space: pre;
+}
+
+.field-binding-row,
+.field-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0;
+}
+
+.field-binding-key {
+  min-width: 10rem;
+}
+
+.field-binding-required {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.version-list,
+.member-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+}
+
+.version-row,
+.member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--rr-border);
+}
+
+.inline-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
