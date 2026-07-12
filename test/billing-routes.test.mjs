@@ -31,6 +31,17 @@ function orgFacilities(table, method) {
   return null;
 }
 
+// Grants the advanced_flags entitlement to the org so the feature-flag-rule
+// write handlers' 402 guard passes. Returns null for any table it does not
+// own, so the per-test responder can supply the rest.
+function entitled(table, method) {
+  if (table === "tenant_subscriptions" && method === "GET") return [{ id: "sub-1", plan_id: "plan-1" }];
+  if (table === "subscription_plans" && method === "GET") {
+    return [{ id: "plan-1", feature_entitlements_jsonb: { advanced_flags: true } }];
+  }
+  return null;
+}
+
 function mount({ memberships = ORG_ADMIN } = {}) {
   const router = createRouter();
   const sent = [];
@@ -123,6 +134,8 @@ test("POST feature-flag-rules happy path inserts the shaped row for an org admin
   const captured = stubFetch(t, (table, method) => {
     const of = orgFacilities(table, method);
     if (of) return of;
+    const ent = entitled(table, method);
+    if (ent) return ent;
     if (table === "feature_flag_rules" && method === "POST") return [{ id: "rule-1" }];
     return [];
   });
@@ -141,6 +154,25 @@ test("POST feature-flag-rules happy path inserts the shaped row for an org admin
   assert.equal(insert.body[0].scope_id, "org-1");
   assert.equal(insert.body[0].state, false);
   assert.equal(insert.body[0].rollout_percentage, 25);
+});
+
+test("POST feature-flag-rules rejects with 402 when the org's plan lacks advanced_flags", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const of = orgFacilities(table, method);
+    if (of) return of;
+    // No subscription -> loadEntitlements returns empty entitlements (fail closed).
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("POST", "/org/org-1/feature-flag-rules", {
+    featureFlagId: "flag-1",
+    scopeType: "organization",
+    scopeId: "org-1",
+    state: false
+  });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "feature_flag_rules" && c.method === "POST"));
 });
 
 test("POST feature-flag-rules rejects an out-of-range rollout percentage", async (t) => {
@@ -202,4 +234,42 @@ test("PATCH feature-flag-rules authorizes against the rule's actual org, not the
   const { call } = mount({ memberships: ORG_ADMIN });
   const result = await call("PATCH", "/org/org-1/feature-flag-rules/rule-9", { state: false });
   assert.equal(result.status, 403);
+});
+
+test("PATCH feature-flag-rules happy path updates the rule for an org admin", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "feature_flag_rules" && method === "GET") {
+      return [{ id: "rule-1", scope_type: "organization", scope_id: "org-1" }];
+    }
+    if (table === "feature_flag_rules" && method === "PATCH") {
+      return [{ id: "rule-1", state: false }];
+    }
+    const of = orgFacilities(table, method);
+    if (of) return of;
+    const ent = entitled(table, method);
+    if (ent) return ent;
+    return [];
+  });
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("PATCH", "/org/org-1/feature-flag-rules/rule-1", { state: false });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "feature_flag_rules" && c.method === "PATCH");
+  assert.equal(patch.body.state, false);
+});
+
+test("PATCH feature-flag-rules rejects with 402 when the rule's org plan lacks advanced_flags", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "feature_flag_rules" && method === "GET") {
+      return [{ id: "rule-1", scope_type: "organization", scope_id: "org-1" }];
+    }
+    const of = orgFacilities(table, method);
+    if (of) return of;
+    // No subscription -> loadEntitlements returns empty entitlements (fail closed).
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: ORG_ADMIN });
+  const result = await call("PATCH", "/org/org-1/feature-flag-rules/rule-1", { state: false });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "feature_flag_rules" && c.method === "PATCH"));
 });

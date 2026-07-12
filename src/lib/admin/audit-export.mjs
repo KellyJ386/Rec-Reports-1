@@ -5,6 +5,7 @@ import { toCsv as genericToCsv, toJson, buildExportPackage as genericBuildExport
 // column order in the CSV export.
 const AUDIT_COLUMNS = [
   "id",
+  "chain_seq",
   "created_at",
   "event_type",
   "entity_table",

@@ -12,6 +12,23 @@ const VALID_SCHEMA = {
   sections: [{ title: "Fields", fields: [{ key: "k1", label: "K1", type: "text", required: true }] }]
 };
 
+// Grants the custom_forms entitlement to the facility's org so the write
+// handlers' 402 guard passes. Returns null for any table it does not own, so
+// the per-test responder can supply the rest.
+function entitled(table, method) {
+  if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+  if (table === "tenant_subscriptions" && method === "GET") return [{ id: "sub-1", plan_id: "plan-1" }];
+  if (table === "subscription_plans" && method === "GET") {
+    return [{ id: "plan-1", feature_entitlements_jsonb: { custom_forms: true } }];
+  }
+  return null;
+}
+
+// Wraps a per-test responder so entitlement lookups always succeed.
+function withEntitlement(respond) {
+  return (table, method, url) => entitled(table, method) ?? respond(table, method, url);
+}
+
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -81,7 +98,13 @@ test("POST custom-fields denies a member without reports.template.manage", async
 });
 
 test("POST custom-fields happy path inserts the shaped row", async (t) => {
-  const captured = stubFetch(t, () => [{ id: "cf-1" }]);
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "custom_fields" && method === "POST") return [{ id: "cf-1" }];
+      return [];
+    })
+  );
   const { call } = mount({ userId: "user-9" });
   const result = await call("POST", "/facilities/fac-1/custom-fields", {
     key: "pool_ready",
@@ -96,12 +119,32 @@ test("POST custom-fields happy path inserts the shaped row", async (t) => {
   assert.equal(insert.body[0].created_by, "user-9");
 });
 
-test("POST forms creates a draft at version = max(existing) + 1", async (t) => {
+test("POST custom-fields rejects with 402 when the plan lacks custom_forms", async (t) => {
   const captured = stubFetch(t, (table, method) => {
-    if (table === "form_definitions" && method === "GET") return [{ version_no: 1 }, { version_no: 2 }];
-    if (table === "form_definitions" && method === "POST") return [{ id: "f-3", version_no: 3 }];
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    // No subscription -> loadEntitlements returns empty entitlements (fail closed).
+    if (table === "tenant_subscriptions" && method === "GET") return [];
     return [];
   });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/custom-fields", {
+    key: "pool_ready",
+    label: "Pool ready",
+    dataType: "select"
+  });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "custom_fields" && c.method === "POST"));
+});
+
+test("POST forms creates a draft at version = max(existing) + 1", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "form_definitions" && method === "GET") return [{ version_no: 1 }, { version_no: 2 }];
+      if (table === "form_definitions" && method === "POST") return [{ id: "f-3", version_no: 3 }];
+      return [];
+    })
+  );
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/forms", {
     moduleCode: "daily_reports",
@@ -112,6 +155,22 @@ test("POST forms creates a draft at version = max(existing) + 1", async (t) => {
   const insert = captured.find((c) => c.table === "form_definitions" && c.method === "POST");
   assert.equal(insert.body[0].version_no, 3);
   assert.equal(insert.body[0].status, "draft");
+});
+
+test("POST forms rejects with 402 when the plan lacks custom_forms", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/forms", {
+    moduleCode: "daily_reports",
+    formCode: "opening",
+    schema: VALID_SCHEMA
+  });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "POST"));
 });
 
 test("POST forms rejects an invalid schema with 400 before any write", async (t) => {
@@ -127,20 +186,23 @@ test("POST forms rejects an invalid schema with 400 before any write", async (t)
 });
 
 test("POST forms/:id/publish publishes the draft and retires published siblings", async (t) => {
-  const captured = stubFetch(t, (table, method, url) => {
-    if (table === "form_definitions" && method === "GET") {
-      // The publish handler first loads the target by id, then loads siblings.
-      if (url.searchParams.get("id") === "eq.f-3") {
-        return [{ id: "f-3", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method, url) => {
+      if (table === "form_definitions" && method === "GET") {
+        // The publish handler first loads the target by id, then loads siblings.
+        if (url.searchParams.get("id") === "eq.f-3") {
+          return [{ id: "f-3", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+        }
+        // siblings query (facility + form_code + status=published)
+        return [{ id: "f-1", facility_id: "fac-1", form_code: "opening", status: "published" }];
       }
-      // siblings query (facility + form_code + status=published)
-      return [{ id: "f-1", facility_id: "fac-1", form_code: "opening", status: "published" }];
-    }
-    if (table === "form_definitions" && method === "PATCH") {
-      return [{ id: url.searchParams.get("id"), status: "updated" }];
-    }
-    return [];
-  });
+      if (table === "form_definitions" && method === "PATCH") {
+        return [{ id: url.searchParams.get("id"), status: "updated" }];
+      }
+      return [];
+    })
+  );
   const { call } = mount();
   const result = await call("POST", "/forms/f-3/publish");
   assert.equal(result.status, 200);
@@ -158,4 +220,54 @@ test("POST forms/:id/publish 404s when the form is missing", async (t) => {
   const { call } = mount();
   const result = await call("POST", "/forms/missing/publish");
   assert.equal(result.status, 404);
+});
+
+test("POST forms/:id/publish rejects with 402 when the plan lacks custom_forms", async (t) => {
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "form_definitions" && method === "GET" && url.searchParams.get("id") === "eq.f-3") {
+      return [{ id: "f-3", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+    }
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/forms/f-3/publish");
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
+});
+
+test("PATCH /custom-fields/:id happy path updates the field", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method, url) => {
+      if (table === "custom_fields" && method === "GET") {
+        return [{ id: "cf-1", facility_id: "fac-1", key: "pool_ready", label: "Pool ready" }];
+      }
+      if (table === "custom_fields" && method === "PATCH") {
+        return [{ id: url.searchParams.get("id"), active: false }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/custom-fields/cf-1", { active: false });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "custom_fields" && c.method === "PATCH");
+  assert.equal(patch.body.active, false);
+});
+
+test("PATCH /custom-fields/:id rejects with 402 when the plan lacks custom_forms", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "custom_fields" && method === "GET") {
+      return [{ id: "cf-1", facility_id: "fac-1", key: "pool_ready", label: "Pool ready" }];
+    }
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/custom-fields/cf-1", { active: false });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "custom_fields" && c.method === "PATCH"));
 });

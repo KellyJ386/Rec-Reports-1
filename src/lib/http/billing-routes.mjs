@@ -1,7 +1,9 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requirePermission, requireOrgAdmin } from "./guard.mjs";
 import { canAccessFacility } from "../permissions.mjs";
-import { entitlementsFor, flagState, usageStatus } from "../admin/entitlements.mjs";
+import { entitlementsFor, flagState, usageStatus, loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
+
+const ENTITLEMENT = "advanced_flags";
 
 // Registers the Phase 7 Billing & Subscription + Feature-flag read/write API.
 // Reads follow the RLS grants from 0018 (subscription = org member; usage/rules
@@ -139,6 +141,19 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
     return true;
   }
 
+  // 402-gate a feature-flag-rule write on the advanced_flags entitlement of
+  // the org that OWNS the rule (org-scoped rules: the rule's own scope_id;
+  // facility-scoped rules: the path org). Missing subscription -> empty
+  // entitlements -> denied (fail closed), per loadEntitlements.
+  async function requireEntitled(auth, orgId, response) {
+    const { entitlements } = await loadEntitlements(auth.client, orgId);
+    if (!isEntitled(entitlements, ENTITLEMENT)) {
+      sendJson(response, 402, { error: `plan does not include ${ENTITLEMENT}` });
+      return false;
+    }
+    return true;
+  }
+
   router.register("POST", "/org/:orgId/feature-flag-rules", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
       const body = await parseJsonBody(request);
@@ -184,6 +199,7 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
       }
       const facilityIds = await orgFacilities(auth.client, params.orgId);
       if (!guardRuleWrite(auth, body.payload.scopeType, body.payload.scopeId, facilityIds, response)) return;
+      if (!(await requireEntitled(auth, params.orgId, response))) return;
       const row = {
         feature_flag_id: body.payload.featureFlagId,
         scope_type: body.payload.scopeType,
@@ -215,6 +231,7 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
       const guardOrgId = existing.scope_type === "organization" ? existing.scope_id : params.orgId;
       const facilityIds = await orgFacilities(auth.client, guardOrgId);
       if (!guardRuleWrite(auth, existing.scope_type, existing.scope_id, facilityIds, response)) return;
+      if (!(await requireEntitled(auth, guardOrgId, response))) return;
       const patch = {};
       if (body.payload.state !== undefined) patch.state = Boolean(body.payload.state);
       if (body.payload.rolloutPercentage !== undefined) {

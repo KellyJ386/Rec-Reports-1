@@ -125,7 +125,9 @@ export function computeDbRowHash(row) {
     .digest("hex");
 }
 
-// Walk a chain of DB-fetched audit_events rows (ascending by created_at).
+// Walk a chain of DB-fetched audit_events rows (ascending by chain_seq, the
+// monotonic sequence fn_audit_chain_link links rows by; created_at alone is
+// transaction-start time and cannot order a same-transaction burst).
 // Returns { valid, brokenAt } exactly like verifyChain above: brokenAt is the
 // index of the first row whose stored prev_hash no longer points at the
 // preceding row's row_hash, or whose row_hash no longer matches a

@@ -4,7 +4,7 @@ import { toCsv, toJson, buildExportPackage } from "../src/lib/admin/audit-export
 import { computeDbRowHash, verifyDbChain } from "../src/lib/audit.mjs";
 
 const CSV_HEADER =
-  "id,created_at,event_type,entity_table,entity_id,facility_id,organization_id,actor_user_id,event_payload,prev_hash,row_hash";
+  "id,chain_seq,created_at,event_type,entity_table,entity_id,facility_id,organization_id,actor_user_id,event_payload,prev_hash,row_hash";
 
 // Minimal RFC 4180 line parser used only to assert toCsv's output round-trips
 // correctly, independent of exactly how it chooses to escape any given field.
@@ -48,6 +48,7 @@ test("toCsv emits only the header for an empty row set", () => {
 test("toCsv escapes commas, quotes, and newlines, and stringifies nested jsonb", () => {
   const row = {
     id: "row-1",
+    chain_seq: 1,
     created_at: "2026-01-01T00:00:00Z",
     event_type: "config,changed",
     entity_table: 'facility"settings',
@@ -66,14 +67,15 @@ test("toCsv escapes commas, quotes, and newlines, and stringifies nested jsonb",
 
   const fields = parseCsvLine(lines[1]);
   assert.equal(fields[0], "row-1");
-  assert.equal(fields[2], "config,changed");
-  assert.equal(fields[3], 'facility"settings');
-  assert.equal(fields[5], "fac-1");
-  assert.equal(fields[6], "");
+  assert.equal(fields[1], "1");
+  assert.equal(fields[3], "config,changed");
+  assert.equal(fields[4], 'facility"settings');
+  assert.equal(fields[6], "fac-1");
   assert.equal(fields[7], "");
-  assert.deepEqual(JSON.parse(fields[8]), { note: "line one\nline two", nested: { ok: true } });
-  assert.equal(fields[9], "");
-  assert.equal(fields[10], "hash-1");
+  assert.equal(fields[8], "");
+  assert.deepEqual(JSON.parse(fields[9]), { note: "line one\nline two", nested: { ok: true } });
+  assert.equal(fields[10], "");
+  assert.equal(fields[11], "hash-1");
 });
 
 test("toJson round-trips rows exactly", () => {

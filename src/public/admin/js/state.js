@@ -72,13 +72,12 @@ export function setFacilities(list) {
   notify();
 }
 
-export function hasAdminAccess() {
-  if (!me.loaded) return true; // optimistic while the initial /me call is in flight
-  return me.memberships.some(
-    (membership) => membership.status === "active" && (membership.permissions ?? []).includes("admin.manage")
-  );
-}
-
+// True when any active membership includes `code`. Used by nav.js to gate
+// each nav item on the permission its page's primary API actually requires
+// (not a single hard-coded "admin.manage" for every restricted page), so a
+// user holding exactly the page's real permission isn't wrongly hidden from
+// it. Optimistic (returns true) while the initial /me call is in flight, same
+// as the rest of the pre-load nav state, so nothing flashes hidden then shown.
 export function hasPermissionAnywhere(code) {
   if (!me.loaded) return true;
   return me.memberships.some(

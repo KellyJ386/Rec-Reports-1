@@ -1,9 +1,12 @@
+import { pgSelect } from "../supabase-rest.mjs";
 import { requirePermission } from "./guard.mjs";
 import { queryAuditTimeline, buildExportPackage } from "../admin/audit-export.mjs";
+import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 import { verifyDbChain } from "../audit.mjs";
 
 const VERIFY_LIMIT = 10000;
 const EXPORT_LIMIT = 10000;
+const EXPORT_ENTITLEMENT = "audit_export";
 
 // Registers the Audit & Compliance API routes on a router, following the same
 // injected-primitives shape as registerAdminRoutes (admin-routes.mjs):
@@ -34,6 +37,29 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
     return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
+  async function facilityOrgId(client, facilityId) {
+    const rows = await pgSelect(client, "facilities", {
+      filters: { id: facilityId },
+      select: "organization_id",
+      limit: 1
+    });
+    return (rows ?? [])[0]?.organization_id ?? null;
+  }
+
+  // Audit export is a plan-gated capability (billing.js shows an audit_export
+  // lock). 402-gate it on the owning org's entitlement; missing subscription ->
+  // empty entitlements -> denied (fail closed), per loadEntitlements. Timeline
+  // and chain-verify reads stay ungated for any admin.
+  async function requireExportEntitlement(auth, facilityId, response) {
+    const orgId = await facilityOrgId(auth.client, facilityId);
+    const { entitlements } = await loadEntitlements(auth.client, orgId);
+    if (!isEntitled(entitlements, EXPORT_ENTITLEMENT)) {
+      sendJson(response, 402, { error: `plan does not include ${EXPORT_ENTITLEMENT}` });
+      return false;
+    }
+    return true;
+  }
+
   // GET /facilities/:facilityId/audit?entityTable=&eventType=&limit=
   router.register("GET", "/facilities/:facilityId/audit", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
@@ -58,7 +84,7 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
       if (!requireAuditAccess(auth, params.facilityId, response)) return;
       const rows = await queryAuditTimeline(auth.client, {
         facilityId: params.facilityId,
-        order: "created_at.asc",
+        order: "chain_seq.asc",
         limit: VERIFY_LIMIT
       });
       const { valid, brokenAt } = verifyDbChain(rows);
@@ -81,13 +107,14 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
   router.register("GET", "/facilities/:facilityId/audit/export", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
       if (!requireAuditAccess(auth, params.facilityId, response)) return;
+      if (!(await requireExportEntitlement(auth, params.facilityId, response))) return;
       const search = queryParams(request);
       const format = (search.get("format") || "csv").toLowerCase() === "json" ? "json" : "csv";
       const rows = await queryAuditTimeline(auth.client, {
         facilityId: params.facilityId,
         entityTable: search.get("entityTable") || undefined,
         eventType: search.get("eventType") || undefined,
-        order: "created_at.asc",
+        order: "chain_seq.asc",
         limit: EXPORT_LIMIT
       });
       const pkg = buildExportPackage(rows, format);

@@ -6,12 +6,11 @@ function extractSettings(raw) {
   const settings = raw?.settings ?? raw?.settings_jsonb ?? raw ?? {};
   const reporting = settings.reporting ?? {};
   const notifications = settings.notifications ?? {};
-  const quietHours = notifications.quietHours ?? settings.quietHours ?? {};
   return {
     dailyReportDueHour:
       reporting.dailyReportDueHour ?? settings.dailyReportDueHour ?? "",
-    quietStart: quietHours.start ?? "",
-    quietEnd: quietHours.end ?? ""
+    quietStart: notifications.quietHoursStart ?? "",
+    quietEnd: notifications.quietHoursEnd ?? ""
   };
 }
 
@@ -323,10 +322,8 @@ async function buildSettingsPanel({ facilityId, facility, statusRegion }) {
             dailyReportDueHour: dueHourInput.value === "" ? null : Number(dueHourInput.value)
           },
           notifications: {
-            quietHours: {
-              start: quietStartInput.value || null,
-              end: quietEndInput.value || null
-            }
+            quietHoursStart: quietStartInput.value || null,
+            quietHoursEnd: quietEndInput.value || null
           }
         };
         try {

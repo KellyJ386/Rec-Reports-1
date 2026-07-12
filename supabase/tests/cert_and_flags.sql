@@ -28,8 +28,10 @@ insert into facilities (id, organization_id, name) values
   ('9bbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '92222222-2222-2222-2222-222222222222', 'P7C Facility B')
 on conflict (id) do nothing;
 
--- Admin A holds training.manage + admin.manage in Facility A only (admin.manage
--- makes them an org admin of Org A via is_organization_admin).
+-- Admin A holds training.manage + admin.manage in Facility A only. Org-level
+-- authority now requires an explicit organization_admins row (the facility-admin
+-- fallback was removed in 0019), seeded below, so Admin A is an org admin of
+-- Org A but has no authority over sibling Facility B or Org B.
 insert into roles (id, facility_id, name) values
   ('9c000000-0000-0000-0000-0000000000c1', '9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'P7C Admin Role A'),
   ('9c000000-0000-0000-0000-0000000000c2', '9bbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'P7C Role B')
@@ -43,6 +45,12 @@ on conflict do nothing;
 insert into memberships (id, user_id, facility_id, role_id, status) values
   ('9d000000-0000-0000-0000-0000000000d1', '99999999-9999-9999-9999-999999999999', '9aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '9c000000-0000-0000-0000-0000000000c1', 'active')
 on conflict (id) do nothing;
+
+-- Explicit org-admin grant for Org A (required for org-level authority since
+-- 0019 removed the facility-admin fallback). Admin A is NOT an org admin of Org B.
+insert into organization_admins (organization_id, user_id) values
+  ('91111111-1111-1111-1111-111111111111', '99999999-9999-9999-9999-999999999999')
+on conflict do nothing;
 
 -- Certification types: one in each facility (seeded as owner, bypassing RLS).
 insert into certification_types (id, facility_id, code, name) values

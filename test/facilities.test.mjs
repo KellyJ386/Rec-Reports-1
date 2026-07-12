@@ -89,6 +89,37 @@ test("validateFacilitySettingsPatch rejects malformed quiet hours", () => {
   );
 });
 
+test("validateFacilitySettingsPatch rejects an invalid HH:MM time like 99:99", () => {
+  assert.equal(
+    validateFacilitySettingsPatch({ notifications: { quietHoursStart: "99:99" } }).valid,
+    false
+  );
+  assert.equal(
+    validateFacilitySettingsPatch({ notifications: { quietHoursEnd: "99:99" } }).valid,
+    false
+  );
+});
+
+test("validateFacilitySettingsPatch accepts a valid quiet-hours window in the canonical (flat) shape", () => {
+  const result = validateFacilitySettingsPatch({
+    notifications: { quietHoursStart: "21:30", quietHoursEnd: "05:15" }
+  });
+  assert.deepEqual(result, { valid: true, errors: [] });
+});
+
+test("validateFacilitySettingsPatch does not validate the legacy nested notifications.quietHours shape (unknown key is left alone)", () => {
+  // Guards against the shape mismatch bug: a stray nested quietHours object is
+  // not a recognized key, so it neither fails nor is treated as the real
+  // quiet-hours value. Regression coverage for the facilities.js fix that
+  // switched the admin UI to send the flat notifications.quietHoursStart /
+  // notifications.quietHoursEnd keys the validator (and the rest of the
+  // system) actually reads.
+  const result = validateFacilitySettingsPatch({
+    notifications: { quietHours: { start: "99:99", end: "99:99" } }
+  });
+  assert.equal(result.valid, true);
+});
+
 test("validateFacilitySettingsPatch rejects wrong container shapes", () => {
   assert.equal(validateFacilitySettingsPatch("nope").valid, false);
   assert.equal(validateFacilitySettingsPatch({ reporting: 5 }).valid, false);

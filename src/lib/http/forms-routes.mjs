@@ -7,8 +7,10 @@ import {
   nextVersionNo,
   buildFormPublish
 } from "../admin/forms.mjs";
+import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
 const TEMPLATE_MANAGE = "reports.template.manage";
+const ENTITLEMENT = "custom_forms";
 
 const CUSTOM_FIELD_COLUMNS =
   "id,facility_id,entity_type,key,label,data_type,validation_jsonb,active,created_by,created_at,updated_at";
@@ -55,6 +57,27 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
     return true;
   }
 
+  async function facilityOrgId(client, facilityId) {
+    const rows = await pgSelect(client, "facilities", {
+      filters: { id: facilityId },
+      select: "organization_id",
+      limit: 1
+    });
+    return (rows ?? [])[0]?.organization_id ?? null;
+  }
+
+  // 402-gate a write on the custom_forms entitlement. Missing subscription ->
+  // empty entitlements -> denied (fail closed), per loadEntitlements.
+  async function requireEntitled(auth, facilityId, response) {
+    const orgId = await facilityOrgId(auth.client, facilityId);
+    const { entitlements } = await loadEntitlements(auth.client, orgId);
+    if (!isEntitled(entitlements, ENTITLEMENT)) {
+      sendJson(response, 402, { error: `plan does not include ${ENTITLEMENT}` });
+      return false;
+    }
+    return true;
+  }
+
   function queryParams(request) {
     return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
@@ -88,6 +111,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
         const { valid, errors } = validateCustomFieldInput(body.payload);
         if (!valid) return sendJson(response, 400, { errors });
         if (!requireManage(auth, params.facilityId, response)) return;
+        if (!(await requireEntitled(auth, params.facilityId, response))) return;
         const row = {
           facility_id: params.facilityId,
           entity_type: body.payload.entityType ?? "report",
@@ -118,6 +142,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
       )?.[0];
       if (!existing) return sendJson(response, 404, { error: "custom field not found" });
       if (!requireManage(auth, existing.facility_id, response)) return;
+      if (!(await requireEntitled(auth, existing.facility_id, response))) return;
       const patch = {};
       if (body.payload.active !== undefined) patch.active = Boolean(body.payload.active);
       if (body.payload.label !== undefined) {
@@ -166,6 +191,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
       });
       if (!valid) return sendJson(response, 400, { errors });
       if (!requireManage(auth, params.facilityId, response)) return;
+      if (!(await requireEntitled(auth, params.facilityId, response))) return;
       const existing = await pgSelect(auth.client, "form_definitions", {
         filters: { facility_id: params.facilityId, form_code: body.payload.formCode },
         select: "version_no"
@@ -198,6 +224,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
       )?.[0];
       if (!target) return sendJson(response, 404, { error: "form definition not found" });
       if (!requireManage(auth, target.facility_id, response)) return;
+      if (!(await requireEntitled(auth, target.facility_id, response))) return;
       const siblings = await pgSelect(auth.client, "form_definitions", {
         filters: { facility_id: target.facility_id, form_code: target.form_code, status: "published" },
         select: FORM_COLUMNS

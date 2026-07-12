@@ -26,6 +26,21 @@ function stubFetch(t, respond) {
   return captured;
 }
 
+// Respond helper for export tests: audit_events yields the given rows, and the
+// facility -> org -> subscription -> plan lookup chain resolves to a plan that
+// includes (or omits) the audit_export entitlement.
+function exportRespond(auditRows, { entitled = true } = {}) {
+  return (table) => {
+    if (table === "audit_events") return auditRows;
+    if (table === "facilities") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions") return [{ status: "active", plan_id: "plan-1" }];
+    if (table === "subscription_plans") {
+      return [{ feature_entitlements_jsonb: entitled ? { audit_export: true } : {} }];
+    }
+    return [];
+  };
+}
+
 function mount({ memberships = ADMIN_ON_FAC1 } = {}) {
   const router = createRouter();
   const sent = [];
@@ -87,6 +102,7 @@ test("GET .../audit denies a non-admin before any DB call", async (t) => {
 test("GET .../audit/verify returns valid:true for a clean stubbed chain", async (t) => {
   const rowA = {
     id: "a",
+    chain_seq: 1,
     event_type: "config.changed",
     entity_table: "facility_settings",
     entity_id: "fs-1",
@@ -99,6 +115,7 @@ test("GET .../audit/verify returns valid:true for a clean stubbed chain", async 
   rowA.row_hash = computeDbRowHash(rowA);
   const rowB = {
     id: "b",
+    chain_seq: 2,
     event_type: "config.changed",
     entity_table: "facility_settings",
     entity_id: "fs-1",
@@ -116,7 +133,7 @@ test("GET .../audit/verify returns valid:true for a clean stubbed chain", async 
   assert.equal(result.status, 200);
   assert.deepEqual(result.payload, { valid: true, brokenAt: null, checked: 2 });
   const read = captured.find((c) => c.table === "audit_events" && c.method === "GET");
-  assert.equal(read.url.searchParams.get("order"), "created_at.asc");
+  assert.equal(read.url.searchParams.get("order"), "chain_seq.asc");
 });
 
 test("GET .../audit/verify returns valid:false with brokenAt for a tampered chain", async (t) => {
@@ -163,7 +180,7 @@ test("GET .../audit/export defaults to csv with a Content-Disposition-ready file
     prev_hash: null,
     row_hash: "hash-a"
   };
-  stubFetch(t, () => [row]);
+  stubFetch(t, exportRespond([row]));
   const { call } = mount();
   const result = await call("GET", "/facilities/fac-1/audit/export");
   assert.equal(result.status, 200);
@@ -175,7 +192,7 @@ test("GET .../audit/export defaults to csv with a Content-Disposition-ready file
 
 test("GET .../audit/export honors format=json", async (t) => {
   const row = { id: "a", event_type: "config.changed" };
-  stubFetch(t, () => [row]);
+  stubFetch(t, exportRespond([row]));
   const { call } = mount();
   const result = await call("GET", "/facilities/fac-1/audit/export?format=json");
   assert.equal(result.payload.contentType, "application/json");
@@ -188,4 +205,13 @@ test("GET .../audit/export denies a non-admin with 403", async (t) => {
   const { call } = mount({ memberships: READER_ON_FAC1 });
   const result = await call("GET", "/facilities/fac-1/audit/export");
   assert.equal(result.status, 403);
+});
+
+test("GET .../audit/export returns 402 when the plan lacks audit_export", async (t) => {
+  const row = { id: "a", event_type: "config.changed" };
+  stubFetch(t, exportRespond([row], { entitled: false }));
+  const { call } = mount();
+  const result = await call("GET", "/facilities/fac-1/audit/export");
+  assert.equal(result.status, 402);
+  assert.match(result.payload.error, /audit_export/);
 });

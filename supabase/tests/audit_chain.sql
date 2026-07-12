@@ -12,20 +12,13 @@
 --     entity_table/entity_id rather than assuming an empty partition, which
 --     is also a more faithful test: it proves fn_audit_admin_change and
 --     fn_audit_chain_link compose correctly across two different triggers.
---   * Within one transaction, now() (the audit_events.created_at default)
---     returns the *transaction's* start time for every statement, not
---     wall-clock time -- so two rows inserted a moment apart in this same
---     begin/rollback block would otherwise tie on created_at, making
---     fn_audit_chain_link's "previous row" lookup (order by created_at desc,
---     id desc) pick arbitrarily rather than chronologically. Worse, that same
---     lookup is a partition-wide "latest wins", so a manually inserted row
---     must also sort after the seed row above (which is stamped with the
---     transaction's real now()) or the seed would keep winning "most recent"
---     forever. The manually inserted audit rows below therefore pass
---     explicit, strictly increasing, and deliberately far-future created_at
---     values -- what real deployments get for free since every request's
---     now() is later than the last, but that a single fixed-transaction test
---     has to fake.
+--   * fn_audit_chain_link orders a scope partition by chain_seq (a monotonic
+--     sequence assigned in insertion order), not created_at -- so linkage in
+--     this block follows the order the rows are inserted, and the seed
+--     (facility-creation) row is always the earliest in its partition. The
+--     far-future created_at values below are therefore only cosmetic
+--     (created_at is still part of the row hash, just not the chain order);
+--     they no longer affect which row is picked as "previous".
 begin;
 
 insert into auth.users (id, email) values

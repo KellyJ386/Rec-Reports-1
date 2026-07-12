@@ -4,9 +4,11 @@ import {
   entitlementsFor,
   isEntitled,
   usageStatus,
-  flagState
+  flagState,
+  loadEntitlements
 } from "../src/lib/admin/entitlements.mjs";
 import { resolveEffectiveSettings } from "../src/lib/settings-registry.mjs";
+import { createClient } from "../src/lib/supabase-rest.mjs";
 
 test("entitlementsFor merges plan object entitlements with add-ons", () => {
   const plan = { feature_entitlements_jsonb: { cert_policies: true, notification_routing: true } };
@@ -116,4 +118,101 @@ test("resolveEffectiveSettings filters entitlement-gated keys when entitlements 
   const partial = resolveEffectiveSettings({ entitlements: { cert_policies: true } });
   assert.ok(Object.prototype.hasOwnProperty.call(partial, "scheduling.certEnforcementMode"));
   assert.ok(!Object.prototype.hasOwnProperty.call(partial, "reports.quietHoursStart"));
+});
+
+// --- loadEntitlements: subscription status gate (fail closed) --------------
+//
+// These stub PostgREST server-side, honoring the `status=in.(...)` filter
+// loadEntitlements now sends, so the tests exercise the actual query it
+// builds -- not just how it handles a canned response.
+
+function matchesInFilter(filterParam, value) {
+  const match = /^in\.\((.*)\)$/.exec(filterParam ?? "");
+  if (!match) return true; // no filter sent -> table scan behavior, matches everything
+  return match[1].split(",").includes(value);
+}
+
+function stubSubscriptionFetch(t, { subscriptionRow, plan }) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "tenant_subscriptions") {
+      const statusFilter = parsed.searchParams.get("status");
+      const rows = subscriptionRow && matchesInFilter(statusFilter, subscriptionRow.status) ? [subscriptionRow] : [];
+      return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
+    }
+    if (table === "subscription_plans") {
+      return { ok: true, status: 200, text: async () => JSON.stringify(plan ? [plan] : []) };
+    }
+    throw new Error(`unexpected table in stub: ${table}`);
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+}
+
+const PLAN_WITH_AUDIT_EXPORT = { id: "plan-1", feature_entitlements_jsonb: { audit_export: true } };
+
+test("loadEntitlements: an active subscription is entitled", async (t) => {
+  stubSubscriptionFetch(t, {
+    subscriptionRow: { id: "sub-1", plan_id: "plan-1", status: "active", renews_at: "2026-08-01T00:00:00Z" },
+    plan: PLAN_WITH_AUDIT_EXPORT
+  });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements, subscription, plan } = await loadEntitlements(client, "org-1");
+  assert.equal(isEntitled(entitlements, "audit_export"), true);
+  assert.ok(subscription);
+  assert.ok(plan);
+});
+
+test("loadEntitlements: a trialing subscription is entitled", async (t) => {
+  stubSubscriptionFetch(t, {
+    subscriptionRow: { id: "sub-1", plan_id: "plan-1", status: "trialing", renews_at: "2026-08-01T00:00:00Z" },
+    plan: PLAN_WITH_AUDIT_EXPORT
+  });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements } = await loadEntitlements(client, "org-1");
+  assert.equal(isEntitled(entitlements, "audit_export"), true);
+});
+
+test("loadEntitlements: a canceled subscription fails closed to empty entitlements", async (t) => {
+  stubSubscriptionFetch(t, {
+    subscriptionRow: { id: "sub-1", plan_id: "plan-1", status: "canceled", renews_at: "2026-08-01T00:00:00Z" },
+    plan: PLAN_WITH_AUDIT_EXPORT
+  });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements, subscription, plan } = await loadEntitlements(client, "org-1");
+  assert.equal(isEntitled(entitlements, "audit_export"), false);
+  assert.deepEqual(entitlements, {});
+  assert.equal(subscription, null);
+  assert.equal(plan, null);
+});
+
+test("loadEntitlements: a past_due subscription fails closed to empty entitlements", async (t) => {
+  stubSubscriptionFetch(t, {
+    subscriptionRow: { id: "sub-1", plan_id: "plan-1", status: "past_due", renews_at: "2026-08-01T00:00:00Z" },
+    plan: PLAN_WITH_AUDIT_EXPORT
+  });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements, subscription } = await loadEntitlements(client, "org-1");
+  assert.equal(isEntitled(entitlements, "audit_export"), false);
+  assert.equal(subscription, null);
+});
+
+test("loadEntitlements: a missing subscription fails closed to empty entitlements", async (t) => {
+  stubSubscriptionFetch(t, { subscriptionRow: null, plan: null });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements, subscription, plan } = await loadEntitlements(client, "org-1");
+  assert.deepEqual(entitlements, {});
+  assert.equal(subscription, null);
+  assert.equal(plan, null);
+});
+
+test("loadEntitlements: a missing organizationId fails closed without querying", async () => {
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const { entitlements, subscription, plan } = await loadEntitlements(client, null);
+  assert.deepEqual(entitlements, {});
+  assert.equal(subscription, null);
+  assert.equal(plan, null);
 });

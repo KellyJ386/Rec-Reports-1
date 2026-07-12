@@ -97,17 +97,27 @@ function normalizeEntitlementKeys(source) {
   return [];
 }
 
+// Subscription statuses that keep a tenant's paid entitlements active. Any
+// other status (canceled, past_due, incomplete, ...) -- or no row at all --
+// fails closed to the free/essentials tier (design 10.3 / plan Phase 7.4).
+const ENTITLED_STATUSES = ["active", "trialing"];
+
 // I/O helper shared by cert-policy-routes and notification-routes: load an
 // organization's active subscription + plan and return its entitlements once per
-// request. A missing subscription (or plan) yields empty entitlements, i.e. the
-// tenant is treated as the free/essentials tier and every advanced,
-// entitlement-gated write FAILS CLOSED. Callers 402 when the needed key is absent.
+// request. Only a subscription whose status is 'active' or 'trialing' counts --
+// canceled/past_due/other statuses (and a missing subscription/plan) yield empty
+// entitlements, i.e. the tenant is treated as the free/essentials tier and every
+// advanced, entitlement-gated write FAILS CLOSED. Callers 402 when the needed
+// key is absent. When more than one subscription row exists for the org, the
+// most-recently-renewing one is picked deterministically (order renews_at desc).
 export async function loadEntitlements(client, organizationId) {
   if (!organizationId) return { entitlements: {}, plan: null, subscription: null };
   const subs = await pgSelect(client, "tenant_subscriptions", {
     filters: { organization_id: organizationId },
     select: "id,organization_id,plan_id,status,seat_limit,renews_at,usage_limits_jsonb",
-    limit: 1
+    order: "renews_at.desc",
+    limit: 1,
+    extra: { status: `in.(${ENTITLED_STATUSES.join(",")})` }
   });
   const subscription = (subs ?? [])[0] ?? null;
   if (!subscription) return { entitlements: {}, plan: null, subscription: null };

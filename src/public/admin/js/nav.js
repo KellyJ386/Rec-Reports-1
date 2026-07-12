@@ -2,11 +2,14 @@
 // in admin/index.html (progressive enhancement + satisfies no-JS baseline);
 // this module only toggles visibility/active state on that existing markup
 // and swaps the page content region. Nav visibility is permission-driven:
-// items marked [data-requires-admin] are hidden for users who don't hold
-// admin.manage anywhere.
+// each restricted item carries [data-requires-permission="<code>"] naming the
+// permission code its page's primary API actually checks (see the route
+// files under src/lib/http/), and is hidden unless the signed-in user holds
+// that exact code on any active membership. Dashboard carries no requirement
+// and is always visible.
 
 import { clearChildren, errorBanner } from "./ui.js";
-import { hasAdminAccess, subscribe } from "./state.js";
+import { hasPermissionAnywhere, subscribe } from "./state.js";
 import { renderDashboard } from "./pages/dashboard.js";
 import { renderModules } from "./pages/modules.js";
 import { renderFacilities } from "./pages/facilities.js";
@@ -55,8 +58,9 @@ function currentRouteId() {
 
 function isVisible(id) {
   const item = document.querySelector(`li[data-nav-id="${id}"]`);
-  if (!item || !item.hasAttribute("data-requires-admin")) return true;
-  return hasAdminAccess();
+  if (!item || !item.hasAttribute("data-requires-permission")) return true;
+  const code = item.getAttribute("data-requires-permission");
+  return hasPermissionAnywhere(code);
 }
 
 function renderNav() {
