@@ -161,7 +161,7 @@ test("POST memberships writes the membership with a default status", async (t) =
   assert.equal(result.status, 201);
   const insert = captured.find((c) => c.table === "memberships" && c.method === "POST");
   assert.deepEqual(insert.body, [
-    { facility_id: "fac-1", user_id: "user-7", role_id: "role-1", status: "active" }
+    { facility_id: "fac-1", user_id: "user-7", role_id: "role-1", status: "active", department_id: null }
   ]);
 });
 

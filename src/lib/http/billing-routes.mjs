@@ -1,6 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requirePermission, requireOrgAdmin } from "./guard.mjs";
-import { canAccessFacility } from "../permissions.mjs";
+import { requireAuthPermission, requireAuthOrgAdmin, authCanAccessFacility } from "./guard.mjs";
 import { entitlementsFor, flagState, usageStatus, loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
 const ENTITLEMENT = "advanced_flags";
@@ -34,7 +33,7 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
   }
 
   function requireOrgMember(auth, facilityIds, response) {
-    const isMember = facilityIds.some((facilityId) => canAccessFacility(auth.memberships, facilityId));
+    const isMember = facilityIds.some((facilityId) => authCanAccessFacility(auth, facilityId));
     if (!isMember) {
       sendJson(response, 403, { error: "not a member of this organization" });
       return false;
@@ -125,7 +124,7 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
   // --- Feature flag rule writes (scope-gated) -------------------------------
   function guardRuleWrite(auth, scopeType, scopeId, orgFacilityIds, response) {
     if (scopeType === "organization") {
-      const guard = requireOrgAdmin(auth.memberships, orgFacilityIds);
+      const guard = requireAuthOrgAdmin(auth, orgFacilityIds);
       if (!guard.allowed) {
         sendJson(response, 403, { error: guard.reason });
         return false;
@@ -133,7 +132,7 @@ export function registerBillingRoutes(router, { authenticate, sendJson, readBody
       return true;
     }
     // facility scope: admin.manage on that facility.
-    const guard = requirePermission(auth.memberships, scopeId, "admin.manage");
+    const guard = requireAuthPermission(auth, scopeId, "admin.manage");
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;

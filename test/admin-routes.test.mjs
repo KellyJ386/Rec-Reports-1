@@ -60,7 +60,7 @@ test("GET /me returns the user id and their memberships", async () => {
   assert.equal(result.status, 200);
   assert.equal(result.payload.userId, "user-1");
   assert.deepEqual(result.payload.memberships, [
-    { facilityId: "fac-1", status: "active", permissions: ["admin.manage"] }
+    { facilityId: "fac-1", departmentId: null, status: "active", permissions: ["admin.manage"] }
   ]);
 });
 

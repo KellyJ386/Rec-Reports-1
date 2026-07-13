@@ -5,7 +5,7 @@ Rec Reports is a recreation operations SaaS platform for multi-facility recreati
 ## Stack
 
 - Zero-runtime-dependency Node web app: static frontend + `/api/admin/v1/*` BFF served by `scripts/server.mjs` (security headers, HS256 JWT auth, PostgREST client over native `fetch`)
-- Supabase Auth, Postgres, and RLS: 21 forward-only migrations with facility-scoped tenant isolation, append-only hash-chained audit trail, and idempotent policies
+- Supabase Auth, Postgres, and RLS: 23 forward-only migrations with facility-scoped tenant isolation, platform super-admin and department-level permission scoping, append-only hash-chained audit trail, and idempotent policies
 - Node built-in test runner for unit tests; SQL test suites under `supabase/tests/`
 - Repository-local format, lint (JS-parse), permission-vocabulary, settings-registry, build, migration, and seed verification gates
 
@@ -18,12 +18,12 @@ The admin area at `/admin/` governs the whole platform. All ten sections are liv
 | Dashboard | Counts, links, unpublished-changes badge |
 | Modules & Features | Org-level module toggles, facility tri-state overrides, per-module settings from the settings registry |
 | Identity & Permissions | Roles, permission grid, memberships, effective-access simulator |
-| Forms & Fields | Custom field registry, versioned form definitions with publish/retire |
+| Forms & Fields | Custom field registry, drag-and-drop multi-section form builder, versioned form definitions with draft editing and publish/retire |
 | Notifications | Event catalog, distribution lists, routing rules, test sends |
 | Facilities & Departments | Facility/department CRUD, timezone/locale/report settings |
 | Certifications | Role requirements matrix, enforcement mode, policies, gaps report |
 | Branding & Documents | Theme editor with live preview, change-request driven publish |
-| Audit & Compliance | Searchable timeline, before/after diffs, hash-chain verification, CSV/JSON export |
+| Audit & Compliance | Searchable timeline, before/after diffs, hash-chain verification, CSV/JSON/PDF export (zero-dependency PDF renderer) |
 | Billing & Subscription | Plan summary, entitlements, usage meters, feature flags |
 
 Every admin mutation is validated at the API boundary, permission-gated (16-code catalog), RLS-backstopped, and audited by database trigger into a tamper-evident hash chain.
@@ -52,7 +52,7 @@ npm run db:test:rls   # runs supabase/tests/*.sql when DATABASE_URL is set
 
 ## Database
 
-Apply migrations in `supabase/migrations` (0001–0021, in order) to an empty Supabase project, then load `supabase/seed.sql` for the demo organization, two facilities, module catalog, system roles, notification events, and subscription plans. Migrations 0009+ are idempotent and safe to re-run.
+Apply migrations in `supabase/migrations` (0001–0023, in order) to an empty Supabase project, then load `supabase/seed.sql` for the demo organization, two facilities, module catalog, system roles, notification events, and subscription plans. Migrations 0009+ are idempotent and safe to re-run.
 
 RLS/behavioral SQL tests live in `supabase/tests/` and run via `npm run db:test:rls` against any Postgres with the Supabase-style `authenticated` role and `auth.uid()` present.
 

@@ -1,6 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
-import { canAccessFacility } from "../permissions.mjs";
+import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
@@ -32,7 +31,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
   }
 
   function requireMember(auth, facilityId, response) {
-    if (!canAccessFacility(auth.memberships, facilityId)) {
+    if (!authCanAccessFacility(auth, facilityId)) {
       sendJson(response, 403, { error: "not a member of this facility" });
       return false;
     }
@@ -40,7 +39,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
   }
 
   function requirePublish(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, PUBLISH);
+    const guard = requireAuthPermission(auth, facilityId, PUBLISH);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;

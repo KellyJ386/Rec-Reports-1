@@ -1,9 +1,9 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
-import { canAccessFacility } from "../permissions.mjs";
+import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import {
   validateCustomFieldInput,
   validateFormDefinition,
+  buildFormDraftUpdate,
   nextVersionNo,
   buildFormPublish
 } from "../admin/forms.mjs";
@@ -41,7 +41,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireMember(auth, facilityId, response) {
-    if (!canAccessFacility(auth.memberships, facilityId)) {
+    if (!authCanAccessFacility(auth, facilityId)) {
       sendJson(response, 403, { error: "not a member of this facility" });
       return false;
     }
@@ -49,7 +49,7 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireManage(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, TEMPLATE_MANAGE);
+    const guard = requireAuthPermission(auth, facilityId, TEMPLATE_MANAGE);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;
@@ -207,6 +207,35 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
       };
       const rows = await pgInsert(auth.client, "form_definitions", [row], { returning: true });
       return sendJson(response, 201, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  // PATCH /forms/:id updates a draft version's schema in place so the builder
+  // canvas can iterate on a draft without minting a new version per save.
+  // Guards run on the loaded row's facility; buildFormDraftUpdate rejects
+  // non-drafts (409) and invalid schemas (400).
+  router.register("PATCH", "/forms/:id", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+      const target = (
+        await pgSelect(auth.client, "form_definitions", {
+          filters: { id: params.id },
+          select: FORM_COLUMNS,
+          limit: 1
+        })
+      )?.[0];
+      if (!target) return sendJson(response, 404, { error: "form definition not found" });
+      if (!requireManage(auth, target.facility_id, response)) return;
+      if (!(await requireEntitled(auth, target.facility_id, response))) return;
+      const plan = buildFormDraftUpdate(target, body.payload.schema);
+      if (plan.errors) return sendJson(response, 400, { errors: plan.errors });
+      if (plan.error) return sendJson(response, 409, { error: plan.error });
+      const patch = { ...plan.target.patch, updated_at: new Date().toISOString() };
+      const rows = await pgUpdate(auth.client, "form_definitions", { id: plan.target.id }, patch, {
+        returning: true
+      });
+      return sendJson(response, 200, (rows ?? [])[0] ?? null);
     })
   );
 

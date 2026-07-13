@@ -1,5 +1,5 @@
 import { pgSelect } from "../supabase-rest.mjs";
-import { requirePermission } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
 import { queryAuditTimeline, buildExportPackage } from "../admin/audit-export.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 import { verifyDbChain } from "../audit.mjs";
@@ -25,7 +25,7 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
   }
 
   function requireAuditAccess(auth, facilityId, response) {
-    const guard = requirePermission(auth.memberships, facilityId, "admin.manage");
+    const guard = requireAuthPermission(auth, facilityId, "admin.manage");
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;
@@ -92,7 +92,7 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
     })
   );
 
-  // GET /facilities/:facilityId/audit/export?format=csv|json
+  // GET /facilities/:facilityId/audit/export?format=csv|json|pdf
   //
   // The shared sendJson primitive (scripts/server.mjs) always serializes its
   // payload as application/json -- registerAuditRoutes only receives that one
@@ -109,7 +109,8 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
       if (!requireAuditAccess(auth, params.facilityId, response)) return;
       if (!(await requireExportEntitlement(auth, params.facilityId, response))) return;
       const search = queryParams(request);
-      const format = (search.get("format") || "csv").toLowerCase() === "json" ? "json" : "csv";
+      const requested = (search.get("format") || "csv").toLowerCase();
+      const format = requested === "json" || requested === "pdf" ? requested : "csv";
       const rows = await queryAuditTimeline(auth.client, {
         facilityId: params.facilityId,
         entityTable: search.get("entityTable") || undefined,

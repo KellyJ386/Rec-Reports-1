@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
-import { requirePermission, requireOrgAdmin } from "./guard.mjs";
+import { requireAuthPermission, requireAuthOrgAdmin } from "./guard.mjs";
 import {
   validateModuleTogglePayload,
   validateMembershipInput,
@@ -90,8 +90,10 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     withAuth(request, response, env, (auth) =>
       sendJson(response, 200, {
         userId: auth.claims.sub,
+        platformAdmin: auth.platformAdmin === true,
         memberships: (auth.memberships ?? []).map((m) => ({
           facilityId: m.facilityId,
+          departmentId: m.departmentId ?? null,
           status: m.status,
           permissions: m.permissions ?? []
         }))
@@ -102,7 +104,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   // --- Facility module overrides ------------------------------------------
   router.register("GET", "/facilities/:facilityId/module-overrides", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "facility_module_overrides", {
         filters: { facility_id: params.facilityId },
@@ -121,7 +123,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
         const { valid, errors } = validateModuleTogglePayload(body.payload);
         if (!valid) return sendJson(response, 400, { errors });
-        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
         if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
         const rows = await pgInsert(
           auth.client,
@@ -145,7 +147,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   router.register("GET", "/org/:orgId/facilities", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
       const facilityIds = await orgFacilityIds(auth.client, params.orgId);
-      const guard = requireOrgAdmin(auth.memberships, facilityIds);
+      const guard = requireAuthOrgAdmin(auth, facilityIds);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "facilities", {
         filters: { organization_id: params.orgId },
@@ -162,7 +164,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const { valid, errors } = validateFacilityInput(body.payload);
       if (!valid) return sendJson(response, 400, { errors });
       const facilityIds = await orgFacilityIds(auth.client, params.orgId);
-      const guard = requireOrgAdmin(auth.memberships, facilityIds);
+      const guard = requireAuthOrgAdmin(auth, facilityIds);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const row = { organization_id: params.orgId, name: body.payload.name };
       if (body.payload.timezone) row.timezone = body.payload.timezone;
@@ -189,7 +191,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const facility = (found ?? [])[0];
       if (!facility) return sendJson(response, 404, { error: "facility not found" });
       const facilityIds = await orgFacilityIds(auth.client, facility.organization_id);
-      const guard = requireOrgAdmin(auth.memberships, facilityIds);
+      const guard = requireAuthOrgAdmin(auth, facilityIds);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const patch = {};
       if (body.payload.name !== undefined) patch.name = body.payload.name;
@@ -220,7 +222,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   // --- Departments ---------------------------------------------------------
   router.register("GET", "/facilities/:facilityId/departments", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "departments", {
         filters: { facility_id: params.facilityId },
@@ -237,7 +239,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const { valid, errors } = validateDepartmentInput(body.payload);
       if (!valid) return sendJson(response, 400, { errors });
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgInsert(
         auth.client,
@@ -262,7 +264,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       });
       const department = (found ?? [])[0];
       if (!department) return sendJson(response, 404, { error: "department not found" });
-      const guard = requirePermission(auth.memberships, department.facility_id, "admin.manage");
+      const guard = requireAuthPermission(auth, department.facility_id, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgUpdate(
         auth.client,
@@ -278,7 +280,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   // --- Facility settings ---------------------------------------------------
   router.register("GET", "/facilities/:facilityId/settings", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "facility_settings", {
         filters: { facility_id: params.facilityId },
@@ -297,7 +299,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const patch = body.payload.settingsPatch;
       const { valid, errors } = validateFacilitySettingsPatch(patch);
       if (!valid) return sendJson(response, 400, { errors });
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const row = await applyFacilitySettingsPatch(auth.client, params.facilityId, patch, auth.claims.sub);
       return sendJson(response, 200, row);
@@ -333,7 +335,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
 
   router.register("GET", "/facilities/:facilityId/roles", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "roles", {
         filters: { facility_id: params.facilityId },
@@ -351,7 +353,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const codes = body.payload.permissionCodes ?? [];
       const { valid, errors } = validateRoleGrant({ name: body.payload.name }, codes);
       if (!valid) return sendJson(response, 400, { errors });
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const roleRows = await pgInsert(
         auth.client,
@@ -381,7 +383,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       const codes = body.payload.permissionCodes ?? [];
       const { valid, errors } = validateRoleGrant({ name: role.name }, codes);
       if (!valid) return sendJson(response, 400, { errors });
-      const guard = requirePermission(auth.memberships, role.facility_id, "admin.manage");
+      const guard = requireAuthPermission(auth, role.facility_id, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       await replaceRolePermissions(auth.client, params.roleId, codes);
       return sendJson(response, 200, { roleId: params.roleId, permissionCodes: codes });
@@ -394,6 +396,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       id: row.id,
       userId: row.user_id,
       facilityId: row.facility_id,
+      departmentId: row.department_id ?? null,
       roleId: row.role_id,
       status: row.status,
       createdAt: row.created_at,
@@ -405,11 +408,11 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
 
   router.register("GET", "/facilities/:facilityId/memberships", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "memberships", {
         filters: { facility_id: params.facilityId },
-        select: "id,user_id,facility_id,role_id,status,created_at,app_users(full_name,email),roles(name)",
+        select: "id,user_id,facility_id,department_id,role_id,status,created_at,app_users(full_name,email),roles(name)",
         order: "created_at.asc"
       });
       return sendJson(response, 200, (rows ?? []).map(mapMembership));
@@ -422,7 +425,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const { valid, errors } = validateMembershipInput(body.payload);
       if (!valid) return sendJson(response, 400, { errors });
-      const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+      const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgInsert(
         auth.client,
@@ -432,7 +435,8 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
             facility_id: params.facilityId,
             user_id: body.payload.userId,
             role_id: body.payload.roleId,
-            status: body.payload.status ?? "active"
+            status: body.payload.status ?? "active",
+            department_id: body.payload.departmentId ?? null
           }
         ],
         { returning: true }
@@ -454,11 +458,12 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       });
       const membership = (found ?? [])[0];
       if (!membership) return sendJson(response, 404, { error: "membership not found" });
-      const guard = requirePermission(auth.memberships, membership.facility_id, "admin.manage");
+      const guard = requireAuthPermission(auth, membership.facility_id, "admin.manage");
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const patch = {};
       if (body.payload.roleId !== undefined) patch.role_id = body.payload.roleId;
       if (body.payload.status !== undefined) patch.status = body.payload.status;
+      if (body.payload.departmentId !== undefined) patch.department_id = body.payload.departmentId;
       const rows = await pgUpdate(
         auth.client,
         "memberships",
@@ -476,7 +481,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     "/facilities/:facilityId/access-simulator",
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
-        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
         if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
         const url = new URL(request.url ?? "/", "http://localhost");
         const userId = url.searchParams.get("userId");
@@ -534,7 +539,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     "/facilities/:facilityId/modules/:moduleCode/config",
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
-        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
         if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
         const module = await loadModuleByCode(auth.client, params.moduleCode);
         if (!module) return sendJson(response, 404, { error: "module not found" });
@@ -575,7 +580,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
         const settings = body.payload.settings;
         const { valid, errors } = validateModuleSettingsPatch(params.moduleCode, settings);
         if (!valid) return sendJson(response, 400, { errors });
-        const guard = requirePermission(auth.memberships, params.facilityId, "admin.manage");
+        const guard = requireAuthPermission(auth, params.facilityId, "admin.manage");
         if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
         const module = await loadModuleByCode(auth.client, params.moduleCode);
         if (!module) return sendJson(response, 404, { error: "module not found" });

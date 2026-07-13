@@ -40,14 +40,31 @@ export function verifySupabaseJwt(token, jwtSecret) {
   return payload;
 }
 
+// True when the user is on the platform_admins roster (0022): the platform
+// super-admin scope that passes every permission check and sees every
+// facility. Fail-closed: any lookup problem reads as "not a platform admin".
+export async function loadPlatformAdmin(client, userId) {
+  try {
+    const rows = await pgSelect(client, "platform_admins", {
+      filters: { user_id: userId },
+      select: "id",
+      limit: 1
+    });
+    return (rows ?? []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function loadMemberships(client, userId) {
   const rows = await pgSelect(client, "memberships", {
     filters: { user_id: userId },
-    select: "id,facility_id,status,role_id,roles(role_permissions(permission_code))"
+    select: "id,facility_id,department_id,status,role_id,roles(role_permissions(permission_code))"
   });
   return (rows ?? []).map((row) => ({
     id: row.id,
     facilityId: row.facility_id,
+    departmentId: row.department_id ?? null,
     status: row.status,
     roleId: row.role_id,
     permissions: (row.roles?.role_permissions ?? []).map((entry) => entry.permission_code)

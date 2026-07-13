@@ -80,6 +80,7 @@ export function setFacilities(list) {
 // as the rest of the pre-load nav state, so nothing flashes hidden then shown.
 export function hasPermissionAnywhere(code) {
   if (!me.loaded) return true;
+  if (me.platformAdmin === true) return true;
   return me.memberships.some(
     (membership) => membership.status === "active" && (membership.permissions ?? []).includes(code)
   );

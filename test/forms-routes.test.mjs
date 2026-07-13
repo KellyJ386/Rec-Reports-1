@@ -237,6 +237,95 @@ test("POST forms/:id/publish rejects with 402 when the plan lacks custom_forms",
   assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
 });
 
+test("PATCH /forms/:id updates a draft schema in place", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method, url) => {
+      if (table === "form_definitions" && method === "GET" && url.searchParams.get("id") === "eq.f-2") {
+        return [{ id: "f-2", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+      }
+      if (table === "form_definitions" && method === "PATCH") {
+        return [{ id: "f-2", status: "draft", schema_jsonb: VALID_SCHEMA }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/forms/f-2", { schema: VALID_SCHEMA });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "form_definitions" && c.method === "PATCH");
+  assert.deepEqual(patch.body.schema_jsonb, VALID_SCHEMA);
+  assert.ok(patch.body.updated_at);
+});
+
+test("PATCH /forms/:id 404s when the form is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("PATCH", "/forms/missing", { schema: VALID_SCHEMA });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH /forms/:id denies a member without reports.template.manage before any write", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "form_definitions" && method === "GET") {
+      return [{ id: "f-2", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("PATCH", "/forms/f-2", { schema: VALID_SCHEMA });
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
+});
+
+test("PATCH /forms/:id rejects with 402 when the plan lacks custom_forms", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "form_definitions" && method === "GET") {
+      return [{ id: "f-2", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+    }
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/forms/f-2", { schema: VALID_SCHEMA });
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
+});
+
+test("PATCH /forms/:id rejects a published version with 409", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "form_definitions" && method === "GET") {
+        return [{ id: "f-1", facility_id: "fac-1", form_code: "opening", status: "published" }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/forms/f-1", { schema: VALID_SCHEMA });
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
+});
+
+test("PATCH /forms/:id rejects an invalid schema with 400 before any write", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "form_definitions" && method === "GET") {
+        return [{ id: "f-2", facility_id: "fac-1", form_code: "opening", status: "draft" }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/forms/f-2", { schema: { sections: [] } });
+  assert.equal(result.status, 400);
+  assert.ok(Array.isArray(result.payload.errors));
+  assert.ok(!captured.some((c) => c.table === "form_definitions" && c.method === "PATCH"));
+});
+
 test("PATCH /custom-fields/:id happy path updates the field", async (t) => {
   const captured = stubFetch(
     t,

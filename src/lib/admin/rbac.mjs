@@ -9,13 +9,20 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-// Union of permission codes across a user's ACTIVE memberships for one facility.
-// Inactive (invited/disabled) memberships contribute nothing, matching how
-// has_permission and canAccessFacility gate on status = 'active'.
+// True when the membership is not narrowed to a department (0023).
+function isFacilityWide(membership) {
+  return membership.departmentId === null || membership.departmentId === undefined;
+}
+
+// Union of permission codes across a user's ACTIVE, FACILITY-WIDE memberships
+// for one facility. Inactive (invited/disabled) memberships contribute
+// nothing, matching how has_permission and canAccessFacility gate on
+// status = 'active'; department-scoped memberships (0023) contribute nothing
+// at facility scope, matching the 3-arg has_permission.
 export function computeEffectivePermissions(memberships, facilityId) {
   const effective = new Set();
   for (const membership of memberships ?? []) {
-    if (membership.facilityId === facilityId && membership.status === "active") {
+    if (membership.facilityId === facilityId && membership.status === "active" && isFacilityWide(membership)) {
       for (const code of membership.permissions ?? []) {
         effective.add(code);
       }
@@ -58,8 +65,10 @@ export function diffRolePermissions(before, after) {
 // returning a reason code that matches has_permission's decision tree:
 //   * no-membership       -> the user has no membership in that facility
 //   * membership-inactive -> memberships exist but none are active
+//   * department-scoped   -> only department-scoped memberships hold the code
+//                            (they narrow to their department, 0023)
 //   * permission-missing  -> an active membership exists but lacks the code
-//   * granted             -> an active membership grants the code
+//   * granted             -> an active facility-wide membership grants the code
 // `allowed` equals hasPermission(memberships, facilityId, code) for every code.
 export function simulateAccess(memberships, facilityId, code) {
   const forFacility = (memberships ?? []).filter(
@@ -72,9 +81,13 @@ export function simulateAccess(memberships, facilityId, code) {
   if (active.length === 0) {
     return { allowed: false, reason: "membership-inactive" };
   }
-  const granted = active.some((membership) => (membership.permissions ?? []).includes(code));
-  if (!granted) {
+  const holding = active.filter((membership) => (membership.permissions ?? []).includes(code));
+  if (holding.length === 0) {
     return { allowed: false, reason: "permission-missing" };
+  }
+  const granted = holding.some((membership) => isFacilityWide(membership));
+  if (!granted) {
+    return { allowed: false, reason: "department-scoped" };
   }
   return { allowed: true, reason: "granted" };
 }

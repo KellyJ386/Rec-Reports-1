@@ -8,15 +8,20 @@ let pending = null;
 
 async function fetchMe() {
   if (!hasToken()) {
-    setMe({ userId: null, memberships: [], error: "missing-token" });
+    setMe({ userId: null, memberships: [], platformAdmin: false, error: "missing-token" });
     return getMe();
   }
   try {
     const data = await api.get("/me");
-    setMe({ userId: data?.userId ?? null, memberships: data?.memberships ?? [], error: null });
+    setMe({
+      userId: data?.userId ?? null,
+      memberships: data?.memberships ?? [],
+      platformAdmin: data?.platformAdmin === true,
+      error: null
+    });
   } catch (error) {
     const reason = error instanceof ApiError && error.status === 401 ? "unauthorized" : "error";
-    setMe({ userId: null, memberships: [], error: reason });
+    setMe({ userId: null, memberships: [], platformAdmin: false, error: reason });
   }
   return getMe();
 }

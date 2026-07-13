@@ -66,6 +66,26 @@ export function validateFormDefinition({ moduleCode, formCode, schema } = {}) {
   return { valid: errors.length === 0, errors };
 }
 
+// Builds the patch for editing a draft version's schema in place, so the
+// builder canvas can iterate on a draft without minting a new version per
+// save. Only drafts are editable -- published and retired versions are
+// immutable history. Returns { error } when the target is not a draft (maps
+// to 409), { errors } when the schema fails the shared template validator
+// (maps to 400), else { target: { id, patch } }.
+export function buildFormDraftUpdate(target, schema) {
+  if (!isPlainObject(target)) {
+    return { error: "target form definition is required" };
+  }
+  if (target.status !== "draft") {
+    return { error: `only draft forms can be edited (target is ${target.status ?? "unknown"})` };
+  }
+  const errors = validateReportTemplateSchema(schema).map((schemaError) => `schema: ${schemaError}`);
+  if (errors.length > 0) {
+    return { errors };
+  }
+  return { target: { id: target.id, patch: { schema_jsonb: schema } } };
+}
+
 // Given the existing versions of a form_code (rows carrying version_no, or bare
 // numbers), returns the next version number: max + 1, or 1 when there are none.
 export function nextVersionNo(existing = []) {

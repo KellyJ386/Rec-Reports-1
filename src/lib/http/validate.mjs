@@ -12,7 +12,9 @@ function isNonEmptyString(value) {
 const MEMBERSHIP_STATUSES = ["invited", "active", "disabled"];
 
 // A membership assignment: which user, in which role, at what status. facility
-// comes from the route, not the body.
+// comes from the route, not the body. departmentId (0023) is optional: absent
+// or null means facility-wide; a non-empty id narrows the membership's
+// permissions to that department.
 export function validateMembershipInput(payload) {
   const errors = [];
   if (!isPlainObject(payload)) {
@@ -29,11 +31,16 @@ export function validateMembershipInput(payload) {
       errors.push(`status must be one of ${MEMBERSHIP_STATUSES.join(", ")}`);
     }
   }
+  if (payload.departmentId !== undefined && payload.departmentId !== null && !isNonEmptyString(payload.departmentId)) {
+    errors.push("departmentId must be a non-empty string or null");
+  }
   return { valid: errors.length === 0, errors };
 }
 
-// A membership patch: change the role and/or the status. At least one is
-// required so a PATCH is never a no-op.
+// A membership patch: change the role, the status, and/or the department
+// scope. At least one is required so a PATCH is never a no-op. departmentId
+// accepts an explicit null to widen a department-scoped membership back to
+// facility-wide (0023).
 export function validateMembershipPatch(payload) {
   const errors = [];
   if (!isPlainObject(payload)) {
@@ -47,10 +54,14 @@ export function validateMembershipPatch(payload) {
       errors.push(`status must be one of ${MEMBERSHIP_STATUSES.join(", ")}`);
     }
   }
+  if (payload.departmentId !== undefined && payload.departmentId !== null && !isNonEmptyString(payload.departmentId)) {
+    errors.push("departmentId must be a non-empty string or null");
+  }
   const hasRole = isNonEmptyString(payload.roleId);
   const hasStatus = MEMBERSHIP_STATUSES.includes(payload.status);
-  if (!hasRole && !hasStatus) {
-    errors.push("at least one of roleId or status is required");
+  const hasDepartment = payload.departmentId !== undefined;
+  if (!hasRole && !hasStatus && !hasDepartment) {
+    errors.push("at least one of roleId, status, or departmentId is required");
   }
   return { valid: errors.length === 0, errors };
 }

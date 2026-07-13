@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   validateCustomFieldInput,
   validateFormDefinition,
+  buildFormDraftUpdate,
   nextVersionNo,
   buildFormPublish
 } from "../src/lib/admin/forms.mjs";
@@ -79,4 +80,31 @@ test("buildFormPublish refuses to publish a non-draft target", () => {
   const plan = buildFormPublish({ id: "f-1", status: "published" }, []);
   assert.ok(plan.error);
   assert.ok(!plan.target);
+});
+
+test("buildFormDraftUpdate shapes a schema patch for a draft target", () => {
+  const plan = buildFormDraftUpdate({ id: "f-2", status: "draft" }, VALID_SCHEMA);
+  assert.ok(!plan.error);
+  assert.ok(!plan.errors);
+  assert.deepEqual(plan.target, { id: "f-2", patch: { schema_jsonb: VALID_SCHEMA } });
+});
+
+test("buildFormDraftUpdate refuses to edit a non-draft target", () => {
+  const plan = buildFormDraftUpdate({ id: "f-1", status: "published" }, VALID_SCHEMA);
+  assert.ok(plan.error);
+  assert.ok(/only draft/.test(plan.error));
+  assert.ok(!plan.target);
+});
+
+test("buildFormDraftUpdate rejects an invalid schema with prefixed errors", () => {
+  const plan = buildFormDraftUpdate({ id: "f-2", status: "draft" }, { sections: [] });
+  assert.ok(Array.isArray(plan.errors));
+  assert.ok(plan.errors.length > 0);
+  assert.ok(plan.errors.every((error) => error.startsWith("schema: ")));
+  assert.ok(!plan.target);
+});
+
+test("buildFormDraftUpdate requires a target object", () => {
+  const plan = buildFormDraftUpdate(null, VALID_SCHEMA);
+  assert.ok(plan.error);
 });
