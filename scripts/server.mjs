@@ -245,8 +245,32 @@ function serveStatic(request, response) {
   stream.pipe(response);
 }
 
-export function createApp() {
-  return createServer((request, response) => {
+// Handles a single API request (routing + auth + JSON responses) without
+// touching static files. Exported so serverless entry points (e.g. Vercel's
+// api/index.mjs) can reuse the exact same pipeline for /api/admin/v1/* traffic.
+export async function handleApiRequest(request, response, routeUrl, search) {
+  const { env, error: envError } = loadEnv();
+  if (envError) {
+    sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
+    return;
+  }
+
+  const { handler, params } = router.match({
+    method: request.method,
+    url: `${routeUrl}${search}`
+  });
+  if (!handler) {
+    sendJson(response, 404, { error: "not found" });
+    return;
+  }
+  await handler(request, response, { env, params });
+}
+
+// Plain Node request listener: routes /api/admin/v1/* to the API pipeline and
+// everything else to static files. Reusable by createServer() (npm start) and
+// by serverless functions, neither of which requires binding a port here.
+export function createRequestListener() {
+  return (request, response) => {
     Promise.resolve()
       .then(async () => {
         const url = new URL(request.url ?? "/", `http://localhost:${port}`);
@@ -255,22 +279,8 @@ export function createApp() {
           return;
         }
 
-        const { env, error: envError } = loadEnv();
-        if (envError) {
-          sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
-          return;
-        }
-
         const routeUrl = url.pathname.slice(apiPrefix.length) || "/";
-        const { handler, params } = router.match({
-          method: request.method,
-          url: `${routeUrl}${url.search}`
-        });
-        if (!handler) {
-          sendJson(response, 404, { error: "not found" });
-          return;
-        }
-        await handler(request, response, { env, params });
+        await handleApiRequest(request, response, routeUrl, url.search);
       })
       .catch((error) => {
         if (!response.headersSent) {
@@ -279,7 +289,11 @@ export function createApp() {
           response.end();
         }
       });
-  });
+  };
+}
+
+export function createApp() {
+  return createServer(createRequestListener());
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
