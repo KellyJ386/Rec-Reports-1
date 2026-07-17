@@ -33,9 +33,9 @@ test("hardened server: security headers, 404s, JSON API 404, and stream resilien
     env: {
       ...process.env,
       PORT: String(port),
-      NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co",
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-key",
-      NEXT_PUBLIC_APP_URL: "http://localhost:3000",
+      SUPABASE_URL: "https://example.supabase.co",
+      SUPABASE_ANON_KEY: "anon-key",
+      APP_URL: "http://localhost:3000",
       SUPABASE_JWT_SECRET: "test-secret"
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -105,9 +105,9 @@ test("server returns 503 JSON on API routes when required server env is missing"
     env: {
       ...process.env,
       PORT: String(badPort),
-      NEXT_PUBLIC_SUPABASE_URL: "",
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: "",
-      NEXT_PUBLIC_APP_URL: "http://localhost:3000",
+      SUPABASE_URL: "",
+      SUPABASE_ANON_KEY: "",
+      APP_URL: "http://localhost:3000",
       SUPABASE_JWT_SECRET: ""
     },
     stdio: ["ignore", "pipe", "pipe"]

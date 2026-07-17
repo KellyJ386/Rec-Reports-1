@@ -81,8 +81,8 @@ function extractBearerToken(request) {
 
 function buildClient(env, authToken) {
   return createClient({
-    url: env.NEXT_PUBLIC_SUPABASE_URL,
-    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    url: env.SUPABASE_URL,
+    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY,
     authToken
   });
 }
