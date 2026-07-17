@@ -4,7 +4,7 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
-import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
+import { verifySupabaseToken, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
 import { requireAuthOrgAdmin } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
@@ -88,12 +88,14 @@ function buildClient(env, authToken) {
 }
 
 async function authenticate(request, env) {
-  if (!env.SUPABASE_JWT_SECRET) {
-    return { error: { status: 503, body: { error: "SUPABASE_JWT_SECRET is not configured" } } };
-  }
   const token = extractBearerToken(request);
   if (!token) return { error: { status: 401, body: { error: "missing bearer token" } } };
-  const claims = verifySupabaseJwt(token, env.SUPABASE_JWT_SECRET);
+  // HS256 via the shared secret when configured (legacy projects), otherwise
+  // ES256 against the project's published JWKS at SUPABASE_URL.
+  const claims = await verifySupabaseToken(token, {
+    jwtSecret: env.SUPABASE_JWT_SECRET,
+    supabaseUrl: env.SUPABASE_URL
+  });
   if (!claims || !claims.sub) {
     return { error: { status: 401, body: { error: "invalid or expired token" } } };
   }

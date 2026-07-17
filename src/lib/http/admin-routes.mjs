@@ -85,6 +85,19 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     return (inserted ?? [])[0] ?? null;
   }
 
+  // --- Public config --------------------------------------------------------
+  // Unauthenticated and DB-free: exposes only what the browser needs to talk
+  // to Supabase Auth directly (the anon key is public by design). Returns 503
+  // until the server environment is configured.
+  router.register("GET", "/config", (request, response, { env }) => {
+    const supabaseUrl = env?.SUPABASE_URL ?? "";
+    const supabaseAnonKey = env?.SUPABASE_ANON_KEY ?? "";
+    if (!supabaseUrl || !supabaseAnonKey) {
+      return sendJson(response, 503, { error: "Supabase configuration is not available" });
+    }
+    return sendJson(response, 200, { supabaseUrl, supabaseAnonKey });
+  });
+
   // --- Identity ------------------------------------------------------------
   router.register("GET", "/me", (request, response, { env }) =>
     withAuth(request, response, env, (auth) =>

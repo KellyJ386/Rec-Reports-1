@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
-import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
+import { createHmac, generateKeyPairSync, sign as signWithKey } from "node:crypto";
+import {
+  verifySupabaseJwt,
+  verifySupabaseToken,
+  clearJwksCache,
+  loadMemberships,
+  loadPlatformAdmin
+} from "../src/lib/http/auth.mjs";
 
 const secret = "test-jwt-secret";
 
@@ -62,6 +68,161 @@ test("verifySupabaseJwt rejects malformed tokens", () => {
 test("verifySupabaseJwt returns null without a jwtSecret", () => {
   const token = signToken({ sub: "user-1" });
   assert.equal(verifySupabaseJwt(token, ""), null);
+});
+
+// --- Asymmetric (ES256/JWKS) verification ----------------------------------
+
+const supabaseUrl = "https://es256-project.supabase.co";
+const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const publicJwk = { ...publicKey.export({ format: "jwk" }), kid: "key-1", alg: "ES256", use: "sig" };
+
+function signEs256Token(payload, { kid = "key-1", signingKey = privateKey } = {}) {
+  const headerB64 = base64Url(JSON.stringify({ alg: "ES256", typ: "JWT", kid }));
+  const payloadB64 = base64Url(JSON.stringify(payload));
+  const signature = signWithKey("sha256", Buffer.from(`${headerB64}.${payloadB64}`), {
+    key: signingKey,
+    dsaEncoding: "ieee-p1363"
+  });
+  return `${headerB64}.${payloadB64}.${base64Url(signature)}`;
+}
+
+// Injected JWKS endpoint: records every request and serves the given key set.
+function jwksFetch(keys, calls = []) {
+  return async (url) => {
+    calls.push(String(url));
+    return { ok: true, status: 200, text: async () => JSON.stringify({ keys }) };
+  };
+}
+
+test("verifySupabaseToken accepts a valid ES256 token via the published JWKS", async () => {
+  clearJwksCache();
+  const calls = [];
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", aud: "authenticated", exp: futureExp });
+  const claims = await verifySupabaseToken(token, {
+    supabaseUrl,
+    fetchImpl: jwksFetch([publicJwk], calls)
+  });
+  assert.equal(claims.sub, "user-1");
+  assert.deepEqual(calls, [`${supabaseUrl}/auth/v1/.well-known/jwks.json`]);
+});
+
+test("verifySupabaseToken caches the JWKS across verifications", async () => {
+  clearJwksCache();
+  const calls = [];
+  const fetchImpl = jwksFetch([publicJwk], calls);
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp });
+  assert.ok(await verifySupabaseToken(token, { supabaseUrl, fetchImpl }));
+  assert.ok(await verifySupabaseToken(token, { supabaseUrl, fetchImpl }));
+  assert.equal(calls.length, 1, "second verification should be served from the cache");
+});
+
+test("verifySupabaseToken rejects a token whose kid is not in the JWKS", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp }, { kid: "unknown-kid" });
+  const claims = await verifySupabaseToken(token, {
+    supabaseUrl,
+    fetchImpl: jwksFetch([publicJwk])
+  });
+  assert.equal(claims, null);
+});
+
+test("verifySupabaseToken rejects an expired ES256 token", async () => {
+  clearJwksCache();
+  const pastExp = Math.floor(Date.now() / 1000) - 60;
+  const token = signEs256Token({ sub: "user-1", exp: pastExp });
+  assert.equal(
+    await verifySupabaseToken(token, { supabaseUrl, fetchImpl: jwksFetch([publicJwk]) }),
+    null
+  );
+});
+
+test("verifySupabaseToken rejects an ES256 token signed by a different key", async () => {
+  clearJwksCache();
+  const otherKey = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey;
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp }, { signingKey: otherKey });
+  assert.equal(
+    await verifySupabaseToken(token, { supabaseUrl, fetchImpl: jwksFetch([publicJwk]) }),
+    null
+  );
+});
+
+test("verifySupabaseToken rejects a tampered ES256 payload", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp });
+  const [headerB64, , signatureB64] = token.split(".");
+  const tamperedPayload = base64Url(JSON.stringify({ sub: "attacker", exp: futureExp }));
+  const tampered = `${headerB64}.${tamperedPayload}.${signatureB64}`;
+  assert.equal(
+    await verifySupabaseToken(tampered, { supabaseUrl, fetchImpl: jwksFetch([publicJwk]) }),
+    null
+  );
+});
+
+test("verifySupabaseToken rejects an ES256 token minted for another audience", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", aud: "anon", exp: futureExp });
+  assert.equal(
+    await verifySupabaseToken(token, { supabaseUrl, fetchImpl: jwksFetch([publicJwk]) }),
+    null
+  );
+});
+
+test("verifySupabaseToken fails closed when the JWKS fetch fails", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp });
+  const failingFetch = async () => {
+    throw new Error("network down");
+  };
+  assert.equal(await verifySupabaseToken(token, { supabaseUrl, fetchImpl: failingFetch }), null);
+});
+
+test("verifySupabaseToken still verifies HS256 tokens when a secret is configured", async () => {
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signToken({ sub: "user-1", role: "authenticated", exp: futureExp });
+  const neverFetch = async () => {
+    throw new Error("HS256 verification must not hit the network");
+  };
+  const claims = await verifySupabaseToken(token, {
+    jwtSecret: secret,
+    supabaseUrl,
+    fetchImpl: neverFetch
+  });
+  assert.equal(claims.sub, "user-1");
+});
+
+test("verifySupabaseToken rejects an HS256 token when no secret is configured", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signToken({ sub: "user-1", exp: futureExp });
+  assert.equal(
+    await verifySupabaseToken(token, { supabaseUrl, fetchImpl: jwksFetch([publicJwk]) }),
+    null
+  );
+});
+
+test("verifySupabaseToken uses JWKS for ES256 tokens even when a secret is set", async () => {
+  clearJwksCache();
+  const futureExp = Math.floor(Date.now() / 1000) + 3600;
+  const token = signEs256Token({ sub: "user-1", exp: futureExp });
+  const claims = await verifySupabaseToken(token, {
+    jwtSecret: secret,
+    supabaseUrl,
+    fetchImpl: jwksFetch([publicJwk])
+  });
+  assert.equal(claims.sub, "user-1");
+});
+
+test("verifySupabaseToken rejects malformed tokens", async () => {
+  assert.equal(await verifySupabaseToken("not-a-jwt", { supabaseUrl }), null);
+  assert.equal(await verifySupabaseToken("", { supabaseUrl }), null);
+  assert.equal(await verifySupabaseToken(null, { supabaseUrl }), null);
 });
 
 test("loadMemberships flattens the role/permission embed from PostgREST", async () => {

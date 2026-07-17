@@ -29,7 +29,7 @@ function stubFetch(t, respond) {
 // Mounts the admin routes with stubbed auth/response primitives and drives one
 // request through the matched handler. Returns the captured sendJson call and
 // the captured fetch calls.
-function mount({ memberships = ADMIN_ON_FAC1, respond = () => [] } = {}) {
+function mount({ memberships = ADMIN_ON_FAC1, respond = () => [], env = {} } = {}) {
   const router = createRouter();
   const sent = [];
   const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
@@ -47,12 +47,52 @@ function mount({ memberships = ADMIN_ON_FAC1, respond = () => [] } = {}) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
     const request = { __body: body === undefined ? undefined : JSON.stringify(body) };
-    await handler(request, {}, { env: {}, params });
+    await handler(request, {}, { env, params });
     return sent[sent.length - 1];
   }
 
   return { call, sent, respond };
 }
+
+test("GET /config returns the Supabase URL and anon key from env", async () => {
+  const { call } = mount({
+    env: { SUPABASE_URL: "https://example.supabase.co", SUPABASE_ANON_KEY: "anon-key" }
+  });
+  const result = await call("GET", "/config");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, {
+    supabaseUrl: "https://example.supabase.co",
+    supabaseAnonKey: "anon-key"
+  });
+});
+
+test("GET /config returns 503 when the Supabase env is not configured", async () => {
+  const { call } = mount({ env: {} });
+  const result = await call("GET", "/config");
+  assert.equal(result.status, 503);
+  assert.match(result.payload.error, /not available/);
+});
+
+test("GET /config requires no authentication and touches no DB", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const router = createRouter();
+  const sent = [];
+  registerAdminRoutes(router, {
+    authenticate: async () => ({ error: { status: 401, body: { error: "no token" } } }),
+    sendJson: (response, status, payload) => sent.push({ status, payload }),
+    readBody: async () => "{}"
+  });
+  const { handler, params } = router.match({ method: "GET", url: "/config" });
+  assert.ok(handler, "no route matched GET /config");
+  await handler(
+    {},
+    {},
+    { env: { SUPABASE_URL: "https://example.supabase.co", SUPABASE_ANON_KEY: "anon-key" }, params }
+  );
+  assert.equal(sent[0].status, 200);
+  assert.equal(sent[0].payload.supabaseAnonKey, "anon-key");
+  assert.equal(captured.length, 0, "GET /config must not touch the database");
+});
 
 test("GET /me returns the user id and their memberships", async () => {
   const { call } = mount({ memberships: ADMIN_ON_FAC1 });
