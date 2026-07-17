@@ -1,4 +1,4 @@
-import { api, getToken, setToken, hasToken } from "./api.js";
+import { api, getToken, setToken, hasToken, signOut } from "./api.js";
 import { getContext, setContext, setFacilities, subscribe } from "./state.js";
 import { toast, clearChildren, el } from "./ui.js";
 import { loadMe } from "./session.js";
@@ -92,6 +92,17 @@ function wireTokenDrawer() {
   });
 }
 
+// Clears both stored tokens and returns to the sign-in page. The session
+// token drawer stays available as a debug tool for pasting raw tokens.
+function wireSignOut() {
+  const button = document.getElementById("sign-out");
+  if (!button) return;
+  button.addEventListener("click", () => {
+    toast("Signed out.", { tone: "info" });
+    signOut();
+  });
+}
+
 async function refreshFacilitySelect() {
   const select = document.getElementById("facility-select");
   if (!select) return;
@@ -150,6 +161,7 @@ function wireUnpublishedBadge() {
 async function bootstrap() {
   wireSidebarToggle();
   wireTokenDrawer();
+  wireSignOut();
   wireContextControls();
   wireUnpublishedBadge();
   await loadMe();

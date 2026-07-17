@@ -1,9 +1,11 @@
 // Fetch wrapper for the /api/admin/v1 admin BFF. Reads the bearer token from
-// localStorage (set via the top-bar session token drawer) and attaches it to
-// every request. Callers are expected to handle ApiError (status 401 in
-// particular should trigger a "sign in" prompt state in the page).
+// localStorage (set by the /login/ page, or via the top-bar session token
+// debug drawer) and attaches it to every request. On a 401 it attempts one
+// silent refresh against Supabase Auth using the stored refresh token and
+// retries once; if the refresh fails it signs out and redirects to /login/.
 
 const TOKEN_KEY = "rr_admin_token";
+const REFRESH_KEY = "rr_admin_refresh";
 const API_BASE = "/api/admin/v1";
 
 export class ApiError extends Error {
@@ -37,7 +39,69 @@ export function hasToken() {
   return getToken().length > 0;
 }
 
-async function request(method, path, body) {
+export function getRefreshToken() {
+  try {
+    return localStorage.getItem(REFRESH_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setRefreshToken(token) {
+  try {
+    if (token) localStorage.setItem(REFRESH_KEY, token);
+    else localStorage.removeItem(REFRESH_KEY);
+  } catch {
+    // Storage unavailable; refresh simply won't survive a reload.
+  }
+}
+
+// Clears both tokens and returns to the sign-in page.
+export function signOut() {
+  setToken("");
+  setRefreshToken("");
+  window.location.href = "/login/";
+}
+
+async function attemptRefresh() {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+  try {
+    const configResponse = await fetch(`${API_BASE}/config`, {
+      headers: { Accept: "application/json" }
+    });
+    if (!configResponse.ok) return false;
+    const config = await configResponse.json();
+    if (!config?.supabaseUrl || !config?.supabaseAnonKey) return false;
+    const response = await fetch(`${config.supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: config.supabaseAnonKey },
+      body: JSON.stringify({ refresh_token: refreshToken })
+    });
+    if (!response.ok) return false;
+    const data = await response.json();
+    if (!data?.access_token) return false;
+    setToken(data.access_token);
+    if (data.refresh_token) setRefreshToken(data.refresh_token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Single-flight refresh: concurrent 401s share one refresh attempt instead of
+// racing (Supabase refresh tokens rotate, so a lost race would sign us out).
+let refreshPending = null;
+function refreshSession() {
+  if (!refreshPending) {
+    refreshPending = attemptRefresh().finally(() => {
+      refreshPending = null;
+    });
+  }
+  return refreshPending;
+}
+
+async function request(method, path, body, hasRetried = false) {
   const token = getToken();
   const headers = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -52,6 +116,13 @@ async function request(method, path, body) {
     });
   } catch (error) {
     throw new ApiError(`Network error contacting the admin API: ${error.message}`, 0, null);
+  }
+
+  if (response.status === 401 && !hasRetried) {
+    const refreshed = await refreshSession();
+    if (refreshed) return request(method, path, body, true);
+    signOut();
+    throw new ApiError("Session expired; redirecting to sign in.", 401, null);
   }
 
   const text = await response.text();

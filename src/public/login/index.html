@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in - Rec Reports</title>
+    <meta name="description" content="Sign in to the Rec Reports admin control center" />
+    <link rel="stylesheet" href="/admin/admin.css" />
+    <link rel="stylesheet" href="/login/login.css" />
+  </head>
+  <body class="login-body">
+    <main class="login-card panel" aria-labelledby="login-title">
+      <p class="login-brand">
+        <span class="brand-name">Rec Reports</span>
+        <span class="brand-tag">Admin control center</span>
+      </p>
+      <h1 id="login-title">Sign in</h1>
+      <form id="login-form" class="stacked-form login-form" novalidate>
+        <label>
+          <span class="field-label">Email</span>
+          <input
+            type="email"
+            id="login-email"
+            name="email"
+            autocomplete="email"
+            spellcheck="false"
+            required
+          />
+        </label>
+        <label>
+          <span class="field-label">Password</span>
+          <input
+            type="password"
+            id="login-password"
+            name="password"
+            autocomplete="current-password"
+            required
+          />
+        </label>
+        <button type="submit" id="login-submit" class="primary-button">Sign in</button>
+      </form>
+      <p id="login-error" class="login-error" role="alert" hidden></p>
+      <p id="login-status" class="login-status" role="status" aria-live="polite"></p>
+    </main>
+
+    <noscript>Signing in requires JavaScript to be enabled.</noscript>
+    <script type="module" src="/login/login.js"></script>
+  </body>
+</html>

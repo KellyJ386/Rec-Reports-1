@@ -1,0 +1,68 @@
+/* Sign-in page layout. Reuses the admin control center palette and controls
+   from /admin/admin.css; this file only adds the centered-card layout. */
+
+.login-body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+}
+
+.login-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 12px;
+}
+
+.login-card h1 {
+  margin: 0 0 16px;
+  font-size: 1.4rem;
+}
+
+.login-form input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  background: var(--rr-surface);
+  color: var(--rr-text);
+  font: inherit;
+}
+
+.login-form input:focus {
+  outline: 2px solid var(--rr-focus);
+  outline-offset: 1px;
+}
+
+.login-form label {
+  margin-bottom: 12px;
+}
+
+.login-form .primary-button {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.login-error {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--rr-danger-border);
+  border-radius: var(--rr-radius-sm);
+  background: var(--rr-danger-bg);
+  color: var(--rr-danger);
+  font-size: 0.9rem;
+}
+
+.login-status {
+  margin: 10px 0 0;
+  color: var(--rr-text-muted);
+  font-size: 0.9rem;
+}
