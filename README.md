@@ -35,6 +35,32 @@ Every admin mutation is validated at the API boundary, permission-gated (16-code
 3. Install dependencies with `npm ci`.
 4. Run `npm run dev` (static only) or `npm start` after `npm run build` (static + API).
 
+## Deploying to Vercel
+
+The same codebase deploys to Vercel with no changes to `npm start`. Vercel builds
+the static app and serves the `/api/admin/v1/*` BFF from a single Node serverless
+function that reuses the exact router + auth pipeline as `scripts/server.mjs`.
+
+- `vercel.json` sets `buildCommand: npm run build` and `outputDirectory: dist`,
+  rewrites `/api/*` to the `api/index.mjs` function, and replicates the static
+  security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`,
+  `Referrer-Policy`, `Strict-Transport-Security`).
+- `api/index.mjs` is a Node 20 ESM serverless function that delegates every
+  request to `createRequestListener()` from `scripts/server.mjs`.
+- Static app is served at `/`, the admin console at `/admin/`, and the API at
+  `/api/admin/v1/*`.
+
+Set these environment variables in the Vercel project settings (Production +
+Preview):
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | yes | Supabase project URL (PostgREST base) |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | yes | Supabase anon key |
+| `SUPABASE_SERVICE_ROLE_KEY` | recommended | Server-only key the BFF uses for privileged reads/writes; falls back to the anon key if unset |
+| `SUPABASE_JWT_SECRET` | required for the API | HS256 secret used to verify bearer tokens; without it the API returns `503` |
+| `NEXT_PUBLIC_APP_URL` | optional | Public app URL (defaults to `http://localhost:3000`) |
+
 ## Production readiness checks
 
 Run these before opening a release candidate (CI runs the same list):
