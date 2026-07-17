@@ -62,7 +62,7 @@ test("serverless handler returns a JSON 404 for an unknown /api/admin/v1 route",
   assert.equal(response.statusCode, 404);
   assert.match(response.headers["Content-Type"] ?? "", /application\/json/);
   // Security headers must be present on the serverless response too.
-  assert.equal(response.headers["Content-Security-Policy"], "default-src 'self'");
+  assert.equal(response.headers["Content-Security-Policy"], "default-src 'self'; connect-src 'self' https://*.supabase.co");
   assert.equal(response.headers["X-Content-Type-Options"], "nosniff");
   const body = JSON.parse(response.body);
   assert.equal(body.error, "not found");
@@ -76,5 +76,5 @@ test("serverless handler rejects a protected route without a bearer token", asyn
   // 401 (missing token) or 503 (missing JWT secret) depending on env; both prove
   // the auth pipeline ran rather than the request crashing.
   assert.ok([401, 503].includes(response.statusCode));
-  assert.equal(response.headers["Content-Security-Policy"], "default-src 'self'");
+  assert.equal(response.headers["Content-Security-Policy"], "default-src 'self'; connect-src 'self' https://*.supabase.co");
 });

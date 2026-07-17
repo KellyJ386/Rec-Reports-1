@@ -21,7 +21,10 @@ function waitForServer(url, attempts = 50) {
 }
 
 function assertSecurityHeaders(response) {
-  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'");
+  assert.equal(
+    response.headers.get("content-security-policy"),
+    "default-src 'self'; connect-src 'self' https://*.supabase.co"
+  );
   assert.equal(response.headers.get("x-frame-options"), "DENY");
   assert.equal(response.headers.get("x-content-type-options"), "nosniff");
   assert.equal(response.headers.get("referrer-policy"), "no-referrer");

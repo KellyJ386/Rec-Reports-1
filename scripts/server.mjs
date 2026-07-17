@@ -22,7 +22,7 @@ const apiPrefix = "/api/admin/v1";
 const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript" };
 
 const securityHeaders = Object.freeze({
-  "Content-Security-Policy": "default-src 'self'",
+  "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://*.supabase.co",
   "X-Frame-Options": "DENY",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
