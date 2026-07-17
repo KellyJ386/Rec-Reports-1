@@ -55,11 +55,11 @@ Preview):
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `NEXT_PUBLIC_SUPABASE_URL` | yes | Supabase project URL (PostgREST base) |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | yes | Supabase anon key |
+| `SUPABASE_URL` | yes | Supabase project URL (PostgREST base) |
+| `SUPABASE_ANON_KEY` | yes | Supabase anon key |
 | `SUPABASE_SERVICE_ROLE_KEY` | recommended | Server-only key the BFF uses for privileged reads/writes; falls back to the anon key if unset |
 | `SUPABASE_JWT_SECRET` | required for the API | HS256 secret used to verify bearer tokens; without it the API returns `503` |
-| `NEXT_PUBLIC_APP_URL` | optional | Public app URL (defaults to `http://localhost:3000`) |
+| `APP_URL` | optional | Public app URL (defaults to `http://localhost:3000`) |
 
 ## Production readiness checks
 
