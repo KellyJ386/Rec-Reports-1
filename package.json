@@ -15,7 +15,8 @@
     "format:check": "node scripts/format-check.mjs",
     "db:verify": "node scripts/verify-migrations.mjs",
     "db:verify:seed": "node scripts/verify-seed.mjs",
-    "db:test:rls": "node scripts/run-rls-tests.mjs"
+    "db:test:rls": "node scripts/run-rls-tests.mjs",
+    "worker:notifications": "node scripts/notification-worker.mjs"
   },
   "engines": {
     "node": ">=20.0.0",

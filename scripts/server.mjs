@@ -22,7 +22,15 @@ import { registerCommunicationRoutes } from "../src/lib/http/communications-rout
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
+import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
+import { createObservability } from "../src/lib/observability/observability.mjs";
+import { elapsedMs } from "../src/lib/observability/timing.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
+
+// Telemetry sink built once from the process environment; no-ops unless
+// OBSERVABILITY_DSN is set. Fire-and-forget — never throws, never blocks a
+// response.
+const observability = createObservability(process.env);
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
@@ -250,6 +258,9 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Attachments: signed upload/download URLs + row recording for report, incident,
+// and work-order attachments (Supabase Storage; facility-scoped paths).
+registerAttachmentRoutes(userRouter, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
@@ -292,12 +303,7 @@ function serveStatic(request, response) {
   stream.pipe(response);
 }
 
-// Core request dispatch, shared by the long-running Node server (createApp) and
-// the Vercel serverless function (api/[[...path]].mjs). Routes /api/admin/v1/*
-// to the admin router and /api/v1/* to the end-user router; anything else falls
-// through to static file serving (used only by the Node server — on Vercel the
-// platform serves dist/ and this function only ever receives /api/* requests).
-export async function handleRequest(request, response) {
+async function dispatchRequest(request, response) {
   const url = new URL(request.url ?? "/", `http://localhost:${port}`);
   const matchesPrefix = (prefix) =>
     url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
@@ -331,17 +337,44 @@ export async function handleRequest(request, response) {
   await handler(request, response, { env, params });
 }
 
+// Core request handler, shared by the long-running Node server (createApp) and
+// the Vercel serverless function (api/[[...path]].mjs). Routes /api/admin/v1/*
+// to the admin router and /api/v1/* to the end-user router; anything else falls
+// through to static file serving (used only by the Node server — on Vercel the
+// platform serves dist/ and this function only ever receives /api/* requests).
+// Wraps dispatch with fire-and-forget observability: errors are reported, and
+// every request is logged with its duration once the response is settled.
+export async function handleRequest(request, response) {
+  const start = process.hrtime.bigint();
+  try {
+    await dispatchRequest(request, response);
+  } catch (error) {
+    observability.reportError(error, { method: request.method, url: request.url });
+    if (!response.headersSent) {
+      sendJson(response, 500, { error: "internal server error", detail: error.message });
+    } else {
+      response.end();
+    }
+  } finally {
+    try {
+      const path = new URL(request.url ?? "/", `http://localhost:${port}`).pathname;
+      observability.logRequest({
+        method: request.method,
+        path,
+        status: response.statusCode,
+        durationMs: elapsedMs(start, process.hrtime.bigint())
+      });
+    } catch {
+      // Telemetry must never break the response.
+    }
+  }
+}
+
 export function createApp() {
   return createServer((request, response) => {
-    Promise.resolve()
-      .then(() => handleRequest(request, response))
-      .catch((error) => {
-        if (!response.headersSent) {
-          sendJson(response, 500, { error: "internal server error", detail: error.message });
-        } else {
-          response.end();
-        }
-      });
+    handleRequest(request, response).catch(() => {
+      if (!response.headersSent) response.end();
+    });
   });
 }
 
