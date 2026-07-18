@@ -20,6 +20,7 @@ import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs"
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
+import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -218,6 +219,20 @@ registerBillingRoutes(router, { authenticate, sendJson, readBody });
 // /api/v1 prefix. Logic lives in the already-tested domain libs under src/lib/.
 export const userRouter = createRouter();
 
+// Unauthenticated: hands the browser the public Supabase config (project URL and
+// anon key) so the login page can drive the same-origin auth proxy below. The
+// anon key is public by design.
+userRouter.register("GET", "/public-config", (request, response, { env }) =>
+  sendJson(response, 200, {
+    supabaseUrl: env.NEXT_PUBLIC_SUPABASE_URL,
+    supabaseAnonKey: env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  })
+);
+
+// Email + password sign-in / refresh, proxied server-side to Supabase Auth so
+// the client stays same-origin under the strict CSP. Logic in auth-routes.mjs.
+registerAuthRoutes(userRouter, { sendJson, readBody });
+
 // Daily Reports: template list/fetch, draft create/edit, and immutable submit.
 registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: capture + escalation queue (incidents.read / incidents.manage).
@@ -272,42 +287,49 @@ function serveStatic(request, response) {
   stream.pipe(response);
 }
 
+// Core request dispatch, shared by the long-running Node server (createApp) and
+// the Vercel serverless function (api/[[...path]].mjs). Routes /api/admin/v1/*
+// to the admin router and /api/v1/* to the end-user router; anything else falls
+// through to static file serving (used only by the Node server — on Vercel the
+// platform serves dist/ and this function only ever receives /api/* requests).
+export async function handleRequest(request, response) {
+  const url = new URL(request.url ?? "/", `http://localhost:${port}`);
+  const matchesPrefix = (prefix) =>
+    url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
+  // Admin prefix is checked first; the two prefixes are disjoint
+  // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
+  const active = matchesPrefix(apiPrefix)
+    ? { prefix: apiPrefix, router }
+    : matchesPrefix(userApiPrefix)
+      ? { prefix: userApiPrefix, router: userRouter }
+      : null;
+  if (!active) {
+    serveStatic(request, response);
+    return;
+  }
+
+  const { env, error: envError } = loadEnv();
+  if (envError) {
+    sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
+    return;
+  }
+
+  const routeUrl = url.pathname.slice(active.prefix.length) || "/";
+  const { handler, params } = active.router.match({
+    method: request.method,
+    url: `${routeUrl}${url.search}`
+  });
+  if (!handler) {
+    sendJson(response, 404, { error: "not found" });
+    return;
+  }
+  await handler(request, response, { env, params });
+}
+
 export function createApp() {
   return createServer((request, response) => {
     Promise.resolve()
-      .then(async () => {
-        const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-        const matchesPrefix = (prefix) =>
-          url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
-        // Admin prefix is checked first; the two prefixes are disjoint
-        // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
-        const active = matchesPrefix(apiPrefix)
-          ? { prefix: apiPrefix, router }
-          : matchesPrefix(userApiPrefix)
-            ? { prefix: userApiPrefix, router: userRouter }
-            : null;
-        if (!active) {
-          serveStatic(request, response);
-          return;
-        }
-
-        const { env, error: envError } = loadEnv();
-        if (envError) {
-          sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
-          return;
-        }
-
-        const routeUrl = url.pathname.slice(active.prefix.length) || "/";
-        const { handler, params } = active.router.match({
-          method: request.method,
-          url: `${routeUrl}${url.search}`
-        });
-        if (!handler) {
-          sendJson(response, 404, { error: "not found" });
-          return;
-        }
-        await handler(request, response, { env, params });
-      })
+      .then(() => handleRequest(request, response))
       .catch((error) => {
         if (!response.headersSent) {
           sendJson(response, 500, { error: "internal server error", detail: error.message });
