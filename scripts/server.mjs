@@ -15,6 +15,11 @@ import { registerNotificationRoutes } from "../src/lib/http/notification-routes.
 import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
 import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
+import { registerIncidentRoutes } from "../src/lib/http/incidents-routes.mjs";
+import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
+import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
+import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
+import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -215,6 +220,16 @@ export const userRouter = createRouter();
 
 // Daily Reports: template list/fetch, draft create/edit, and immutable submit.
 registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
+// Incidents: capture + escalation queue (incidents.read / incidents.manage).
+registerIncidentRoutes(userRouter, { authenticate, sendJson, readBody });
+// Work orders: dashboard list, create (incl. from incidents), status updates.
+registerWorkOrderRoutes(userRouter, { authenticate, sendJson, readBody });
+// Scheduling: periods, shifts, and publish-readiness/conflict validation.
+registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Communications: messages + acknowledgements (communications.read / .publish).
+registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
+// Training: courses, assignments, and completions (training.read / .manage).
+registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
