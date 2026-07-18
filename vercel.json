@@ -4,5 +4,8 @@
   "outputDirectory": "dist",
   "framework": null,
   "trailingSlash": false,
-  "rewrites": [{ "source": "/admin", "destination": "/admin/index.html" }]
+  "rewrites": [
+    { "source": "/admin", "destination": "/admin/index.html" },
+    { "source": "/signin", "destination": "/signin/index.html" }
+  ]
 }
