@@ -11,6 +11,10 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <header class="app-header">
+      <div class="user-info">Signed in as <span id="user-email">...</span></div>
+      <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
+    </header>
     <main class="shell">
       <section class="hero">
         <div>
@@ -23,10 +27,7 @@
         </div>
         <label class="facility-switcher">
           <span>Facility context</span>
-          <select aria-label="Active facility">
-            <option value="north-arena">North Arena</option>
-            <option value="riverfront-aquatics">Riverfront Aquatics</option>
-          </select>
+          <select id="facility-select" aria-label="Active facility"></select>
         </label>
       </section>
       <section class="grid" aria-label="MVP workflow modules">
@@ -40,31 +41,13 @@
       <section class="panel" aria-labelledby="daily-report-heading">
         <div>
           <p class="eyebrow">Daily report workflow</p>
-          <h2 id="daily-report-heading">Opening checklist preview</h2>
+          <h2 id="daily-report-heading">Report templates and submissions</h2>
           <p>
             This first production slice models configurable report templates, required answers,
             immutable submitted snapshots, attachments, audit events, and outbox notifications.
           </p>
         </div>
-        <form class="report-form">
-          <label>
-            Shift supervisor
-            <input type="text" value="Jordan Lee" />
-          </label>
-          <label>
-            Pool ready
-            <select>
-              <option>pass</option>
-              <option>fail</option>
-            </select>
-          </label>
-          <label>
-            Expected attendance
-            <input type="number" value="42" />
-          </label>
-          <button type="button">Save draft</button>
-          <button type="button" class="primary">Submit final report</button>
-        </form>
+        <div id="reports-list" class="module-list"></div>
       </section>
       <section class="panel" aria-labelledby="schedule-heading">
         <div>
@@ -75,81 +58,51 @@
             publish versions, and conflict checks before managers publish coverage.
           </p>
         </div>
-        <div class="schedule-list" aria-label="Schedule readiness checks">
-          <article>
-            <strong>Mon Jul 6 · 9:00 AM–1:00 PM</strong>
-            <span>Lifeguard · Jordan Lee · certifications verified</span>
-          </article>
-          <article class="warning">
-            <strong>Mon Jul 6 · 12:00 PM–4:00 PM</strong>
-            <span>Cashier · open shift · overlaps Jordan Lee if assigned</span>
-          </article>
-          <button type="button" class="primary">Validate schedule</button>
-        </div>
+        <div id="schedule-list" class="schedule-list" aria-label="Schedule readiness checks"></div>
       </section>
       <section class="panel" aria-labelledby="incident-heading">
         <div>
           <p class="eyebrow">Incident workflow</p>
-          <h2 id="incident-heading">High-severity escalation queue</h2>
+          <h2 id="incident-heading">Incident reports</h2>
           <p>
             Incident capture now has a tenant-scoped data model for people involved, evidence,
             escalations, follow-up actions, append-only audit events, and legal-safe amendments.
           </p>
         </div>
-        <div class="incident-card">
-          <strong>INC-2026-0001 · Accident · High</strong>
-          <span>North pool deck · OSHA review required</span>
-          <span>Follow-up: review mats and wet floor signage by Jul 7</span>
-          <button type="button" class="primary">Acknowledge escalation</button>
-        </div>
+        <div id="incidents-list"></div>
       </section>
       <section class="panel" aria-labelledby="work-order-heading">
         <div>
           <p class="eyebrow">Maintenance workflow</p>
-          <h2 id="work-order-heading">Open work from incidents and reports</h2>
+          <h2 id="work-order-heading">Work orders</h2>
           <p>
             Work orders connect operational issues to assets, assignments, due dates, updates,
             attachments, and audit-ready status history.
           </p>
         </div>
-        <div class="work-order-card">
-          <strong>High · Review pool deck mats</strong>
-          <span>Source: INC-2026-0001 · Asset: Pool deck safety mats</span>
-          <span>Assigned to Riley Patel · Due Jul 7</span>
-          <button type="button" class="primary">Update work order</button>
-        </div>
+        <div id="work-orders-list"></div>
       </section>
       <section class="panel" aria-labelledby="communications-heading">
         <div>
           <p class="eyebrow">Communications workflow</p>
-          <h2 id="communications-heading">Required acknowledgement center</h2>
+          <h2 id="communications-heading">Messages</h2>
           <p>
             Communications track channels, audiences, delivery receipts, acknowledgements,
             notification jobs, and urgent messages that can bypass quiet hours.
           </p>
         </div>
-        <div class="message-card">
-          <strong>Urgent · Pool deck safety reminder</strong>
-          <span>Aquatics Operations · required acknowledgement due today</span>
-          <span>1 delivered · 1 read · acknowledgement pending</span>
-          <button type="button" class="primary">Send reminder</button>
-        </div>
+        <div id="messages-list"></div>
       </section>
       <section class="panel" aria-labelledby="training-heading">
         <div>
           <p class="eyebrow">Training workflow</p>
-          <h2 id="training-heading">Certification and refresher tracking</h2>
+          <h2 id="training-heading">Training assignments</h2>
           <p>
             Training connects courses, modules, assignments, progress, completions, and
             certification events back to scheduling and incident follow-up requirements.
           </p>
         </div>
-        <div class="training-card">
-          <strong>Pool Deck Safety Refresher</strong>
-          <span>Assigned to Jordan Lee · due Jul 13</span>
-          <span>Source: incident follow-up · status not started</span>
-          <button type="button" class="primary">Review assignment</button>
-        </div>
+        <div id="training-list"></div>
       </section>
       <section class="panel" aria-labelledby="admin-heading">
         <div>
@@ -161,12 +114,10 @@
           </p>
         </div>
         <div class="admin-card">
-          <strong>North Arena Default Settings · Published</strong>
-          <span>Daily reports due at 6:00 PM · quiet hours 10:00 PM–6:00 AM</span>
-          <span>Modules enabled: reports, scheduling, incidents, work orders, communications, training</span>
           <a href="/admin/" class="primary">Open admin control center</a>
         </div>
       </section>
     </main>
+    <script type="module" src="/js/app.js"></script>
   </body>
 </html>
