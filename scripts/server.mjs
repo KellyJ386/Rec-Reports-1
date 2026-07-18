@@ -21,6 +21,7 @@ import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs"
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
+import { registerMeRoute } from "../src/lib/http/me-route.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -232,6 +233,10 @@ userRouter.register("GET", "/public-config", (request, response, { env }) =>
 // Email + password sign-in / refresh, proxied server-side to Supabase Auth so
 // the client stays same-origin under the strict CSP. Logic in auth-routes.mjs.
 registerAuthRoutes(userRouter, { sendJson, readBody });
+
+// GET /me — the signed-in user plus the facilities they can act in. Logic in
+// me-route.mjs; used by the end-user app to populate its facility switcher.
+registerMeRoute(userRouter, { authenticate, sendJson });
 
 // Daily Reports: template list/fetch, draft create/edit, and immutable submit.
 registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
