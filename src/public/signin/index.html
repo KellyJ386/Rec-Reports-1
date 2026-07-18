@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign In - Rec Reports</title>
+    <meta
+      name="description"
+      content="Sign in to your Rec Reports account"
+    />
+    <link rel="stylesheet" href="/admin/admin.css" />
+    <link rel="stylesheet" href="/signin/signin.css" />
+  </head>
+  <body class="signin-page">
+    <div class="signin-container">
+      <div class="signin-card">
+        <div class="signin-header">
+          <h1 class="signin-title">Rec Reports</h1>
+          <p class="signin-subtitle">Admin Control Center</p>
+        </div>
+
+        <form id="signin-form" class="signin-form">
+          <label class="signin-field">
+            <span class="signin-label">Email address</span>
+            <input
+              type="email"
+              id="email-input"
+              name="email"
+              required
+              autocomplete="email"
+              placeholder="your@organization.com"
+            />
+          </label>
+
+          <label class="signin-field">
+            <span class="signin-label">Password</span>
+            <input
+              type="password"
+              id="password-input"
+              name="password"
+              required
+              autocomplete="current-password"
+              placeholder="Enter your password"
+            />
+          </label>
+
+          <button type="submit" id="signin-button" class="signin-button primary-button">
+            Sign In
+          </button>
+        </form>
+
+        <div id="error-message" class="signin-error" hidden></div>
+
+        <p class="signin-footer">
+          Need help signing in? Contact your administrator.
+        </p>
+      </div>
+    </div>
+
+    <noscript>This sign-in page requires JavaScript to be enabled.</noscript>
+    <script type="module" src="/signin/app.js"></script>
+  </body>
+</html>

@@ -161,3 +161,118 @@ a.primary:focus-visible {
   outline: 3px solid #0b57d0;
   outline-offset: 2px;
 }
+
+.app-header {
+  background: #ffffff;
+  border-bottom: 1px solid #dce5f2;
+  padding: 16px 32px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.user-info {
+  font-size: 0.9em;
+  color: #666;
+}
+
+.sign-out-btn {
+  background: #eef4ff;
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.sign-out-btn:hover {
+  background: #d6e4f7;
+}
+
+.module-list {
+  display: grid;
+  gap: 12px;
+}
+
+.module-section {
+  display: block;
+}
+
+.module-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #dce5f2;
+}
+
+.item-subtitle {
+  font-size: 0.9em;
+  color: #666;
+  display: block;
+}
+
+.item-title {
+  font-weight: bold;
+  display: block;
+}
+
+.shift-item {
+  border: 1px solid #dce5f2;
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 4px;
+}
+
+.schedule-validate-btn {
+  margin-top: 12px;
+}
+
+.validation-result {
+  padding: 12px;
+  background: #f0f8ff;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.validation-success {
+  color: green;
+  font-weight: bold;
+}
+
+.validation-error {
+  color: red;
+  font-weight: bold;
+}
+
+.validation-issues {
+  margin-top: 8px;
+  color: #d32f2f;
+}
+
+.issue-item {
+  font-size: 0.9em;
+}
+
+.osha-warning {
+  color: #d32f2f;
+  font-weight: bold;
+  margin-top: 4px;
+  display: block;
+}
+
+.message-action-btn {
+  margin-top: 8px;
+  padding: 6px 12px;
+  font-size: 0.9em;
+}
+
+.training-action-btn {
+  margin-top: 8px;
+  padding: 6px 12px;
+  font-size: 0.9em;
+}
+
+.rr-error {
+  color: #d32f2f;
+}
+

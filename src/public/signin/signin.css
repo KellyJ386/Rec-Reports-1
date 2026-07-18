@@ -1,0 +1,110 @@
+/* Sign-in page styles. Extends the palette from admin.css with
+   a centered card layout. Reuses color variables and button styles. */
+
+.signin-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 20px;
+}
+
+.signin-container {
+  width: 100%;
+  max-width: 360px;
+}
+
+.signin-card {
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-lg);
+  padding: 32px 28px;
+  box-shadow: var(--rr-shadow);
+}
+
+.signin-header {
+  text-align: center;
+  margin-bottom: 28px;
+}
+
+.signin-title {
+  margin: 0;
+  font-size: 1.8rem;
+  font-weight: 800;
+  color: var(--rr-text);
+}
+
+.signin-subtitle {
+  margin: 4px 0 0;
+  font-size: 0.9rem;
+  color: var(--rr-text-muted);
+}
+
+.signin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.signin-field {
+  display: grid;
+  gap: 6px;
+}
+
+.signin-label {
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: var(--rr-text);
+}
+
+.signin-field input {
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  padding: 10px 12px;
+  background: var(--rr-surface);
+  color: var(--rr-text);
+  font-size: 1rem;
+}
+
+.signin-field input:focus {
+  outline: none;
+  border-color: var(--rr-accent);
+  box-shadow: 0 0 0 3px rgba(28, 109, 208, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  .signin-field input:focus {
+    box-shadow: 0 0 0 3px rgba(91, 155, 240, 0.15);
+  }
+}
+
+.signin-button {
+  padding: 11px 16px;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.signin-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.signin-error {
+  background: var(--rr-danger-bg);
+  border: 1px solid var(--rr-danger-border);
+  border-radius: var(--rr-radius-sm);
+  color: var(--rr-danger);
+  padding: 12px 14px;
+  font-size: 0.9rem;
+  margin-top: -8px;
+  margin-bottom: 16px;
+}
+
+.signin-footer {
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--rr-text-muted);
+  margin: 0;
+}
