@@ -11,6 +11,43 @@ can do the job**.
 
 ---
 
+## 0. Progress log — updated 2026-07-18
+
+Decisions locked by the owner: new Supabase project `rec-reports` (us-east-1); host on
+**Vercel** (serverless); **email + password** auth; **legacy HS256** JWT secret.
+
+**Done (built, tested, pushed):**
+- ✅ **Workstream E (all six modules)** — end-user `/api/v1` routes + tests for daily
+  reports, incidents, work orders, scheduling, communications, training. Built by 1 Opus
+  reference module + 5 parallel **Haiku** agents. 61 route tests; live dispatch smoke-tested.
+- ✅ **Workstream C (live database)** — the `rec-reports` project (`ynrwmlrbpaddmknzckyt`)
+  was already fully stood up: all 23 migrations + seed applied, every table the new routes
+  need exists. Credentials (URL + anon key) retrieved; security advisor run (findings below).
+- ✅ **Workstream B (Vercel adaptation)** — `handleRequest()` extracted and shared by the
+  Node server and a new `api/[[...path]].mjs` serverless function; `vercel.json` added
+  (build `dist/`, serve static, route `/api/*` to the function).
+- ✅ **Workstream D (auth), backend + UI** — server-side auth proxy `/api/v1/auth/sign-in`
+  + `/auth/refresh` (forwards to GoTrue; keeps the browser same-origin under the strict
+  CSP; reuses the `rr_admin_token` bearer), `GET /api/v1/public-config`, and a CSP-safe
+  `/signin` page. 490 tests pass overall.
+
+**Remaining to actually go live (need the owner or a follow-up):**
+- ⏳ **JWT secret** — set `SUPABASE_JWT_SECRET` (project's legacy HS256 secret, from
+  Supabase → Settings → API → JWT Secret) as a Vercel env var; confirm the project signs
+  tokens with it. Not retrievable via MCP.
+- ⏳ **Vercel env vars** — `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+  (known), `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (secret, from dashboard).
+- ⏳ **First admin user (D5)** — create an `auth.users` row (email+password) mapped to the
+  seeded org/facility memberships. Can do via Supabase once an email/password is chosen.
+- ⏳ **Deploy** — connect the repo to a Vercel project and ship (outward action).
+- ⏳ **Advisor follow-ups** — 3 `search_path` trigger-function warnings (safe to fix in a
+  migration); SECURITY DEFINER RPC helpers callable by anon/authenticated (needs a decision
+  — fixing risks the tested RLS); enable leaked-password protection for email+password.
+- ⏳ **E[d] UI wiring** and **Workstream F** (notification worker, storage, observability)
+  remain per the plan below; F items carry their own provider decisions.
+
+---
+
 ## 1. Model & agent strategy
 
 We use three tiers. The rule: push work down to the cheapest tier that can do it
