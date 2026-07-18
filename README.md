@@ -50,6 +50,31 @@ npm run db:verify:seed
 npm run db:test:rls   # runs supabase/tests/*.sql when DATABASE_URL is set
 ```
 
+## Deployment smoke test
+
+After deploying, verify the critical path (config → sign-in → authenticated call)
+against the live URL:
+
+```bash
+npm run smoke -- https://your-app.example.com you@example.com 'your-password'
+# or: SMOKE_URL=... SMOKE_EMAIL=... SMOKE_PASSWORD=... npm run smoke
+```
+
+It prints a pass/fail line per step and exits non-zero on failure. A 401 on the
+authenticated `/me` step almost always means `SUPABASE_JWT_SECRET` is unset or does
+not match the algorithm the Supabase project signs tokens with — the script says so.
+
+## Background workers
+
+Drain the notification queue (safe `log` transport by default; set
+`NOTIFICATION_TRANSPORT=webhook` + `NOTIFICATION_WEBHOOK_URL` to deliver to a real
+channel once an email/webhook provider is chosen):
+
+```bash
+npm run worker:notifications          # one-shot: drain a batch and exit
+npm run worker:notifications -- --loop  # keep draining on an interval
+```
+
 ## Database
 
 Apply migrations in `supabase/migrations` (0001–0024, in order) to an empty Supabase project, then load `supabase/seed.sql` for the demo organization, two facilities, module catalog, system roles, notification events, and subscription plans. Migrations 0009+ are idempotent and safe to re-run.
