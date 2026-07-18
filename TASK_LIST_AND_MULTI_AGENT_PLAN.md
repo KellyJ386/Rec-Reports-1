@@ -38,18 +38,25 @@ temp password set; ✅ **E[d] end-user UIs wired** — `src/public/index.html` +
 render all six modules from their live `/api/v1` endpoints (CSP-safe; actions wired only
 where an endpoint exists). 493 tests pass.
 
-**Remaining to actually go live (need the owner):**
+Also done since: ✅ **Workstream F** — notification delivery worker (F1, provider-agnostic:
+`npm run worker:notifications`, retries + dead-lettering), file storage (F2, Supabase Storage
+signed-URL pattern + `/api/v1` attachment routes for reports/incidents/work-orders), and
+observability (F3, per-request logging + error reporting to `OBSERVABILITY_DSN`, wired into
+`handleRequest`). Built by 3 parallel Sonnet agents, integrated + verified (561 tests pass).
+✅ **Advisor fix** — migration `0024` pins `search_path` on the 3 flagged trigger functions;
+applied live, warnings cleared.
+
+**Remaining — all owner-side or decision-gated:**
 - ⏳ **JWT secret** — set `SUPABASE_JWT_SECRET` (project's legacy HS256 secret, from
   Supabase → Settings → API → JWT Secret) as a Vercel env var; confirm the project signs
-  tokens with it. Not retrievable via MCP. **This is the one true blocker for login.**
+  tokens with it. Not retrievable via MCP. **The one true blocker for login.**
 - ⏳ **Vercel env vars** — `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
   (known), `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (secret, from dashboard).
 - ⏳ **Deploy** — owner connects the repo to a Vercel project and ships (outward action).
-- ⏳ **Advisor follow-ups** (deferred by owner) — 3 `search_path` trigger-function warnings
-  (safe migration fix); SECURITY DEFINER RPC helpers callable by anon/authenticated (needs
-  a decision — fixing risks the tested RLS); enable leaked-password protection.
-- ⏳ **Workstream F** (notification worker, storage, observability) — carries its own
-  provider decisions; not started.
+- ⏳ **Email provider** — pick one (SendGrid/Postmark/SMTP) to wire the notification
+  worker's `webhookTransport` to a real channel; `log` transport is the safe default today.
+- ⏳ **Advisor decision** — SECURITY DEFINER RPC helpers callable by anon/authenticated
+  (fixing risks the tested RLS); leaked-password protection toggle (dashboard).
 
 ---
 
