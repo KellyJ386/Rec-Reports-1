@@ -14,11 +14,13 @@ import { registerFormsRoutes } from "../src/lib/http/forms-routes.mjs";
 import { registerNotificationRoutes } from "../src/lib/http/notification-routes.mjs";
 import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
+import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
 const apiPrefix = "/api/admin/v1";
+const userApiPrefix = "/api/v1";
 const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript" };
 
 const securityHeaders = Object.freeze({
@@ -204,6 +206,16 @@ registerCertPolicyRoutes(router, { authenticate, sendJson, readBody });
 // writes). Logic lives in src/lib/admin/entitlements.mjs.
 registerBillingRoutes(router, { authenticate, sendJson, readBody });
 
+// --- End-user product routes (/api/v1) -------------------------------------
+// The operational modules that facility staff use directly (as opposed to the
+// admin control center). Same injected auth/guard pipeline as the admin router;
+// each module registers on this separate router and is dispatched under the
+// /api/v1 prefix. Logic lives in the already-tested domain libs under src/lib/.
+export const userRouter = createRouter();
+
+// Daily Reports: template list/fetch, draft create/edit, and immutable submit.
+registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
+
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
   if (requestedPath.includes("..")) {
@@ -250,7 +262,16 @@ export function createApp() {
     Promise.resolve()
       .then(async () => {
         const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-        if (!url.pathname.startsWith(`${apiPrefix}/`) && url.pathname !== apiPrefix) {
+        const matchesPrefix = (prefix) =>
+          url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
+        // Admin prefix is checked first; the two prefixes are disjoint
+        // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
+        const active = matchesPrefix(apiPrefix)
+          ? { prefix: apiPrefix, router }
+          : matchesPrefix(userApiPrefix)
+            ? { prefix: userApiPrefix, router: userRouter }
+            : null;
+        if (!active) {
           serveStatic(request, response);
           return;
         }
@@ -261,8 +282,8 @@ export function createApp() {
           return;
         }
 
-        const routeUrl = url.pathname.slice(apiPrefix.length) || "/";
-        const { handler, params } = router.match({
+        const routeUrl = url.pathname.slice(active.prefix.length) || "/";
+        const { handler, params } = active.router.match({
           method: request.method,
           url: `${routeUrl}${url.search}`
         });
