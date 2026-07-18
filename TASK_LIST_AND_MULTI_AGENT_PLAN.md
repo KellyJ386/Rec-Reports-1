@@ -31,20 +31,25 @@ Decisions locked by the owner: new Supabase project `rec-reports` (us-east-1); h
   CSP; reuses the `rr_admin_token` bearer), `GET /api/v1/public-config`, and a CSP-safe
   `/signin` page. 490 tests pass overall.
 
-**Remaining to actually go live (need the owner or a follow-up):**
+Also done since: ✅ **`GET /api/v1/me`** (facility context for the end-user app); ✅ **first
+admin user (D5)** — `kgjohn02@gmail.com` was already provisioned as a platform super-admin,
+temp password set; ✅ **E[d] end-user UIs wired** — `src/public/index.html` +
+`src/public/js/app.js` gate on the login token, drive a facility switcher from `/me`, and
+render all six modules from their live `/api/v1` endpoints (CSP-safe; actions wired only
+where an endpoint exists). 493 tests pass.
+
+**Remaining to actually go live (need the owner):**
 - ⏳ **JWT secret** — set `SUPABASE_JWT_SECRET` (project's legacy HS256 secret, from
   Supabase → Settings → API → JWT Secret) as a Vercel env var; confirm the project signs
-  tokens with it. Not retrievable via MCP.
+  tokens with it. Not retrievable via MCP. **This is the one true blocker for login.**
 - ⏳ **Vercel env vars** — `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
   (known), `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (secret, from dashboard).
-- ⏳ **First admin user (D5)** — create an `auth.users` row (email+password) mapped to the
-  seeded org/facility memberships. Can do via Supabase once an email/password is chosen.
-- ⏳ **Deploy** — connect the repo to a Vercel project and ship (outward action).
-- ⏳ **Advisor follow-ups** — 3 `search_path` trigger-function warnings (safe to fix in a
-  migration); SECURITY DEFINER RPC helpers callable by anon/authenticated (needs a decision
-  — fixing risks the tested RLS); enable leaked-password protection for email+password.
-- ⏳ **E[d] UI wiring** and **Workstream F** (notification worker, storage, observability)
-  remain per the plan below; F items carry their own provider decisions.
+- ⏳ **Deploy** — owner connects the repo to a Vercel project and ships (outward action).
+- ⏳ **Advisor follow-ups** (deferred by owner) — 3 `search_path` trigger-function warnings
+  (safe migration fix); SECURITY DEFINER RPC helpers callable by anon/authenticated (needs
+  a decision — fixing risks the tested RLS); enable leaked-password protection.
+- ⏳ **Workstream F** (notification worker, storage, observability) — carries its own
+  provider decisions; not started.
 
 ---
 
