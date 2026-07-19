@@ -8,8 +8,11 @@
 //   node scripts/notification-worker.mjs --loop      # keep draining forever
 //
 // Env:
-//   NOTIFICATION_TRANSPORT     - "log" (default, safe/no network) or "webhook"
+//   NOTIFICATION_TRANSPORT     - "log" (default, safe/no network), "webhook",
+//                                or "sendgrid" (email)
 //   NOTIFICATION_WEBHOOK_URL   - required when NOTIFICATION_TRANSPORT=webhook
+//   SENDGRID_API_KEY           - required when NOTIFICATION_TRANSPORT=sendgrid
+//   NOTIFICATION_FROM_EMAIL    - sender address when NOTIFICATION_TRANSPORT=sendgrid
 //   NOTIFICATION_BATCH_SIZE    - jobs claimed per batch (default 25)
 //   NOTIFICATION_MAX_ATTEMPTS  - attempts before dead-lettering (default 5)
 //   NOTIFICATION_LOOP_INTERVAL_MS - sleep between batches in --loop mode (default 5000)
@@ -39,7 +42,9 @@ function loadConfig(env, argv) {
       DEFAULT_MAX_ATTEMPTS,
     loopIntervalMs: Number(process.env.NOTIFICATION_LOOP_INTERVAL_MS ?? 5000) || 5000,
     transportName: process.env.NOTIFICATION_TRANSPORT ?? "log",
-    webhookUrl: process.env.NOTIFICATION_WEBHOOK_URL
+    webhookUrl: process.env.NOTIFICATION_WEBHOOK_URL,
+    sendgridApiKey: process.env.SENDGRID_API_KEY,
+    fromEmail: process.env.NOTIFICATION_FROM_EMAIL
   };
 }
 
@@ -214,7 +219,11 @@ async function main() {
   const env = readServerEnv();
   const config = loadConfig(env, process.argv.slice(2));
   const client = buildClient(env);
-  const transport = selectTransport(config.transportName, { webhookUrl: config.webhookUrl });
+  const transport = selectTransport(config.transportName, {
+    webhookUrl: config.webhookUrl,
+    sendgridApiKey: config.sendgridApiKey,
+    fromEmail: config.fromEmail
+  });
 
   if (!config.loop) {
     await drainOnce(client, transport, config);

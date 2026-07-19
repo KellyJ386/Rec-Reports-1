@@ -48,9 +48,62 @@ export function webhookTransport(url) {
   };
 }
 
+// Concrete email transport (SendGrid v3 Mail Send). Zero-dependency: a single
+// authenticated fetch, no SDK. Only email deliveries are sent here; deliveries
+// on other channels (in_app/sms/push) are logged and reported ok so a mixed
+// queue still drains. Subject/body are a basic template derived from the event
+// type — swap `renderEmail` for richer content, or copy this function to target
+// a different provider (Postmark/Resend/SES all take the same delivery shape).
+export function sendgridTransport({ apiKey, from, render } = {}) {
+  if (!apiKey) throw new Error("sendgridTransport requires an apiKey");
+  if (!from) throw new Error("sendgridTransport requires a from address");
+  const renderEmail =
+    render ??
+    ((delivery) => ({
+      subject: `Rec Reports: ${delivery?.eventType ?? "notification"}`,
+      text:
+        `You have a new ${delivery?.eventType ?? "notification"} in Rec Reports` +
+        `${delivery?.facilityId ? ` (facility ${delivery.facilityId})` : ""}.`
+    }));
+  return {
+    async send(delivery) {
+      if (delivery?.channel !== "email") {
+        return logTransport.send(delivery);
+      }
+      const to = delivery?.target;
+      if (!to) return { ok: false, error: "email delivery has no target address" };
+      const { subject, text } = renderEmail(delivery);
+      try {
+        const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            personalizations: [{ to: [{ email: to }] }],
+            from: { email: from },
+            subject,
+            content: [{ type: "text/plain", value: text }]
+          })
+        });
+        if (!response.ok) {
+          return { ok: false, error: `sendgrid responded with status ${response.status}` };
+        }
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : "sendgrid request failed" };
+      }
+    }
+  };
+}
+
 // Picks a transport by name (env-driven). Defaults to the safe log
 // transport for any unrecognized/unset name.
-export function selectTransport(name, { webhookUrl } = {}) {
+export function selectTransport(name, { webhookUrl, sendgridApiKey, fromEmail } = {}) {
   if (name === "webhook") return webhookTransport(webhookUrl);
+  if (name === "sendgrid" || name === "email") {
+    return sendgridTransport({ apiKey: sendgridApiKey, from: fromEmail });
+  }
   return logTransport;
 }
