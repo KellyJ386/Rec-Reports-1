@@ -4,6 +4,25 @@ Date: 2026-07-17
 Scope: full repository audit at commit `fd34ffd` (tip of `main`), plus live-infrastructure
 review of the connected Supabase and Vercel accounts.
 
+> **Execution update (2026-07-17, later the same day):** Phases 0–3 were executed on
+> branch `claude/app-status-fix-plan-dvc1ts`:
+> - **Phase 0** — PR #3 closed as superseded; env vars renamed to `SUPABASE_URL` /
+>   `SUPABASE_ANON_KEY` / `APP_URL` with legacy fallbacks.
+> - **Phase 1** — new Supabase project **rec-reports** (`ynrwmlrbpaddmknzckyt`,
+>   us-east-1, $10/mo) created; all migrations applied plus new `0024`
+>   (pgcrypto search_path fix discovered during provisioning); seed loaded;
+>   70 tables, RLS on all; advisors report no ERROR-level findings. First admin
+>   user provisioned (Tenant Owner at North Arena + platform admin).
+> - **Phase 2** — real authentication shipped: ES256/JWKS token verification with
+>   HS256 fallback, `/login/` page (Supabase Auth password grant), automatic token
+>   refresh on 401, sign-out, public `/config` endpoint, CSP extended with
+>   `connect-src` for the Supabase origin.
+> - **Phase 3** — Vercel deployment support: `api/index.mjs` serverless entry
+>   reusing the server pipeline, `vercel.json` (build, rewrites, security headers),
+>   deploy docs in README. Test suite grew from 423 to 443, all passing.
+> Remaining: Phase 4 (end-user module UIs/APIs) and Phase 5 (delivery worker,
+> storage, observability).
+
 ---
 
 ## 1. Executive summary
