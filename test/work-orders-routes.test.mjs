@@ -574,3 +574,135 @@ test("GET work-orders?order=bogus 400s before any fetch", async (t) => {
   assert.equal(result.status, 400);
   assert.equal(captured.length, 0);
 });
+
+// --- WO-03: create work order from incident (dual guard + SLA due_at) ------
+
+const INCIDENT_AND_WO_MANAGER = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "work_orders.manage"] }
+];
+const INCIDENT_READ_ONLY = [{ facilityId: "fac-1", status: "active", permissions: ["incidents.read"] }];
+const WO_MANAGE_ONLY = [{ facilityId: "fac-1", status: "active", permissions: ["work_orders.manage"] }];
+
+function stubIncident(table, method, overrides = {}) {
+  if (table === "incident_reports" && method === "GET") {
+    return [
+      {
+        id: "inc-1",
+        facility_id: "fac-1",
+        incident_no: "INC-1",
+        severity: "low",
+        summary: "x",
+        ...overrides
+      }
+    ];
+  }
+  return undefined;
+}
+
+test("POST incidents/:id/work-orders happy path creates a shaped row with source fields, mapped priority and derived due_at", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const incident = stubIncident(table, method, { severity: "high", summary: "Deck mat missing" });
+    if (incident) return incident;
+    if (table === "modules" && method === "GET") return [{ id: "mod-wo", code: "work_orders" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings" && method === "GET") return [];
+    if (table === "facility_module_overrides" && method === "GET") {
+      return [{ config_patch_jsonb: { "workOrders.slaHoursUrgent": 6 } }];
+    }
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER, userId: "user-9" });
+  const before = Date.now();
+  const result = await call("POST", "/incidents/inc-1/work-orders", {});
+  const after = Date.now();
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].source_type, "incident");
+  assert.equal(insert.body[0].source_id, "inc-1");
+  assert.equal(insert.body[0].priority, "high"); // severity high -> priority high
+  assert.equal(insert.body[0].title, "Follow up: INC-1");
+  assert.equal(insert.body[0].description, "Deck mat missing");
+  assert.equal(insert.body[0].status, "open");
+  assert.equal(insert.body[0].created_by, "user-9");
+  assert.ok(insert.body[0].due_at, "due_at should be derived when absent");
+  const dueAtMs = new Date(insert.body[0].due_at).getTime();
+  assert.ok(dueAtMs >= before + 6 * 60 * 60 * 1000, "due_at should be at least now+6h (configured SLA)");
+  assert.ok(dueAtMs <= after + 6 * 60 * 60 * 1000, "due_at should not exceed now+6h by more than call latency");
+});
+
+test("POST incidents/:id/work-orders denies a caller with only incidents.read (403)", async (t) => {
+  stubFetch(t, (table, method) => stubIncident(table, method) ?? []);
+  const { call } = mount({ memberships: INCIDENT_READ_ONLY });
+  const result = await call("POST", "/incidents/inc-1/work-orders", {});
+  assert.equal(result.status, 403);
+});
+
+test("POST incidents/:id/work-orders denies a caller with only work_orders.manage (403)", async (t) => {
+  stubFetch(t, (table, method) => stubIncident(table, method) ?? []);
+  const { call } = mount({ memberships: WO_MANAGE_ONLY });
+  const result = await call("POST", "/incidents/inc-1/work-orders", {});
+  assert.equal(result.status, 403);
+});
+
+test("POST incidents/:id/work-orders 404s on an unknown incident", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/nope/work-orders", {});
+  assert.equal(result.status, 404);
+});
+
+test("POST incidents/:id/work-orders inherits facility_id from the incident, never the body", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const incident = stubIncident(table, method);
+    if (incident) return incident;
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { facility_id: "fac-evil" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+});
+
+test("POST incidents/:id/work-orders rejects an invalid dueAt override with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { dueAt: "not-a-date" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST incidents/:id/work-orders rejects a blank title override with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { title: "   " });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST incidents/:id/work-orders honors title/description/assignee/dueAt overrides when valid", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const incident = stubIncident(table, method);
+    if (incident) return incident;
+    if (table === "modules" && method === "GET") return [{ id: "mod-wo", code: "work_orders" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", {
+    title: "Custom title",
+    description: "Custom description",
+    assignee: "emp-3",
+    dueAt: "2026-09-01T00:00:00Z"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].title, "Custom title");
+  assert.equal(insert.body[0].description, "Custom description");
+  assert.equal(insert.body[0].assigned_to_employee_id, "emp-3");
+  assert.equal(insert.body[0].due_at, "2026-09-01T00:00:00Z");
+});

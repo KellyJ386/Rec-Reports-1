@@ -1,12 +1,27 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
-import { WORK_ORDER_STATUSES, WORK_ORDER_PRIORITIES, OPEN_STATUSES, canTransition, applyStatusChange } from "../work-orders.mjs";
+import { loadModuleConfig } from "./module-config.mjs";
+import {
+  WORK_ORDER_STATUSES,
+  WORK_ORDER_PRIORITIES,
+  OPEN_STATUSES,
+  canTransition,
+  applyStatusChange,
+  createWorkOrderFromIncident,
+  workOrderDueAt
+} from "../work-orders.mjs";
 
 const READ = "work_orders.read";
 const MANAGE = "work_orders.manage";
+const INCIDENT_READ = "incidents.read";
 
 const WORK_ORDER_COLUMNS =
   "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status,assigned_to_employee_id,due_at,completed_at,created_by,created_at,updated_at";
+
+// Minimal incident projection needed to derive a work order (WO-03). Kept
+// separate from incidents-routes.mjs's INCIDENT_COLUMNS on purpose -- this
+// module never imports from incidents-routes.mjs.
+const INCIDENT_FOR_WORK_ORDER_COLUMNS = "id,facility_id,incident_no,severity,summary";
 
 const WORK_ORDER_UPDATE_COLUMNS =
   "id,facility_id,work_order_id,update_type,body,previous_value,new_value,created_by,created_at";
@@ -78,6 +93,15 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     const rows = await pgSelect(client, "work_orders", {
       filters: { id: workOrderId },
       select: WORK_ORDER_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadIncidentForWorkOrder(client, incidentId) {
+    const rows = await pgSelect(client, "incident_reports", {
+      filters: { id: incidentId },
+      select: INCIDENT_FOR_WORK_ORDER_COLUMNS,
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
@@ -178,6 +202,99 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           offset: query.offset
         });
         return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Creates a work order from an incident (WO-03). Dual-guards on the
+  // INCIDENT's facility -- both incidents.read AND work_orders.manage are
+  // required, so a caller holding only one of the two is denied. The
+  // incident is always loaded first and facility_id is always taken from
+  // the loaded row, never from the request body (a body-supplied
+  // facility_id is silently ignored). Optional body overrides (title,
+  // description, assignee, dueAt) are shape-validated before any fetch is
+  // issued. When dueAt is not overridden it is derived from the resolved
+  // module config's SLA hours via workOrderDueAt -- this partially delivers
+  // WO-04's route wiring ahead of that task landing the shared per-request
+  // config-loader memoization.
+  router.register(
+    "POST",
+    "/incidents/:id/work-orders",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const { title, description, assignee, dueAt } = body.payload;
+        const shape = [];
+        if (title !== undefined && (typeof title !== "string" || !title.trim())) {
+          shape.push("title must be a non-empty string");
+        }
+        if (description !== undefined && (typeof description !== "string" || !description.trim())) {
+          shape.push("description must be a non-empty string");
+        }
+        if (assignee !== undefined && (typeof assignee !== "string" || !assignee.trim())) {
+          shape.push("assignee must be a non-empty string");
+        }
+        if (dueAt !== undefined && (typeof dueAt !== "string" || Number.isNaN(new Date(dueAt).getTime()))) {
+          shape.push("dueAt must be a valid ISO date string");
+        }
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const incident = await loadIncidentForWorkOrder(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+
+        // Dual guard: evaluate BOTH permissions before responding, so a
+        // caller holding only one of the two always gets a single 403
+        // rather than a partial success.
+        const readGuard = requireAuthPermission(auth, incident.facility_id, INCIDENT_READ);
+        const manageGuard = requireAuthPermission(auth, incident.facility_id, MANAGE);
+        if (!readGuard.allowed || !manageGuard.allowed) {
+          return sendJson(response, 403, {
+            error: !readGuard.allowed ? readGuard.reason : manageGuard.reason
+          });
+        }
+
+        const config = await loadModuleConfig({
+          client: auth.client,
+          facilityId: incident.facility_id,
+          moduleCode: "work_orders"
+        });
+
+        const defaults = {};
+        if (title !== undefined) defaults.title = title;
+        if (description !== undefined) defaults.description = description;
+
+        const created = createWorkOrderFromIncident(
+          {
+            id: incident.id,
+            facilityId: incident.facility_id,
+            incidentNo: incident.incident_no,
+            severity: incident.severity,
+            summary: incident.summary
+          },
+          defaults,
+          config
+        );
+
+        const now = new Date();
+        const resolvedDueAt = dueAt ?? workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+
+        const row = {
+          facility_id: created.facilityId,
+          department_id: null,
+          asset_id: null,
+          source_type: created.sourceType,
+          source_id: created.sourceId,
+          title: created.title,
+          description: created.description,
+          priority: created.priority,
+          status: created.status,
+          assigned_to_employee_id: assignee ?? null,
+          due_at: resolvedDueAt,
+          created_by: auth.claims.sub
+        };
+        const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
+        return sendJson(response, 201, (rows ?? [])[0] ?? null);
       })
   );
 
