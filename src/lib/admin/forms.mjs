@@ -7,12 +7,21 @@
 // report-schema.mjs (the same validator the runtime submission path uses), so a
 // form the builder accepts is a form the runtime can render and validate --
 // they agree by construction rather than by convention.
+//
+// buildFormPromotion (DR-06, plans/DAILY_REPORTS_PLAN.md) bridges this
+// authoring surface to the parallel report_templates/report_template_versions
+// governance store (src/lib/report-templates.mjs): form_definitions stays the
+// only place a form is drafted and edited, and "promote" materializes a
+// published daily_reports form into that store rather than forking a second
+// authoring UI. It reuses nextTemplateVersionNumber from report-templates.mjs
+// rather than re-deriving version-numbering semantics.
 
 import {
   validateReportTemplateSchema,
   isSupportedFieldType,
   supportedFieldTypes
 } from "../report-schema.mjs";
+import { nextTemplateVersionNumber } from "../report-templates.mjs";
 
 const SNAKE_CASE_RE = /^[a-z][a-z0-9_]*$/;
 
@@ -118,5 +127,90 @@ export function buildFormPublish(target, publishedSiblings = []) {
   return {
     target: { id: target.id, patch: { status: "published" } },
     retirements
+  };
+}
+
+// Builds the write plan for promoting a published daily_reports form into the
+// report_templates/report_template_versions governance store. Pure mapping --
+// the route layer owns the actual reads/writes and permission guards.
+//
+// Only a published form_definitions row can be promoted (a draft has no
+// frozen schema yet), and only one whose module_code is 'daily_reports' --
+// this bridge exists solely for that module, not as a general form->template
+// converter. Both failures return { error } (the route maps this to 409,
+// matching buildFormPublish/buildTemplatePublish's convention for
+// state-transition failures).
+//
+// form_code becomes both the template's code and its name -- form_definitions
+// (0015) carries no separate display-name column to promote instead, and
+// form_code is already snake_case-validated, which also satisfies
+// validateTemplateInput's code shape.
+//
+// existingTemplate is the report_templates row already at (facility_id, code)
+// = (form.facility_id, form.form_code), or null when none exists yet.
+// existingVersions is that template's version rows (or bare numbers), used
+// with nextTemplateVersionNumber the same way report-templates-routes.mjs's
+// POST /report-templates/:id/versions numbers a new version -- so
+// re-promoting after a form is re-published always mints version n+1 rather
+// than colliding with the last-promoted version.
+//
+// schema_jsonb is copied byte-identical into versionRow.schema_json (the same
+// object/value, no re-shaping) so the promoted version validates and renders
+// exactly like the form did.
+//
+// versionRow deliberately omits template_id: for a brand-new template its id
+// only exists after the route's insert returns, and for an existing template
+// the route already holds it (templatePatch.id) -- either way template_id is
+// the route's to attach, not this pure function's to guess.
+//
+// Returns:
+//   - existingTemplate is null:      { templateRow, versionRow }
+//     templateRow is insert data for a new report_templates row, created as a
+//     draft; the route publishes it once the version row it creates is
+//     itself is_published, then applies the same activation shape below.
+//   - existingTemplate is provided:  { templatePatch, versionRow }
+//     templatePatch is already the full activation patch (active_version +
+//     status), since the target template's id and the new version's number
+//     are both known up front -- the route only needs to apply it (after
+//     inserting versionRow) rather than compute it itself.
+export function buildFormPromotion(form, existingTemplate, existingVersions = []) {
+  if (!isPlainObject(form)) {
+    return { error: "form definition is required" };
+  }
+  if (form.status !== "published") {
+    return { error: `only a published form can be promoted (form is ${form.status ?? "unknown"})` };
+  }
+  if (form.module_code !== "daily_reports") {
+    return { error: `only daily_reports forms can be promoted (form module is ${form.module_code ?? "unknown"})` };
+  }
+
+  const versionNumber = nextTemplateVersionNumber(existingVersions ?? []);
+  const versionRow = {
+    facility_id: form.facility_id,
+    version_number: versionNumber,
+    schema_json: form.schema_jsonb,
+    is_published: true
+  };
+
+  if (isPlainObject(existingTemplate)) {
+    return {
+      templatePatch: {
+        id: existingTemplate.id,
+        patch: { active_version: versionNumber, status: "published" }
+      },
+      versionRow
+    };
+  }
+
+  return {
+    templateRow: {
+      facility_id: form.facility_id,
+      department_id: null,
+      code: form.form_code,
+      name: form.form_code,
+      description: null,
+      status: "draft"
+    },
+    versionRow
   };
 }

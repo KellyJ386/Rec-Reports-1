@@ -5,7 +5,8 @@ import {
   validateFormDefinition,
   buildFormDraftUpdate,
   nextVersionNo,
-  buildFormPublish
+  buildFormPublish,
+  buildFormPromotion
 } from "../src/lib/admin/forms.mjs";
 
 const VALID_SCHEMA = {
@@ -106,5 +107,82 @@ test("buildFormDraftUpdate rejects an invalid schema with prefixed errors", () =
 
 test("buildFormDraftUpdate requires a target object", () => {
   const plan = buildFormDraftUpdate(null, VALID_SCHEMA);
+  assert.ok(plan.error);
+});
+
+// --- buildFormPromotion (DR-06) ---------------------------------------------
+
+const PUBLISHED_FORM = {
+  id: "form-1",
+  facility_id: "fac-1",
+  module_code: "daily_reports",
+  form_code: "opening_checklist",
+  status: "published",
+  schema_jsonb: VALID_SCHEMA
+};
+
+test("buildFormPromotion creates a new template + first version when none exists yet", () => {
+  const plan = buildFormPromotion(PUBLISHED_FORM, null, []);
+  assert.ok(!plan.error);
+  assert.deepEqual(plan.templateRow, {
+    facility_id: "fac-1",
+    department_id: null,
+    code: "opening_checklist",
+    name: "opening_checklist",
+    description: null,
+    status: "draft"
+  });
+  assert.equal(plan.versionRow.version_number, 1);
+  assert.equal(plan.versionRow.is_published, true);
+  assert.equal(plan.versionRow.facility_id, "fac-1");
+  // schema_jsonb must be copied byte-identical (same value, not a re-shaped copy).
+  assert.strictEqual(plan.versionRow.schema_json, PUBLISHED_FORM.schema_jsonb);
+  assert.deepEqual(plan.versionRow.schema_json, VALID_SCHEMA);
+});
+
+test("buildFormPromotion mints version n+1 and moves active_version when a template already exists", () => {
+  const existingTemplate = { id: "tpl-1", facility_id: "fac-1", code: "opening_checklist" };
+  const existingVersions = [{ version_number: 1 }, { version_number: 2 }];
+  const plan = buildFormPromotion(PUBLISHED_FORM, existingTemplate, existingVersions);
+  assert.ok(!plan.error);
+  assert.ok(!plan.templateRow);
+  assert.deepEqual(plan.templatePatch, {
+    id: "tpl-1",
+    patch: { active_version: 3, status: "published" }
+  });
+  assert.equal(plan.versionRow.version_number, 3);
+  assert.equal(plan.versionRow.is_published, true);
+  assert.strictEqual(plan.versionRow.schema_json, PUBLISHED_FORM.schema_jsonb);
+});
+
+test("buildFormPromotion re-promoting after a re-publish mints the next version again", () => {
+  const existingTemplate = { id: "tpl-1", facility_id: "fac-1", code: "opening_checklist" };
+  const firstPromotion = buildFormPromotion(PUBLISHED_FORM, existingTemplate, []);
+  assert.equal(firstPromotion.versionRow.version_number, 1);
+
+  const secondPromotion = buildFormPromotion(PUBLISHED_FORM, existingTemplate, [{ version_number: 1 }]);
+  assert.equal(secondPromotion.versionRow.version_number, 2);
+  assert.deepEqual(secondPromotion.templatePatch.patch, { active_version: 2, status: "published" });
+  // Byte-identity holds across re-promotion too.
+  assert.deepEqual(secondPromotion.versionRow.schema_json, PUBLISHED_FORM.schema_jsonb);
+});
+
+test("buildFormPromotion refuses to promote a draft form", () => {
+  const plan = buildFormPromotion({ ...PUBLISHED_FORM, status: "draft" }, null, []);
+  assert.ok(plan.error);
+  assert.ok(/published/.test(plan.error));
+  assert.ok(!plan.templateRow);
+  assert.ok(!plan.versionRow);
+});
+
+test("buildFormPromotion refuses to promote a form outside module_code daily_reports", () => {
+  const plan = buildFormPromotion({ ...PUBLISHED_FORM, module_code: "incidents" }, null, []);
+  assert.ok(plan.error);
+  assert.ok(/daily_reports/.test(plan.error));
+  assert.ok(!plan.templateRow);
+});
+
+test("buildFormPromotion requires a form object", () => {
+  const plan = buildFormPromotion(null, null, []);
   assert.ok(plan.error);
 });

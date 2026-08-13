@@ -7,6 +7,12 @@ import { createClient } from "../src/lib/supabase-rest.mjs";
 const MANAGER = [{ facilityId: "fac-1", status: "active", permissions: ["reports.template.manage"] }];
 const MEMBER = [{ facilityId: "fac-1", status: "active", permissions: ["reports.read"] }];
 const OUTSIDER = [{ facilityId: "fac-2", status: "active", permissions: ["reports.template.manage"] }];
+const MANAGER_AND_PUBLISHER = [
+  { facilityId: "fac-1", status: "active", permissions: ["reports.template.manage", "reports.publish"] }
+];
+const MANAGER_NO_PUBLISH = [
+  { facilityId: "fac-1", status: "active", permissions: ["reports.template.manage"] }
+];
 
 const VALID_SCHEMA = {
   sections: [{ title: "Fields", fields: [{ key: "k1", label: "K1", type: "text", required: true }] }]
@@ -344,6 +350,165 @@ test("PATCH /custom-fields/:id happy path updates the field", async (t) => {
   assert.equal(result.status, 200);
   const patch = captured.find((c) => c.table === "custom_fields" && c.method === "PATCH");
   assert.equal(patch.body.active, false);
+});
+
+// --- POST /forms/:id/promote (DR-06) ----------------------------------------
+
+const PUBLISHED_FORM_ROW = {
+  id: "form-1",
+  facility_id: "fac-1",
+  module_code: "daily_reports",
+  form_code: "opening_checklist",
+  status: "published",
+  schema_jsonb: VALID_SCHEMA
+};
+
+test("POST /forms/:id/promote creates a new template + version 1, then activates it, in order", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method, url) => {
+      if (table === "form_definitions" && method === "GET") return [PUBLISHED_FORM_ROW];
+      if (table === "report_templates" && method === "GET") return []; // no existing template
+      if (table === "report_templates" && method === "POST") {
+        return [{ id: "tpl-1", facility_id: "fac-1", code: "opening_checklist", name: "opening_checklist", status: "draft" }];
+      }
+      if (table === "report_template_versions" && method === "POST") {
+        return [{ id: "v-1", template_id: "tpl-1", version_number: 1, is_published: true }];
+      }
+      if (table === "report_templates" && method === "PATCH") {
+        return [{ id: url.searchParams.get("id")?.replace("eq.", ""), active_version: 1, status: "published" }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount({ memberships: MANAGER_AND_PUBLISHER });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.template.id, "tpl-1");
+  assert.equal(result.payload.version.id, "v-1");
+
+  const writes = captured.filter((c) => ["report_templates", "report_template_versions"].includes(c.table) && c.method !== "GET");
+  assert.equal(writes.length, 3);
+  const [templateInsert, versionInsert, templatePatch] = writes;
+
+  assert.equal(templateInsert.table, "report_templates");
+  assert.equal(templateInsert.method, "POST");
+  assert.equal(templateInsert.body[0].code, "opening_checklist");
+  assert.equal(templateInsert.body[0].name, "opening_checklist");
+  assert.equal(templateInsert.body[0].status, "draft");
+  assert.equal(templateInsert.body[0].facility_id, "fac-1");
+
+  assert.equal(versionInsert.table, "report_template_versions");
+  assert.equal(versionInsert.method, "POST");
+  assert.equal(versionInsert.body[0].template_id, "tpl-1");
+  assert.equal(versionInsert.body[0].version_number, 1);
+  assert.equal(versionInsert.body[0].is_published, true);
+  assert.deepEqual(versionInsert.body[0].schema_json, VALID_SCHEMA);
+
+  assert.equal(templatePatch.table, "report_templates");
+  assert.equal(templatePatch.method, "PATCH");
+  assert.equal(templatePatch.url.searchParams.get("id"), "eq.tpl-1");
+  assert.equal(templatePatch.body.active_version, 1);
+  assert.equal(templatePatch.body.status, "published");
+  assert.ok(templatePatch.body.updated_at);
+});
+
+test("POST /forms/:id/promote re-promotion mints version n+1 and moves active_version on the existing template", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method, url) => {
+      if (table === "form_definitions" && method === "GET") return [PUBLISHED_FORM_ROW];
+      if (table === "report_templates" && method === "GET") {
+        return [{ id: "tpl-1", facility_id: "fac-1", code: "opening_checklist", active_version: 1, status: "published" }];
+      }
+      if (table === "report_template_versions" && method === "GET") return [{ version_number: 1 }];
+      if (table === "report_template_versions" && method === "POST") {
+        return [{ id: "v-2", template_id: "tpl-1", version_number: 2, is_published: true }];
+      }
+      if (table === "report_templates" && method === "PATCH") {
+        return [{ id: "tpl-1", active_version: 2, status: "published" }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount({ memberships: MANAGER_AND_PUBLISHER });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 201);
+
+  // No new template row is created when one already exists at this code.
+  assert.ok(!captured.some((c) => c.table === "report_templates" && c.method === "POST"));
+
+  const versionInsert = captured.find((c) => c.table === "report_template_versions" && c.method === "POST");
+  assert.equal(versionInsert.body[0].template_id, "tpl-1");
+  assert.equal(versionInsert.body[0].version_number, 2);
+  assert.equal(versionInsert.body[0].is_published, true);
+
+  const templatePatch = captured.find((c) => c.table === "report_templates" && c.method === "PATCH");
+  assert.equal(templatePatch.url.searchParams.get("id"), "eq.tpl-1");
+  assert.equal(templatePatch.body.active_version, 2);
+  assert.equal(templatePatch.body.status, "published");
+
+  // The version insert must precede the template's active_version patch --
+  // the 0028 trigger requires a matching published version to already exist.
+  assert.ok(captured.indexOf(versionInsert) < captured.indexOf(templatePatch));
+});
+
+test("POST /forms/:id/promote 404s when the form is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER_AND_PUBLISHER });
+  const result = await call("POST", "/forms/missing/promote");
+  assert.equal(result.status, 404);
+});
+
+test("POST /forms/:id/promote rejects a draft form with 409 before any write", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "form_definitions" && method === "GET") {
+        return [{ ...PUBLISHED_FORM_ROW, status: "draft" }];
+      }
+      return [];
+    })
+  );
+  const { call } = mount({ memberships: MANAGER_AND_PUBLISHER });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => ["report_templates", "report_template_versions"].includes(c.table) && c.method !== "GET"));
+});
+
+test("POST /forms/:id/promote denies a member without reports.template.manage", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "form_definitions" && method === "GET") return [PUBLISHED_FORM_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "report_templates" && c.method === "POST"));
+});
+
+test("POST /forms/:id/promote denies a template manager who lacks reports.publish", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "form_definitions" && method === "GET") return [PUBLISHED_FORM_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER_NO_PUBLISH });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "report_templates" && c.method === "POST"));
+});
+
+test("POST /forms/:id/promote rejects with 402 when the plan lacks custom_forms", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "form_definitions" && method === "GET") return [PUBLISHED_FORM_ROW];
+    if (table === "facilities" && method === "GET") return [{ organization_id: "org-1" }];
+    if (table === "tenant_subscriptions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER_AND_PUBLISHER });
+  const result = await call("POST", "/forms/form-1/promote");
+  assert.equal(result.status, 402);
+  assert.ok(!captured.some((c) => c.table === "report_templates" && c.method === "POST"));
 });
 
 test("PATCH /custom-fields/:id rejects with 402 when the plan lacks custom_forms", async (t) => {
