@@ -117,20 +117,42 @@ test("POST /facilities/:facilityId/messages happy path inserts a shaped row", as
   assert.equal(insert.body[0].author_employee_id, "emp-99");
 });
 
-test("POST /messages/:id/acknowledge inserts an acknowledgement row", async (t) => {
+test("POST /messages/:id/acknowledge resolves the caller's own employee row and inserts an acknowledgement row", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "messages" && method === "GET") return [MESSAGE];
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
     if (table === "message_acknowledgements" && method === "POST") return [{ id: "ack-1" }];
     return [];
   });
-  const { call } = mount({ userId: "emp-42" });
+  const { call } = mount({ userId: "user-42" });
   const result = await call("POST", "/messages/msg-1/acknowledge");
   assert.equal(result.status, 201);
+
+  const employeeLookup = captured.find((c) => c.table === "employees" && c.method === "GET");
+  assert.ok(employeeLookup, "expected a lookup of the caller's employee row");
+  assert.equal(employeeLookup.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(employeeLookup.url.searchParams.get("user_id"), "eq.user-42");
+
   const insert = captured.find((c) => c.table === "message_acknowledgements" && c.method === "POST");
   assert.equal(insert.body[0].message_id, "msg-1");
-  assert.equal(insert.body[0].employee_id, "emp-42");
+  // employee_id must be the resolved employees.id, NOT the caller's auth user id --
+  // RLS keys ownership off employees.user_id = auth.uid(), which is a different value.
+  assert.equal(insert.body[0].employee_id, "emp-own-row");
+  assert.notEqual(insert.body[0].employee_id, "user-42");
   assert.equal(insert.body[0].ack_state, "acknowledged");
   assert.ok(insert.body[0].acknowledged_at);
+});
+
+test("POST /messages/:id/acknowledge denies with 403 when the caller has no employee record in the facility", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [MESSAGE];
+    if (table === "employees" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ userId: "user-no-employee" });
+  const result = await call("POST", "/messages/msg-1/acknowledge");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "message_acknowledgements"));
 });
 
 test("GET /messages/:id 404s when missing", async (t) => {

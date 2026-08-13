@@ -64,6 +64,20 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
     return (rows ?? [])[0] ?? null;
   }
 
+  // Resolves the caller's own employees.id in a facility from their auth user
+  // id (auth.claims.sub). message_acknowledgements/message_receipts RLS keys
+  // ownership off employees.id (via employees.user_id = auth.uid()), which is
+  // NOT the same value as the auth user id itself -- inserting auth.claims.sub
+  // directly as employee_id would never satisfy the self-service RLS policy.
+  async function loadCallerEmployeeId(client, facilityId, userId) {
+    const rows = await pgSelect(client, "employees", {
+      filters: { facility_id: facilityId, user_id: userId },
+      select: "id",
+      limit: 1
+    });
+    return (rows ?? [])[0]?.id ?? null;
+  }
+
   // --- Messages --------------------------------------------------------------
   // Lists messages for a facility, newest first. Optional ?status= filter.
   router.register(
@@ -143,10 +157,15 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (!message) return sendJson(response, 404, { error: "message not found" });
         if (!requireRead(auth, message.facility_id, response)) return;
 
+        const employeeId = await loadCallerEmployeeId(auth.client, message.facility_id, auth.claims.sub);
+        if (!employeeId) {
+          return sendJson(response, 403, { error: "no employee record for this facility" });
+        }
+
         const row = {
           facility_id: message.facility_id,
           message_id: params.id,
-          employee_id: auth.claims.sub,
+          employee_id: employeeId,
           ack_state: "acknowledged",
           acknowledged_at: new Date().toISOString()
         };
