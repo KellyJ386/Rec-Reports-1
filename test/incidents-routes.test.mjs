@@ -9,6 +9,16 @@ const CREATOR = [
 ];
 const READER = [{ facilityId: "fac-1", status: "active", permissions: ["incidents.read"] }];
 const OUTSIDER = [{ facilityId: "fac-2", status: "active", permissions: ["incidents.read", "incidents.manage"] }];
+const REVIEWER = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.review"] }
+];
+const LEGAL_HOLD_MANAGER = [
+  {
+    facilityId: "fac-1",
+    status: "active",
+    permissions: ["incidents.read", "incidents.review", "incidents.legal_hold.manage"]
+  }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -30,6 +40,10 @@ const INCIDENT = {
   created_at: "2026-07-18T11:00:00Z",
   updated_at: "2026-07-18T11:00:00Z"
 };
+
+const SUBMITTED_INCIDENT = { ...INCIDENT, status: "submitted", submitted_by: "user-1", submitted_at: INCIDENT.reported_at };
+const ACTION_PENDING_INCIDENT = { ...INCIDENT, status: "action_pending" };
+const ACTION_PENDING_LEGAL_HOLD_INCIDENT = { ...INCIDENT, status: "action_pending", legal_hold: true };
 
 const ESCALATION = {
   id: "esc-1",
@@ -193,4 +207,196 @@ test("POST escalate happy path inserts an escalation row", async (t) => {
   assert.equal(insert.body[0].reason_code, "user_escalation");
   assert.equal(insert.body[0].status, "pending");
   assert.ok(insert.body[0].due_at);
+});
+
+// --- POST /incidents/:id/submit ---------------------------------------------
+
+test("POST submit happy path stamps submitted_by/submitted_at and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") {
+      return [{ ...INCIDENT, status: "submitted", submitted_by: "user-9", submitted_at: "2026-08-13T00:00:00.000Z" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-9" });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "submitted");
+
+  const patch = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
+  assert.ok(patch, "expected a PATCH of incident_reports");
+  assert.equal(patch.body.status, "submitted");
+  assert.equal(patch.body.submitted_by, "user-9");
+  assert.ok(patch.body.submitted_at);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  const event = auditInsert.body[0];
+  assert.equal(event.facility_id, "fac-1");
+  assert.equal(event.incident_id, "inc-1");
+  assert.equal(event.actor_user_id, "user-9");
+  assert.equal(event.event_type, "incident.submitted");
+  assert.deepEqual(event.event_payload, { actor: "user-9", from: "draft", to: "submitted" });
+  assert.equal(typeof event.event_hash, "string");
+  // prev_hash/row_hash are the DB trigger's job (0013), never set by the API.
+  assert.equal(event.prev_hash, undefined);
+  assert.equal(event.row_hash, undefined);
+});
+
+test("POST submit forbidden role: 403 and no writes", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.method === "PATCH" || (c.table === "incident_audit_events" && c.method === "POST")));
+});
+
+test("POST submit invalid transition: already-submitted incident is rejected with 409 and no writes", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.method === "PATCH" || (c.table === "incident_audit_events" && c.method === "POST")));
+});
+
+test("POST submit 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/nope/submit");
+  assert.equal(result.status, 404);
+});
+
+// --- POST /incidents/:id/status ---------------------------------------------
+
+test("POST status validates shape before guarding or fetching (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "not_a_real_status" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST status missing `to` is a 400 with zero fetches", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", {});
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST status happy path (submitted -> under_review) writes the transition and an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") {
+      return [{ ...SUBMITTED_INCIDENT, status: "under_review" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER, userId: "user-7" });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "under_review", reason: "starting review" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "under_review");
+
+  const patch = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
+  assert.equal(patch.body.status, "under_review");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  const event = auditInsert.body[0];
+  assert.equal(event.event_type, "incident.status_changed");
+  assert.equal(event.actor_user_id, "user-7");
+  assert.deepEqual(event.event_payload, {
+    actor: "user-7",
+    from: "submitted",
+    to: "under_review",
+    reason: "starting review"
+  });
+});
+
+test("POST status forbidden role: a manage-only actor lacks incidents.review and gets 403", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage, not incidents.review
+  const result = await call("POST", "/incidents/inc-1/status", { to: "under_review" });
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.method === "PATCH"));
+});
+
+test("POST status invalid transition (structurally illegal edge) is 409", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // draft
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+});
+
+test("POST status closing an incident with open follow-ups is blocked (409) and no writes occur", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [{ id: "f1" }, { id: "f2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /follow-up/);
+
+  const followupQuery = captured.find((c) => c.table === "incident_followup_actions" && c.method === "GET");
+  assert.ok(followupQuery, "expected the route to query open follow-ups before closing");
+  assert.equal(followupQuery.url.searchParams.get("status"), "in.(open,in_progress)");
+  assert.equal(followupQuery.url.searchParams.get("incident_id"), "eq.inc-1");
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("POST status closing succeeds once follow-ups are all closed", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...ACTION_PENDING_INCIDENT, status: "closed" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "closed");
+  assert.ok(captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("POST status closing a legal-hold incident without incidents.legal_hold.manage is blocked (409)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_LEGAL_HOLD_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /legal_hold/);
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+test("POST status closing a legal-hold incident succeeds with incidents.legal_hold.manage", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_LEGAL_HOLD_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_reports" && method === "PATCH") {
+      return [{ ...ACTION_PENDING_LEGAL_HOLD_INCIDENT, status: "closed" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "closed");
+  assert.ok(captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+test("POST status 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/nope/status", { to: "under_review" });
+  assert.equal(result.status, 404);
 });

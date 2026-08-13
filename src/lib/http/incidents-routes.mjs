@@ -1,9 +1,26 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
-import { escalationDueAt } from "../incidents.mjs";
+import {
+  escalationDueAt,
+  canTransitionIncident,
+  buildIncidentAuditEvent,
+  INCIDENT_STATUSES
+} from "../incidents.mjs";
 
 const READ = "incidents.read";
 const MANAGE = "incidents.manage";
+const REVIEW = "incidents.review";
+const LEGAL_HOLD_MANAGE = "incidents.legal_hold.manage";
+
+// Permission codes the transition machine (canTransitionIncident) consults.
+// Gathered once per request into a plain string[] via requireAuthPermission
+// (which already honors auth.platformAdmin) so the pure function never has
+// to see auth/membership shapes.
+const TRANSITION_PERMISSION_CODES = [MANAGE, REVIEW, LEGAL_HOLD_MANAGE];
+
+// Open (not completed/waived) follow-up actions block closing an incident
+// (IN-02's closure gate). Only queried when the target status is "closed".
+const OPEN_FOLLOWUP_STATUSES = ["open", "in_progress"];
 
 const INCIDENT_COLUMNS =
   "id,facility_id,department_id,incident_no,report_type,status,severity,occurred_at,reported_at," +
@@ -56,6 +73,24 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
 
   function queryParams(request) {
     return new URL(request.url ?? "/", "http://localhost").searchParams;
+  }
+
+  // Collapses the actor's membership into the plain permission-code list
+  // canTransitionIncident expects, reusing requireAuthPermission (and its
+  // auth.platformAdmin bypass, 0022) per code rather than reaching into
+  // auth.memberships directly.
+  function actorPermissionsFor(auth, facilityId) {
+    return TRANSITION_PERMISSION_CODES.filter(
+      (code) => requireAuthPermission(auth, facilityId, code).allowed
+    );
+  }
+
+  // Maps a canTransitionIncident rejection to an HTTP status: a forbidden
+  // actor is 403; a structurally illegal edge or a closure gate (open
+  // follow-ups / unmanaged legal hold) is 409 -- the incident's own state
+  // is what's blocking the request, not the caller's identity.
+  function transitionStatusCode(reasonCode) {
+    return reasonCode === "forbidden" ? 403 : 409;
   }
 
   async function loadIncident(client, incidentId) {
@@ -168,6 +203,126 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           returning: true
         });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // Submits a draft incident: loads it, runs the draft->submitted edge
+  // through the transition machine (submit needs incidents.manage or being
+  // the creator -- see canTransitionIncident's doc comment for why routes
+  // currently always pass isCreator: false), stamps submitted_by/
+  // submitted_at server-side (never client-supplied), and writes an
+  // incident_audit_events row -- the DB trigger from 0013 fills in
+  // prev_hash/row_hash on insert.
+  router.register(
+    "POST",
+    "/incidents/:id/submit",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+
+        const actorPermissions = actorPermissionsFor(auth, incident.facility_id);
+        const check = canTransitionIncident(incident.status, "submitted", {
+          actorPermissions,
+          isCreator: false
+        });
+        if (!check.allowed) {
+          return sendJson(response, transitionStatusCode(check.reasonCode), { error: check.reason });
+        }
+
+        const submittedAt = new Date().toISOString();
+        const rows = await pgUpdate(
+          auth.client,
+          "incident_reports",
+          { id: incident.id },
+          { status: "submitted", submitted_by: auth.claims.sub, submitted_at: submittedAt },
+          { returning: true }
+        );
+
+        await pgInsert(
+          auth.client,
+          "incident_audit_events",
+          [
+            buildIncidentAuditEvent({
+              facilityId: incident.facility_id,
+              incidentId: incident.id,
+              actorUserId: auth.claims.sub,
+              eventType: "incident.submitted",
+              payload: { actor: auth.claims.sub, from: incident.status, to: "submitted" }
+            })
+          ],
+          { returning: false }
+        );
+
+        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // Guarded status transition: body { to, reason? }. Shape is validated
+  // (to must be one of INCIDENT_STATUSES) before any fetch, matching the
+  // file's validate-before-guard pattern. Review/close moves (everything
+  // past draft->submitted) require incidents.review, enforced inside
+  // canTransitionIncident; closing additionally consults open follow-ups and
+  // legal_hold. Every successful transition writes an incident_audit_events
+  // row.
+  router.register(
+    "POST",
+    "/incidents/:id/status",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const { to, reason } = body.payload;
+        if (!to || !INCIDENT_STATUSES.includes(to)) {
+          return sendJson(response, 400, { error: `to must be one of: ${INCIDENT_STATUSES.join(", ")}` });
+        }
+
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+
+        const actorPermissions = actorPermissionsFor(auth, incident.facility_id);
+
+        let openFollowUps = [];
+        if (to === "closed") {
+          openFollowUps = await pgSelect(auth.client, "incident_followup_actions", {
+            filters: { incident_id: incident.id, status: { in: OPEN_FOLLOWUP_STATUSES } },
+            select: "id"
+          });
+        }
+
+        const check = canTransitionIncident(incident.status, to, {
+          actorPermissions,
+          openFollowUps: openFollowUps ?? [],
+          legalHold: incident.legal_hold === true
+        });
+        if (!check.allowed) {
+          return sendJson(response, transitionStatusCode(check.reasonCode), { error: check.reason });
+        }
+
+        const rows = await pgUpdate(
+          auth.client,
+          "incident_reports",
+          { id: incident.id },
+          { status: to },
+          { returning: true }
+        );
+
+        await pgInsert(
+          auth.client,
+          "incident_audit_events",
+          [
+            buildIncidentAuditEvent({
+              facilityId: incident.facility_id,
+              incidentId: incident.id,
+              actorUserId: auth.claims.sub,
+              eventType: "incident.status_changed",
+              payload: { actor: auth.claims.sub, from: incident.status, to, reason: reason ?? null }
+            })
+          ],
+          { returning: false }
+        );
+
+        return sendJson(response, 200, (rows ?? [])[0] ?? null);
       })
   );
 
