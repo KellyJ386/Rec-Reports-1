@@ -9,10 +9,19 @@ insert into permissions (code, description) values
   ('training.manage', 'Manage training and certifications'),
   ('incidents.read', 'Read incidents'),
   ('incidents.manage', 'Manage incidents'),
+  ('incidents.review', 'Review and approve incident reports'),
+  ('incidents.escalate', 'Escalate incidents to higher review levels'),
+  ('incidents.tasks.create', 'Create incident follow-up tasks'),
+  ('incidents.legal_hold.manage', 'Place and release legal holds on incidents'),
+  ('incidents.export.pdf', 'Export incident legal packet PDFs'),
+  ('incidents.audit.view', 'View the immutable incident audit trail'),
   ('work_orders.read', 'Read work orders'),
   ('work_orders.manage', 'Manage work orders'),
   ('admin.manage', 'Manage facility configuration'),
   ('reports.template.manage', 'Manage report templates'),
+  ('reports.publish', 'Publish report templates and versions'),
+  ('reports.workflow.manage', 'Manage report submission workflow automation rules'),
+  ('reports.distribution.manage', 'Manage report distribution lists and delivery routing'),
   ('communications.read', 'Read communications'),
   ('communications.publish', 'Publish communications')
 on conflict (code) do nothing;
@@ -28,11 +37,19 @@ on conflict (id) do nothing;
 
 
 -- System roles: shared, deletion-protected scaffolding (is_system_role=true).
--- Tenant Owner holds the full 16-code catalog; Compliance Admin owns
--- reporting/incident/training/comms governance plus admin.manage; Ops Admin runs
--- day-to-day scheduling/work-orders/incidents/reports; Read-Only Auditor gets
--- every *.read plus reports.export for evidence gathering. Any additional roles
--- an admin creates through the UI stay custom (is_system_role=false).
+-- Tenant Owner holds the full 25-code catalog; Compliance Admin owns
+-- reporting/incident/training/comms governance plus admin.manage -- both are
+-- facility/ops admin tier and so also hold all nine DR-05/IN-01 governance
+-- codes (reports.publish/workflow.manage/distribution.manage,
+-- incidents.review/escalate/tasks.create/legal_hold.manage/export.pdf/audit.view).
+-- Ops Admin runs day-to-day scheduling/work-orders/incidents/reports without
+-- admin.manage -- supervisor tier, so it gets only the four day-to-day
+-- governance codes (incidents.review/escalate/tasks.create, reports.publish)
+-- and is deliberately withheld legal_hold.manage/export.pdf/audit.view/
+-- workflow.manage/distribution.manage. Read-Only Auditor gets every *.read
+-- plus reports.export for evidence gathering and none of the new codes (it
+-- neither administers nor supervises). Any additional roles an admin creates
+-- through the UI stay custom (is_system_role=false).
 insert into roles (id, facility_id, name, is_system_role, active) values
   ('00000000-0000-0000-0000-000000003201', '00000000-0000-0000-0000-000000000201', 'Tenant Owner', true, true),
   ('00000000-0000-0000-0000-000000003202', '00000000-0000-0000-0000-000000000201', 'Compliance Admin', true, true),
@@ -51,18 +68,36 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003201', 'training.manage'),
   ('00000000-0000-0000-0000-000000003201', 'incidents.read'),
   ('00000000-0000-0000-0000-000000003201', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.review'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.escalate'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.tasks.create'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.legal_hold.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.export.pdf'),
+  ('00000000-0000-0000-0000-000000003201', 'incidents.audit.view'),
   ('00000000-0000-0000-0000-000000003201', 'work_orders.read'),
   ('00000000-0000-0000-0000-000000003201', 'work_orders.manage'),
   ('00000000-0000-0000-0000-000000003201', 'admin.manage'),
   ('00000000-0000-0000-0000-000000003201', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.publish'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.workflow.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'reports.distribution.manage'),
   ('00000000-0000-0000-0000-000000003201', 'communications.read'),
   ('00000000-0000-0000-0000-000000003201', 'communications.publish'),
   ('00000000-0000-0000-0000-000000003202', 'admin.manage'),
   ('00000000-0000-0000-0000-000000003202', 'reports.read'),
   ('00000000-0000-0000-0000-000000003202', 'reports.export'),
   ('00000000-0000-0000-0000-000000003202', 'reports.template.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.publish'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.workflow.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'reports.distribution.manage'),
   ('00000000-0000-0000-0000-000000003202', 'incidents.read'),
   ('00000000-0000-0000-0000-000000003202', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.review'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.escalate'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.tasks.create'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.legal_hold.manage'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.export.pdf'),
+  ('00000000-0000-0000-0000-000000003202', 'incidents.audit.view'),
   ('00000000-0000-0000-0000-000000003202', 'training.read'),
   ('00000000-0000-0000-0000-000000003202', 'training.manage'),
   ('00000000-0000-0000-0000-000000003202', 'communications.read'),
@@ -70,12 +105,16 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003203', 'reports.read'),
   ('00000000-0000-0000-0000-000000003203', 'reports.create'),
   ('00000000-0000-0000-0000-000000003203', 'reports.submit'),
+  ('00000000-0000-0000-0000-000000003203', 'reports.publish'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.read'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.manage'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.read'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.manage'),
   ('00000000-0000-0000-0000-000000003203', 'incidents.read'),
   ('00000000-0000-0000-0000-000000003203', 'incidents.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.review'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.escalate'),
+  ('00000000-0000-0000-0000-000000003203', 'incidents.tasks.create'),
   ('00000000-0000-0000-0000-000000003203', 'communications.read'),
   ('00000000-0000-0000-0000-000000003204', 'reports.read'),
   ('00000000-0000-0000-0000-000000003204', 'reports.export'),

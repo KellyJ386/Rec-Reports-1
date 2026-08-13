@@ -9,10 +9,26 @@ export const permissions = Object.freeze([
   "training.manage",
   "incidents.read",
   "incidents.manage",
+  // Fine-grained incident governance codes (IN-01). Not implied by
+  // incidents.manage: a supervisor may review/escalate/create tasks without
+  // holding full incidents.manage, and legal_hold/export.pdf/audit.view are
+  // restricted to facility/ops admin roles even where incidents.manage is held.
+  "incidents.review",
+  "incidents.escalate",
+  "incidents.tasks.create",
+  "incidents.legal_hold.manage",
+  "incidents.export.pdf",
+  "incidents.audit.view",
   "work_orders.read",
   "work_orders.manage",
   "admin.manage",
   "reports.template.manage",
+  // Reports governance codes (DR-05). reports.template.manage alone can author
+  // a template but cannot publish it, manage its workflow automation, or
+  // manage its distribution lists -- each is its own governance surface.
+  "reports.publish",
+  "reports.workflow.manage",
+  "reports.distribution.manage",
   "communications.read",
   "communications.publish"
 ]);

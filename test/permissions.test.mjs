@@ -90,6 +90,26 @@ test("hasDepartmentPermission grants a department-scoped membership its own depa
   assert.equal(hasDepartmentPermission(deptScoped, "south-arena", "dept-aquatics", "admin.manage"), false);
 });
 
+// --- Governance permission expansion (DR-05 + IN-01) -----------------------
+
+test("permissions catalog includes the nine DR-05/IN-01 governance codes", () => {
+  const expected = [
+    "reports.publish",
+    "reports.workflow.manage",
+    "reports.distribution.manage",
+    "incidents.review",
+    "incidents.escalate",
+    "incidents.tasks.create",
+    "incidents.legal_hold.manage",
+    "incidents.export.pdf",
+    "incidents.audit.view"
+  ];
+  for (const code of expected) {
+    assert.ok(permissions.includes(code), `expected permissions catalog to include ${code}`);
+  }
+  assert.equal(permissions.length, 25);
+});
+
 test("hasDepartmentPermission grants facility-wide memberships every department", () => {
   const facilityWide = [
     { facilityId: "north-arena", status: "active", permissions: ["admin.manage"] }
