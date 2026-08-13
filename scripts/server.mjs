@@ -90,8 +90,8 @@ function extractBearerToken(request) {
 
 function buildClient(env, authToken) {
   return createClient({
-    url: env.NEXT_PUBLIC_SUPABASE_URL,
-    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    url: env.SUPABASE_URL,
+    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY,
     authToken
   });
 }
@@ -225,8 +225,8 @@ export const userRouter = createRouter();
 // anon key is public by design.
 userRouter.register("GET", "/public-config", (request, response, { env }) =>
   sendJson(response, 200, {
-    supabaseUrl: env.NEXT_PUBLIC_SUPABASE_URL,
-    supabaseAnonKey: env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    supabaseUrl: env.SUPABASE_URL,
+    supabaseAnonKey: env.SUPABASE_ANON_KEY
   })
 );
 

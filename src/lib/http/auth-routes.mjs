@@ -21,12 +21,12 @@ export function registerAuthRoutes(router, { sendJson, readBody }) {
   }
 
   function gotrue(env, path) {
-    const base = String(env.NEXT_PUBLIC_SUPABASE_URL).replace(/\/+$/, "");
+    const base = String(env.SUPABASE_URL).replace(/\/+$/, "");
     return `${base}/auth/v1/${path}`;
   }
 
   function anonKey(env) {
-    return env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    return env.SUPABASE_ANON_KEY;
   }
 
   // Shapes the session GoTrue returns into the minimal payload the client
@@ -73,7 +73,7 @@ export function registerAuthRoutes(router, { sendJson, readBody }) {
   }
 
   function requireConfigured(env, response) {
-    if (!env.NEXT_PUBLIC_SUPABASE_URL || !anonKey(env)) {
+    if (!env.SUPABASE_URL || !anonKey(env)) {
       sendJson(response, 503, { error: "authentication is not configured" });
       return false;
     }

@@ -4,8 +4,8 @@ import { createRouter } from "../src/lib/http/router.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 
 const ENV = {
-  NEXT_PUBLIC_SUPABASE_URL: "https://proj.supabase.co",
-  NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-key"
+  SUPABASE_URL: "https://proj.supabase.co",
+  SUPABASE_ANON_KEY: "anon-key"
 };
 
 function stubFetch(t, respond) {
