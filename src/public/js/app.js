@@ -135,7 +135,8 @@ async function loadAllModules() {
       loadIncidents(),
       loadWorkOrders(),
       loadMessages(),
-      loadTraining()
+      loadTraining(),
+      loadCertifications()
     ]);
   } catch (error) {
     console.error("Error loading modules:", error);
@@ -432,6 +433,39 @@ async function completeTraining(assignmentId) {
     await loadTraining();
   } catch (error) {
     console.error("Failed to mark training complete:", error);
+  }
+}
+
+// Certification wallet module
+async function loadCertifications() {
+  const container = document.getElementById("certifications-list");
+  if (!container) return;
+
+  setLoading(container, true);
+  try {
+    const certifications = await apiFetch(`/facilities/${currentFacility}/employee-certifications`);
+    const certData = certifications || [];
+
+    if (certData.length === 0) {
+      container.innerHTML = '<p>No certifications on file.</p>';
+      return;
+    }
+
+    let html = "";
+    for (const cert of certData) {
+      html += '<div class="module-item">';
+      html += `<div class="item-title">${escapeHtml(cert.certification_type_name || cert.certification_type_code || "Certification")}</div>`;
+      html += `<div class="item-subtitle">Status: ${escapeHtml(cert.status)}</div>`;
+      if (cert.expires_at) {
+        html += `<div class="item-subtitle">Expires ${new Date(cert.expires_at).toLocaleDateString()}</div>`;
+      }
+      html += `<div class="item-subtitle">Evidence: ${cert.evidence_path ? "on file" : "not uploaded"}</div>`;
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
+  } catch (error) {
+    setError(container, error.message);
   }
 }
 
