@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
+import { permissions } from "../src/lib/permissions.mjs";
 
 const ADMIN_ON_FAC1 = [{ facilityId: "fac-1", status: "active", permissions: ["admin.manage"] }];
 const READER_ON_FAC1 = [{ facilityId: "fac-1", status: "active", permissions: ["reports.read"] }];
@@ -196,7 +197,7 @@ test("PATCH membership denies a non-admin on the resolved facility", async (t) =
   assert.equal(result.status, 403);
 });
 
-test("GET access-simulator returns a 16-row matrix reflecting the user's grants", async (t) => {
+test("GET access-simulator returns a full-catalog matrix reflecting the user's grants", async (t) => {
   stubFetch(t, (table) =>
     table === "memberships"
       ? [
@@ -213,7 +214,7 @@ test("GET access-simulator returns a 16-row matrix reflecting the user's grants"
   const { call } = mount({ memberships: ADMIN_ON_FAC1 });
   const result = await call("GET", "/facilities/fac-1/access-simulator?userId=user-7");
   assert.equal(result.status, 200);
-  assert.equal(result.payload.length, 16);
+  assert.equal(result.payload.length, permissions.length);
   const readRow = result.payload.find((r) => r.permission === "reports.read");
   assert.deepEqual(readRow, { permission: "reports.read", allowed: true, reason: "granted" });
   const missingRow = result.payload.find((r) => r.permission === "training.manage");
