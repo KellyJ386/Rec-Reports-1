@@ -183,3 +183,394 @@ test("PATCH work-order rejects empty patch", async (t) => {
   assert.equal(result.status, 400);
   assert.match(result.payload.error, /nothing to update/);
 });
+
+// --- WO-02: status lifecycle / transition matrix / history rows ------------
+
+test("PATCH work-order rejects an unknown status value with 400 and zero fetches", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "bogus" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH work-order rejects an unknown priority value with 400 and zero fetches", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { priority: "bogus" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH work-order accepts in_progress -> resolved and sets completed_at", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "in_progress", priority: "medium" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "resolved" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "resolved" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.status, "resolved");
+  assert.ok(patch.body.completed_at, "completed_at should be stamped on resolve");
+});
+
+test("PATCH work-order accepts resolved -> closed", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "resolved", priority: "medium" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "closed" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "closed" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.status, "closed");
+  assert.ok(patch.body.completed_at);
+});
+
+test("PATCH work-order rejects closed -> in_progress with 409 and does not write", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "closed", priority: "medium" }];
+    }
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 409);
+  assert.equal(
+    captured.filter((c) => c.method === "PATCH" || (c.table === "work_order_updates" && c.method === "POST")).length,
+    0
+  );
+});
+
+test("PATCH work-order rejects a same-status no-op transition with 409", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "work_orders" && method === "GET" ? [{ id: "wo-1", facility_id: "fac-1", status: "open" }] : []
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "open" });
+  assert.equal(result.status, 409);
+});
+
+test("PATCH work-order reopens resolved -> in_progress and clears completed_at", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "resolved", completed_at: "2026-01-01T00:00:00Z" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "in_progress" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.completed_at, null);
+});
+
+test("PATCH work-order status change writes exactly one status_change history row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "open" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "in_progress" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 200);
+  const historyInsert = captured.find((c) => c.table === "work_order_updates" && c.method === "POST");
+  assert.equal(historyInsert.body.length, 1);
+  assert.equal(historyInsert.body[0].update_type, "status_change");
+  assert.equal(historyInsert.body[0].previous_value, "open");
+  assert.equal(historyInsert.body[0].new_value, "in_progress");
+  assert.equal(historyInsert.body[0].facility_id, "fac-1");
+  assert.equal(historyInsert.body[0].work_order_id, "wo-1");
+  assert.equal(historyInsert.body[0].created_by, "user-9");
+});
+
+test("PATCH work-order assignment change writes an assignment_change history row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", assigned_to_employee_id: "emp-1" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { assigned_to_employee_id: "emp-7" });
+  assert.equal(result.status, 200);
+  const historyInsert = captured.find((c) => c.table === "work_order_updates" && c.method === "POST");
+  assert.equal(historyInsert.body.length, 1);
+  assert.equal(historyInsert.body[0].update_type, "assignment_change");
+  assert.equal(historyInsert.body[0].previous_value, "emp-1");
+  assert.equal(historyInsert.body[0].new_value, "emp-7");
+});
+
+test("PATCH work-order priority change writes a priority_change history row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", priority: "medium" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", priority: "urgent" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { priority: "urgent" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.priority, "urgent");
+  const historyInsert = captured.find((c) => c.table === "work_order_updates" && c.method === "POST");
+  assert.equal(historyInsert.body.length, 1);
+  assert.equal(historyInsert.body[0].update_type, "priority_change");
+  assert.equal(historyInsert.body[0].previous_value, "medium");
+  assert.equal(historyInsert.body[0].new_value, "urgent");
+});
+
+test("PATCH work-order changing status, assignee and priority together writes one history row per changed field", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "open", priority: "low", assigned_to_employee_id: null }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", {
+    status: "in_progress",
+    priority: "high",
+    assigned_to_employee_id: "emp-3"
+  });
+  assert.equal(result.status, 200);
+  const historyInsert = captured.find((c) => c.table === "work_order_updates" && c.method === "POST");
+  assert.equal(historyInsert.body.length, 3);
+  const types = historyInsert.body.map((row) => row.update_type).sort();
+  assert.deepEqual(types, ["assignment_change", "priority_change", "status_change"]);
+});
+
+// --- WO-01: comment thread endpoints (work_order_updates) ------------------
+
+test("GET work-order updates denies a non-member of the parent's facility with 403", async (t) => {
+  stubFetch(t, (table) => (table === "work_orders" && [{ id: "wo-1", facility_id: "fac-1" }]) || []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/work-orders/wo-1/updates");
+  assert.equal(result.status, 403);
+});
+
+test("GET work-order updates 404s when the parent work order is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("GET", "/work-orders/nope/updates");
+  assert.equal(result.status, 404);
+});
+
+test("GET work-order updates returns the thread chronologically for a reader", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") return [{ id: "wo-1", facility_id: "fac-1" }];
+    if (table === "work_order_updates" && method === "GET") {
+      return [{ id: "u-1", work_order_id: "wo-1", update_type: "comment", body: "hi" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/work-orders/wo-1/updates");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  const get = captured.find((c) => c.table === "work_order_updates" && c.method === "GET");
+  assert.match(get.url.search, /work_order_id=eq\.wo-1/);
+  assert.match(get.url.search, /order=created_at\.asc/);
+});
+
+test("POST work-order updates rejects an empty comment body with 400 and zero fetches", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "   " });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST work-order updates denies a reader without work_orders.manage with 403", async (t) => {
+  stubFetch(t, (table) => (table === "work_orders" && [{ id: "wo-1", facility_id: "fac-1" }]) || []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "Replaced the filter" });
+  assert.equal(result.status, 403);
+});
+
+test("POST work-order updates denies a non-member of the parent's facility with 403", async (t) => {
+  stubFetch(t, (table) => (table === "work_orders" && [{ id: "wo-1", facility_id: "fac-1" }]) || []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "Replaced the filter" });
+  assert.equal(result.status, 403);
+});
+
+test("POST work-order updates 404s when the parent work order is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/work-orders/nope/updates", { body: "Replaced the filter" });
+  assert.equal(result.status, 404);
+});
+
+test("POST work-order updates stamps facility_id from the parent and created_by from auth claims", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") return [{ id: "wo-1", facility_id: "fac-1" }];
+    if (table === "work_order_updates" && method === "POST") {
+      return [{ id: "u-1", update_type: "comment", body: "Replaced the filter" }];
+    }
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "Replaced the filter" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_order_updates" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].work_order_id, "wo-1");
+  assert.equal(insert.body[0].update_type, "comment");
+  assert.equal(insert.body[0].body, "Replaced the filter");
+  assert.equal(insert.body[0].created_by, "user-42");
+});
+
+// --- WO-05: list filters, sorting, pagination -------------------------------
+
+test("GET work-orders?priority= filters by priority", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?priority=urgent");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /priority=eq\.urgent/);
+});
+
+test("GET work-orders?priority=bogus 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?priority=bogus");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders?status=bogus 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?status=bogus");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders?assignee= filters by assigned_to_employee_id", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?assignee=emp-7");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /assigned_to_employee_id=eq\.emp-7/);
+});
+
+test("GET work-orders?asset= filters by asset_id", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?asset=asset-1");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /asset_id=eq\.asset-1/);
+});
+
+test("GET work-orders?department= filters by department_id", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?department=dept-1");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /department_id=eq\.dept-1/);
+});
+
+test("GET work-orders?overdue=true filters open statuses past due_at", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?overdue=true");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /status=in\.%28open%2Cin_progress%2Con_hold%29|status=in\.\(open,in_progress,on_hold\)/);
+  assert.match(get.url.search, /due_at=lt\./);
+});
+
+test("GET work-orders?overdue=true with an explicit status keeps the eq filter and adds due_at", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?overdue=true&status=in_progress");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.match(get.url.search, /status=eq\.in_progress/);
+  assert.match(get.url.search, /due_at=lt\./);
+});
+
+test("GET work-orders?overdue=bogus 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?overdue=bogus");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders defaults to limit=50 when unspecified", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("limit"), "50");
+});
+
+test("GET work-orders?limit= clamps values above 200 down to the cap", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?limit=9000");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("limit"), "200");
+});
+
+test("GET work-orders?limit=abc 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?limit=abc");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders?limit=0 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?limit=0");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders?offset= is passed through to the query", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?offset=40");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("offset"), "40");
+});
+
+test("GET work-orders?offset=-1 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?offset=-1");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET work-orders?order= accepts an allowlisted column", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?order=priority.asc");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("order"), "priority.asc");
+});
+
+test("GET work-orders?order=bogus 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?order=bogus");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
