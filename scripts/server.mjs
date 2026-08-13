@@ -11,6 +11,7 @@ import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
 import { registerWorkflowRoutes } from "../src/lib/http/workflow-routes.mjs";
 import { registerFormsRoutes } from "../src/lib/http/forms-routes.mjs";
+import { registerReportTemplatesRoutes } from "../src/lib/http/report-templates-routes.mjs";
 import { registerNotificationRoutes } from "../src/lib/http/notification-routes.mjs";
 import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
@@ -197,6 +198,12 @@ registerWorkflowRoutes(router, { authenticate, sendJson, readBody });
 // Phase 7 Forms & Fields (lite) routes (custom fields, versioned form
 // definitions, publish/retire). Logic lives in src/lib/admin/forms.mjs.
 registerFormsRoutes(router, { authenticate, sendJson, readBody });
+
+// Daily Reports template management (DR-02..DR-04): draft/publish/archive for
+// report_templates + report_template_versions. Logic lives in
+// src/lib/report-templates.mjs; writes require reports.template.manage
+// (publish additionally requires reports.publish), matching the 0028 RLS.
+registerReportTemplatesRoutes(router, { authenticate, sendJson, readBody });
 
 // Phase 7 Notifications routing routes (event catalog, distribution lists +
 // members, routes, and the test-notification sandbox). Logic lives in
