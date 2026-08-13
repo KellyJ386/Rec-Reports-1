@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
 
 const READ = "work_orders.read";
 const MANAGE = "work_orders.manage";

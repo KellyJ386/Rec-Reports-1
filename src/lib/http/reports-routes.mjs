@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
 import { validateReportSubmission } from "../report-schema.mjs";
 
 const READ = "reports.read";
@@ -171,9 +171,9 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       })
   );
 
-  // Creates a draft submission. The payload is validated against the template's
-  // active published version before insert; a draft may be partial, so only
-  // provided fields are validated here — full validation is enforced on submit.
+  // Creates a draft submission. Validates only required fields (templateId,
+  // reportDate); the payload is not validated on create. Full payload validation
+  // is enforced only when the draft is submitted.
   router.register(
     "POST",
     "/facilities/:facilityId/reports",
