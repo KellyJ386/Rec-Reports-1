@@ -7,6 +7,13 @@ const optionalServerFields = [
   "OBSERVABILITY_DSN"
 ];
 
+// SUPABASE_STORAGE_BUCKET (OP-16, src/lib/storage.mjs) is optional like the
+// fields above, but unlike them it always ends up set on the returned env --
+// it falls back to the "attachments" default below rather than being left
+// undefined when unset, since every storage-client caller needs a bucket
+// name to build requests against.
+const STORAGE_BUCKET_DEFAULT = "attachments";
+
 // One-release fallback: this app used to read these under the abandoned
 // Next.js NEXT_PUBLIC_* naming convention (a holdover from before the
 // zero-dependency rewrite). The new, framework-neutral names are preferred;
@@ -65,5 +72,6 @@ export function readServerEnv(source = process.env) {
       }
     }
   }
+  env.SUPABASE_STORAGE_BUCKET = source.SUPABASE_STORAGE_BUCKET || STORAGE_BUCKET_DEFAULT;
   return env;
 }
