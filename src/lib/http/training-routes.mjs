@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import { trainingAssignmentState, certificationStatus } from "../training.mjs";
@@ -7,9 +8,23 @@ import {
   validateCourseModuleInput,
   validateCourseModuleUpdateInput
 } from "../admin/training.mjs";
+import { certificationEventFor, evidenceUploadedPayload } from "../admin/cert-evidence.mjs";
+import {
+  createStorageClientFromEnv,
+  buildAttachmentPath,
+  assertMimeAllowed,
+  assertWithinSizeCap,
+  uploadObject,
+  createSignedUrl,
+  DEFAULT_MAX_UPLOAD_BYTES,
+  StorageValidationError
+} from "../storage.mjs";
 
 const READ = "training.read";
 const MANAGE = "training.manage";
+const EVIDENCE_STORAGE_MODULE = "certifications";
+const EVIDENCE_SIGNED_URL_TTL_SECONDS = 300;
+const CERTIFICATION_STATUSES = ["active", "expired", "revoked"];
 
 const COURSES_COLUMNS =
   "id,facility_id,code,title,description,status,created_at,updated_at";
@@ -32,13 +47,86 @@ const CERT_TYPE_COLUMNS = "id,facility_id,code,name,renewal_window_days,created_
 //
 // Reads require training.read on the row's facility; creating or managing
 // training assignments requires training.manage.
-export function registerTrainingRoutes(router, { authenticate, sendJson, readBody }) {
+//
+// createStorageClient(env) -> storage client (see src/lib/storage.mjs); only
+// used by the TR-03 evidence routes below. Defaults to
+// createStorageClientFromEnv(env), same convention as
+// attachments-routes.mjs's registerAttachmentRoutes -- tests inject a stub
+// client with a fake fetchImpl instead of hitting real Storage REST.
+export function registerTrainingRoutes(
+  router,
+  { authenticate, sendJson, readBody, createStorageClient = (env) => createStorageClientFromEnv(env) }
+) {
   async function parseJsonBody(request) {
     try {
       return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
     } catch {
       return { ok: false };
     }
+  }
+
+  // Thrown by readRawBody when the request body (declared or actual)
+  // exceeds the per-route cap.
+  class UploadTooLargeError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "UploadTooLargeError";
+    }
+  }
+
+  // Reads the declared Content-Length header, if any, as a plain number (no
+  // I/O) so an oversize upload can 413 before the cert row is even loaded.
+  function declaredContentLength(request) {
+    const header = request.headers?.["content-length"];
+    if (header === undefined || header === null || header === "") return null;
+    const value = Number(header);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  // Reads the raw request body into a Buffer, enforcing maxBytes as data
+  // arrives. Duplicated from attachments-routes.mjs's readRawBody (not
+  // exported there) rather than sharing an import, per plans/TRAINING_PLAN.md
+  // TR-03 -- noted here as a candidate for a future shared http-body helper.
+  function readRawBody(request, maxBytes) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let received = 0;
+      request.on("data", (chunk) => {
+        received += chunk.length;
+        if (received > maxBytes) {
+          if (typeof request.destroy === "function") request.destroy();
+          reject(new UploadTooLargeError(`request body exceeds the ${maxBytes}-byte cap`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      request.on("end", () => resolve(Buffer.concat(chunks)));
+      request.on("error", reject);
+    });
+  }
+
+  // A StorageValidationError's `code` decides the HTTP status: only
+  // "file_too_large" is a 413, everything else (bad mime, unsafe path
+  // segments, empty/invalid filename) is a 400 shape problem.
+  function storageErrorStatus(error) {
+    return error.code === "file_too_large" ? 413 : 400;
+  }
+
+  // A percent-encoded x-file-name is decoded here; a plain ASCII filename
+  // with no "%" round-trips through decodeURIComponent unchanged, so this is
+  // safe either way. A malformed percent-encoding falls back to the raw
+  // header value -- sanitizeFilename (inside buildAttachmentPath) rejects/
+  // cleans whatever comes out.
+  function decodeFilenameHeader(rawHeader) {
+    try {
+      return decodeURIComponent(rawHeader);
+    } catch {
+      return rawHeader;
+    }
+  }
+
+  function sha256Hex(buffer) {
+    return createHash("sha256").update(buffer).digest("hex");
   }
 
   async function withAuth(request, response, env, handler) {
@@ -75,6 +163,29 @@ export function registerTrainingRoutes(router, { authenticate, sendJson, readBod
       select: TRAINING_ASSIGNMENTS_COLUMNS,
       limit: 1
     });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadCertification(client, certificationId) {
+    const rows = await pgSelect(client, "employee_certifications", {
+      filters: { id: certificationId },
+      select: EMPLOYEE_CERT_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // Appends a certification_events row (0007 columns: facility_id,
+  // employee_certification_id, event_type, payload_jsonb). event_at is left
+  // to the column default (now()).
+  async function insertCertificationEvent(client, { facilityId, certificationId, eventType, payload }) {
+    const row = {
+      facility_id: facilityId,
+      employee_certification_id: certificationId,
+      event_type: eventType,
+      payload_jsonb: payload ?? {}
+    };
+    const rows = await pgInsert(client, "certification_events", [row], { returning: true });
     return (rows ?? [])[0] ?? null;
   }
 
@@ -478,6 +589,249 @@ export function registerTrainingRoutes(router, { authenticate, sendJson, readBod
           };
         });
         return sendJson(response, 200, wallet);
+      })
+  );
+
+  // --- Certification lifecycle writes (TR-04) --------------------------------
+  // Issues a new employee_certifications row and appends the matching
+  // certification_events row (always 'created' for a fresh issue --
+  // certificationEventFor(null, after) is unconditional). Guarded
+  // training.manage on the target facility; validated before the guard so a
+  // malformed payload never reaches the permission check or a fetch.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/employee-certifications",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const { employeeId, certificationTypeId } = body.payload;
+        const shape = [];
+        if (typeof employeeId !== "string" || employeeId.trim().length === 0) {
+          shape.push("employeeId is required");
+        }
+        if (typeof certificationTypeId !== "string" || certificationTypeId.trim().length === 0) {
+          shape.push("certificationTypeId is required");
+        }
+        if (body.payload.status !== undefined && !CERTIFICATION_STATUSES.includes(body.payload.status)) {
+          shape.push(`status must be one of: ${CERTIFICATION_STATUSES.join(", ")}`);
+        }
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const row = {
+          facility_id: params.facilityId,
+          employee_id: employeeId,
+          certification_type_id: certificationTypeId,
+          issued_at: body.payload.issuedAt ?? null,
+          expires_at: body.payload.expiresAt ?? null,
+          status: body.payload.status ?? "active"
+        };
+        const rows = await pgInsert(auth.client, "employee_certifications", [row], { returning: true });
+        const created = (rows ?? [])[0] ?? null;
+        if (created) {
+          const event = certificationEventFor(null, created);
+          if (event) {
+            await insertCertificationEvent(auth.client, {
+              facilityId: params.facilityId,
+              certificationId: created.id,
+              eventType: event.eventType,
+              payload: event.payload
+            });
+          }
+        }
+        return sendJson(response, 201, created);
+      })
+  );
+
+  // Renews (later expiresAt) or revokes (status: 'revoked') an existing
+  // certification -- a single PATCH endpoint, since both are "edit this
+  // cert's lifecycle fields" and the resulting event type is derived (never
+  // caller-supplied) by certificationEventFor from the before/after rows.
+  // Loads the row first (before both the shape validation and the guard)
+  // purely to resolve its facility_id -- the guard always runs against the
+  // row's OWN facility, never a client-supplied one.
+  router.register(
+    "PATCH",
+    "/employee-certifications/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const before = await loadCertification(auth.client, params.id);
+        if (!before) return sendJson(response, 404, { error: "certification not found" });
+        if (!requirePerm(auth, before.facility_id, MANAGE, response)) return;
+
+        const shape = [];
+        if (body.payload.status !== undefined && !CERTIFICATION_STATUSES.includes(body.payload.status)) {
+          shape.push(`status must be one of: ${CERTIFICATION_STATUSES.join(", ")}`);
+        }
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const patch = {};
+        if (body.payload.expiresAt !== undefined) patch.expires_at = body.payload.expiresAt;
+        if (body.payload.issuedAt !== undefined) patch.issued_at = body.payload.issuedAt;
+        if (body.payload.status !== undefined) patch.status = body.payload.status;
+        if (Object.keys(patch).length === 0) return sendJson(response, 400, { error: "nothing to update" });
+        patch.updated_at = new Date().toISOString();
+
+        const rows = await pgUpdate(
+          auth.client,
+          "employee_certifications",
+          { id: params.id, facility_id: before.facility_id },
+          patch,
+          { returning: true }
+        );
+        const after = (rows ?? [])[0] ?? null;
+        if (after) {
+          const event = certificationEventFor(before, after);
+          if (event) {
+            await insertCertificationEvent(auth.client, {
+              facilityId: before.facility_id,
+              certificationId: after.id,
+              eventType: event.eventType,
+              payload: event.payload
+            });
+          }
+        }
+        return sendJson(response, 200, after);
+      })
+  );
+
+  // --- Evidence upload (TR-03) ------------------------------------------
+  // Raw binary upload proxied through the BFF, reusing the platform storage
+  // primitive (src/lib/storage.mjs) rather than a parallel client -- same
+  // shape as attachments-routes.mjs's POST /<module>/:id/attachments (see
+  // the readRawBody family of helpers above for why this is a local copy
+  // rather than a shared import).
+  //
+  // Order: shape-only checks (mime, filename header, declared
+  // Content-Length) with zero I/O first; then load the cert and guard
+  // training.manage on ITS facility_id; only then is the body actually read
+  // off the socket. storage_path, checksum, and the certification_events
+  // payload are always server-derived.
+  router.register(
+    "POST",
+    "/employee-certifications/:id/evidence",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        let contentType;
+        try {
+          contentType = assertMimeAllowed(request.headers["content-type"]);
+        } catch (error) {
+          return sendJson(response, storageErrorStatus(error), { error: error.message, code: error.code });
+        }
+
+        const filenameHeader = request.headers["x-file-name"];
+        if (!filenameHeader) {
+          return sendJson(response, 400, { error: "x-file-name header is required" });
+        }
+
+        const declaredLength = declaredContentLength(request);
+        if (declaredLength !== null && declaredLength > DEFAULT_MAX_UPLOAD_BYTES) {
+          if (typeof request.destroy === "function") request.destroy();
+          return sendJson(response, 413, {
+            error: `request body of ${declaredLength} bytes exceeds the ${DEFAULT_MAX_UPLOAD_BYTES}-byte cap`
+          });
+        }
+
+        const cert = await loadCertification(auth.client, params.id);
+        if (!cert) return sendJson(response, 404, { error: "certification not found" });
+        if (!requirePerm(auth, cert.facility_id, MANAGE, response)) return;
+
+        let bodyBuffer;
+        try {
+          bodyBuffer = await readRawBody(request, DEFAULT_MAX_UPLOAD_BYTES);
+        } catch (error) {
+          if (error instanceof UploadTooLargeError) return sendJson(response, 413, { error: error.message });
+          return sendJson(response, 400, { error: "failed to read request body" });
+        }
+
+        try {
+          assertWithinSizeCap(bodyBuffer.length);
+        } catch (error) {
+          return sendJson(response, storageErrorStatus(error), { error: error.message, code: error.code });
+        }
+        if (bodyBuffer.length === 0) {
+          return sendJson(response, 400, { error: "request body is empty" });
+        }
+
+        const filename = decodeFilenameHeader(filenameHeader);
+        let path;
+        try {
+          path = buildAttachmentPath(cert.facility_id, EVIDENCE_STORAGE_MODULE, cert.id, filename);
+        } catch (error) {
+          if (error instanceof StorageValidationError) {
+            return sendJson(response, 400, { error: error.message, code: error.code });
+          }
+          throw error;
+        }
+
+        const checksum = sha256Hex(bodyBuffer);
+        const storageClient = createStorageClient(env);
+        try {
+          await uploadObject(storageClient, { path, body: bodyBuffer, contentType });
+        } catch {
+          return sendJson(response, 502, { error: "storage upload failed" });
+        }
+
+        const rows = await pgUpdate(
+          auth.client,
+          "employee_certifications",
+          { id: params.id, facility_id: cert.facility_id },
+          { evidence_path: path, updated_at: new Date().toISOString() },
+          { returning: true }
+        );
+        const updated = (rows ?? [])[0] ?? null;
+
+        await insertCertificationEvent(auth.client, {
+          facilityId: cert.facility_id,
+          certificationId: cert.id,
+          eventType: "evidence_uploaded",
+          payload: evidenceUploadedPayload({
+            path,
+            checksumSha256: checksum,
+            contentType,
+            sizeBytes: bodyBuffer.length
+          })
+        });
+
+        return sendJson(response, 201, updated);
+      })
+  );
+
+  // Short-TTL signed URL for a certification's evidence file. Read-guarded:
+  // either training.read on the cert's facility (an admin/manager), OR the
+  // caller's own certification (self-scoping, same pattern the wallet route
+  // above uses -- resolve the caller's own employees.id and compare it
+  // against the row rather than trusting a client-supplied identity).
+  router.register(
+    "GET",
+    "/employee-certifications/:id/evidence-url",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const cert = await loadCertification(auth.client, params.id);
+        if (!cert) return sendJson(response, 404, { error: "certification not found" });
+
+        const readGuard = requireAuthPermission(auth, cert.facility_id, READ);
+        let allowed = readGuard.allowed;
+        if (!allowed) {
+          const callerEmployeeId = await loadCallerEmployeeId(auth.client, cert.facility_id, auth.claims.sub);
+          allowed = callerEmployeeId !== null && callerEmployeeId === cert.employee_id;
+        }
+        if (!allowed) return sendJson(response, 403, { error: readGuard.reason });
+
+        if (!cert.evidence_path) {
+          return sendJson(response, 404, { error: "no evidence uploaded for this certification" });
+        }
+
+        const storageClient = createStorageClient(env);
+        try {
+          const url = await createSignedUrl(storageClient, cert.evidence_path, EVIDENCE_SIGNED_URL_TTL_SECONDS);
+          return sendJson(response, 200, { url, expiresInSeconds: EVIDENCE_SIGNED_URL_TTL_SECONDS });
+        } catch {
+          return sendJson(response, 502, { error: "failed to create signed url" });
+        }
       })
   );
 

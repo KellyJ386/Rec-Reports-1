@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
+import { createStorageClient } from "../src/lib/storage.mjs";
 
 const MANAGER = [
   { facilityId: "fac-1", status: "active", permissions: ["training.read", "training.manage"] }
@@ -86,14 +89,19 @@ function stubFetchWithConflict(t, conflictTable, conflictMethod, respond) {
   return captured;
 }
 
-function mount({ memberships = MANAGER, userId = "user-1" } = {}) {
+function mount({ memberships = MANAGER, userId = "user-1", createStorageClient: createStorageClientDep } = {}) {
   const router = createRouter();
   const sent = [];
   const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
   const authenticate = async () => ({ claims: { sub: userId }, client, memberships, error: null });
   const sendJson = (response, status, payload) => sent.push({ status, payload });
   const readBody = async (request) => request.__body ?? "{}";
-  registerTrainingRoutes(router, { authenticate, sendJson, readBody });
+  registerTrainingRoutes(router, {
+    authenticate,
+    sendJson,
+    readBody,
+    ...(createStorageClientDep ? { createStorageClient: createStorageClientDep } : {})
+  });
   async function call(method, path, body) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
@@ -101,7 +109,45 @@ function mount({ memberships = MANAGER, userId = "user-1" } = {}) {
     await handler(request, {}, { env: {}, params });
     return sent[sent.length - 1];
   }
-  return { call };
+  // Like call, but builds a raw binary request (a real Readable stream, so
+  // the route's readRawBody -- request.on("data"/"end"/"error") -- consumes
+  // it exactly like a live Node http.IncomingMessage) instead of the
+  // JSON-body __body shape `call` uses. Used only by the TR-03 evidence
+  // upload tests below.
+  async function callRaw(method, path, { headers = {}, body = Buffer.alloc(0) } = {}) {
+    const { handler, params } = router.match({ method, url: path });
+    assert.ok(handler, `no route matched ${method} ${path}`);
+    const request = Readable.from(body.length > 0 ? [body] : []);
+    request.url = path;
+    request.headers = headers;
+    await handler(request, {}, { env: {}, params });
+    return sent[sent.length - 1];
+  }
+  return { call, callRaw };
+}
+
+// Stubs a storage client's fetchImpl (see src/lib/storage.mjs) so
+// uploadObject/createSignedUrl never touch the real Supabase Storage REST
+// API. `respond` receives { url, init } for each call and returns
+// { status, body } (defaulting to a 200 with an empty body).
+function stubStorageClient(respond) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: new URL(url), init });
+    const result = respond(calls[calls.length - 1]) ?? { status: 200, body: {} };
+    return {
+      ok: result.status >= 200 && result.status < 300,
+      status: result.status,
+      text: async () => (result.body === undefined ? "" : JSON.stringify(result.body))
+    };
+  };
+  const client = createStorageClient({
+    url: "https://example.supabase.co",
+    key: "service-role-key",
+    bucket: "attachments",
+    fetchImpl
+  });
+  return { client, calls };
 }
 
 test("GET courses denies a non-member of the facility with 403", async (t) => {
@@ -565,4 +611,373 @@ test("PATCH course modules surfaces an order_no collision as a clean 409", async
     orderNo: 2
   });
   assert.equal(result.status, 409);
+});
+
+// --- TR-04: certification lifecycle writes (issue/renew/revoke) -------------
+
+const EXISTING_CERT = {
+  id: "cert-1",
+  facility_id: "fac-1",
+  employee_id: "emp-1",
+  certification_type_id: "type-cpr",
+  issued_at: "2026-01-01",
+  expires_at: "2027-01-01",
+  evidence_path: null,
+  status: "active"
+};
+
+test("POST employee-certifications validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/employee-certifications", {
+    employeeId: "emp-1"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST employee-certifications denies a reader without training.manage", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/employee-certifications", {
+    employeeId: "emp-1",
+    certificationTypeId: "type-cpr"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST employee-certifications happy path issues the cert and appends a 'created' event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_certifications" && method === "POST") {
+      return [{ ...EXISTING_CERT, id: "cert-new" }];
+    }
+    if (table === "certification_events" && method === "POST") return [{ id: "event-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/employee-certifications", {
+    employeeId: "emp-1",
+    certificationTypeId: "type-cpr",
+    issuedAt: "2026-01-01",
+    expiresAt: "2027-01-01"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.id, "cert-new");
+
+  const certInsert = captured.find((c) => c.table === "employee_certifications" && c.method === "POST");
+  assert.equal(certInsert.body[0].facility_id, "fac-1");
+  assert.equal(certInsert.body[0].employee_id, "emp-1");
+  assert.equal(certInsert.body[0].certification_type_id, "type-cpr");
+  assert.equal(certInsert.body[0].status, "active");
+
+  const eventInsert = captured.find((c) => c.table === "certification_events" && c.method === "POST");
+  assert.ok(eventInsert, "expected a certification_events insert");
+  assert.equal(eventInsert.body[0].facility_id, "fac-1");
+  assert.equal(eventInsert.body[0].employee_certification_id, "cert-new");
+  assert.equal(eventInsert.body[0].event_type, "created");
+  assert.equal(eventInsert.body[0].payload_jsonb.before, null);
+});
+
+test("POST employee-certifications rejects an invalid status before guarding", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/employee-certifications", {
+    employeeId: "emp-1",
+    certificationTypeId: "type-cpr",
+    status: "bogus"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH employee-certifications 404s when the certification is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/employee-certifications/nope", { expiresAt: "2028-01-01" });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH employee-certifications guards training.manage on the CERT'S OWN facility, not a client-supplied one", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EXISTING_CERT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("PATCH", "/employee-certifications/cert-1", { expiresAt: "2028-01-01" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH employee-certifications rejects an empty patch", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EXISTING_CERT] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/employee-certifications/cert-1", {});
+  assert.equal(result.status, 400);
+});
+
+test("PATCH employee-certifications rejects an invalid status", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EXISTING_CERT] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/employee-certifications/cert-1", { status: "bogus" });
+  assert.equal(result.status, 400);
+});
+
+test("PATCH employee-certifications renew: a later expiresAt appends a 'renewed' event", async (t) => {
+  const renewed = { ...EXISTING_CERT, expires_at: "2028-06-01" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_certifications" && method === "GET") return [EXISTING_CERT];
+    if (table === "employee_certifications" && method === "PATCH") return [renewed];
+    if (table === "certification_events" && method === "POST") return [{ id: "event-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/employee-certifications/cert-1", { expiresAt: "2028-06-01" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.expires_at, "2028-06-01");
+
+  const update = captured.find((c) => c.table === "employee_certifications" && c.method === "PATCH");
+  assert.equal(update.body.expires_at, "2028-06-01");
+
+  const eventInsert = captured.find((c) => c.table === "certification_events" && c.method === "POST");
+  assert.ok(eventInsert, "expected a certification_events insert for the renewal");
+  assert.equal(eventInsert.body[0].employee_certification_id, "cert-1");
+  assert.equal(eventInsert.body[0].event_type, "renewed");
+  assert.equal(eventInsert.body[0].payload_jsonb.before.expiresAt, "2027-01-01");
+  assert.equal(eventInsert.body[0].payload_jsonb.after.expiresAt, "2028-06-01");
+});
+
+test("PATCH employee-certifications revoke: status='revoked' appends a 'revoked' event", async (t) => {
+  const revoked = { ...EXISTING_CERT, status: "revoked" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_certifications" && method === "GET") return [EXISTING_CERT];
+    if (table === "employee_certifications" && method === "PATCH") return [revoked];
+    if (table === "certification_events" && method === "POST") return [{ id: "event-3" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/employee-certifications/cert-1", { status: "revoked" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "revoked");
+
+  const eventInsert = captured.find((c) => c.table === "certification_events" && c.method === "POST");
+  assert.ok(eventInsert, "expected a certification_events insert for the revocation");
+  assert.equal(eventInsert.body[0].event_type, "revoked");
+  assert.equal(eventInsert.body[0].payload_jsonb.before.status, "active");
+  assert.equal(eventInsert.body[0].payload_jsonb.after.status, "revoked");
+});
+
+test("PATCH employee-certifications does not append a certification_events row for a no-op patch", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_certifications" && method === "GET") return [EXISTING_CERT];
+    if (table === "employee_certifications" && method === "PATCH") return [{ ...EXISTING_CERT }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  // issuedAt is present (so the patch is non-empty and passes the "nothing
+  // to update" guard) but unchanged from the loaded row, and no expiresAt or
+  // status field is sent at all -- so certificationEventFor(before, after)
+  // finds neither a revoke nor a later expiresAt and returns null.
+  const result = await call("PATCH", "/employee-certifications/cert-1", { issuedAt: "2026-01-01" });
+  assert.equal(result.status, 200);
+  const eventInsert = captured.find((c) => c.table === "certification_events" && c.method === "POST");
+  assert.equal(eventInsert, undefined);
+});
+
+// --- TR-03: evidence upload ---------------------------------------------
+// buildAttachmentPath (src/lib/storage.mjs) requires a UUID-shaped
+// facilityId, so the evidence routes' fixtures use real UUIDs rather than
+// the plain "fac-1"/"cert-1" ids used elsewhere in this file (those never
+// reach buildAttachmentPath). Membership facilityId is matched to
+// EVIDENCE_CERT.facility_id throughout.
+const EVIDENCE_FACILITY_ID = "11111111-1111-1111-1111-111111111111";
+const EVIDENCE_CERT_ID = "22222222-2222-2222-2222-222222222222";
+const EVIDENCE_EMPLOYEE_ID = "33333333-3333-3333-3333-333333333333";
+const EVIDENCE_MANAGER = [
+  { facilityId: EVIDENCE_FACILITY_ID, status: "active", permissions: ["training.read", "training.manage"] }
+];
+const EVIDENCE_READER = [{ facilityId: EVIDENCE_FACILITY_ID, status: "active", permissions: ["training.read"] }];
+const EVIDENCE_CERT = {
+  ...EXISTING_CERT,
+  id: EVIDENCE_CERT_ID,
+  facility_id: EVIDENCE_FACILITY_ID,
+  employee_id: EVIDENCE_EMPLOYEE_ID
+};
+
+test("POST evidence rejects a disallowed content-type before any I/O (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "text/html", "x-file-name": "evidence.pdf" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST evidence requires an x-file-name header (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST evidence 404s when the certification is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER });
+  const result = await callRaw("POST", "/employee-certifications/nope/evidence", {
+    headers: { "content-type": "application/pdf", "x-file-name": "evidence.pdf" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 404);
+});
+
+test("POST evidence denies a caller without training.manage on the cert's facility", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EVIDENCE_CERT] : []));
+  const { calls, client } = stubStorageClient(() => ({ status: 200, body: {} }));
+  const { callRaw } = mount({ memberships: EVIDENCE_READER, createStorageClient: () => client });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf", "x-file-name": "evidence.pdf" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 403);
+  assert.equal(calls.length, 0);
+});
+
+test("POST evidence rejects a malformed/unsafe filename (400) without ever calling storage upload", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EVIDENCE_CERT] : []));
+  const { calls, client } = stubStorageClient(() => ({ status: 200, body: {} }));
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER, createStorageClient: () => client });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf", "x-file-name": "../../etc/passwd" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 400);
+  assert.equal(calls.length, 0, "storage upload must never be attempted for a rejected filename");
+});
+
+test("POST evidence rejects an empty body", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EVIDENCE_CERT] : []));
+  const { calls, client } = stubStorageClient(() => ({ status: 200, body: {} }));
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER, createStorageClient: () => client });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf", "x-file-name": "evidence.pdf" },
+    body: Buffer.alloc(0)
+  });
+  assert.equal(result.status, 400);
+  assert.equal(calls.length, 0);
+});
+
+test("POST evidence happy path uploads via the storage client, sets evidence_path, and appends an 'evidence_uploaded' event with a sha256 checksum", async (t) => {
+  const evidencePath = `facilities/${EVIDENCE_FACILITY_ID}/certifications/${EVIDENCE_CERT_ID}/uuid-evidence.pdf`;
+  const withEvidence = { ...EVIDENCE_CERT, evidence_path: evidencePath };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_certifications" && method === "GET") return [EVIDENCE_CERT];
+    if (table === "employee_certifications" && method === "PATCH") return [withEvidence];
+    if (table === "certification_events" && method === "POST") return [{ id: "event-4" }];
+    return [];
+  });
+  const pathPrefix = `/storage/v1/object/attachments/facilities/${EVIDENCE_FACILITY_ID}/certifications/${EVIDENCE_CERT_ID}/`;
+  const { calls, client } = stubStorageClient((call) => {
+    if (call.url.pathname.startsWith(pathPrefix)) {
+      return { status: 200, body: { Key: "attachments/x" } };
+    }
+    return { status: 200, body: {} };
+  });
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER, createStorageClient: () => client });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf", "x-file-name": "evidence.pdf" },
+    body: Buffer.from("pdf-bytes")
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.evidence_path, withEvidence.evidence_path);
+
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].url.pathname.startsWith(pathPrefix));
+  assert.equal(calls[0].init.headers["Content-Type"], "application/pdf");
+
+  const certUpdate = captured.find((c) => c.table === "employee_certifications" && c.method === "PATCH");
+  assert.ok(certUpdate.body.evidence_path.startsWith(`facilities/${EVIDENCE_FACILITY_ID}/certifications/${EVIDENCE_CERT_ID}/`));
+
+  const eventInsert = captured.find((c) => c.table === "certification_events" && c.method === "POST");
+  assert.ok(eventInsert, "expected a certification_events insert for the evidence upload");
+  assert.equal(eventInsert.body[0].event_type, "evidence_uploaded");
+  assert.equal(eventInsert.body[0].employee_certification_id, EVIDENCE_CERT_ID);
+  const expectedChecksum = createHash("sha256").update(Buffer.from("pdf-bytes")).digest("hex");
+  assert.equal(eventInsert.body[0].payload_jsonb.checksumSha256, expectedChecksum);
+  assert.equal(eventInsert.body[0].payload_jsonb.contentType, "application/pdf");
+  assert.equal(eventInsert.body[0].payload_jsonb.sizeBytes, Buffer.byteLength("pdf-bytes"));
+});
+
+test("POST evidence surfaces a storage upload failure as a 502 without writing evidence_path", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "employee_certifications" ? [EVIDENCE_CERT] : []));
+  const { calls, client } = stubStorageClient(() => ({ status: 500, body: { message: "boom" } }));
+  const { callRaw } = mount({ memberships: EVIDENCE_MANAGER, createStorageClient: () => client });
+  const result = await callRaw("POST", `/employee-certifications/${EVIDENCE_CERT_ID}/evidence`, {
+    headers: { "content-type": "application/pdf", "x-file-name": "evidence.pdf" },
+    body: Buffer.from("hello")
+  });
+  assert.equal(result.status, 502);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    captured.find((c) => c.table === "employee_certifications" && c.method === "PATCH"),
+    undefined
+  );
+});
+
+// --- TR-03: evidence signed URL (self vs manager access) ---------------
+
+test("GET evidence-url 404s when the certification is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("GET", "/employee-certifications/nope/evidence-url");
+  assert.equal(result.status, 404);
+});
+
+test("GET evidence-url denies a caller who is neither training.read nor the cert's own employee", async (t) => {
+  const withEvidence = { ...EXISTING_CERT, evidence_path: "facilities/fac-1/certifications/cert-1/uuid-evidence.pdf" };
+  stubFetch(t, (table) => {
+    if (table === "employee_certifications") return [withEvidence];
+    if (table === "employees") return []; // caller has no employee row in this facility
+    return [];
+  });
+  const { call } = mount({ memberships: [{ facilityId: "fac-1", status: "active", permissions: [] }] });
+  const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
+  assert.equal(result.status, 403);
+});
+
+test("GET evidence-url grants a training.read manager access without needing to be the cert owner", async (t) => {
+  const withEvidence = { ...EXISTING_CERT, evidence_path: "facilities/fac-1/certifications/cert-1/uuid-evidence.pdf" };
+  stubFetch(t, (table) => (table === "employee_certifications" ? [withEvidence] : []));
+  const { client, calls } = stubStorageClient(() => ({ status: 200, body: { signedURL: "/object/sign/attachments/p?token=abc" } }));
+  const { call } = mount({ memberships: READER, createStorageClient: () => client });
+  const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
+  assert.equal(result.status, 200);
+  assert.ok(result.payload.url.includes("token=abc"));
+  assert.equal(calls.length, 1);
+});
+
+test("GET evidence-url grants the cert's own employee access without training.read (self-scoping)", async (t) => {
+  const withEvidence = { ...EXISTING_CERT, evidence_path: "facilities/fac-1/certifications/cert-1/uuid-evidence.pdf" };
+  stubFetch(t, (table) => {
+    if (table === "employee_certifications") return [withEvidence];
+    if (table === "employees") return [{ id: "emp-1" }]; // caller's own employee row == cert.employee_id
+    return [];
+  });
+  const { client, calls } = stubStorageClient(() => ({ status: 200, body: { signedURL: "/object/sign/attachments/p?token=self" } }));
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: [] }],
+    userId: "user-1",
+    createStorageClient: () => client
+  });
+  const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
+  assert.equal(result.status, 200);
+  assert.ok(result.payload.url.includes("token=self"));
+  assert.equal(calls.length, 1);
+});
+
+test("GET evidence-url 404s when no evidence has been uploaded yet", async (t) => {
+  stubFetch(t, (table) => (table === "employee_certifications" ? [EXISTING_CERT] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
+  assert.equal(result.status, 404);
 });
