@@ -47,7 +47,7 @@ export function emptyState(message) {
   return el("p", { class: "empty-state" }, [message]);
 }
 
-export function signInPrompt(message = "Sign in required. Paste a session token to continue.") {
+export function signInPrompt(message = "Sign in required. Sign in again to continue.") {
   return el("div", { class: "banner banner-warning", role: "alert" }, [message]);
 }
 

@@ -4,7 +4,7 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
-import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
+import { createJwtVerifier, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
 import { requireAuthOrgAdmin } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
@@ -97,12 +97,24 @@ function buildClient(env, authToken) {
 }
 
 async function authenticate(request, env) {
-  if (!env.SUPABASE_JWT_SECRET) {
-    return { error: { status: 503, body: { error: "SUPABASE_JWT_SECRET is not configured" } } };
+  // Either signing mode is enough to verify a token: the legacy shared secret
+  // (HS256) or the project's published JWKS (ES256/RS256, needs only the
+  // project URL). Refuse only when neither is available.
+  if (!env.SUPABASE_JWT_SECRET && !env.NEXT_PUBLIC_SUPABASE_URL) {
+    return {
+      error: {
+        status: 503,
+        body: { error: "SUPABASE_JWT_SECRET or NEXT_PUBLIC_SUPABASE_URL is not configured" }
+      }
+    };
   }
   const token = extractBearerToken(request);
   if (!token) return { error: { status: 401, body: { error: "missing bearer token" } } };
-  const claims = verifySupabaseJwt(token, env.SUPABASE_JWT_SECRET);
+  const verify = createJwtVerifier({
+    jwtSecret: env.SUPABASE_JWT_SECRET,
+    supabaseUrl: env.NEXT_PUBLIC_SUPABASE_URL
+  });
+  const claims = await verify(token);
   if (!claims || !claims.sub) {
     return { error: { status: 401, body: { error: "invalid or expired token" } } };
   }
@@ -212,6 +224,13 @@ registerCertPolicyRoutes(router, { authenticate, sendJson, readBody });
 // usage meters, feature-flag catalog + effective state, scope-gated rule
 // writes). Logic lives in src/lib/admin/entitlements.mjs.
 registerBillingRoutes(router, { authenticate, sendJson, readBody });
+
+// GET /me on the admin prefix as well. The admin control center's fetch wrapper
+// is pinned to /api/admin/v1, so it cannot reach the end-user copy below. This
+// mounts the same handler on both prefixes; admin-routes.mjs used to carry a
+// second /me of its own with a different payload shape, which meant the two
+// apps disagreed about what a session looks like.
+registerMeRoute(router, { authenticate, sendJson });
 
 // --- End-user product routes (/api/v1) -------------------------------------
 // The operational modules that facility staff use directly (as opposed to the

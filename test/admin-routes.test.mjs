@@ -54,14 +54,19 @@ function mount({ memberships = ADMIN_ON_FAC1, respond = () => [] } = {}) {
   return { call, sent, respond };
 }
 
-test("GET /me returns the user id and their memberships", async () => {
-  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
-  const result = await call("GET", "/me");
-  assert.equal(result.status, 200);
-  assert.equal(result.payload.userId, "user-1");
-  assert.deepEqual(result.payload.memberships, [
-    { facilityId: "fac-1", departmentId: null, status: "active", permissions: ["admin.manage"] }
-  ]);
+// /me belongs to me-route.mjs, which scripts/server.mjs mounts on both API
+// prefixes. Registering a second one here would shadow it on the admin prefix
+// (the router takes the first match), so the two apps would read different
+// shapes from the same path.
+test("admin routes do not register their own GET /me", () => {
+  const router = createRouter();
+  registerAdminRoutes(router, {
+    authenticate: async () => ({ error: null }),
+    sendJson: () => {},
+    readBody: async () => "{}"
+  });
+  const { handler } = router.match({ method: "GET", url: "/me" });
+  assert.equal(handler, null, "GET /me must come from me-route.mjs, not admin-routes.mjs");
 });
 
 test("PUT module-overrides denies a non-admin with 403", async (t) => {

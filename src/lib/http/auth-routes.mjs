@@ -42,14 +42,16 @@ export function registerAuthRoutes(router, { sendJson, readBody }) {
     };
   }
 
-  async function callGotrue(env, path, body) {
+  // `authorization` overrides the anon-key bearer with the caller's own access
+  // token, which GoTrue requires for user-scoped calls such as logout.
+  async function callGotrue(env, path, body, { authorization } = {}) {
     let response;
     try {
       response = await fetch(gotrue(env, path), {
         method: "POST",
         headers: {
           apikey: anonKey(env),
-          Authorization: `Bearer ${anonKey(env)}`,
+          Authorization: authorization ?? `Bearer ${anonKey(env)}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify(body)
@@ -115,6 +117,22 @@ export function registerAuthRoutes(router, { sendJson, readBody }) {
         return sendJson(response, 401, { error: "could not refresh session" });
       }
       return sendJson(response, 200, sessionPayload(result.data));
+    })()
+  );
+
+  // POST /auth/sign-out -> revokes the caller's refresh token upstream.
+  //
+  // Always answers 200: the browser clears its own copy of the session either
+  // way, so a token GoTrue has already forgotten (expired, revoked, missing
+  // header) is not an error the user can act on. Signing out must never fail.
+  router.register("POST", "/auth/sign-out", (request, response, { env }) =>
+    (async () => {
+      if (!requireConfigured(env, response)) return;
+      const authorization = request.headers?.authorization;
+      if (authorization) {
+        await callGotrue(env, "logout", {}, { authorization });
+      }
+      return sendJson(response, 200, { signed_out: true });
     })()
   );
 

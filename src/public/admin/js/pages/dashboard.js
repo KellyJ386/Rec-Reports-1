@@ -17,11 +17,13 @@ export async function renderDashboard(container) {
 
   const me = await loadMe();
   if (me.error === "missing-token" || me.error === "unauthorized") {
+    // requireSession() in app.js already redirects to /signin in these cases;
+    // this prompt only shows if the session lapses while the page is open.
     container.append(
       signInPrompt(
         me.error === "missing-token"
-          ? "No session token is set. Open “Session token” in the top bar and paste an access token to continue."
-          : "Your session token was rejected (401). Open “Session token” in the top bar and paste a valid access token."
+          ? "You are signed out. Sign in again to continue."
+          : "Your session expired or was rejected. Sign in again to continue."
       )
     );
     return;
@@ -30,11 +32,10 @@ export async function renderDashboard(container) {
     container.append(errorBanner("Could not reach the admin API to load your session. Some data below may be unavailable."));
   }
 
-  const activeMemberships = (me.memberships ?? []).filter((membership) => membership.status === "active");
   const context = getContext();
 
   const statsRow = el("div", { class: "stat-row" }, [
-    statTile("Active facility memberships", activeMemberships.length, "#/facilities")
+    statTile("Facilities you can access", (me.facilities ?? []).length, "#/facilities")
   ]);
   container.append(statsRow);
 
@@ -55,7 +56,7 @@ export async function renderDashboard(container) {
   if (!context.orgId) {
     container.append(
       emptyState(
-        "Set an Organization ID in the top bar to see facility counts and manage module and facility settings."
+        "Choose an organization in the top bar to see facility counts and manage module and facility settings."
       )
     );
   } else {

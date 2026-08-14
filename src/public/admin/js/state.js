@@ -22,7 +22,14 @@ function loadContext() {
 }
 
 let context = loadContext();
-let me = { userId: null, memberships: [], loaded: false, error: null };
+let me = {
+  userId: null,
+  email: null,
+  facilities: [],
+  platformAdmin: false,
+  loaded: false,
+  error: null
+};
 let facilities = [];
 
 function persistContext() {
@@ -72,16 +79,17 @@ export function setFacilities(list) {
   notify();
 }
 
-// True when any active membership includes `code`. Used by nav.js to gate
-// each nav item on the permission its page's primary API actually requires
-// (not a single hard-coded "admin.manage" for every restricted page), so a
-// user holding exactly the page's real permission isn't wrongly hidden from
-// it. Optimistic (returns true) while the initial /me call is in flight, same
-// as the rest of the pre-load nav state, so nothing flashes hidden then shown.
+// True when the user holds `code` in any facility they can act in. /me already
+// resolves each facility's permissions from that user's active memberships, so
+// membership status is filtered server-side and every facility listed here is
+// one the user genuinely has. Used by nav.js to gate each nav item on the
+// permission its page's primary API actually requires (not a single hard-coded
+// "admin.manage" for every restricted page), so a user holding exactly the
+// page's real permission isn't wrongly hidden from it. Optimistic (returns
+// true) while the initial /me call is in flight, same as the rest of the
+// pre-load nav state, so nothing flashes hidden then shown.
 export function hasPermissionAnywhere(code) {
   if (!me.loaded) return true;
   if (me.platformAdmin === true) return true;
-  return me.memberships.some(
-    (membership) => membership.status === "active" && (membership.permissions ?? []).includes(code)
-  );
+  return me.facilities.some((facility) => (facility.permissions ?? []).includes(code));
 }

@@ -1,6 +1,7 @@
-import { api, getToken, setToken, hasToken } from "./api.js";
-import { getContext, setContext, setFacilities, subscribe } from "./state.js";
-import { toast, clearChildren, el } from "./ui.js";
+import { api } from "./api.js";
+import { hasToken, redirectToSignIn, signOut } from "./auth.js";
+import { getContext, getMe, setContext, setFacilities, subscribe } from "./state.js";
+import { clearChildren, el } from "./ui.js";
 import { loadMe } from "./session.js";
 import { initRouter, closeSidebarOnNavigate } from "./nav.js";
 
@@ -44,52 +45,41 @@ function wireSidebarToggle() {
   closeSidebarOnNavigate();
 }
 
-function wireTokenDrawer() {
-  const drawer = document.getElementById("token-drawer");
-  const toggleButton = document.getElementById("token-drawer-toggle");
-  const closeButton = document.getElementById("token-drawer-close");
-  const input = document.getElementById("token-input");
-  const saveButton = document.getElementById("token-save");
-  const clearButton = document.getElementById("token-clear");
-  const status = document.getElementById("token-status");
-  if (!drawer || !toggleButton || !input || !saveButton || !clearButton) return;
+// Shows who is signed in and wires the sign-out button. The email comes from
+// /me, so it reflects the token the API actually accepted rather than anything
+// the browser typed in.
+function wireSessionControl() {
+  const emailSpan = document.getElementById("session-email");
+  const signOutButton = document.getElementById("sign-out-button");
 
-  input.value = getToken();
+  signOutButton?.addEventListener("click", () => {
+    signOutButton.disabled = true;
+    signOut();
+  });
 
-  function openDrawer() {
-    drawer.hidden = false;
-    toggleButton.setAttribute("aria-expanded", "true");
-    input.focus();
-  }
-  function closeDrawer() {
-    drawer.hidden = true;
-    toggleButton.setAttribute("aria-expanded", "false");
-    toggleButton.focus();
+  function render() {
+    if (!emailSpan) return;
+    const me = getMe();
+    emailSpan.textContent = me.email ?? (me.loaded ? "unknown user" : "…");
   }
 
-  toggleButton.addEventListener("click", () => {
-    if (drawer.hidden) openDrawer();
-    else closeDrawer();
-  });
-  closeButton?.addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !drawer.hidden) closeDrawer();
-  });
+  subscribe(render);
+  render();
+}
 
-  saveButton.addEventListener("click", async () => {
-    setToken(input.value.trim());
-    status.textContent = hasToken() ? "Token saved." : "Token cleared (empty value).";
-    toast("Session token saved.", { tone: "success" });
-    await loadMe({ force: true });
-  });
-
-  clearButton.addEventListener("click", async () => {
-    setToken("");
-    input.value = "";
-    status.textContent = "Token cleared.";
-    toast("Session token cleared.", { tone: "info" });
-    await loadMe({ force: true });
-  });
+// Organizations the signed-in user can act in, derived from the facilities /me
+// returned. A platform admin sees every organization; everyone else sees the
+// ones they hold a membership in.
+function organizationsFromMe() {
+  const byId = new Map();
+  for (const facility of getMe().facilities ?? []) {
+    if (!facility.organizationId || byId.has(facility.organizationId)) continue;
+    byId.set(facility.organizationId, {
+      id: facility.organizationId,
+      name: facility.organizationName ?? facility.organizationId
+    });
+  }
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 async function refreshFacilitySelect() {
@@ -102,43 +92,72 @@ async function refreshFacilitySelect() {
     select.append(el("option", { value: "" }, ["All facilities"]));
     return;
   }
+
+  // Prefer the org-scoped list (it includes facilities the user administers but
+  // holds no direct membership in); fall back to the /me facilities for that
+  // org when the caller lacks org-admin scope on this endpoint.
+  let facilities;
   try {
-    const facilities = (await api.get(`/org/${encodeURIComponent(context.orgId)}/facilities`)) ?? [];
-    setFacilities(facilities);
-    clearChildren(select);
-    select.append(el("option", { value: "" }, ["All facilities"]));
-    for (const facility of facilities) {
-      select.append(el("option", { value: facility.id }, [facility.name ?? facility.id]));
-    }
-    select.value = context.facilityId ?? "";
-    select.disabled = false;
+    facilities = (await api.get(`/org/${encodeURIComponent(context.orgId)}/facilities`)) ?? [];
   } catch {
-    select.disabled = true;
+    facilities = (getMe().facilities ?? []).filter((f) => f.organizationId === context.orgId);
   }
+
+  setFacilities(facilities);
+  clearChildren(select);
+  select.append(el("option", { value: "" }, ["All facilities"]));
+  for (const facility of facilities) {
+    select.append(el("option", { value: facility.id }, [facility.name ?? facility.id]));
+  }
+  // Drop a remembered facility that isn't in this organization.
+  const remembered = context.facilityId ?? "";
+  const valid = facilities.some((facility) => facility.id === remembered);
+  select.value = valid ? remembered : "";
+  if (!valid && remembered) setContext({ facilityId: "" });
+  select.disabled = facilities.length === 0;
 }
 
-function wireContextControls() {
-  const orgInput = document.getElementById("org-input");
+// Populates the organization picker from /me and restores (or picks) the active
+// organization. Replaces the old "paste an organization id" text field.
+async function wireContextControls() {
+  const orgSelect = document.getElementById("org-select");
   const facilitySelect = document.getElementById("facility-select");
-  if (!orgInput || !facilitySelect) return;
+  if (!orgSelect || !facilitySelect) return;
 
-  const context = getContext();
-  orgInput.value = context.orgId ?? "";
+  const organizations = organizationsFromMe();
+  clearChildren(orgSelect);
 
-  let debounceTimer = null;
-  orgInput.addEventListener("input", () => {
-    if (debounceTimer) window.clearTimeout(debounceTimer);
-    debounceTimer = window.setTimeout(() => {
-      setContext({ orgId: orgInput.value.trim(), facilityId: "" });
-      refreshFacilitySelect();
-    }, 400);
+  if (organizations.length === 0) {
+    orgSelect.append(el("option", { value: "" }, ["No organizations available"]));
+    orgSelect.disabled = true;
+    await refreshFacilitySelect();
+    return;
+  }
+
+  for (const organization of organizations) {
+    orgSelect.append(el("option", { value: organization.id }, [organization.name]));
+  }
+
+  // Keep the remembered organization when the user still has access to it,
+  // otherwise fall back to their first one so the app is usable immediately.
+  const remembered = getContext().orgId ?? "";
+  const active = organizations.some((organization) => organization.id === remembered)
+    ? remembered
+    : organizations[0].id;
+  orgSelect.value = active;
+  orgSelect.disabled = false;
+  if (active !== remembered) setContext({ orgId: active, facilityId: "" });
+
+  orgSelect.addEventListener("change", () => {
+    setContext({ orgId: orgSelect.value, facilityId: "" });
+    refreshFacilitySelect();
   });
 
   facilitySelect.addEventListener("change", () => {
     setContext({ facilityId: facilitySelect.value });
   });
 
-  refreshFacilitySelect();
+  await refreshFacilitySelect();
 }
 
 function wireUnpublishedBadge() {
@@ -147,12 +166,31 @@ function wireUnpublishedBadge() {
   refreshUnpublishedBadge();
 }
 
+// The admin area is for signed-in users only. Bounce to /signin before doing any
+// work when there is no stored session at all, and again if the API rejects the
+// one we have (api.js has already tried a silent refresh by that point).
+async function requireSession() {
+  if (!hasToken()) {
+    redirectToSignIn();
+    return null;
+  }
+  const me = await loadMe();
+  if (me.error === "missing-token" || me.error === "unauthorized") {
+    redirectToSignIn();
+    return null;
+  }
+  return me;
+}
+
 async function bootstrap() {
   wireSidebarToggle();
-  wireTokenDrawer();
-  wireContextControls();
+  wireSessionControl();
+
+  const me = await requireSession();
+  if (!me) return;
+
+  await wireContextControls();
   wireUnpublishedBadge();
-  await loadMe();
   initRouter();
 }
 

@@ -1,11 +1,35 @@
 const TOKEN_KEY = "rr_admin_token";
 const REFRESH_TOKEN_KEY = "rr_refresh_token";
+const DEFAULT_DESTINATION = "/admin/";
 
 const form = document.getElementById("signin-form");
 const emailInput = document.getElementById("email-input");
 const passwordInput = document.getElementById("password-input");
 const signinButton = document.getElementById("signin-button");
 const errorMessage = document.getElementById("error-message");
+
+// Where to land after a successful sign-in. Only same-origin, path-only values
+// are honoured: `next` comes from the query string, so an absolute URL there
+// would turn this page into an open redirect.
+function destination() {
+  const requested = new URLSearchParams(window.location.search).get("next");
+  if (!requested) return DEFAULT_DESTINATION;
+  if (!requested.startsWith("/") || requested.startsWith("//")) return DEFAULT_DESTINATION;
+  return requested;
+}
+
+function storeSession(session) {
+  try {
+    localStorage.setItem(TOKEN_KEY, session.access_token);
+    if (session.refresh_token) {
+      localStorage.setItem(REFRESH_TOKEN_KEY, session.refresh_token);
+    }
+  } catch {
+    // Storage may be unavailable (private browsing, blocked cookies). The
+    // redirect below will bounce straight back here, and the message shown
+    // then is more useful than silently looping.
+  }
+}
 
 form.addEventListener("submit", handleSignIn);
 
@@ -21,6 +45,7 @@ async function handleSignIn(event) {
   }
 
   signinButton.disabled = true;
+  signinButton.textContent = "Signing in…";
   clearError();
 
   try {
@@ -34,37 +59,30 @@ async function handleSignIn(event) {
 
     if (response.status === 200) {
       const data = await response.json();
-      const accessToken = data.access_token;
-      const refreshToken = data.refresh_token;
 
-      if (!accessToken) {
-        showError("Invalid sign-in response from server. Please try again.");
-        signinButton.disabled = false;
+      if (!data.access_token) {
+        failWith("Invalid sign-in response from server. Please try again.");
         return;
       }
 
-      try {
-        localStorage.setItem(TOKEN_KEY, accessToken);
-        if (refreshToken) {
-          localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-        }
-      } catch {
-        // Storage may be unavailable; redirect anyway and hope the token
-        // persists via session storage or that the app handles missing storage gracefully.
-      }
-
-      window.location.href = "/admin/";
+      storeSession(data);
+      window.location.assign(destination());
     } else if (response.status === 401) {
-      showError("Invalid email or password.");
-      signinButton.disabled = false;
+      failWith("Invalid email or password.");
+    } else if (response.status === 503) {
+      failWith("Sign-in is not configured on this server. Contact your administrator.");
     } else {
-      showError("Sign-in failed. Please try again.");
-      signinButton.disabled = false;
+      failWith("Sign-in failed. Please try again.");
     }
-  } catch (error) {
-    showError("Network error. Please check your connection and try again.");
-    signinButton.disabled = false;
+  } catch {
+    failWith("Network error. Please check your connection and try again.");
   }
+}
+
+function failWith(message) {
+  showError(message);
+  signinButton.disabled = false;
+  signinButton.textContent = "Sign In";
 }
 
 function showError(message) {
