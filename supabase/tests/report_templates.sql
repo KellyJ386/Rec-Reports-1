@@ -56,12 +56,18 @@ on conflict (id) do nothing;
 
 -- A pre-existing published template + version in Facility B, seeded with RLS
 -- bypassed (owner role), used only as the FK-injection target below.
+-- active_version starts null and is set only AFTER the matching version row
+-- exists -- fn_report_template_active_version_published (0028) requires a
+-- published version_number match at insert/update time, so the template and
+-- its version can't be created in the opposite order within one insert.
 insert into report_templates (id, facility_id, code, name, status, active_version) values
-  ('28e00000-0000-0000-0000-0000000000e1', '28bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'rt_b', 'RT Facility B Template', 'published', 1)
+  ('28e00000-0000-0000-0000-0000000000e1', '28bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'rt_b', 'RT Facility B Template', 'published', null)
 on conflict (id) do nothing;
 insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published) values
   ('28f00000-0000-0000-0000-0000000000f1', '28bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '28e00000-0000-0000-0000-0000000000e1', 1, '{}'::jsonb, true)
 on conflict (id) do nothing;
+update report_templates set active_version = 1
+  where id = '28e00000-0000-0000-0000-0000000000e1' and active_version is null;
 
 -- ---------------------------------------------------------------------------
 -- 1. Act as the manager: create a draft template, then a draft version under

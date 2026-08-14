@@ -81,9 +81,12 @@ on conflict (id) do nothing;
 
 -- A pre-existing incident_audit_events row, seeded with RLS bypassed, used
 -- only for the append-only check in step 6 (id is bigserial -- referenced
--- below by event_type rather than a chosen id).
-insert into incident_audit_events (facility_id, incident_id, event_type, event_payload) values
-  ('32aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '32e00000-0000-0000-0000-0000000000e1', 'incident_immutability.seed', '{}'::jsonb);
+-- below by event_type rather than a chosen id). event_hash (0004) is a NOT
+-- NULL legacy column no trigger populates -- every real caller goes through
+-- buildIncidentAuditEvent (src/lib/incidents.mjs), which fills it; this raw
+-- fixture insert must supply one explicitly the same way.
+insert into incident_audit_events (facility_id, incident_id, event_type, event_payload, event_hash) values
+  ('32aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '32e00000-0000-0000-0000-0000000000e1', 'incident_immutability.seed', '{}'::jsonb, 'seed-fixture-hash');
 
 -- ---------------------------------------------------------------------------
 -- 1a. incidents.manage holder can INSERT an amendment for their own
@@ -140,15 +143,31 @@ $$;
 -- ---------------------------------------------------------------------------
 -- 5. Append-only: even the manager who inserted the row cannot UPDATE or
 -- DELETE it afterwards.
+--
+-- incident_amendments carries NO update/delete policy at all (0032): with
+-- RLS enabled and zero permissive policies for a command, Postgres denies it
+-- by silently matching zero rows -- it does NOT raise insufficient_privilege
+-- (that only happens when a USING/WITH CHECK clause is evaluated and fails;
+-- here there is no policy to evaluate at all, so fn_block_audit_mutation's
+-- BEFORE UPDATE/DELETE trigger never even fires for this row). This is the
+-- exact "RLS-by-omission" semantics 0032's own header documents and the same
+-- idiom work_orders_scope.sql uses for a reader's denied UPDATE -- so the
+-- correct assertion is "the row is unchanged afterward", not "an exception
+-- was raised". The insufficient_privilege catch is kept (not required, but
+-- harmless) as defense-in-depth coverage for a hypothetical future stray
+-- permissive policy, which is exactly what 0032 added the trigger to guard
+-- against.
 -- ---------------------------------------------------------------------------
 do $$
 begin
   begin
     update incident_amendments set amendment_reason = 'tampered' where id = '32100000-0000-0000-0000-000000001001';
-    raise exception 'IM FAIL: an incident_amendments row was updated';
   exception
-    when insufficient_privilege then null; -- expected: fn_block_audit_mutation raised
+    when insufficient_privilege then null; -- acceptable: fn_block_audit_mutation raised
   end;
+  if exists (select 1 from incident_amendments where id = '32100000-0000-0000-0000-000000001001' and amendment_reason = 'tampered') then
+    raise exception 'IM FAIL: an incident_amendments row was updated';
+  end if;
 end;
 $$;
 
@@ -156,26 +175,34 @@ do $$
 begin
   begin
     delete from incident_amendments where id = '32100000-0000-0000-0000-000000001001';
-    raise exception 'IM FAIL: an incident_amendments row was deleted';
   exception
-    when insufficient_privilege then null; -- expected: fn_block_audit_mutation raised
+    when insufficient_privilege then null; -- acceptable: fn_block_audit_mutation raised
   end;
+  if not exists (select 1 from incident_amendments where id = '32100000-0000-0000-0000-000000001001') then
+    raise exception 'IM FAIL: an incident_amendments row was deleted';
+  end if;
 end;
 $$;
 
 -- ---------------------------------------------------------------------------
 -- 6. Append-only: incident_audit_events cannot be UPDATEd or DELETEd either
 -- (0010's trigger), exercised here (not just audit_events, which
--- audit_append_only.sql already covers).
+-- audit_append_only.sql already covers). Same RLS-by-omission semantics as
+-- step 5 above: incident_audit_events also carries no update/delete policy,
+-- so the UPDATE/DELETE below silently matches zero rows rather than
+-- raising -- verified by re-reading the row afterward, not by expecting an
+-- exception.
 -- ---------------------------------------------------------------------------
 do $$
 begin
   begin
     update incident_audit_events set event_type = 'tampered' where event_type = 'incident_immutability.seed';
-    raise exception 'IM FAIL: an incident_audit_events row was updated';
   exception
-    when insufficient_privilege then null; -- expected: fn_block_audit_mutation raised
+    when insufficient_privilege then null; -- acceptable: fn_block_audit_mutation raised
   end;
+  if exists (select 1 from incident_audit_events where event_type = 'tampered') then
+    raise exception 'IM FAIL: an incident_audit_events row was updated';
+  end if;
 end;
 $$;
 
@@ -183,10 +210,12 @@ do $$
 begin
   begin
     delete from incident_audit_events where event_type = 'incident_immutability.seed';
-    raise exception 'IM FAIL: an incident_audit_events row was deleted';
   exception
-    when insufficient_privilege then null; -- expected: fn_block_audit_mutation raised
+    when insufficient_privilege then null; -- acceptable: fn_block_audit_mutation raised
   end;
+  if not exists (select 1 from incident_audit_events where event_type = 'incident_immutability.seed') then
+    raise exception 'IM FAIL: an incident_audit_events row was deleted';
+  end if;
 end;
 $$;
 

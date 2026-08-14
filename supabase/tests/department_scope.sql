@@ -132,14 +132,19 @@ insert into memberships (id, user_id, facility_id, role_id, status) values
   ('d0000000-0000-0000-0000-0000000000e3', 'd0000000-0000-0000-0000-0000000000ad', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000d2', 'active')
 on conflict (id) do nothing;
 
+-- active_version starts null and is set only AFTER the matching version row
+-- exists -- fn_report_template_active_version_published (0028) requires a
+-- published version_number match at insert/update time.
 insert into report_templates (id, facility_id, department_id, code, name, status, active_version) values
-  ('d0000000-0000-0000-0000-0000000000f0', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'dept_a_rpt', 'Aquatics Report', 'published', 1),
-  ('d0000000-0000-0000-0000-0000000000f1', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'dept_b_rpt', 'Fitness Report', 'published', 1)
+  ('d0000000-0000-0000-0000-0000000000f0', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'dept_a_rpt', 'Aquatics Report', 'published', null),
+  ('d0000000-0000-0000-0000-0000000000f1', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'dept_b_rpt', 'Fitness Report', 'published', null)
 on conflict (id) do nothing;
 insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published) values
   ('d0000000-0000-0000-0000-0000000000f2', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000f0', 1, '{"sections":[]}'::jsonb, true),
   ('d0000000-0000-0000-0000-0000000000f3', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000f1', 1, '{"sections":[]}'::jsonb, true)
 on conflict (id) do nothing;
+update report_templates set active_version = 1
+  where id in ('d0000000-0000-0000-0000-0000000000f0', 'd0000000-0000-0000-0000-0000000000f1') and active_version is null;
 
 -- Reader scoping: the dept-A filer can see the Aquatics template but not the
 -- Fitness template; the facility-wide filer sees both.

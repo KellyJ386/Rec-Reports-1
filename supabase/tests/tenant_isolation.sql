@@ -55,9 +55,12 @@ insert into organization_admins (organization_id, user_id) values
 on conflict do nothing;
 
 -- Report templates/versions in both facilities (for the FK-injection test).
+-- active_version starts null and is set only AFTER the matching version row
+-- exists -- fn_report_template_active_version_published (0028) requires a
+-- published version_number match at insert/update time.
 insert into report_templates (id, facility_id, code, name, status, active_version) values
-  ('a2000000-0000-0000-0000-0000000000a2', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'iso_a', 'Iso Template A', 'published', 1),
-  ('b2000000-0000-0000-0000-0000000000b2', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'iso_b', 'Iso Template B', 'published', 1)
+  ('a2000000-0000-0000-0000-0000000000a2', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'iso_a', 'Iso Template A', 'published', null),
+  ('b2000000-0000-0000-0000-0000000000b2', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'iso_b', 'Iso Template B', 'published', null)
 on conflict (id) do nothing;
 
 insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published) values
@@ -65,9 +68,15 @@ insert into report_template_versions (id, facility_id, template_id, version_numb
   ('b3000000-0000-0000-0000-0000000000b3', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'b2000000-0000-0000-0000-0000000000b2', 1, '{}'::jsonb, true)
 on conflict (id) do nothing;
 
--- A soft-deleted template in Facility A must stay invisible to Facility A readers.
+update report_templates set active_version = 1
+  where id in ('a2000000-0000-0000-0000-0000000000a2', 'b2000000-0000-0000-0000-0000000000b2') and active_version is null;
+
+-- A soft-deleted template in Facility A must stay invisible to Facility A
+-- readers. No report_template_versions row exists for it, so active_version
+-- stays null (nothing to link it to; this fixture only exercises the
+-- soft-delete visibility check, not active-version linkage).
 insert into report_templates (id, facility_id, code, name, status, active_version, deleted_at) values
-  ('a4000000-0000-0000-0000-0000000000a4', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'iso_a_deleted', 'Iso Deleted A', 'archived', 1, now())
+  ('a4000000-0000-0000-0000-0000000000a4', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'iso_a_deleted', 'Iso Deleted A', 'archived', null, now())
 on conflict (id) do nothing;
 
 -- Act as User A (member of Facility A / Org A).

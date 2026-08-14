@@ -35,12 +35,17 @@ insert into memberships (id, user_id, facility_id, role_id, status) values
   ('9a000000-0000-0000-0000-00000000009e', '9a000000-0000-0000-0000-00000000009a', '9a000000-0000-0000-0000-00000000009c', '9a000000-0000-0000-0000-00000000009d', 'active')
 on conflict (id) do nothing;
 
+-- active_version starts null and is set only AFTER the matching version row
+-- exists -- fn_report_template_active_version_published (0028) requires a
+-- published version_number match at insert/update time.
 insert into report_templates (id, facility_id, code, name, status, active_version) values
-  ('9a000000-0000-0000-0000-00000000009f', '9a000000-0000-0000-0000-00000000009c', 'audit_tpl', 'Audit Template', 'published', 1)
+  ('9a000000-0000-0000-0000-00000000009f', '9a000000-0000-0000-0000-00000000009c', 'audit_tpl', 'Audit Template', 'published', null)
 on conflict (id) do nothing;
 insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published) values
   ('9a000000-0000-0000-0000-0000000000a0', '9a000000-0000-0000-0000-00000000009c', '9a000000-0000-0000-0000-00000000009f', 1, '{"sections":[]}'::jsonb, true)
 on conflict (id) do nothing;
+update report_templates set active_version = 1
+  where id = '9a000000-0000-0000-0000-00000000009f' and active_version is null;
 
 -- Draft create -> draft edit -> submit, all under the actor's own
 -- RLS-scoped session (the real API's connection shape).
