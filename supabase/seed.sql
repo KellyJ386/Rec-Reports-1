@@ -5,6 +5,7 @@ insert into permissions (code, description) values
   ('reports.export', 'Export reports'),
   ('schedule.read', 'Read schedules'),
   ('schedule.manage', 'Manage schedules'),
+  ('schedule.publish', 'Publish schedule periods'),
   ('training.read', 'Read training and certifications'),
   ('training.manage', 'Manage training and certifications'),
   ('incidents.read', 'Read incidents'),
@@ -37,7 +38,7 @@ on conflict (id) do nothing;
 
 
 -- System roles: shared, deletion-protected scaffolding (is_system_role=true).
--- Tenant Owner holds the full 25-code catalog; Compliance Admin owns
+-- Tenant Owner holds the full 26-code catalog; Compliance Admin owns
 -- reporting/incident/training/comms governance plus admin.manage -- both are
 -- facility/ops admin tier and so also hold all nine DR-05/IN-01 governance
 -- codes (reports.publish/workflow.manage/distribution.manage,
@@ -46,7 +47,9 @@ on conflict (id) do nothing;
 -- admin.manage -- supervisor tier, so it gets only the four day-to-day
 -- governance codes (incidents.review/escalate/tasks.create, reports.publish)
 -- and is deliberately withheld legal_hold.manage/export.pdf/audit.view/
--- workflow.manage/distribution.manage. Read-Only Auditor gets every *.read
+-- workflow.manage/distribution.manage; it does hold schedule.publish (SC-07)
+-- alongside schedule.manage, since Ops Admin runs day-to-day scheduling
+-- including publishing the live schedule. Read-Only Auditor gets every *.read
 -- plus reports.export for evidence gathering and none of the new codes (it
 -- neither administers nor supervises). Any additional roles an admin creates
 -- through the UI stay custom (is_system_role=false).
@@ -64,6 +67,7 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003201', 'reports.export'),
   ('00000000-0000-0000-0000-000000003201', 'schedule.read'),
   ('00000000-0000-0000-0000-000000003201', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.publish'),
   ('00000000-0000-0000-0000-000000003201', 'training.read'),
   ('00000000-0000-0000-0000-000000003201', 'training.manage'),
   ('00000000-0000-0000-0000-000000003201', 'incidents.read'),
@@ -108,6 +112,7 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003203', 'reports.publish'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.read'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.manage'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.publish'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.read'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.manage'),
   ('00000000-0000-0000-0000-000000003203', 'incidents.read'),

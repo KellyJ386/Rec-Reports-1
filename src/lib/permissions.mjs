@@ -5,6 +5,11 @@ export const permissions = Object.freeze([
   "reports.export",
   "schedule.read",
   "schedule.manage",
+  // schedule.manage alone can build/edit a period's shifts and assignments
+  // but cannot push them live -- publishing is its own governance surface
+  // (SC-07), gated separately so a facility can grant day-to-day scheduling
+  // without also granting the ability to publish.
+  "schedule.publish",
   "training.read",
   "training.manage",
   "incidents.read",

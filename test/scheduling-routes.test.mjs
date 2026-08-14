@@ -7,6 +7,11 @@ import { createClient } from "../src/lib/supabase-rest.mjs";
 const READER = [{ facilityId: "fac-1", status: "active", permissions: ["schedule.read"] }];
 const MANAGER = [{ facilityId: "fac-1", status: "active", permissions: ["schedule.read", "schedule.manage"] }];
 const OUTSIDER = [{ facilityId: "fac-2", status: "active", permissions: ["schedule.read", "schedule.manage"] }];
+// SC-07: schedule.manage alone cannot publish -- schedule.publish is its own
+// governance surface, so PUBLISHER carries all three.
+const PUBLISHER = [
+  { facilityId: "fac-1", status: "active", permissions: ["schedule.read", "schedule.manage", "schedule.publish"] }
+];
 
 const PERIOD = {
   id: "per-1",
@@ -118,6 +123,12 @@ const ASSIGNMENT_MISSING_CERT = {
   status: "pending",
   assigned_by: null
 };
+
+// Period-scoped variant of the above (schedule_period_id = "per-review") --
+// used by the SC-07 publish-blocking tests below, which publish against
+// REVIEW_PERIOD.
+const PUBLISH_BLOCKING_SHIFT = { ...SHIFT_REQUIRES_CERT, schedule_period_id: "per-review" };
+const PUBLISH_BLOCKING_ASSIGNMENT = { ...ASSIGNMENT_MISSING_CERT };
 
 // Two overlapping shifts assigned to the same employee -- used by the
 // conflict-check-enabled tests below.
@@ -1503,4 +1514,242 @@ test("PATCH assignments rejects a terminal cancelled assignment moving anywhere"
   const { call } = mount({ memberships: MANAGER });
   const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "pending" });
   assert.equal(result.status, 400);
+});
+
+// =============================================================================
+// POST .../schedule-periods/:periodId/publish (SC-07)
+// =============================================================================
+
+test("POST publish returns 404 when the period does not exist", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/missing/publish");
+  assert.equal(result.status, 404);
+});
+
+test("POST publish returns 403 when the period belongs to a different facility", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [{ ...REVIEW_PERIOD, facility_id: "fac-2" }] : []));
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 403);
+});
+
+test("POST publish denies a reader without schedule.manage or schedule.publish", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [REVIEW_PERIOD] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 403);
+});
+
+// Auth matrix: schedule.manage alone is deliberately not enough (SC-07 splits
+// "manage the schedule" from "publish it live").
+test("POST publish denies a schedule.manage holder WITHOUT schedule.publish (403)", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [REVIEW_PERIOD] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 403);
+});
+
+test("POST publish denies an OUTSIDER", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [REVIEW_PERIOD] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 403);
+});
+
+test("POST publish rejects an archived period with 409 (illegal transition)", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [ARCHIVED_PERIOD] : []));
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-archived/publish");
+  assert.equal(result.status, 409);
+});
+
+test("POST publish enforces requireApprovalBeforePublish (default true): a draft period is blocked with 409", async (t) => {
+  // No facility_module_overrides row -> the registry default (true) applies.
+  stubFetch(t, (table) => (table === "schedule_periods" ? [PERIOD] : []));
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-1/publish");
+  assert.equal(result.status, 409);
+});
+
+test("POST publish allows a draft period when scheduling.requireApprovalBeforePublish=false", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods" && method === "GET") return [PERIOD];
+    if (table === "schedule_periods" && method === "PATCH") return [{ ...PERIOD, status: "published", publish_version: 1 }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides") {
+      return [facilityOverride({ "scheduling.requireApprovalBeforePublish": false })];
+    }
+    if (table === "schedule_publications" && method === "POST") return [{ id: "pub-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-1/publish");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.period.status, "published");
+  const patch = captured.find((c) => c.table === "schedule_periods" && c.method === "PATCH");
+  assert.equal(patch.body.status, "published");
+  assert.equal(patch.body.publish_version, 1);
+});
+
+test("POST publish blocks with 409 when there are blocking issues and no overrideReason", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "schedule_periods") return [REVIEW_PERIOD];
+    if (table === "schedule_shifts") return [PUBLISH_BLOCKING_SHIFT];
+    if (table === "shift_assignments") return [PUBLISH_BLOCKING_ASSIGNMENT];
+    if (table === "certification_types") return [CERT_TYPE];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.canPublish, false);
+  assert.equal(result.payload.missingCertifications.length, 1);
+  // Blocked before any write -- no publication insert, no period update.
+  assert.equal(captured.some((c) => c.table === "schedule_publications" && c.method === "POST"), false);
+  assert.equal(captured.some((c) => c.table === "schedule_periods" && c.method === "PATCH"), false);
+});
+
+test("POST publish blocks with 409 when overrideReason is present but blank", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "schedule_periods") return [REVIEW_PERIOD];
+    if (table === "schedule_shifts") return [PUBLISH_BLOCKING_SHIFT];
+    if (table === "shift_assignments") return [PUBLISH_BLOCKING_ASSIGNMENT];
+    if (table === "certification_types") return [CERT_TYPE];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish", { overrideReason: "   " });
+  assert.equal(result.status, 409);
+});
+
+test("POST publish override path: a non-empty overrideReason bypasses blocking issues and is recorded", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods" && method === "GET") return [REVIEW_PERIOD];
+    if (table === "schedule_periods" && method === "PATCH") {
+      return [{ ...REVIEW_PERIOD, status: "published", publish_version: 1 }];
+    }
+    if (table === "schedule_shifts") return [PUBLISH_BLOCKING_SHIFT];
+    if (table === "shift_assignments") return [PUBLISH_BLOCKING_ASSIGNMENT];
+    if (table === "certification_types") return [CERT_TYPE];
+    if (table === "schedule_publications" && method === "POST") return [{ id: "pub-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish", {
+    overrideReason: "Short-staffed this week; publishing anyway per manager sign-off"
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.period.status, "published");
+
+  const insert = captured.find((c) => c.table === "schedule_publications" && c.method === "POST");
+  assert.ok(insert, "expected a schedule_publications insert");
+  assert.equal(insert.body[0].change_summary.overrideReason, "Short-staffed this week; publishing anyway per manager sign-off");
+  assert.equal(insert.body[0].change_summary.overriddenIssues.missingCertifications.length, 1);
+});
+
+test("POST publish happy path (no blocking issues): publish_version increments and a publication row is inserted", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods" && method === "GET") return [REVIEW_PERIOD];
+    if (table === "schedule_periods" && method === "PATCH") {
+      return [{ ...REVIEW_PERIOD, status: "published", publish_version: 1 }];
+    }
+    if (table === "schedule_shifts") return [{ ...SHIFT, schedule_period_id: "per-review" }];
+    if (table === "shift_assignments") return [{ ...ASSIGNMENT }];
+    if (table === "schedule_publications" && method === "POST") return [{ id: "pub-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.period.publish_version, 1);
+  assert.equal(result.payload.period.status, "published");
+  assert.equal(result.payload.publication.id, "pub-1");
+
+  const insert = captured.find((c) => c.table === "schedule_publications" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].schedule_period_id, "per-review");
+  assert.equal(insert.body[0].publish_version, 1);
+  assert.equal(insert.body[0].published_by, "user-1");
+  // Publication row shape: a shifts/assignments diff plus the snapshot the
+  // NEXT publish will diff against.
+  assert.ok("shifts" in insert.body[0].change_summary);
+  assert.ok("assignments" in insert.body[0].change_summary);
+  assert.ok("snapshot" in insert.body[0].change_summary);
+  assert.equal(insert.body[0].change_summary.shifts.added.length, 1);
+  assert.equal(insert.body[0].change_summary.assignments.added.length, 1);
+  assert.equal(insert.body[0].change_summary.snapshot.shifts.length, 1);
+
+  const periodPatch = captured.find((c) => c.table === "schedule_periods" && c.method === "PATCH");
+  assert.equal(periodPatch.body.status, "published");
+  assert.equal(periodPatch.body.publish_version, 1);
+});
+
+test("POST publish diffs against the prior publication's embedded snapshot, not against []", async (t) => {
+  const priorSnapshotShift = {
+    id: "shift-1",
+    roleCode: "nurse",
+    shiftDate: "2026-07-18",
+    startsAt: "2026-07-18T08:00:00Z",
+    endsAt: "2026-07-18T16:00:00Z",
+    status: "draft",
+    departmentId: null
+  };
+  const priorPublication = {
+    id: "pub-0",
+    facility_id: "fac-1",
+    schedule_period_id: "per-review",
+    publish_version: 1,
+    change_summary: { snapshot: { shifts: [priorSnapshotShift], assignments: [] } }
+  };
+  const editedShift = { ...SHIFT, schedule_period_id: "per-review", status: "published" };
+
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods" && method === "GET") return [{ ...REVIEW_PERIOD, publish_version: 1 }];
+    if (table === "schedule_periods" && method === "PATCH") {
+      return [{ ...REVIEW_PERIOD, status: "published", publish_version: 2 }];
+    }
+    if (table === "schedule_shifts") return [editedShift];
+    if (table === "shift_assignments") return [];
+    if (table === "schedule_publications" && method === "GET") return [priorPublication];
+    if (table === "schedule_publications" && method === "POST") return [{ id: "pub-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish");
+  assert.equal(result.status, 200);
+
+  const insert = captured.find((c) => c.table === "schedule_publications" && c.method === "POST");
+  assert.equal(insert.body[0].publish_version, 2);
+  // The shift's `status` field changed (draft -> published) relative to the
+  // prior snapshot -- diffed against it, not against [].
+  assert.equal(insert.body[0].change_summary.shifts.added.length, 0);
+  assert.equal(insert.body[0].change_summary.shifts.changed.length, 1);
+  assert.deepEqual(insert.body[0].change_summary.shifts.changed[0].changes, [
+    { field: "status", before: "draft", after: "published" }
+  ]);
+});
+
+test("POST publish on an already-published period republishes: skips the transition/approval gates but still increments publish_version", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods" && method === "GET") return [{ ...PUBLISHED_PERIOD, publish_version: 3 }];
+    if (table === "schedule_periods" && method === "PATCH") {
+      return [{ ...PUBLISHED_PERIOD, status: "published", publish_version: 4 }];
+    }
+    if (table === "schedule_shifts") return [];
+    if (table === "shift_assignments") return [];
+    if (table === "schedule_publications" && method === "POST") return [{ id: "pub-4" }];
+    return [];
+  });
+  const { call } = mount({ memberships: PUBLISHER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-published/publish");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.period.publish_version, 4);
+
+  const periodPatch = captured.find((c) => c.table === "schedule_periods" && c.method === "PATCH");
+  // The period was already published -- the patch still bumps publish_version
+  // but does not need to (and per the captured body, does not) resend status.
+  assert.equal(periodPatch.body.publish_version, 4);
+  assert.equal(periodPatch.body.status, undefined);
 });

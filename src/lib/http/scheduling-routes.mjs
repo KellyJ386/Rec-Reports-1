@@ -8,12 +8,14 @@ import {
   shiftNaturalKey,
   canTransitionAssignment,
   ASSIGNMENT_STATUSES,
-  shiftsOverlap
+  shiftsOverlap,
+  buildChangeSummary
 } from "../scheduling.mjs";
 import { settingsForModule, effectiveConfig, configValue } from "../settings-registry.mjs";
 
 const READ = "schedule.read";
 const MANAGE = "schedule.manage";
+const PUBLISH = "schedule.publish";
 
 const PERIOD_COLUMNS =
   "id,facility_id,department_id,week_start_date,week_end_date,status,publish_version,metadata,created_at,updated_at";
@@ -29,6 +31,8 @@ const SHIFT_TEMPLATE_COLUMNS =
   "id,facility_id,department_id,role_code,recurrence_rule,start_time_local,end_time_local,days_of_week,required_certification_ids,active,created_at,updated_at";
 const EMPLOYEE_COLUMNS =
   "id,facility_id,department_id,user_id,employee_no,first_name,last_name,status,created_at,updated_at";
+const PUBLICATION_COLUMNS =
+  "id,facility_id,schedule_period_id,publish_version,published_at,published_by,change_summary";
 const PERIOD_STATUS_VALUES = ["draft", "review", "published", "archived"];
 const SHIFT_STATUS_VALUES = ["draft", "open", "assigned", "published", "cancelled"];
 const ASSIGNMENT_TYPE_VALUES = ["primary", "cover"];
@@ -178,6 +182,155 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     const facilityLayer = (facRows ?? [])[0]?.config_patch_jsonb ?? {};
 
     return effectiveConfig({ orgLayer, facilityLayer, definitions: SCHEDULING_SETTING_DEFINITIONS });
+  }
+
+  // Adapts a raw schedule_shifts/shift_assignments row into buildChangeSummary's
+  // domain shape (SC-07). Kept separate from the summarizeScheduleReadiness
+  // adaptation below (domainAssignments) because the two consumers need
+  // different fields off the same rows.
+  function toShiftDiffRow(row) {
+    return {
+      id: row.id,
+      roleCode: row.role_code,
+      shiftDate: row.shift_date,
+      startsAt: row.starts_at,
+      endsAt: row.ends_at,
+      status: row.status,
+      departmentId: row.department_id ?? null
+    };
+  }
+
+  function toAssignmentDiffRow(row) {
+    return {
+      id: row.id,
+      shiftId: row.shift_id,
+      employeeId: row.employee_id,
+      assignmentType: row.assignment_type,
+      status: row.status
+    };
+  }
+
+  // Shared by POST /schedule/validate and POST .../publish (SC-07): loads the
+  // facility's shifts (optionally scoped to one schedule period),
+  // assignments, certifications, live scheduling config, and active
+  // per-requirement cert-policy overrides, adapts them into
+  // summarizeScheduleReadiness's input shapes, and calls it exactly once.
+  // Callers that also need the raw rows (the publish route, to build its
+  // change summary) get them back alongside the readiness result rather than
+  // re-querying.
+  async function computeScheduleReadiness(client, facilityId, { periodId } = {}) {
+    const shiftFilters = { facility_id: facilityId };
+    if (periodId) shiftFilters.schedule_period_id = periodId;
+
+    // Load shifts (period-scoped when periodId given), assignments,
+    // certifications, certification types, the facility's effective
+    // scheduling config, and active per-requirement cert-policy overrides.
+    // shift_assignments carries no schedule_period_id column of its own, so
+    // it is loaded facility-wide and scoped to the period implicitly below
+    // via shiftById (an assignment whose shift fell outside the period-
+    // scoped shifts query is dropped as "orphaned").
+    const [shiftsRows, assignmentsRows, certsRows, certTypesRows, config, roleRequirementRows] = await Promise.all([
+      pgSelect(client, "schedule_shifts", {
+        filters: shiftFilters,
+        select: SHIFT_COLUMNS
+      }),
+      pgSelect(client, "shift_assignments", {
+        filters: { facility_id: facilityId },
+        select: ASSIGNMENT_COLUMNS
+      }),
+      pgSelect(client, "employee_certifications", {
+        filters: { facility_id: facilityId },
+        select: EMPLOYEE_CERT_COLUMNS
+      }),
+      pgSelect(client, "certification_types", {
+        filters: { facility_id: facilityId },
+        select: CERT_TYPE_COLUMNS
+      }),
+      loadSchedulingConfig(client, facilityId),
+      pgSelect(client, "certification_role_requirements", {
+        filters: { facility_id: facilityId },
+        select: ROLE_REQUIREMENT_COLUMNS
+      })
+    ]);
+
+    const shifts = shiftsRows ?? [];
+    const assignments = assignmentsRows ?? [];
+    const certs = certsRows ?? [];
+    const certTypes = certTypesRows ?? [];
+
+    // Build a map from certification ID to code.
+    const certIdToCode = new Map();
+    for (const ct of certTypes) {
+      certIdToCode.set(ct.id, ct.code);
+    }
+
+    // Adapt certification_role_requirements (0017) rows -- keyed by
+    // certification_type_id -- into the { certificationCode,
+    // enforcement_mode } shape summarizeScheduleReadiness's roleRequirements
+    // expects, dropping inactive rows and any pointing at an unknown cert
+    // type (mirrors cert-policy.mjs certGaps' active-row filtering).
+    const roleRequirements = [];
+    for (const requirement of roleRequirementRows ?? []) {
+      if (requirement.active === false) continue;
+      const certificationCode = certIdToCode.get(requirement.certification_type_id);
+      if (!certificationCode) continue;
+      roleRequirements.push({ certificationCode, enforcement_mode: requirement.enforcement_mode });
+    }
+
+    // Build a map from employee ID to array of certification codes.
+    const certificationsByEmployee = {};
+    for (const cert of certs) {
+      if (cert.status !== "active") continue;
+      const code = certIdToCode.get(cert.certification_type_id);
+      if (!code) continue;
+      if (!certificationsByEmployee[cert.employee_id]) {
+        certificationsByEmployee[cert.employee_id] = [];
+      }
+      certificationsByEmployee[cert.employee_id].push(code);
+    }
+
+    // Build a map from shift ID to shift for easy lookup.
+    const shiftById = new Map();
+    for (const shift of shifts) {
+      shiftById.set(shift.id, shift);
+    }
+
+    // Transform assignments to domain shape: employeeId, shiftId, startsAt, endsAt, requiredCertificationCodes.
+    const domainAssignments = [];
+    for (const assignment of assignments) {
+      const shift = shiftById.get(assignment.shift_id);
+      if (!shift) continue; // Orphaned assignment, skip.
+      const requiredCodes = [];
+      for (const certId of shift.required_certification_ids ?? []) {
+        const code = certIdToCode.get(certId);
+        if (code) requiredCodes.push(code);
+      }
+      domainAssignments.push({
+        employeeId: assignment.employee_id,
+        shiftId: assignment.shift_id,
+        startsAt: shift.starts_at,
+        endsAt: shift.ends_at,
+        requiredCertificationCodes: requiredCodes
+      });
+    }
+
+    // Call the domain function once -- it already computes doubleBookings
+    // internally (gated on config's conflictCheckEnabled), so a separate
+    // findDoubleBookings call here would just duplicate that work.
+    const readiness = summarizeScheduleReadiness(domainAssignments, certificationsByEmployee, config, {
+      roleRequirements
+    });
+
+    // Assignments actually inside this period's shifts (the same "orphaned
+    // assignment" narrowing domainAssignments already applies above),
+    // adapted to buildChangeSummary's shape for the publish route.
+    const periodAssignmentRows = assignments.filter((assignment) => shiftById.has(assignment.shift_id));
+
+    return {
+      readiness,
+      shiftRows: shifts,
+      assignmentRows: periodAssignmentRows
+    };
   }
 
   // --- Schedule Periods -------------------------------------------------------
@@ -793,8 +946,9 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
   // scoped to one schedule period via ?period_id= or a { periodId } body
   // field -- omitting it keeps the prior facility-wide behavior), the
   // facility's live scheduling config, and any per-requirement cert-policy
-  // overrides, then calling summarizeScheduleReadiness. Returns the
-  // domain-lib result: { canPublish, doubleBookings, missingCertifications, warnings, certEnforcementMode }
+  // overrides, then calling summarizeScheduleReadiness (via the
+  // computeScheduleReadiness helper shared with the publish route below).
+  // Returns the domain-lib result: { canPublish, doubleBookings, missingCertifications, warnings, certEnforcementMode }
   router.register(
     "POST",
     "/facilities/:facilityId/schedule/validate",
@@ -807,107 +961,7 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
         const periodId =
           qp.get("period_id") || (body.ok ? body.payload?.periodId ?? body.payload?.period_id : undefined) || undefined;
 
-        const shiftFilters = { facility_id: params.facilityId };
-        if (periodId) shiftFilters.schedule_period_id = periodId;
-
-        // Load shifts (period-scoped when period_id given), assignments,
-        // certifications, certification types, the facility's effective
-        // scheduling config, and active per-requirement cert-policy overrides.
-        // shift_assignments carries no schedule_period_id column of its own, so
-        // it is loaded facility-wide and scoped to the period implicitly below
-        // via shiftById (an assignment whose shift fell outside the period-
-        // scoped shifts query is dropped as "orphaned", same as today).
-        const [shiftsRows, assignmentsRows, certsRows, certTypesRows, config, roleRequirementRows] = await Promise.all([
-          pgSelect(auth.client, "schedule_shifts", {
-            filters: shiftFilters,
-            select: SHIFT_COLUMNS
-          }),
-          pgSelect(auth.client, "shift_assignments", {
-            filters: { facility_id: params.facilityId },
-            select: ASSIGNMENT_COLUMNS
-          }),
-          pgSelect(auth.client, "employee_certifications", {
-            filters: { facility_id: params.facilityId },
-            select: EMPLOYEE_CERT_COLUMNS
-          }),
-          pgSelect(auth.client, "certification_types", {
-            filters: { facility_id: params.facilityId },
-            select: CERT_TYPE_COLUMNS
-          }),
-          loadSchedulingConfig(auth.client, params.facilityId),
-          pgSelect(auth.client, "certification_role_requirements", {
-            filters: { facility_id: params.facilityId },
-            select: ROLE_REQUIREMENT_COLUMNS
-          })
-        ]);
-
-        const shifts = shiftsRows ?? [];
-        const assignments = assignmentsRows ?? [];
-        const certs = certsRows ?? [];
-        const certTypes = certTypesRows ?? [];
-
-        // Build a map from certification ID to code.
-        const certIdToCode = new Map();
-        for (const ct of certTypes) {
-          certIdToCode.set(ct.id, ct.code);
-        }
-
-        // Adapt certification_role_requirements (0017) rows -- keyed by
-        // certification_type_id -- into the { certificationCode,
-        // enforcement_mode } shape summarizeScheduleReadiness's roleRequirements
-        // expects, dropping inactive rows and any pointing at an unknown cert
-        // type (mirrors cert-policy.mjs certGaps' active-row filtering).
-        const roleRequirements = [];
-        for (const requirement of roleRequirementRows ?? []) {
-          if (requirement.active === false) continue;
-          const certificationCode = certIdToCode.get(requirement.certification_type_id);
-          if (!certificationCode) continue;
-          roleRequirements.push({ certificationCode, enforcement_mode: requirement.enforcement_mode });
-        }
-
-        // Build a map from employee ID to array of certification codes.
-        const certificationsByEmployee = {};
-        for (const cert of certs) {
-          if (cert.status !== "active") continue;
-          const code = certIdToCode.get(cert.certification_type_id);
-          if (!code) continue;
-          if (!certificationsByEmployee[cert.employee_id]) {
-            certificationsByEmployee[cert.employee_id] = [];
-          }
-          certificationsByEmployee[cert.employee_id].push(code);
-        }
-
-        // Build a map from shift ID to shift for easy lookup.
-        const shiftById = new Map();
-        for (const shift of shifts) {
-          shiftById.set(shift.id, shift);
-        }
-
-        // Transform assignments to domain shape: employeeId, shiftId, startsAt, endsAt, requiredCertificationCodes.
-        const domainAssignments = [];
-        for (const assignment of assignments) {
-          const shift = shiftById.get(assignment.shift_id);
-          if (!shift) continue; // Orphaned assignment, skip.
-          const requiredCodes = [];
-          for (const certId of shift.required_certification_ids ?? []) {
-            const code = certIdToCode.get(certId);
-            if (code) requiredCodes.push(code);
-          }
-          domainAssignments.push({
-            employeeId: assignment.employee_id,
-            shiftId: assignment.shift_id,
-            startsAt: shift.starts_at,
-            endsAt: shift.ends_at,
-            requiredCertificationCodes: requiredCodes
-          });
-        }
-
-        // Call the domain function once -- it already computes doubleBookings
-        // internally (gated on config's conflictCheckEnabled), so a separate
-        // findDoubleBookings call here would just duplicate that work.
-        const readiness = summarizeScheduleReadiness(domainAssignments, certificationsByEmployee, config, {
-          roleRequirements
-        });
+        const { readiness } = await computeScheduleReadiness(auth.client, params.facilityId, { periodId });
 
         return sendJson(response, 200, {
           canPublish: readiness.canPublish,
@@ -915,6 +969,151 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           missingCertifications: readiness.missingCertifications,
           warnings: readiness.warnings,
           certEnforcementMode: readiness.certEnforcementMode
+        });
+      })
+  );
+
+  // --- Publish (SC-07) ---------------------------------------------------------
+  // POST .../schedule-periods/:periodId/publish runs the SAME readiness check
+  // as POST /schedule/validate (via computeScheduleReadiness, scoped to this
+  // period -- no duplicated validation logic), then:
+  //   1. Rejects (409) if the period's current status cannot reach 'published'
+  //      -- either directly illegal (canTransitionPeriod, e.g. from
+  //      'archived') or, when the facility's
+  //      scheduling.requireApprovalBeforePublish setting is true, because the
+  //      period hasn't gone through 'review' first. An already-'published'
+  //      period is exempt from both checks -- this is a *republish* (e.g. a
+  //      correction after the fact), not a fresh transition into 'published',
+  //      so there is nothing to transition and no fresh review gate to pass;
+  //      canTransitionPeriod('published','published') is (correctly) illegal
+  //      per SC-01's transition graph, so this route special-cases it rather
+  //      than calling that check for an already-published period.
+  //   2. Rejects (409) with the readiness payload if there are blocking
+  //      issues (doubleBookings or non-warning missingCertifications) UNLESS
+  //      the body supplies a non-empty `overrideReason`, which is then
+  //      recorded on the publication row's change_summary alongside the
+  //      blocking issues it overrode.
+  //   3. Computes the change summary via buildChangeSummary, diffing the
+  //      current shift/assignment state against the snapshot embedded in the
+  //      period's most recent prior schedule_publications row (or against []
+  //      for a period's first publish -- schedule_shifts/shift_assignments
+  //      carry no history of their own, so that embedded snapshot is the only
+  //      place a "previous state" can come from for the next publish's diff).
+  //   4. Inserts a new schedule_publications row at publish_version + 1, then
+  //      updates the period's publish_version to match and its status to
+  //      'published' (only when it wasn't already).
+  router.register(
+    "POST",
+    "/facilities/:facilityId/schedule-periods/:periodId/publish",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const period = await loadPeriod(auth.client, params.periodId);
+        if (!period) return sendJson(response, 404, { error: "schedule period not found" });
+        if (period.facility_id !== params.facilityId) {
+          return sendJson(response, 403, { error: "schedule period does not belong to this facility" });
+        }
+        if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
+
+        const alreadyPublished = period.status === "published";
+        if (!alreadyPublished && !canTransitionPeriod(period.status, "published")) {
+          return sendJson(response, 409, {
+            error: `cannot publish a schedule period in status '${period.status}'`
+          });
+        }
+
+        const config = await loadSchedulingConfig(auth.client, params.facilityId);
+        const requireApproval = configValue(config, "scheduling.requireApprovalBeforePublish");
+        if (!alreadyPublished && requireApproval && period.status !== "review") {
+          return sendJson(response, 409, {
+            error: "this facility requires a schedule period to be in 'review' status before it can be published"
+          });
+        }
+
+        const { readiness, shiftRows, assignmentRows } = await computeScheduleReadiness(auth.client, params.facilityId, {
+          periodId: params.periodId
+        });
+
+        const overrideReason = typeof body.payload?.overrideReason === "string" ? body.payload.overrideReason.trim() : "";
+        if (!readiness.canPublish && !overrideReason) {
+          return sendJson(response, 409, {
+            error: "schedule period is not ready to publish",
+            canPublish: readiness.canPublish,
+            doubleBookings: readiness.doubleBookings,
+            missingCertifications: readiness.missingCertifications,
+            warnings: readiness.warnings,
+            certEnforcementMode: readiness.certEnforcementMode
+          });
+        }
+
+        // The prior publication (if any) carries the snapshot this publish's
+        // diff is computed against, embedded in its own change_summary --
+        // schedule_shifts/shift_assignments have no history table of their
+        // own to diff against instead.
+        const priorPublicationRows = await pgSelect(auth.client, "schedule_publications", {
+          filters: { facility_id: params.facilityId, schedule_period_id: params.periodId },
+          select: PUBLICATION_COLUMNS,
+          order: "publish_version.desc",
+          limit: 1
+        });
+        const priorPublication = (priorPublicationRows ?? [])[0] ?? null;
+        const previousShifts = priorPublication?.change_summary?.snapshot?.shifts ?? [];
+        const previousAssignments = priorPublication?.change_summary?.snapshot?.assignments ?? [];
+
+        const currentShifts = shiftRows.map(toShiftDiffRow);
+        const currentAssignments = assignmentRows.map(toAssignmentDiffRow);
+        const diff = buildChangeSummary(previousShifts, currentShifts, previousAssignments, currentAssignments);
+
+        const changeSummary = {
+          ...diff,
+          snapshot: { shifts: currentShifts, assignments: currentAssignments }
+        };
+        if (!readiness.canPublish && overrideReason) {
+          changeSummary.overrideReason = overrideReason;
+          changeSummary.overriddenIssues = {
+            doubleBookings: readiness.doubleBookings,
+            missingCertifications: readiness.missingCertifications
+          };
+        }
+
+        const newPublishVersion = (period.publish_version ?? 0) + 1;
+        const publicationRow = {
+          facility_id: params.facilityId,
+          schedule_period_id: params.periodId,
+          publish_version: newPublishVersion,
+          published_by: auth.claims.sub,
+          change_summary: changeSummary
+        };
+
+        let insertedPublication;
+        try {
+          const inserted = await pgInsert(auth.client, "schedule_publications", [publicationRow], { returning: true });
+          insertedPublication = (inserted ?? [])[0] ?? null;
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, {
+              error: "a publication already exists for this schedule period at this publish version"
+            });
+          }
+          throw err;
+        }
+
+        const periodPatch = { publish_version: newPublishVersion, updated_at: new Date().toISOString() };
+        if (!alreadyPublished) periodPatch.status = "published";
+
+        const updatedPeriodRows = await pgUpdate(
+          auth.client,
+          "schedule_periods",
+          { id: params.periodId, facility_id: params.facilityId },
+          periodPatch,
+          { returning: true }
+        );
+
+        return sendJson(response, 200, {
+          period: (updatedPeriodRows ?? [])[0] ?? null,
+          publication: insertedPublication
         });
       })
   );

@@ -9,7 +9,8 @@ import {
   expandTemplates,
   shiftNaturalKey,
   canTransitionAssignment,
-  ASSIGNMENT_STATUSES
+  ASSIGNMENT_STATUSES,
+  buildChangeSummary
 } from "../src/lib/scheduling.mjs";
 
 const assignments = [
@@ -495,4 +496,104 @@ test("canTransitionAssignment rejects unknown statuses", () => {
   assert.equal(canTransitionAssignment("bogus", "pending"), false);
   assert.equal(canTransitionAssignment("pending", "bogus"), false);
   assert.equal(canTransitionAssignment(undefined, "pending"), false);
+});
+
+// =============================================================================
+// buildChangeSummary (SC-07)
+// =============================================================================
+
+const SHIFT_A = {
+  id: "shift-a",
+  roleCode: "lifeguard",
+  shiftDate: "2026-08-10",
+  startsAt: "2026-08-10T12:00:00.000Z",
+  endsAt: "2026-08-10T20:00:00.000Z",
+  status: "published",
+  departmentId: "dept-1"
+};
+
+const SHIFT_B = {
+  id: "shift-b",
+  roleCode: "cashier",
+  shiftDate: "2026-08-11",
+  startsAt: "2026-08-11T12:00:00.000Z",
+  endsAt: "2026-08-11T20:00:00.000Z",
+  status: "published",
+  departmentId: null
+};
+
+const ASSIGNMENT_A = {
+  id: "asg-a",
+  shiftId: "shift-a",
+  employeeId: "emp-1",
+  assignmentType: "primary",
+  status: "approved"
+};
+
+test("buildChangeSummary reports no changes for identical previous/current state", () => {
+  const summary = buildChangeSummary([SHIFT_A], [SHIFT_A], [ASSIGNMENT_A], [ASSIGNMENT_A]);
+  assert.deepEqual(summary, {
+    shifts: { added: [], removed: [], changed: [] },
+    assignments: { added: [], removed: [], changed: [] }
+  });
+});
+
+test("buildChangeSummary treats a period's first publish (no previous state) as all-added", () => {
+  const summary = buildChangeSummary([], [SHIFT_A, SHIFT_B], [], [ASSIGNMENT_A]);
+  assert.deepEqual(summary.shifts.added, [SHIFT_A, SHIFT_B]);
+  assert.deepEqual(summary.shifts.removed, []);
+  assert.deepEqual(summary.shifts.changed, []);
+  assert.deepEqual(summary.assignments.added, [ASSIGNMENT_A]);
+  assert.deepEqual(summary.assignments.removed, []);
+  assert.deepEqual(summary.assignments.changed, []);
+});
+
+test("buildChangeSummary reports a shift present only in current as added", () => {
+  const summary = buildChangeSummary([SHIFT_A], [SHIFT_A, SHIFT_B], [], []);
+  assert.deepEqual(summary.shifts.added, [SHIFT_B]);
+  assert.deepEqual(summary.shifts.removed, []);
+});
+
+test("buildChangeSummary reports a shift present only in previous as removed", () => {
+  const summary = buildChangeSummary([SHIFT_A, SHIFT_B], [SHIFT_A], [], []);
+  assert.deepEqual(summary.shifts.removed, [SHIFT_B]);
+  assert.deepEqual(summary.shifts.added, []);
+});
+
+test("buildChangeSummary reports a field change on a shift with a matching id", () => {
+  const editedShift = { ...SHIFT_A, startsAt: "2026-08-10T13:00:00.000Z", status: "published" };
+  const summary = buildChangeSummary([SHIFT_A], [editedShift], [], []);
+  assert.equal(summary.shifts.added.length, 0);
+  assert.equal(summary.shifts.removed.length, 0);
+  assert.deepEqual(summary.shifts.changed, [
+    { id: "shift-a", changes: [{ field: "startsAt", before: SHIFT_A.startsAt, after: editedShift.startsAt }] }
+  ]);
+});
+
+test("buildChangeSummary reports every differing field, not just the first", () => {
+  const editedShift = { ...SHIFT_A, roleCode: "nurse", status: "cancelled" };
+  const summary = buildChangeSummary([SHIFT_A], [editedShift], [], []);
+  assert.equal(summary.shifts.changed.length, 1);
+  const fields = summary.shifts.changed[0].changes.map((c) => c.field).sort();
+  assert.deepEqual(fields, ["roleCode", "status"]);
+});
+
+test("buildChangeSummary: a reassignment decomposes into the old assignment changing status and a new one being added", () => {
+  // The old assignment (approved, employee-1) is cancelled and a distinct new
+  // assignment row (pending, employee-2) is created for the same shift --
+  // shift_assignments has no employeeId-mutating update path, so this is how
+  // a reassignment actually looks at the row level.
+  const cancelledOld = { ...ASSIGNMENT_A, status: "cancelled" };
+  const newAssignment = { id: "asg-b", shiftId: "shift-a", employeeId: "emp-2", assignmentType: "primary", status: "pending" };
+  const summary = buildChangeSummary([], [], [ASSIGNMENT_A], [cancelledOld, newAssignment]);
+  assert.deepEqual(summary.assignments.added, [newAssignment]);
+  assert.deepEqual(summary.assignments.removed, []);
+  assert.deepEqual(summary.assignments.changed, [
+    { id: "asg-a", changes: [{ field: "status", before: "approved", after: "cancelled" }] }
+  ]);
+});
+
+test("buildChangeSummary treats null/undefined previous/current arrays as empty", () => {
+  assert.deepEqual(buildChangeSummary(undefined, [SHIFT_A], undefined, []).shifts.added, [SHIFT_A]);
+  assert.deepEqual(buildChangeSummary([SHIFT_A], undefined, [], undefined).shifts.removed, [SHIFT_A]);
 });

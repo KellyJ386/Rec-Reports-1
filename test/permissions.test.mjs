@@ -107,7 +107,14 @@ test("permissions catalog includes the nine DR-05/IN-01 governance codes", () =>
   for (const code of expected) {
     assert.ok(permissions.includes(code), `expected permissions catalog to include ${code}`);
   }
-  assert.equal(permissions.length, 25);
+});
+
+// --- Publish governance (SC-07) ---------------------------------------------
+
+test("permissions catalog includes schedule.publish, separate from schedule.manage", () => {
+  assert.ok(permissions.includes("schedule.publish"));
+  assert.ok(permissions.includes("schedule.manage"));
+  assert.equal(permissions.length, 26);
 });
 
 test("hasDepartmentPermission grants facility-wide memberships every department", () => {

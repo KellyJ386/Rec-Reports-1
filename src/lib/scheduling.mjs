@@ -388,3 +388,67 @@ export function canTransitionAssignment(from, to) {
   if (!allowed) return false;
   return allowed.has(to);
 }
+
+// --- Publish change summary (SC-07) -----------------------------------------
+// Pure structural diff between a schedule period's shift/assignment state as
+// of its previous publication (or [] for a period's first publish) and its
+// current state, feeding the schedule_publications.change_summary jsonb
+// column so every publication carries an auditable record of exactly what
+// changed since the prior one -- not just a point-in-time snapshot.
+//
+// Rows are domain-shaped and matched by `id` (the route layer is responsible
+// for adapting DB rows -- schedule_shifts/shift_assignments columns are
+// snake_case -- into this shape first, the same way summarizeScheduleReadiness's
+// callers already adapt rows before calling in):
+//   shift:      { id, roleCode, shiftDate, startsAt, endsAt, status, departmentId }
+//   assignment: { id, shiftId, employeeId, assignmentType, status }
+//
+// A row present in both `previous*` and `current*` with the same id is
+// "changed" if any tracked field differs (listed per-field as { field,
+// before, after }); a row whose id is new is "added"; a row whose id no
+// longer appears is "removed". Two distinct assignment rows for the same
+// shift with different ids -- e.g. the prior assignment cancelled and a new
+// one created for a different employee, which is how a reassignment actually
+// surfaces given shift_assignments has no employee_id-mutating update path --
+// show up as one "changed" (the old row's status flipping to cancelled) plus
+// one "added" (the new row) rather than a single synthetic "reassigned"
+// entry; callers can derive that narrative from the pair via shiftId, but the
+// pure diff itself stays a straightforward id-keyed set/field comparison.
+const SHIFT_DIFF_FIELDS = ["roleCode", "shiftDate", "startsAt", "endsAt", "status", "departmentId"];
+const ASSIGNMENT_DIFF_FIELDS = ["shiftId", "employeeId", "assignmentType", "status"];
+
+function diffRowsById(previousRows, currentRows, fields) {
+  const previousById = new Map((previousRows ?? []).filter((row) => row?.id != null).map((row) => [row.id, row]));
+  const currentById = new Map((currentRows ?? []).filter((row) => row?.id != null).map((row) => [row.id, row]));
+
+  const added = [];
+  const removed = [];
+  const changed = [];
+
+  for (const [id, current] of currentById) {
+    const previous = previousById.get(id);
+    if (!previous) {
+      added.push(current);
+      continue;
+    }
+    const fieldChanges = [];
+    for (const field of fields) {
+      if (previous[field] !== current[field]) {
+        fieldChanges.push({ field, before: previous[field] ?? null, after: current[field] ?? null });
+      }
+    }
+    if (fieldChanges.length > 0) changed.push({ id, changes: fieldChanges });
+  }
+  for (const [id, previous] of previousById) {
+    if (!currentById.has(id)) removed.push(previous);
+  }
+
+  return { added, removed, changed };
+}
+
+export function buildChangeSummary(previousShifts, currentShifts, previousAssignments, currentAssignments) {
+  return {
+    shifts: diffRowsById(previousShifts, currentShifts, SHIFT_DIFF_FIELDS),
+    assignments: diffRowsById(previousAssignments, currentAssignments, ASSIGNMENT_DIFF_FIELDS)
+  };
+}
