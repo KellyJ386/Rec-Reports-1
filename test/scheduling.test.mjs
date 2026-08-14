@@ -5,7 +5,11 @@ import {
   findMissingCertifications,
   summarizeScheduleReadiness,
   canTransitionPeriod,
-  validateTemplateInput
+  validateTemplateInput,
+  expandTemplates,
+  shiftNaturalKey,
+  canTransitionAssignment,
+  ASSIGNMENT_STATUSES
 } from "../src/lib/scheduling.mjs";
 
 const assignments = [
@@ -215,4 +219,280 @@ test("validateTemplateInput partial mode requires both start and end when only o
   const result = validateTemplateInput({ startTimeLocal: "09:00" }, { partial: true });
   assert.equal(result.valid, false);
   assert.ok(result.errors.includes("endTimeLocal is required"));
+});
+
+// =============================================================================
+// expandTemplates (SC-03)
+// =============================================================================
+
+// 2026-07-05 is a Sunday (weekday 0); the week runs through 2026-07-11 (Saturday).
+const WEEK_START = "2026-07-05";
+
+const MON_WED_TEMPLATE = {
+  id: "tmpl-mon-wed",
+  active: true,
+  daysOfWeek: [1, 3],
+  startTimeLocal: "08:00",
+  endTimeLocal: "16:00",
+  roleCode: "lifeguard",
+  departmentId: "dept-1",
+  requiredCertificationIds: ["cert-1"]
+};
+
+test("expandTemplates emits one shift per matching weekday within the week", () => {
+  const rows = expandTemplates([MON_WED_TEMPLATE], WEEK_START, "America/New_York");
+  assert.equal(rows.length, 2);
+  assert.deepEqual(
+    rows.map((r) => r.shiftDate),
+    ["2026-07-06", "2026-07-08"]
+  );
+  for (const row of rows) {
+    assert.equal(row.templateId, "tmpl-mon-wed");
+    assert.equal(row.departmentId, "dept-1");
+    assert.equal(row.roleCode, "lifeguard");
+    assert.deepEqual(row.requiredCertificationIds, ["cert-1"]);
+    assert.equal(row.source, "template");
+  }
+});
+
+test("expandTemplates emits a shift for every day when daysOfWeek covers the full week", () => {
+  const rows = expandTemplates(
+    [{ ...MON_WED_TEMPLATE, id: "tmpl-all", daysOfWeek: [0, 1, 2, 3, 4, 5, 6] }],
+    WEEK_START,
+    "America/New_York"
+  );
+  assert.equal(rows.length, 7);
+  assert.deepEqual(
+    rows.map((r) => r.shiftDate),
+    ["2026-07-05", "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10", "2026-07-11"]
+  );
+});
+
+test("expandTemplates emits one shift per active template per matching weekday (weekday matrix across templates)", () => {
+  const secondTemplate = {
+    id: "tmpl-fri",
+    active: true,
+    daysOfWeek: [5],
+    startTimeLocal: "12:00",
+    endTimeLocal: "20:00",
+    roleCode: "cashier",
+    departmentId: null,
+    requiredCertificationIds: []
+  };
+  const rows = expandTemplates([MON_WED_TEMPLATE, secondTemplate], WEEK_START, "America/New_York");
+  assert.equal(rows.length, 3);
+  assert.deepEqual(
+    rows.map((r) => [r.templateId, r.shiftDate]),
+    [
+      ["tmpl-mon-wed", "2026-07-06"],
+      ["tmpl-mon-wed", "2026-07-08"],
+      ["tmpl-fri", "2026-07-10"]
+    ]
+  );
+});
+
+test("expandTemplates excludes inactive templates", () => {
+  const rows = expandTemplates([{ ...MON_WED_TEMPLATE, active: false }], WEEK_START, "America/New_York");
+  assert.deepEqual(rows, []);
+});
+
+test("expandTemplates excludes an inactive template while still expanding an active one in the same call", () => {
+  const rows = expandTemplates(
+    [{ ...MON_WED_TEMPLATE, active: false }, { ...MON_WED_TEMPLATE, id: "tmpl-active", daysOfWeek: [1] }],
+    WEEK_START,
+    "America/New_York"
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].templateId, "tmpl-active");
+});
+
+test("expandTemplates accepts raw snake_case shift_templates row shape from PostgREST", () => {
+  const snakeCaseRow = {
+    id: "tmpl-snake",
+    active: true,
+    days_of_week: [1],
+    start_time_local: "08:00",
+    end_time_local: "16:00",
+    role_code: "lifeguard",
+    department_id: "dept-2",
+    required_certification_ids: ["cert-9"]
+  };
+  const rows = expandTemplates([snakeCaseRow], WEEK_START, "America/New_York");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].shiftDate, "2026-07-06");
+  assert.equal(rows[0].departmentId, "dept-2");
+  assert.equal(rows[0].roleCode, "lifeguard");
+  assert.deepEqual(rows[0].requiredCertificationIds, ["cert-9"]);
+});
+
+test("expandTemplates returns [] for no templates", () => {
+  assert.deepEqual(expandTemplates([], WEEK_START, "America/New_York"), []);
+  assert.deepEqual(expandTemplates(undefined, WEEK_START, "America/New_York"), []);
+});
+
+test("expandTemplates converts local times to correct UTC instants outside any DST transition", () => {
+  // Non-DST week (America/New_York is EST, UTC-5, in January).
+  const winterRows = expandTemplates(
+    [{ ...MON_WED_TEMPLATE, daysOfWeek: [1] }],
+    "2026-01-04", // Sunday
+    "America/New_York"
+  );
+  assert.equal(winterRows[0].startsAt, "2026-01-05T13:00:00.000Z"); // 08:00 EST = 13:00 UTC
+  assert.equal(winterRows[0].endsAt, "2026-01-05T21:00:00.000Z"); // 16:00 EST = 21:00 UTC
+
+  // DST week (America/New_York is EDT, UTC-4, in July).
+  const summerRows = expandTemplates([{ ...MON_WED_TEMPLATE, daysOfWeek: [1] }], WEEK_START, "America/New_York");
+  assert.equal(summerRows[0].startsAt, "2026-07-06T12:00:00.000Z"); // 08:00 EDT = 12:00 UTC
+  assert.equal(summerRows[0].endsAt, "2026-07-06T20:00:00.000Z"); // 16:00 EDT = 20:00 UTC
+});
+
+// --- DST spring-forward (gap) week --------------------------------------
+// America/New_York springs forward on 2026-03-08: local clocks jump from
+// 02:00 EST straight to 03:00 EDT, so 02:00-02:59 never occurs that day.
+// The week starting 2026-03-08 (a Sunday) is the spring-forward week.
+
+test("expandTemplates: a template whose start time falls in the spring-forward gap resolves DST-safely (pinned instant)", () => {
+  const gapTemplate = {
+    id: "tmpl-gap",
+    active: true,
+    daysOfWeek: [0], // Sunday, the transition day itself
+    startTimeLocal: "02:30", // nonexistent local time on 2026-03-08
+    endTimeLocal: "05:00",
+    roleCode: "nurse",
+    departmentId: null,
+    requiredCertificationIds: []
+  };
+  const rows = expandTemplates([gapTemplate], "2026-03-08", "America/New_York");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].shiftDate, "2026-03-08");
+  // Documented policy: the nonexistent local time resolves "as if the old
+  // (pre-transition) offset still applied" -- 02:30 + 5h (EST) = 07:30 UTC,
+  // which displays as 03:30 EDT (pushed forward across the gap by exactly
+  // its one-hour size).
+  assert.equal(rows[0].startsAt, "2026-03-08T07:30:00.000Z");
+  // endTimeLocal (05:00) is unambiguous, ordinary EDT conversion: 05:00 + 4h.
+  assert.equal(rows[0].endsAt, "2026-03-08T09:00:00.000Z");
+});
+
+test("expandTemplates: the rest of the spring-forward week (non-transition days) still converts at ordinary EDT offset", () => {
+  const rows = expandTemplates(
+    [{ ...MON_WED_TEMPLATE, daysOfWeek: [1] }], // Monday 2026-03-09, the day after the transition
+    "2026-03-08",
+    "America/New_York"
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].shiftDate, "2026-03-09");
+  assert.equal(rows[0].startsAt, "2026-03-09T12:00:00.000Z"); // 08:00 EDT = 12:00 UTC
+  assert.equal(rows[0].endsAt, "2026-03-09T20:00:00.000Z"); // 16:00 EDT = 20:00 UTC
+});
+
+// --- DST fall-back (fold) week -------------------------------------------
+// America/New_York falls back on 2026-11-01: local clocks jump from 02:00
+// EDT back to 01:00 EST, so 01:00-01:59 occurs twice that day. The week
+// starting 2026-11-01 (a Sunday) is the fall-back week.
+
+test("expandTemplates: a template whose start time falls in the fall-back fold resolves to the first (pre-transition) occurrence (pinned instant)", () => {
+  const foldTemplate = {
+    id: "tmpl-fold",
+    active: true,
+    daysOfWeek: [0], // Sunday, the transition day itself
+    startTimeLocal: "01:30", // ambiguous local time on 2026-11-01, occurs twice
+    endTimeLocal: "04:00",
+    roleCode: "nurse",
+    departmentId: null,
+    requiredCertificationIds: []
+  };
+  const rows = expandTemplates([foldTemplate], "2026-11-01", "America/New_York");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].shiftDate, "2026-11-01");
+  // Documented policy: a fold resolves to the FIRST (pre-transition,
+  // still-daylight) occurrence -- 01:30 EDT = 05:30 UTC, not the second
+  // occurrence an hour later at 01:30 EST = 06:30 UTC.
+  assert.equal(rows[0].startsAt, "2026-11-01T05:30:00.000Z");
+  // endTimeLocal (04:00) is unambiguous, past the fold, ordinary EST: 04:00 + 5h.
+  assert.equal(rows[0].endsAt, "2026-11-01T09:00:00.000Z");
+});
+
+test("expandTemplates: the rest of the fall-back week (non-transition days) still converts at ordinary EST offset", () => {
+  const rows = expandTemplates(
+    [{ ...MON_WED_TEMPLATE, daysOfWeek: [1] }], // Monday 2026-11-02, the day after the transition
+    "2026-11-01",
+    "America/New_York"
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].shiftDate, "2026-11-02");
+  assert.equal(rows[0].startsAt, "2026-11-02T13:00:00.000Z"); // 08:00 EST = 13:00 UTC
+  assert.equal(rows[0].endsAt, "2026-11-02T21:00:00.000Z"); // 16:00 EST = 21:00 UTC
+});
+
+// =============================================================================
+// shiftNaturalKey (SC-03 idempotency)
+// =============================================================================
+
+test("shiftNaturalKey is stable across ISO string formatting differences for the same instant", () => {
+  const keyA = shiftNaturalKey("dept-1", "lifeguard", "2026-07-06", "2026-07-06T12:00:00.000Z", "2026-07-06T20:00:00.000Z");
+  const keyB = shiftNaturalKey("dept-1", "lifeguard", "2026-07-06", "2026-07-06T12:00:00+00:00", "2026-07-06T20:00:00+00:00");
+  assert.equal(keyA, keyB);
+});
+
+test("shiftNaturalKey differs when department, role, date, or times differ", () => {
+  const base = shiftNaturalKey("dept-1", "lifeguard", "2026-07-06", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z");
+  assert.notEqual(shiftNaturalKey("dept-2", "lifeguard", "2026-07-06", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z"), base);
+  assert.notEqual(shiftNaturalKey("dept-1", "cashier", "2026-07-06", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z"), base);
+  assert.notEqual(shiftNaturalKey("dept-1", "lifeguard", "2026-07-07", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z"), base);
+  assert.notEqual(shiftNaturalKey("dept-1", "lifeguard", "2026-07-06", "2026-07-06T13:00:00Z", "2026-07-06T20:00:00Z"), base);
+});
+
+test("shiftNaturalKey normalizes a null/undefined departmentId consistently", () => {
+  const keyA = shiftNaturalKey(null, "lifeguard", "2026-07-06", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z");
+  const keyB = shiftNaturalKey(undefined, "lifeguard", "2026-07-06", "2026-07-06T12:00:00Z", "2026-07-06T20:00:00Z");
+  assert.equal(keyA, keyB);
+});
+
+// =============================================================================
+// canTransitionAssignment (SC-05)
+// =============================================================================
+
+test("ASSIGNMENT_STATUSES matches the 0003_scheduling.sql check constraint", () => {
+  assert.deepEqual(ASSIGNMENT_STATUSES, ["pending", "approved", "declined", "cancelled"]);
+});
+
+const LEGAL_ASSIGNMENT_TRANSITIONS = [
+  ["pending", "approved"],
+  ["pending", "declined"],
+  ["pending", "cancelled"],
+  ["approved", "cancelled"],
+  ["declined", "cancelled"]
+];
+
+const ILLEGAL_ASSIGNMENT_TRANSITIONS = [
+  ["pending", "pending"],
+  ["approved", "pending"],
+  ["approved", "declined"],
+  ["approved", "approved"],
+  ["declined", "pending"],
+  ["declined", "approved"],
+  ["declined", "declined"],
+  ["cancelled", "pending"],
+  ["cancelled", "approved"],
+  ["cancelled", "declined"],
+  ["cancelled", "cancelled"]
+];
+
+for (const [from, to] of LEGAL_ASSIGNMENT_TRANSITIONS) {
+  test(`canTransitionAssignment allows ${from} -> ${to}`, () => {
+    assert.equal(canTransitionAssignment(from, to), true);
+  });
+}
+
+for (const [from, to] of ILLEGAL_ASSIGNMENT_TRANSITIONS) {
+  test(`canTransitionAssignment rejects ${from} -> ${to}`, () => {
+    assert.equal(canTransitionAssignment(from, to), false);
+  });
+}
+
+test("canTransitionAssignment rejects unknown statuses", () => {
+  assert.equal(canTransitionAssignment("bogus", "pending"), false);
+  assert.equal(canTransitionAssignment("pending", "bogus"), false);
+  assert.equal(canTransitionAssignment(undefined, "pending"), false);
 });

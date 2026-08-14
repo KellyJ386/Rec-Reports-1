@@ -927,3 +927,580 @@ test("GET employees scopes the query to the URL facility", async (t) => {
   assert.ok(req);
   assert.equal(req.url.searchParams.get("facility_id"), "eq.fac-1");
 });
+
+// =============================================================================
+// SC-03 -- Generate shifts from templates
+// =============================================================================
+
+// A Sunday-start period whose week matches SHIFT_TEMPLATE's daysOfWeek [1..5]
+// (Mon-Fri): 2026-07-19 through 2026-07-25.
+const GEN_PERIOD = {
+  ...PERIOD,
+  id: "per-gen",
+  week_start_date: "2026-07-19",
+  week_end_date: "2026-07-25",
+  status: "draft"
+};
+
+test("POST generate returns 404 when the period does not exist", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/missing/generate");
+  assert.equal(result.status, 404);
+});
+
+test("POST generate returns 403 when the period belongs to a different facility", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [{ ...GEN_PERIOD, facility_id: "fac-2" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 403);
+});
+
+test("POST generate denies a reader without schedule.manage", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [GEN_PERIOD] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 403);
+});
+
+test("POST generate denies an OUTSIDER", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [GEN_PERIOD] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 403);
+});
+
+test("POST generate returns 409 for a period in 'published' status", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [{ ...GEN_PERIOD, status: "published" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 409);
+});
+
+test("POST generate returns 409 for a period in 'archived' status", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_periods" ? [{ ...GEN_PERIOD, status: "archived" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 409);
+});
+
+test("POST generate allows a period in 'review' status", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods") return [{ ...GEN_PERIOD, status: "review" }];
+    if (table === "shift_templates") return [SHIFT_TEMPLATE];
+    if (table === "schedule_shifts" && method === "GET") return [];
+    if (table === "schedule_shifts" && method === "POST") return [{ id: "gen-shift-1" }];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 201);
+});
+
+test("POST generate happy path: inserted shifts carry source='template' and the period's id", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods") return [GEN_PERIOD];
+    if (table === "shift_templates") return [SHIFT_TEMPLATE];
+    if (table === "schedule_shifts" && method === "GET") return [];
+    if (table === "schedule_shifts" && method === "POST") return [{ id: "gen-shift-1" }];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 201);
+
+  const insert = captured.find((c) => c.table === "schedule_shifts" && c.method === "POST");
+  assert.ok(insert, "expected a schedule_shifts insert");
+  // SHIFT_TEMPLATE has daysOfWeek [1,2,3,4,5] over the Mon-Fri span of the
+  // period's week -> 5 generated rows.
+  assert.equal(insert.body.length, 5);
+  for (const row of insert.body) {
+    assert.equal(row.source, "template");
+    assert.equal(row.schedule_period_id, "per-gen");
+    assert.equal(row.facility_id, "fac-1");
+    assert.equal(row.status, "draft");
+    assert.equal(row.role_code, "lifeguard");
+  }
+  assert.deepEqual(
+    insert.body.map((r) => r.shift_date),
+    ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"]
+  );
+});
+
+test("POST generate skips templates that are not active", async (t) => {
+  // active=false is filtered at the query layer by the route's own
+  // { active: true } filter, so the stub simulates that by returning [].
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods") return [GEN_PERIOD];
+    if (table === "shift_templates") return [];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.inserted, []);
+  assert.ok(!captured.some((c) => c.table === "schedule_shifts" && c.method === "POST"));
+});
+
+test("POST generate queries shift_templates filtered to active=true", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "schedule_periods") return [GEN_PERIOD];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  const req = captured.find((c) => c.table === "shift_templates" && c.method === "GET");
+  assert.ok(req);
+  assert.equal(req.url.searchParams.get("active"), "eq.true");
+});
+
+test("POST generate is idempotent: re-running inserts nothing for template/date pairs that already have a shift", async (t) => {
+  // Simulate that all 5 expected shifts already exist for this period, as
+  // source='template' rows with the exact natural-key tuple expandTemplates
+  // would produce for SHIFT_TEMPLATE over per-gen's week.
+  const existingShifts = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"].map((date, i) => ({
+    id: `existing-${i}`,
+    facility_id: "fac-1",
+    schedule_period_id: "per-gen",
+    department_id: null,
+    role_code: "lifeguard",
+    shift_date: date,
+    starts_at: `${date}T12:00:00.000Z`, // 08:00 EDT
+    ends_at: `${date}T20:00:00.000Z`, // 16:00 EDT
+    source: "template",
+    status: "draft",
+    required_certification_ids: [],
+    notes: null
+  }));
+
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods") return [GEN_PERIOD];
+    if (table === "shift_templates") return [SHIFT_TEMPLATE];
+    if (table === "schedule_shifts" && method === "GET") return existingShifts;
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.inserted, []);
+  assert.ok(
+    !captured.some((c) => c.table === "schedule_shifts" && c.method === "POST"),
+    "a re-run must not attempt any insert once every template/date pair already has a shift"
+  );
+});
+
+test("POST generate re-run only inserts the still-missing template/date pairs", async (t) => {
+  // Only Monday (2026-07-20) already exists; the other 4 weekdays should
+  // still be generated.
+  const existingShifts = [
+    {
+      id: "existing-mon",
+      facility_id: "fac-1",
+      schedule_period_id: "per-gen",
+      department_id: null,
+      role_code: "lifeguard",
+      shift_date: "2026-07-20",
+      starts_at: "2026-07-20T12:00:00.000Z",
+      ends_at: "2026-07-20T20:00:00.000Z",
+      source: "template",
+      status: "draft",
+      required_certification_ids: [],
+      notes: null
+    }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_periods") return [GEN_PERIOD];
+    if (table === "shift_templates") return [SHIFT_TEMPLATE];
+    if (table === "schedule_shifts" && method === "GET") return existingShifts;
+    if (table === "schedule_shifts" && method === "POST") return [{ id: "new" }];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/schedule-periods/per-gen/generate");
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "schedule_shifts" && c.method === "POST");
+  assert.equal(insert.body.length, 4);
+  assert.deepEqual(
+    insert.body.map((r) => r.shift_date),
+    ["2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"]
+  );
+});
+
+// =============================================================================
+// SC-05 -- Shift assignments
+// =============================================================================
+
+test("POST assignments validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", {});
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST assignments rejects an invalid assignmentType before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", {
+    employeeId: "emp-1",
+    assignmentType: "bogus"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST assignments returns 404 when the shift does not exist", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/missing/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 404);
+});
+
+test("POST assignments returns 403 for a cross-facility shift", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_shifts" ? [{ ...SHIFT, facility_id: "fac-2" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 403);
+});
+
+test("POST assignments denies a reader without schedule.manage", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_shifts" ? [SHIFT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 403);
+});
+
+test("POST assignments denies an OUTSIDER", async (t) => {
+  stubFetch(t, (table) => (table === "schedule_shifts" ? [SHIFT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 403);
+});
+
+test("POST assignments happy path assigns an employee (default assignmentType='primary')", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "shift_assignments" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].shift_id, "shift-1");
+  assert.equal(insert.body[0].employee_id, "emp-1");
+  assert.equal(insert.body[0].assignment_type, "primary");
+});
+
+test("POST assignments accepts assignmentType='cover'", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", {
+    employeeId: "emp-1",
+    assignmentType: "cover"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "shift_assignments" && c.method === "POST");
+  assert.equal(insert.body[0].assignment_type, "cover");
+});
+
+test("POST assignments blocks an overlapping assignment with 409 and a conflict payload when conflictCheckEnabled (default)", async (t) => {
+  const existingAssignment = {
+    id: "asg-existing",
+    facility_id: "fac-1",
+    shift_id: "shift-a",
+    employee_id: "emp-1",
+    assignment_type: "primary",
+    status: "pending",
+    assigned_by: null
+  };
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "schedule_shifts" && method === "GET") {
+      // The target shift (SHIFT_OVERLAP_B, loaded by exact id) and the batch
+      // lookup of the employee's other live assignments' shifts (an
+      // id=in.(...) filter, which here resolves SHIFT_OVERLAP_A) overlap in
+      // time. Discriminate on the actual filter, as PostgREST would, rather
+      // than returning both rows for every schedule_shifts GET.
+      const idFilter = url.searchParams.get("id");
+      if (idFilter === "eq.shift-b") return [SHIFT_OVERLAP_B];
+      if (idFilter && idFilter.startsWith("in.")) return [SHIFT_OVERLAP_A, SHIFT_OVERLAP_B];
+      return [];
+    }
+    if (table === "shift_assignments" && method === "GET") return [existingAssignment];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-b/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 409);
+  assert.ok(Array.isArray(result.payload.conflicts));
+  assert.equal(result.payload.conflicts.length, 1);
+  assert.equal(result.payload.conflicts[0].employeeId, "emp-1");
+  assert.deepEqual(result.payload.conflicts[0].shiftIds.sort(), ["shift-a", "shift-b"].sort());
+  assert.ok(
+    !captured.some((c) => c.table === "shift_assignments" && c.method === "POST"),
+    "a blocked assignment must never reach the insert"
+  );
+});
+
+test("POST assignments does not flag a second assignment_type on the SAME shift as a self-conflict", async (t) => {
+  const existingAssignment = {
+    id: "asg-existing",
+    facility_id: "fac-1",
+    shift_id: "shift-1",
+    employee_id: "emp-1",
+    assignment_type: "primary",
+    status: "pending",
+    assigned_by: null
+  };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [existingAssignment];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-cover" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", {
+    employeeId: "emp-1",
+    assignmentType: "cover"
+  });
+  assert.equal(result.status, 201);
+});
+
+test("POST assignments: conflict suppressed when scheduling.conflictCheckEnabled=false", async (t) => {
+  const existingAssignment = {
+    id: "asg-existing",
+    facility_id: "fac-1",
+    shift_id: "shift-a",
+    employee_id: "emp-1",
+    assignment_type: "primary",
+    status: "pending",
+    assigned_by: null
+  };
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "schedule_shifts" && method === "GET") {
+      const idFilter = url.searchParams.get("id");
+      if (idFilter === "eq.shift-b") return [SHIFT_OVERLAP_B];
+      return [];
+    }
+    if (table === "shift_assignments" && method === "GET") return [existingAssignment];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides") {
+      return [facilityOverride({ "scheduling.conflictCheckEnabled": false })];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-b/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 201);
+  assert.ok(captured.some((c) => c.table === "shift_assignments" && c.method === "POST"));
+  // With the check disabled, no overlap lookups should even run.
+  assert.ok(!captured.some((c) => c.table === "shift_assignments" && c.method === "GET"));
+});
+
+test("POST assignments ignores a declined/cancelled assignment when checking overlaps", async (t) => {
+  const declinedAssignment = {
+    id: "asg-declined",
+    facility_id: "fac-1",
+    shift_id: "shift-a",
+    employee_id: "emp-1",
+    assignment_type: "primary",
+    status: "declined",
+    assigned_by: null
+  };
+  const captured = stubFetch(t, (table, method, url) => {
+    // The route filters shift_assignments to status in (pending, approved),
+    // so a declined assignment would never come back from this query in
+    // production -- this stub simulates that filtering behavior.
+    if (table === "schedule_shifts" && method === "GET") {
+      const idFilter = url.searchParams.get("id");
+      if (idFilter === "eq.shift-b") return [SHIFT_OVERLAP_B];
+      return [];
+    }
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-b/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 201);
+});
+
+test("POST assignments scopes the overlap lookup to active statuses (pending, approved)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  const req = captured.find((c) => c.table === "shift_assignments" && c.method === "GET");
+  assert.ok(req);
+  assert.equal(req.url.searchParams.get("status"), "in.(pending,approved)");
+});
+
+test("POST assignments maps a DB unique-constraint violation to a clean 409", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") {
+      return errorResponse(409, { message: "duplicate key value violates unique constraint" });
+    }
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 409);
+});
+
+test("PATCH assignments validates the status shape before any fetch (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "bogus" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH assignments returns 404 when the assignment does not exist", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/missing", { status: "approved" });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH assignments returns 403 for a cross-facility assignment", async (t) => {
+  stubFetch(t, (table) => (table === "shift_assignments" ? [{ ...ASSIGNMENT, facility_id: "fac-2" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "approved" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH assignments returns 404 when the assignment does not belong to the shift in the URL", async (t) => {
+  stubFetch(t, (table) => (table === "shift_assignments" ? [{ ...ASSIGNMENT, shift_id: "shift-other" }] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "approved" });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH assignments denies a reader without schedule.manage", async (t) => {
+  stubFetch(t, (table) => (table === "shift_assignments" ? [ASSIGNMENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "approved" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH assignments denies an OUTSIDER", async (t) => {
+  stubFetch(t, (table) => (table === "shift_assignments" ? [ASSIGNMENT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "approved" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH assignments allows pending -> approved", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "shift_assignments" && method === "GET") return [ASSIGNMENT];
+    if (table === "shift_assignments" && method === "PATCH") return [{ ...ASSIGNMENT, status: "approved" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "approved" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "approved");
+  const patch = captured.find((c) => c.table === "shift_assignments" && c.method === "PATCH");
+  assert.equal(patch.body.status, "approved");
+  assert.equal(patch.url.searchParams.get("facility_id"), "eq.fac-1");
+});
+
+test("PATCH assignments allows pending -> declined", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "shift_assignments" && method === "GET") return [ASSIGNMENT];
+    if (table === "shift_assignments" && method === "PATCH") return [{ ...ASSIGNMENT, status: "declined" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "declined" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "declined");
+});
+
+test("PATCH assignments allows pending -> cancelled", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "shift_assignments" && method === "GET") return [ASSIGNMENT];
+    if (table === "shift_assignments" && method === "PATCH") return [{ ...ASSIGNMENT, status: "cancelled" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "cancelled" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "cancelled");
+});
+
+test("PATCH assignments allows approved -> cancelled (unassign)", async (t) => {
+  const approved = { ...ASSIGNMENT, status: "approved" };
+  stubFetch(t, (table, method) => {
+    if (table === "shift_assignments" && method === "GET") return [approved];
+    if (table === "shift_assignments" && method === "PATCH") return [{ ...approved, status: "cancelled" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "cancelled" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "cancelled");
+});
+
+test("PATCH assignments allows declined -> cancelled", async (t) => {
+  const declined = { ...ASSIGNMENT, status: "declined" };
+  stubFetch(t, (table, method) => {
+    if (table === "shift_assignments" && method === "GET") return [declined];
+    if (table === "shift_assignments" && method === "PATCH") return [{ ...declined, status: "cancelled" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "cancelled" });
+  assert.equal(result.status, 200);
+});
+
+test("PATCH assignments rejects approved -> declined as an illegal transition", async (t) => {
+  const approved = { ...ASSIGNMENT, status: "approved" };
+  stubFetch(t, (table) => (table === "shift_assignments" ? [approved] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "declined" });
+  assert.equal(result.status, 400);
+});
+
+test("PATCH assignments rejects a terminal cancelled assignment moving anywhere", async (t) => {
+  const cancelled = { ...ASSIGNMENT, status: "cancelled" };
+  stubFetch(t, (table) => (table === "shift_assignments" ? [cancelled] : []));
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("PATCH", "/facilities/fac-1/shifts/shift-1/assignments/asg-1", { status: "pending" });
+  assert.equal(result.status, 400);
+});

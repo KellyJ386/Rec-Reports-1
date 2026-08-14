@@ -1,7 +1,16 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
-import { summarizeScheduleReadiness, canTransitionPeriod, validateTemplateInput } from "../scheduling.mjs";
-import { settingsForModule, effectiveConfig } from "../settings-registry.mjs";
+import {
+  summarizeScheduleReadiness,
+  canTransitionPeriod,
+  validateTemplateInput,
+  expandTemplates,
+  shiftNaturalKey,
+  canTransitionAssignment,
+  ASSIGNMENT_STATUSES,
+  shiftsOverlap
+} from "../scheduling.mjs";
+import { settingsForModule, effectiveConfig, configValue } from "../settings-registry.mjs";
 
 const READ = "schedule.read";
 const MANAGE = "schedule.manage";
@@ -22,6 +31,14 @@ const EMPLOYEE_COLUMNS =
   "id,facility_id,department_id,user_id,employee_no,first_name,last_name,status,created_at,updated_at";
 const PERIOD_STATUS_VALUES = ["draft", "review", "published", "archived"];
 const SHIFT_STATUS_VALUES = ["draft", "open", "assigned", "published", "cancelled"];
+const ASSIGNMENT_TYPE_VALUES = ["primary", "cover"];
+// Statuses whose assignment still occupies the employee's calendar for
+// conflict-check purposes (0003_scheduling.sql shift_assignments.status);
+// 'declined'/'cancelled' assignments are no longer live bookings.
+const ACTIVE_ASSIGNMENT_STATUSES = ["pending", "approved"];
+// Periods a generate-from-templates run may target; published/archived
+// periods are already locked (SC-03).
+const GENERATABLE_PERIOD_STATUSES = ["draft", "review"];
 const SCHEDULING_MODULE_CODE = "scheduling";
 const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE);
 
@@ -111,10 +128,22 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     return (rows ?? [])[0] ?? null;
   }
 
+  // Selects timezone alongside organization_id so the SC-03 generate route can
+  // reuse this same lookup for expandTemplates' DST-safe local->UTC conversion
+  // instead of issuing a second facilities query.
   async function loadFacilityOrgId(client, facilityId) {
     const rows = await pgSelect(client, "facilities", {
       filters: { id: facilityId },
-      select: "id,organization_id",
+      select: "id,organization_id,timezone",
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadAssignment(client, assignmentId) {
+    const rows = await pgSelect(client, "shift_assignments", {
+      filters: { id: assignmentId },
+      select: ASSIGNMENT_COLUMNS,
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
@@ -388,6 +417,81 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       })
   );
 
+  // --- Generate shifts from templates (SC-03) ---------------------------------
+  // POST .../schedule-periods/:periodId/generate expands the facility's active
+  // shift_templates over the period's week (expandTemplates, DST-safe) and
+  // inserts the resulting rows as source='template' schedule_shifts. Idempotent:
+  // a template/date pair that already produced a shift (matched via
+  // shiftNaturalKey against the period's existing source='template' shifts) is
+  // skipped rather than re-inserted, so re-running the same generate call is
+  // always safe. Only legal on periods still open for editing (draft/review);
+  // published/archived periods are locked (GENERATABLE_PERIOD_STATUSES).
+  router.register(
+    "POST",
+    "/facilities/:facilityId/schedule-periods/:periodId/generate",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const period = await loadPeriod(auth.client, params.periodId);
+        if (!period) return sendJson(response, 404, { error: "schedule period not found" });
+        if (period.facility_id !== params.facilityId) {
+          return sendJson(response, 403, { error: "schedule period does not belong to this facility" });
+        }
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        if (!GENERATABLE_PERIOD_STATUSES.includes(period.status)) {
+          return sendJson(response, 409, {
+            error: `cannot generate shifts for a schedule period in status '${period.status}'`
+          });
+        }
+
+        const [templateRows, existingShiftRows, facility] = await Promise.all([
+          pgSelect(auth.client, "shift_templates", {
+            filters: { facility_id: params.facilityId, active: true },
+            select: SHIFT_TEMPLATE_COLUMNS
+          }),
+          pgSelect(auth.client, "schedule_shifts", {
+            filters: { facility_id: params.facilityId, schedule_period_id: params.periodId, source: "template" },
+            select: SHIFT_COLUMNS
+          }),
+          loadFacilityOrgId(auth.client, params.facilityId)
+        ]);
+
+        const timeZone = facility?.timezone || "America/New_York";
+        const existingKeys = new Set(
+          (existingShiftRows ?? []).map((shift) =>
+            shiftNaturalKey(shift.department_id, shift.role_code, shift.shift_date, shift.starts_at, shift.ends_at)
+          )
+        );
+
+        const expanded = expandTemplates(templateRows ?? [], period.week_start_date, timeZone);
+        const toInsert = expanded.filter(
+          (row) =>
+            !existingKeys.has(shiftNaturalKey(row.departmentId, row.roleCode, row.shiftDate, row.startsAt, row.endsAt))
+        );
+
+        if (toInsert.length === 0) {
+          return sendJson(response, 200, { inserted: [] });
+        }
+
+        const rows = toInsert.map((row) => ({
+          facility_id: params.facilityId,
+          schedule_period_id: params.periodId,
+          department_id: row.departmentId,
+          role_code: row.roleCode,
+          shift_date: row.shiftDate,
+          starts_at: row.startsAt,
+          ends_at: row.endsAt,
+          source: "template",
+          status: "draft",
+          required_certification_ids: row.requiredCertificationIds,
+          notes: null
+        }));
+
+        const inserted = await pgInsert(auth.client, "schedule_shifts", rows, { returning: true });
+        return sendJson(response, 201, { inserted: inserted ?? [] });
+      })
+  );
+
   // --- Employees (read-only, for the future board's assignee picker; SC-09) --
   // No employees listing route existed anywhere in src/lib/http/ before this
   // (grepped for pgSelect(..., "employees", ...) and any /employees route --
@@ -529,6 +633,156 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           "schedule_shifts",
           { id: params.shiftId, facility_id: params.facilityId },
           patch,
+          { returning: true }
+        );
+        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Shift Assignments (SC-05) -----------------------------------------------
+  // Assigns an employee to a shift. When the facility's
+  // scheduling.conflictCheckEnabled setting is on (the default), the employee's
+  // other still-live assignments (status in ACTIVE_ASSIGNMENT_STATUSES -- a
+  // declined/cancelled assignment no longer occupies their calendar) are
+  // checked for a time overlap against this shift via the pure shiftsOverlap;
+  // an overlap blocks the assignment with 409 and a conflict payload instead of
+  // reaching the DB. The shift itself (same shift_id) is excluded from that
+  // comparison so a second assignment_type ('cover') on the same shift is never
+  // flagged as a self-conflict. A unique-constraint violation on
+  // (shift_id, employee_id, assignment_type) -- i.e. the employee is already
+  // assigned to this shift with this assignment type -- is still caught and
+  // surfaced as a clean 409 rather than an uncaught PostgrestError.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/shifts/:shiftId/assignments",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const { employeeId } = body.payload;
+        const assignmentType = body.payload.assignmentType ?? "primary";
+        const shape = [];
+        if (!employeeId) shape.push("employeeId is required");
+        if (!ASSIGNMENT_TYPE_VALUES.includes(assignmentType)) {
+          shape.push(`assignmentType must be one of ${ASSIGNMENT_TYPE_VALUES.join(", ")}`);
+        }
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const shift = await loadShift(auth.client, params.shiftId);
+        if (!shift) return sendJson(response, 404, { error: "shift not found" });
+        if (shift.facility_id !== params.facilityId) {
+          return sendJson(response, 403, { error: "shift does not belong to this facility" });
+        }
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const config = await loadSchedulingConfig(auth.client, params.facilityId);
+        const conflictCheckEnabled = configValue(config, "scheduling.conflictCheckEnabled");
+
+        if (conflictCheckEnabled) {
+          const otherAssignments = await pgSelect(auth.client, "shift_assignments", {
+            filters: {
+              facility_id: params.facilityId,
+              employee_id: employeeId,
+              status: { in: ACTIVE_ASSIGNMENT_STATUSES }
+            },
+            select: ASSIGNMENT_COLUMNS
+          });
+          const liveOthers = (otherAssignments ?? []).filter((a) => a.shift_id !== params.shiftId);
+
+          if (liveOthers.length > 0) {
+            const otherShiftIds = [...new Set(liveOthers.map((a) => a.shift_id))];
+            const otherShiftRows = await pgSelect(auth.client, "schedule_shifts", {
+              filters: { id: { in: otherShiftIds } },
+              select: SHIFT_COLUMNS
+            });
+            const otherShiftById = new Map((otherShiftRows ?? []).map((s) => [s.id, s]));
+
+            const conflicts = [];
+            for (const other of liveOthers) {
+              const otherShift = otherShiftById.get(other.shift_id);
+              if (!otherShift) continue;
+              if (
+                shiftsOverlap(
+                  { startsAt: otherShift.starts_at, endsAt: otherShift.ends_at },
+                  { startsAt: shift.starts_at, endsAt: shift.ends_at }
+                )
+              ) {
+                conflicts.push({ employeeId, shiftIds: [otherShift.id, shift.id], assignmentId: other.id });
+              }
+            }
+            if (conflicts.length > 0) {
+              return sendJson(response, 409, {
+                error: "employee already has an overlapping shift assignment",
+                conflicts
+              });
+            }
+          }
+        }
+
+        const row = {
+          facility_id: params.facilityId,
+          shift_id: params.shiftId,
+          employee_id: employeeId,
+          assignment_type: assignmentType,
+          assigned_by: auth.claims.sub
+        };
+        try {
+          const rows = await pgInsert(auth.client, "shift_assignments", [row], { returning: true });
+          return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, {
+              error: "employee is already assigned to this shift with this assignment type"
+            });
+          }
+          throw err;
+        }
+      })
+  );
+
+  // PATCHes a shift assignment's status. shift_assignments.status is
+  // constrained to pending/approved/declined/cancelled (0003_scheduling.sql);
+  // canTransitionAssignment enforces the legal-transition graph (pending can
+  // move to any of the three; approved/declined can only be cancelled, which
+  // is this API's "unassign" -- there is no separate DELETE route; cancelled is
+  // terminal). Order of checks mirrors PATCH schedule-periods: shape -> exists
+  // (404) -> belongs to both the facility and the shift in the URL (403/404) ->
+  // schedule.manage (403) -> transition legality (400).
+  router.register(
+    "PATCH",
+    "/facilities/:facilityId/shifts/:shiftId/assignments/:assignmentId",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const targetStatus = body.payload?.status;
+        if (!targetStatus || !ASSIGNMENT_STATUSES.includes(targetStatus)) {
+          return sendJson(response, 400, {
+            error: `status is required and must be one of ${ASSIGNMENT_STATUSES.join(", ")}`
+          });
+        }
+
+        const assignment = await loadAssignment(auth.client, params.assignmentId);
+        if (!assignment) return sendJson(response, 404, { error: "shift assignment not found" });
+        if (assignment.facility_id !== params.facilityId) {
+          return sendJson(response, 403, { error: "shift assignment does not belong to this facility" });
+        }
+        if (assignment.shift_id !== params.shiftId) {
+          return sendJson(response, 404, { error: "shift assignment not found for this shift" });
+        }
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        if (!canTransitionAssignment(assignment.status, targetStatus)) {
+          return sendJson(response, 400, {
+            error: `cannot transition shift assignment from '${assignment.status}' to '${targetStatus}'`
+          });
+        }
+
+        const rows = await pgUpdate(
+          auth.client,
+          "shift_assignments",
+          { id: params.assignmentId, facility_id: params.facilityId },
+          { status: targetStatus, updated_at: new Date().toISOString() },
           { returning: true }
         );
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
