@@ -4,9 +4,17 @@ const optionalServerFields = [
   "SUPABASE_SERVICE_ROLE_KEY",
   "SUPABASE_JWT_SECRET",
   "DATABASE_URL",
-  "OBSERVABILITY_DSN"
+  "OBSERVABILITY_DSN",
+  "CRON_SECRET"
 ];
 
+// CRON_SECRET (OP-13, src/lib/http/internal-routes.mjs) gates the internal
+// notification-drain route: the route compares an incoming bearer token
+// against this value (never the normal facility-token/JWT auth) and returns
+// 503 -- disabled, never open -- when it is unset. Vercel injects it
+// automatically as the cron request's Authorization header once the env var
+// of this exact name is configured on the project (see vercel.json).
+//
 // SUPABASE_STORAGE_BUCKET (OP-16, src/lib/storage.mjs) is optional like the
 // fields above, but unlike them it always ends up set on the returned env --
 // it falls back to the "attachments" default below rather than being left

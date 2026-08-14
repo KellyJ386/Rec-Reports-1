@@ -1,11 +1,19 @@
-// Notification delivery worker core (OP-11) -- pure orchestration over an
-// injectable PostgREST client (service-role; RLS is bypassed, so every query
-// here is already facility-scoped by hand). No HTTP/cron wiring lives here --
-// that is OP-13/14's job (scripts/notifications-worker.mjs, the internal
-// drain route, vercel.json crons, and outbox draining). This file only knows
-// how to claim due notification_jobs rows, resolve their recipients, write
-// notification_deliveries, and manage retry/backoff/dead-letter bookkeeping
-// added by 0029_delivery_bookkeeping.sql.
+// Notification delivery worker core (OP-11/OP-14) -- pure orchestration over
+// an injectable PostgREST client (service-role; RLS is bypassed, so every
+// query here is already facility-scoped by hand). No HTTP/cron wiring lives
+// here -- that is OP-13's job (scripts/notifications-worker.mjs and the
+// internal drain route in src/lib/http/internal-routes.mjs, plus vercel.json
+// crons). This file knows how to:
+//   - claim due notification_jobs rows, resolve their recipients, write
+//     notification_deliveries, and manage retry/backoff/dead-letter
+//     bookkeeping added by 0029_delivery_bookkeeping.sql (OP-11), and
+//   - claim due outbox_events rows and translate each into a
+//     notification_jobs row via resolveRoute + buildNotificationJob,
+//     reusing the same retry/backoff bookkeeping (OP-14). outbox_events has
+//     no 'dead_letter' status (0002's check constraint only allows
+//     'pending' | 'processing' | 'processed' | 'failed', and 0029 did not
+//     extend it), so an outbox row's terminal failure state is 'failed'
+//     rather than notification_jobs' 'dead_letter'.
 //
 // Recipient resolution deliberately reuses (never reimplements) the four pure
 // helpers in src/lib/admin/notifications.mjs:
@@ -40,6 +48,9 @@ import { configValue } from "../settings-registry.mjs";
 
 const JOB_COLUMNS =
   "id,facility_id,event_type,payload_jsonb,scheduled_for,status,attempts,last_error,next_attempt_at,created_at,updated_at";
+
+const OUTBOX_COLUMNS =
+  "id,facility_id,event_type,payload,status,attempts,available_at,processed_at,last_error,next_attempt_at,created_at";
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_MS = 2 * 60 * 1000; // 2 minutes
@@ -80,38 +91,55 @@ function computeBackoffMs(attempts) {
   return Math.min(exponential, MAX_BACKOFF_MS);
 }
 
-// Re-resolves a job's route + target distribution list at drain time and
-// normalizes the result through buildNotificationJob, so the delivered shape
-// matches what a directly-recipient-carrying job would already have.
-async function resolveRouteRecipients({ client, job, config }) {
+// Loads a facility's active routes for one event code and resolves the
+// highest-priority one (see resolveRoute in admin/notifications.mjs). Shared
+// by job recipient re-resolution (below) and outbox event translation
+// (drainOutboxOnce), so both paths pick the identical live route.
+async function loadActiveRoute({ client, facilityId, eventCode }) {
   const routes = await pgSelect(client, "notification_routes", {
-    filters: { facility_id: job.facility_id, event_code: job.event_type, active: true },
+    filters: { facility_id: facilityId, event_code: eventCode, active: true },
     select: "id,facility_id,event_code,priority,route_jsonb,active"
   });
-  const route = resolveRoute(job.event_type, routes ?? []);
+  return resolveRoute(eventCode, routes ?? []);
+}
+
+// Expands a route's target distribution list against CURRENT membership into
+// a deduped array of employee ids. Returns [] when the route has no
+// distributionListId (nothing to expand). Shared by job recipient
+// re-resolution and outbox event translation.
+async function expandRouteRecipients({ client, facilityId, route, config }) {
   const listId = route?.route_jsonb?.distributionListId ?? null;
-  if (!route || !listId) return { recipients: [], channels: [] };
+  if (!route || !listId) return [];
 
   const [listRows, members, employees] = await Promise.all([
     pgSelect(client, "distribution_lists", {
-      filters: { id: listId, facility_id: job.facility_id },
+      filters: { id: listId, facility_id: facilityId },
       select: "id,facility_id,name,active",
       limit: 1
     }),
     pgSelect(client, "distribution_list_members", {
-      filters: { distribution_list_id: listId, facility_id: job.facility_id },
+      filters: { distribution_list_id: listId, facility_id: facilityId },
       select: "id,facility_id,distribution_list_id,member_type,member_ref_id"
     }),
     pgSelect(client, "employees", {
-      filters: { facility_id: job.facility_id },
+      filters: { facility_id: facilityId },
       select: "id"
     })
   ]);
   const list = (listRows ?? [])[0] ?? { id: listId };
-  const expanded = expandDistributionList(list, members ?? [], {
+  return expandDistributionList(list, members ?? [], {
     employees: employees ?? [],
     roleAssignments: config?.roleAssignments ?? []
   });
+}
+
+// Re-resolves a job's route + target distribution list at drain time and
+// normalizes the result through buildNotificationJob, so the delivered shape
+// matches what a directly-recipient-carrying job would already have.
+async function resolveRouteRecipients({ client, job, config }) {
+  const route = await loadActiveRoute({ client, facilityId: job.facility_id, eventCode: job.event_type });
+  if (!route) return { recipients: [], channels: [] };
+  const expanded = await expandRouteRecipients({ client, facilityId: job.facility_id, route, config });
   const rebuilt = buildNotificationJob(job.event_type, route, expanded);
   return {
     recipients: rebuilt.payload_jsonb.recipients,
@@ -266,4 +294,154 @@ export async function drainOnce({ client, now = new Date(), limit = 25, config =
   }
 
   return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Outbox draining (OP-14) -- translates outbox_events rows (produced by
+// module code elsewhere: cert-expiry, escalation, report-reminder, etc. --
+// none of that lives here) into notification_jobs rows that claimDueJobs/
+// processJob above can then deliver on a later drain pass.
+// ---------------------------------------------------------------------------
+
+// Selects due, pending outbox_events (available_at <= now, or a prior
+// failure's next_attempt_at <= now) and claims each with a conditional
+// pending -> processing update, mirroring claimDueJobs' race-safe claim
+// (the loser's UPDATE matches zero rows and is silently skipped).
+export async function claimDueOutboxEvents({ client, now = new Date(), limit = 25 }) {
+  const nowIso = toIso(now);
+  const candidates = await pgSelect(client, "outbox_events", {
+    filters: { status: "pending" },
+    select: OUTBOX_COLUMNS,
+    order: "available_at.asc",
+    limit,
+    extra: { or: `(available_at.lte.${nowIso},next_attempt_at.lte.${nowIso})` }
+  });
+
+  const claimed = [];
+  for (const event of candidates ?? []) {
+    const updated = await pgUpdate(
+      client,
+      "outbox_events",
+      { id: event.id, status: "pending" },
+      { status: "processing" },
+      { returning: true }
+    );
+    if (Array.isArray(updated) && updated.length > 0) {
+      claimed.push(updated[0]);
+    }
+    // else: lost the race to another concurrent drain for this event -- skip it.
+  }
+  return claimed;
+}
+
+// Resolves an outbox event's live route and recipients, matching event_type
+// against notification_events (the global catalog -- an event this facility
+// never registered a route for, or that isn't in the catalog at all, is
+// "unrouteable") and notification_routes (the highest-priority active route
+// for that event, same resolveRoute semantics processJob's jobs use). Returns
+// either { job } (ready to insert into notification_jobs) or { skip: reason }
+// for an event that should be marked processed without ever becoming a job.
+async function translateOutboxEvent({ client, event, config }) {
+  const knownEvents = await pgSelect(client, "notification_events", {
+    filters: { code: event.event_type },
+    select: "id,code,severity,module_code,default_channels_jsonb",
+    limit: 1
+  });
+  if (!(knownEvents ?? [])[0]) {
+    return { skip: `event type "${event.event_type}" is not in the notification_events catalog` };
+  }
+
+  const route = await loadActiveRoute({ client, facilityId: event.facility_id, eventCode: event.event_type });
+  if (!route) {
+    return { skip: `no active notification_routes entry for "${event.event_type}" at facility ${event.facility_id}` };
+  }
+
+  const recipients = await expandRouteRecipients({ client, facilityId: event.facility_id, route, config });
+  if (recipients.length === 0) {
+    return { skip: `route ${route.id} for "${event.event_type}" resolved with no recipients` };
+  }
+
+  const job = buildNotificationJob(event.event_type, route, recipients);
+  // Carry the outbox event's id and original payload along so a channel
+  // adapter (or a human reading notification_jobs) can trace a delivered
+  // notification back to the domain event that produced it, without
+  // disturbing the {route_id, priority, channels, recipients} shape every
+  // other job producer already relies on.
+  job.payload_jsonb = { ...job.payload_jsonb, outbox_event_id: event.id, context: event.payload ?? {} };
+  return { job };
+}
+
+// Processes one already-claimed (status='processing') outbox event: routed
+// events become a notification_jobs row and the outbox row is marked
+// 'processed'; unrouteable events are ALSO marked 'processed' (never retried
+// forever) with a "skipped: <reason>" note in last_error so an operator can
+// see why nothing fired. A genuine error (PostgREST outage, etc.) uses the
+// same last_error/next_attempt_at retry bookkeeping as notification_jobs,
+// except the terminal state is 'failed' (outbox_events has no 'dead_letter'
+// status -- see the file-header note).
+async function processOutboxEvent({ client, event, now, config, maxAttempts }) {
+  const nowIso = toIso(now);
+  try {
+    const result = await translateOutboxEvent({ client, event, config });
+    if (result.skip) {
+      await pgUpdate(
+        client,
+        "outbox_events",
+        { id: event.id },
+        { status: "processed", processed_at: nowIso, last_error: `skipped: ${result.skip}` },
+        { returning: true }
+      );
+      return { outcome: "skipped", event, reason: result.skip };
+    }
+
+    await pgInsert(client, "notification_jobs", [result.job], { returning: true });
+    await pgUpdate(
+      client,
+      "outbox_events",
+      { id: event.id },
+      { status: "processed", processed_at: nowIso, last_error: null },
+      { returning: true }
+    );
+    return { outcome: "routed", event, job: result.job };
+  } catch (error) {
+    const attempts = Number(event.attempts ?? 0) + 1;
+    const lastError = error?.message ? String(error.message) : String(error);
+    const exhausted = attempts >= maxAttempts;
+    const patch = {
+      attempts,
+      last_error: lastError,
+      status: exhausted ? "failed" : "pending",
+      next_attempt_at: exhausted ? null : toIso(new Date(now.getTime() + computeBackoffMs(attempts)))
+    };
+    await pgUpdate(client, "outbox_events", { id: event.id }, patch, { returning: true });
+    return { outcome: exhausted ? "failed" : "retried", event, error: lastError, attempts };
+  }
+}
+
+// Composes claimDueOutboxEvents + processOutboxEvent for a single drain pass.
+export async function drainOutboxOnce({ client, now = new Date(), limit = 25, config = {} }) {
+  const maxAttempts = config.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const claimed = await claimDueOutboxEvents({ client, now, limit });
+  const summary = { claimed: claimed.length, routed: 0, skipped: 0, retried: 0, failed: 0 };
+
+  for (const event of claimed) {
+    const result = await processOutboxEvent({ client, event, now, config, maxAttempts });
+    if (result.outcome === "routed") summary.routed += 1;
+    else if (result.outcome === "skipped") summary.skipped += 1;
+    else if (result.outcome === "retried") summary.retried += 1;
+    else summary.failed += 1;
+  }
+
+  return summary;
+}
+
+// One invocation, two queues: drains outbox_events into notification_jobs
+// first, then drains notification_jobs for delivery, so an event routed on
+// this pass can be delivered on this same pass rather than waiting for the
+// next one. Shared by scripts/notifications-worker.mjs (local dev loop) and
+// the CRON_SECRET-guarded internal route (src/lib/http/internal-routes.mjs).
+export async function drainAll({ client, now = new Date(), limit = 25, config = {} }) {
+  const outbox = await drainOutboxOnce({ client, now, limit, config });
+  const jobs = await drainOnce({ client, now, limit, config });
+  return { outbox, jobs };
 }

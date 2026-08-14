@@ -23,6 +23,7 @@ import { registerCommunicationRoutes } from "../src/lib/http/communications-rout
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
+import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
@@ -257,6 +258,14 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+
+// Internal, CRON_SECRET-guarded notification drain (OP-13/OP-14): POST and
+// GET /api/v1/internal/notifications/drain. Deliberately bypasses the
+// `authenticate` (facility-token/JWT) pipeline every route above uses -- see
+// src/lib/http/internal-routes.mjs for the auth contract. GET exists because
+// Vercel Cron always invokes via GET; POST exists for manual/local/test
+// invocation.
+registerInternalRoutes(userRouter, { sendJson });
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
