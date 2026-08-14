@@ -50,6 +50,52 @@
           </p>
         </div>
         <div id="reports-list" class="module-list"></div>
+        <div id="report-form-area" class="report-form-area" hidden></div>
+      </section>
+      <section class="panel" aria-labelledby="report-inbox-heading">
+        <div>
+          <p class="eyebrow">Manager review</p>
+          <h2 id="report-inbox-heading">Report review inbox</h2>
+          <p>
+            Filter submissions by status, date range, department, and template. Opening a
+            submission renders its answers from the exact schema version it was filled against
+            (never the current template, even if it's since been re-published), plus its
+            attachments, any validation warnings it was submitted with, and a PDF export.
+          </p>
+        </div>
+        <div class="report-inbox">
+          <form id="report-inbox-filters" class="report-inbox-filters">
+            <label>
+              <span>Status</span>
+              <select id="report-filter-status">
+                <option value="">All</option>
+                <option value="draft">Draft</option>
+                <option value="submitted">Submitted</option>
+                <option value="locked">Locked</option>
+                <option value="revised">Revised</option>
+              </select>
+            </label>
+            <label>
+              <span>From</span>
+              <input type="date" id="report-filter-from" />
+            </label>
+            <label>
+              <span>To</span>
+              <input type="date" id="report-filter-to" />
+            </label>
+            <label>
+              <span>Department</span>
+              <select id="report-filter-department"><option value="">All departments</option></select>
+            </label>
+            <label>
+              <span>Template</span>
+              <select id="report-filter-template"><option value="">All templates</option></select>
+            </label>
+            <button type="submit" class="primary">Apply filters</button>
+          </form>
+          <div id="report-inbox-list" class="module-list"></div>
+          <div id="report-inbox-detail" class="report-form-area" hidden></div>
+        </div>
       </section>
       <section class="panel" aria-labelledby="schedule-heading">
         <div>

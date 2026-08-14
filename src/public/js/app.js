@@ -1,3 +1,5 @@
+import { fieldDescriptors, collectPayload, applyServerErrors } from "./report-form.mjs";
+
 const TOKEN_KEY = "rr_admin_token";
 const REFRESH_TOKEN_KEY = "rr_refresh_token";
 const API_BASE = "/api/v1";
@@ -6,6 +8,7 @@ const API_BASE = "/api/v1";
 let currentUser = null;
 let currentFacility = null;
 let facilities = [];
+let reportTemplatesById = new Map();
 
 // Helper: Get token from localStorage
 function getToken() {
@@ -67,7 +70,14 @@ async function apiFetch(path, options = {}) {
     const message =
       (data && (data.error || (Array.isArray(data.errors) && data.errors.join(", ")))) ||
       `Request failed with status ${response.status}`;
-    throw new Error(message);
+    const error = new Error(message);
+    // Attached for callers that need the raw 4xx/5xx body rather than the
+    // joined-for-humans message string above -- the report entry UI's 422
+    // handling (DR-13) maps each of `data.errors` back onto its own field via
+    // report-form.mjs's applyServerErrors, which needs the array intact.
+    error.status = response.status;
+    error.details = data;
+    throw error;
   }
 
   return data;
@@ -128,9 +138,16 @@ async function initialize() {
 async function loadAllModules() {
   if (!currentFacility) return;
 
+  // A report form or inbox detail pane left open belongs to whichever
+  // facility it was opened under -- close both before switching so a
+  // (re)load never leaves a stale cross-facility submission on screen.
+  reportFormController.close();
+  inboxDetailController.close();
+
   try {
     await Promise.all([
       loadReports(),
+      loadReportInbox(),
       loadSchedule(),
       loadIncidents(),
       loadWorkOrders(),
@@ -141,6 +158,29 @@ async function loadAllModules() {
   } catch (error) {
     console.error("Error loading modules:", error);
   }
+}
+
+// Small DOM builder used by every schema-driven view added in this batch
+// (the report entry form and the manager review inbox's detail pane): the
+// CSP is `default-src 'self'` with no inline-script/inline-style allowance,
+// and schema labels + submitted answers are attacker-controlled strings, so
+// every one of those views is built with createElement/textContent here
+// rather than innerHTML -- textContent (via the string/number branch below)
+// never parses its input as markup, so there is no HTML-injection surface
+// even for a hostile field label or answer.
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (value === true) node.setAttribute(key, "");
+    else node.setAttribute(key, value);
+  }
+  for (const child of [].concat(children)) {
+    if (child === null || child === undefined) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
 }
 
 // --- Attachments (OP-17/OP-18) ---------------------------------------------
@@ -156,13 +196,17 @@ const ATTACHMENT_ACCEPT = "image/jpeg,image/png,image/gif,image/webp,image/heic,
 
 // Uploads a file's raw bytes to `${API_BASE}${path}`. Deliberately bypasses
 // apiFetch (whose automatic JSON body handling is wrong for a binary body)
-// but mirrors its auth/401/error-shape handling.
-async function uploadAttachmentFile(path, file) {
+// but mirrors its auth/401/error-shape handling. `extraHeaders` lets the
+// report entry form (DR-13) tag a photo/signature upload with its field via
+// x-field-key (see src/lib/http/attachments-routes.mjs), without every other
+// existing caller (incidents/work-orders panels) having to know it exists.
+async function uploadAttachmentFile(path, file, extraHeaders = {}) {
   const token = getToken();
   const headers = {
     Accept: "application/json",
     "Content-Type": file.type || "application/octet-stream",
-    "x-file-name": encodeURIComponent(file.name || "upload")
+    "x-file-name": encodeURIComponent(file.name || "upload"),
+    ...extraHeaders
   };
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
@@ -323,7 +367,11 @@ function renderAttachmentsPanel(panel, moduleSegment, parentId, attachments, can
   }
 }
 
-// Reports module
+// Reports module ------------------------------------------------------------
+// DR-13 lets a facility actually fill a template in from the browser (until
+// now the panel below only ever listed templates/submissions read-only); the
+// schema-driven form itself lives in createReportFormController further
+// down, shared with DR-14's manager review inbox.
 async function loadReports() {
   const container = document.getElementById("reports-list");
   if (!container) return;
@@ -335,46 +383,804 @@ async function loadReports() {
       apiFetch(`/facilities/${currentFacility}/reports`)
     ]);
 
-    const templatesData = templates || [];
-    const reportsData = reports || [];
-
-    if (templatesData.length === 0 && reportsData.length === 0) {
-      container.innerHTML = '<p>No reports or templates available.</p>';
-      return;
-    }
-
-    let html = "";
-
-    if (templatesData.length > 0) {
-      html += '<div class="module-section"><strong>Available Templates:</strong></div>';
-      for (const template of templatesData) {
-        html += '<div class="module-item">';
-        html += `<div>${escapeHtml(template.name)}</div>`;
-        if (template.description) {
-          html += `<div class="item-subtitle">${escapeHtml(template.description)}</div>`;
-        }
-        html += '</div>';
-      }
-    }
-
-    if (reportsData.length > 0) {
-      html += '<div class="module-section"><strong>Recent Submissions:</strong></div>';
-      for (const report of reportsData) {
-        html += '<div class="module-item">';
-        html += `<div>${escapeHtml(report.status)} - ${escapeHtml(report.report_date)}</div>`;
-        if (report.submitted_at) {
-          html += `<div class="item-subtitle">Submitted ${new Date(report.submitted_at).toLocaleDateString()}</div>`;
-        }
-        html += attachmentsToggleMarkup("reports", report.id, { canUpload: report.status === "draft" });
-        html += '</div>';
-      }
-    }
-
-    container.innerHTML = html;
-    wireAttachmentToggles(container);
+    renderReportsList(container, templates || [], reports || []);
   } catch (error) {
     setError(container, error.message);
   }
+}
+
+// Rebuilds the same DOM structure attachmentsToggleMarkup's string used to
+// produce (`.attachments-block` > toggle button + `.attachments-panel`) with
+// createElement instead, so wireAttachmentToggles (unchanged, still string/
+// innerHTML-based -- it was already escapeHtml-safe before this batch) keeps
+// working unmodified against these nodes.
+function buildAttachmentsToggle(moduleSegment, parentId, canUpload) {
+  const panelId = `attachments-${moduleSegment}-${parentId}`;
+  return el("div", { class: "attachments-block" }, [
+    el(
+      "button",
+      {
+        type: "button",
+        class: "attachments-toggle-btn",
+        "data-module": moduleSegment,
+        "data-id": parentId,
+        "data-panel": panelId,
+        "data-can-upload": canUpload ? "true" : "false"
+      },
+      "Attachments"
+    ),
+    el("div", { class: "attachments-panel", id: panelId, hidden: true })
+  ]);
+}
+
+function renderReportsList(container, templatesData, reportsData) {
+  container.textContent = "";
+
+  if (templatesData.length === 0 && reportsData.length === 0) {
+    container.append(el("p", {}, "No reports or templates available."));
+    return;
+  }
+
+  if (templatesData.length > 0) {
+    container.append(el("div", { class: "module-section" }, el("strong", {}, "Available templates:")));
+    for (const template of templatesData) {
+      const item = el("div", { class: "module-item" });
+      item.append(el("div", { class: "item-title" }, template.name));
+      if (template.description) {
+        item.append(el("div", { class: "item-subtitle" }, template.description));
+      }
+      const startBtn = el("button", { type: "button", class: "primary" }, "Fill out report");
+      startBtn.addEventListener("click", () => startNewReport(template));
+      item.append(startBtn);
+      container.append(item);
+    }
+  }
+
+  if (reportsData.length > 0) {
+    container.append(el("div", { class: "module-section" }, el("strong", {}, "Recent submissions:")));
+    for (const report of reportsData) {
+      const item = el("div", { class: "module-item" });
+      item.append(el("div", {}, `${report.status} - ${report.report_date}`));
+      if (report.submitted_at) {
+        item.append(el("div", { class: "item-subtitle" }, `Submitted ${new Date(report.submitted_at).toLocaleDateString()}`));
+      }
+      const actionBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        report.status === "draft" ? "Continue editing" : "View"
+      );
+      actionBtn.addEventListener("click", () => reportFormController.open(report.id));
+      item.append(actionBtn);
+      item.append(buildAttachmentsToggle("reports", report.id, report.status === "draft"));
+      container.append(item);
+    }
+    wireAttachmentToggles(container);
+  }
+}
+
+// Creates a fresh draft from a published template (today's date, empty
+// payload) and immediately opens it in the fill form. The server pins the
+// draft to the template's *current* active version (reports-routes.mjs), so
+// reloading /reports/:id/detail right after creation is guaranteed to return
+// that same version's schema -- no separate "fetch the schema" round trip
+// needed here.
+async function startNewReport(template) {
+  if (!currentFacility) return;
+  const area = document.getElementById("report-form-area");
+  if (area) {
+    area.hidden = false;
+    area.textContent = "";
+    area.append(el("p", {}, "Creating draft…"));
+  }
+  try {
+    const reportDate = new Date().toISOString().slice(0, 10);
+    const created = await apiFetch(`/facilities/${currentFacility}/reports`, {
+      method: "POST",
+      body: { templateId: template.id, reportDate, payload: {} }
+    });
+    await reportFormController.open(created.id);
+    await loadReports();
+  } catch (error) {
+    if (area) {
+      area.textContent = "";
+      area.append(el("p", { class: "rr-error" }, `Error: ${error.message}`));
+    }
+  }
+}
+
+const AUTOSAVE_DELAY_MS = 2000;
+
+// Shared engine behind both the fill-in-a-draft form (DR-13, `editable:
+// true`, mounted in the Daily reports panel) and the manager review inbox's
+// read-only detail pane (DR-14, `editable: false`, mounted in the inbox
+// panel with an `extra` renderer bolting on attachments/validation
+// results/PDF export). Two independent instances -- each with its own
+// closed-over `state` -- so opening a submission in one never disturbs
+// whatever the other has in progress (e.g. a manager Browse-ing the inbox
+// while the same session also has an in-progress draft open above).
+//
+// Autosave race-avoidance: field edits call scheduleAutosave, which just
+// debounces (clearTimeout + a fresh setTimeout) -- normal typing never fires
+// a request per keystroke. When the timer does fire, runAutosave only starts
+// a new PATCH if `state.saveInFlight` is false; if a save is already in
+// flight (e.g. autosave firing right as the user hits "Save draft", or two
+// autosave ticks landing close together after a slow response), it just sets
+// `state.pendingAutosave = true` and returns -- no second overlapping PATCH
+// is ever issued. saveDraft's `finally` block checks that flag once the
+// in-flight request settles and reschedules if it was set, so the latest
+// edits always get persisted eventually without two requests racing to
+// overwrite each other's response.
+function createReportFormController({ areaId, editable, extra }) {
+  const state = {
+    submissionId: null,
+    templateName: "",
+    descriptors: [],
+    values: {},
+    status: null,
+    readOnly: true,
+    currentSectionIndex: 0,
+    saveInFlight: false,
+    dirty: false,
+    pendingAutosave: false,
+    needsReason: false,
+    fieldErrors: {},
+    formErrors: [],
+    fieldNodes: new Map(),
+    autosaveTimer: null,
+    detail: null
+  };
+
+  function area() {
+    return document.getElementById(areaId);
+  }
+
+  function setSaveStatus(text, { error = false } = {}) {
+    const statusEl = document.getElementById(`${areaId}-status`);
+    if (!statusEl) return;
+    statusEl.textContent = text || "";
+    statusEl.classList.toggle("rr-error", !!error);
+  }
+
+  function clearFieldError(key) {
+    if (state.fieldErrors[key]) delete state.fieldErrors[key];
+    const node = state.fieldNodes.get(key);
+    if (node) node.errorEl.textContent = "";
+  }
+
+  // Updates in-memory state only -- never re-renders the form on every
+  // keystroke, which would rebuild the input nodes and steal focus/cursor
+  // position out from under whoever is typing. Only navigation (section
+  // change) and save/submit responses trigger a full render() / targeted
+  // renderFieldErrors().
+  function setFieldValue(key, value) {
+    state.values[key] = value;
+    clearFieldError(key);
+    if (editable && !state.readOnly) scheduleAutosave();
+  }
+
+  function scheduleAutosave() {
+    state.dirty = true;
+    if (state.autosaveTimer) clearTimeout(state.autosaveTimer);
+    state.autosaveTimer = setTimeout(() => {
+      state.autosaveTimer = null;
+      runAutosave();
+    }, AUTOSAVE_DELAY_MS);
+  }
+
+  async function runAutosave() {
+    if (!state.dirty || state.readOnly) return;
+    if (state.saveInFlight) {
+      state.pendingAutosave = true;
+      return;
+    }
+    await saveDraft({ silent: true });
+  }
+
+  // Recovers the raw 422 error array (or a single {error} string, wrapped)
+  // from an apiFetch rejection -- apiFetch's `.message` alone is a
+  // human-joined string that applyServerErrors can't map back to fields.
+  function parseApiErrorDetails(error) {
+    const details = error && error.details;
+    if (details && Array.isArray(details.errors)) return details.errors;
+    if (details && typeof details.error === "string") return [details.error];
+    return [error.message];
+  }
+
+  // Updates only the per-field error nodes and the form-level banner --
+  // deliberately not a full render(), for the same no-DOM-churn-while-typing
+  // reason as setFieldValue above.
+  function renderFieldErrors() {
+    for (const [key, node] of state.fieldNodes) {
+      const messages = state.fieldErrors[key] || [];
+      node.errorEl.textContent = messages.join(" ");
+    }
+    const banner = document.getElementById(`${areaId}-banner`);
+    if (banner) {
+      banner.textContent = "";
+      for (const message of state.formErrors) banner.append(el("p", {}, message));
+      banner.hidden = state.formErrors.length === 0;
+    }
+  }
+
+  async function saveDraft({ silent = false } = {}) {
+    if (state.readOnly || !state.submissionId) return;
+    const payload = collectPayload(state.descriptors, state.values);
+    state.saveInFlight = true;
+    state.dirty = false;
+    setSaveStatus(silent ? "Saving…" : "Saving draft…");
+    try {
+      await apiFetch(`/reports/${state.submissionId}`, { method: "PATCH", body: { payload } });
+      state.fieldErrors = {};
+      state.formErrors = [];
+      setSaveStatus(`Saved ${new Date().toLocaleTimeString()}`);
+      renderFieldErrors();
+    } catch (error) {
+      const messages = parseApiErrorDetails(error);
+      const mapped = applyServerErrors(state.descriptors, messages);
+      state.fieldErrors = mapped.fieldErrors;
+      state.formErrors = mapped.formErrors.length > 0 ? mapped.formErrors : messages;
+      setSaveStatus("Save failed", { error: true });
+      renderFieldErrors();
+    } finally {
+      state.saveInFlight = false;
+      if (state.pendingAutosave) {
+        state.pendingAutosave = false;
+        scheduleAutosave();
+      }
+    }
+  }
+
+  async function submitReport({ reason } = {}) {
+    if (state.readOnly || !state.submissionId) return;
+    // Flush any edits still only in memory before validating a submit -- the
+    // server validates whatever is already persisted on the row, not
+    // whatever's in the request body.
+    if (state.dirty) {
+      await saveDraft();
+      if (Object.keys(state.fieldErrors).length > 0) return;
+    }
+    setSaveStatus("Submitting…");
+    try {
+      const body = reason ? { reason } : {};
+      const updated = await apiFetch(`/reports/${state.submissionId}/submit`, { method: "POST", body });
+      state.status = (updated && updated.status) || "submitted";
+      state.readOnly = true;
+      state.needsReason = false;
+      state.fieldErrors = {};
+      state.formErrors = [];
+      setSaveStatus("Submitted");
+      render();
+      await loadReports();
+    } catch (error) {
+      const messages = parseApiErrorDetails(error);
+      // warn_and_submit templates (validation_json.submit_policy, see
+      // reports-routes.mjs) reject a submit with validation warnings unless
+      // a reason is supplied -- surface a reason box instead of treating
+      // this like an ordinary field-validation failure.
+      if (messages.some((message) => /reason is required/i.test(message))) {
+        state.needsReason = true;
+        state.formErrors = ["This report has validation warnings. Enter a reason to submit anyway."];
+        setSaveStatus("Needs a reason", { error: true });
+        render();
+        return;
+      }
+      const mapped = applyServerErrors(state.descriptors, messages);
+      state.fieldErrors = mapped.fieldErrors;
+      state.formErrors = mapped.formErrors.length > 0 ? mapped.formErrors : messages;
+      setSaveStatus("Submit failed", { error: true });
+      renderFieldErrors();
+    }
+  }
+
+  // photo/signature fields answer with a storage path, filled in by
+  // uploading through the existing per-module attachments route (DR-09,
+  // attachments-routes.mjs) tagged with this field's key via x-field-key so
+  // it's traceable back to the question it answers.
+  function buildFileFieldInput(descriptor) {
+    const wrapper = el("div", { class: "report-field-file" });
+    const value = state.values[descriptor.key];
+    const status = el("span", { class: "item-subtitle" }, value ? "File on record for this field." : "No file uploaded yet.");
+    wrapper.append(status);
+    if (!state.readOnly) {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = descriptor.type === "signature" ? "image/png,image/jpeg" : ATTACHMENT_ACCEPT;
+      input.addEventListener("change", async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        status.textContent = "Uploading…";
+        status.classList.remove("rr-error");
+        try {
+          const attachment = await uploadAttachmentFile(`/reports/${state.submissionId}/attachments`, file, {
+            "x-field-key": descriptor.key
+          });
+          setFieldValue(descriptor.key, attachment.storage_path);
+          status.textContent = `Uploaded ${file.name}.`;
+        } catch (error) {
+          status.textContent = `Error: ${error.message}`;
+          status.classList.add("rr-error");
+        }
+      });
+      wrapper.append(input);
+    }
+    return wrapper;
+  }
+
+  function buildFieldInput(descriptor) {
+    const value = state.values[descriptor.key];
+    const disabled = state.readOnly;
+    const inputId = `${areaId}-field-${descriptor.key}`;
+
+    if (descriptor.type === "photo" || descriptor.type === "signature") {
+      return buildFileFieldInput(descriptor);
+    }
+
+    if (descriptor.type === "multiselect") {
+      const wrapper = el("div", { class: "report-field-multiselect" });
+      const current = Array.isArray(value) ? value : [];
+      for (const option of descriptor.options || []) {
+        const optionId = `${inputId}-${option}`;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.id = optionId;
+        checkbox.value = option;
+        checkbox.checked = current.includes(option);
+        checkbox.disabled = disabled;
+        checkbox.addEventListener("change", () => {
+          const existing = Array.isArray(state.values[descriptor.key]) ? state.values[descriptor.key] : [];
+          const next = checkbox.checked
+            ? [...new Set([...existing, option])]
+            : existing.filter((entry) => entry !== option);
+          setFieldValue(descriptor.key, next);
+        });
+        wrapper.append(el("label", { class: "report-field-option", for: optionId }, [checkbox, ` ${option}`]));
+      }
+      return wrapper;
+    }
+
+    if (descriptor.type === "select") {
+      const select = document.createElement("select");
+      select.id = inputId;
+      select.disabled = disabled;
+      select.append(el("option", { value: "" }, "-- select --"));
+      for (const option of descriptor.options || []) {
+        const optionEl = el("option", { value: option }, option);
+        if (value === option) optionEl.selected = true;
+        select.append(optionEl);
+      }
+      select.addEventListener("change", () => setFieldValue(descriptor.key, select.value));
+      return select;
+    }
+
+    if (descriptor.type === "checkbox") {
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.id = inputId;
+      input.checked = value === true;
+      input.disabled = disabled;
+      input.addEventListener("change", () => setFieldValue(descriptor.key, input.checked));
+      return input;
+    }
+
+    if (descriptor.type === "textarea") {
+      const textarea = document.createElement("textarea");
+      textarea.id = inputId;
+      textarea.value = value ?? "";
+      textarea.disabled = disabled;
+      textarea.addEventListener("input", () => setFieldValue(descriptor.key, textarea.value));
+      return textarea;
+    }
+
+    // text, number, date, time all render as a single <input> differing only
+    // in `type`.
+    const input = document.createElement("input");
+    input.type = descriptor.type === "number" || descriptor.type === "date" || descriptor.type === "time"
+      ? descriptor.type
+      : "text";
+    input.id = inputId;
+    input.value = value ?? "";
+    input.disabled = disabled;
+    input.addEventListener("input", () => setFieldValue(descriptor.key, input.value));
+    return input;
+  }
+
+  function buildFieldRow(descriptor) {
+    const isGroup = descriptor.type === "multiselect" || descriptor.type === "photo" || descriptor.type === "signature";
+    const row = el(isGroup ? "fieldset" : "div", { class: "report-field" });
+    const labelText = `${descriptor.label}${descriptor.required ? " *" : ""}`;
+    row.append(
+      isGroup ? el("legend", {}, labelText) : el("label", { for: `${areaId}-field-${descriptor.key}` }, labelText)
+    );
+    row.append(buildFieldInput(descriptor));
+    if (descriptor.helpText) row.append(el("span", { class: "item-subtitle" }, descriptor.helpText));
+    const errorEl = el("div", { class: "field-error rr-error" });
+    row.append(errorEl);
+    state.fieldNodes.set(descriptor.key, { errorEl });
+    return row;
+  }
+
+  function groupSections(descriptors) {
+    const bySection = new Map();
+    for (const descriptor of descriptors) {
+      if (!bySection.has(descriptor.sectionIndex)) {
+        bySection.set(descriptor.sectionIndex, { index: descriptor.sectionIndex, title: descriptor.sectionTitle, fields: [] });
+      }
+      bySection.get(descriptor.sectionIndex).fields.push(descriptor);
+    }
+    return [...bySection.values()].sort((a, b) => a.index - b.index);
+  }
+
+  function render() {
+    const host = area();
+    if (!host) return;
+    host.textContent = "";
+    state.fieldNodes = new Map();
+
+    const header = el("div", { class: "report-form-header" });
+    header.append(el("h3", {}, state.templateName || "Report"));
+    const closeBtn = el("button", { type: "button" }, "Close");
+    closeBtn.addEventListener("click", () => close());
+    header.append(closeBtn);
+    host.append(header);
+
+    const banner = el("div", { class: "rr-error report-form-banner", id: `${areaId}-banner` });
+    banner.hidden = state.formErrors.length === 0;
+    for (const message of state.formErrors) banner.append(el("p", {}, message));
+    host.append(banner);
+
+    const sections = groupSections(state.descriptors);
+    if (state.currentSectionIndex >= sections.length) state.currentSectionIndex = 0;
+
+    if (sections.length > 1) {
+      const nav = el("div", { class: "report-form-steps" });
+      sections.forEach((section, index) => {
+        const stepBtn = el(
+          "button",
+          { type: "button", class: index === state.currentSectionIndex ? "report-step-btn active" : "report-step-btn" },
+          section.title || `Section ${index + 1}`
+        );
+        stepBtn.addEventListener("click", () => {
+          state.currentSectionIndex = index;
+          render();
+        });
+        nav.append(stepBtn);
+      });
+      host.append(nav);
+    }
+
+    const formEl = el("div", { class: "report-form" });
+    const currentSection = sections[state.currentSectionIndex];
+    if (currentSection) {
+      if (currentSection.title) formEl.append(el("h4", {}, currentSection.title));
+      for (const descriptor of currentSection.fields) formEl.append(buildFieldRow(descriptor));
+    } else {
+      formEl.append(el("p", {}, "This report template has no fields."));
+    }
+    host.append(formEl);
+
+    if (sections.length > 1) {
+      const stepNav = el("div", { class: "report-step-nav" });
+      const prevBtn = el("button", { type: "button" }, "Back");
+      prevBtn.disabled = state.currentSectionIndex === 0;
+      prevBtn.addEventListener("click", () => {
+        state.currentSectionIndex -= 1;
+        render();
+      });
+      const nextBtn = el("button", { type: "button" }, "Next");
+      nextBtn.disabled = state.currentSectionIndex >= sections.length - 1;
+      nextBtn.addEventListener("click", () => {
+        state.currentSectionIndex += 1;
+        render();
+      });
+      stepNav.append(prevBtn, nextBtn);
+      host.append(stepNav);
+    }
+
+    // Sticky Save draft / Submit action bar (see .report-form-actions in
+    // styles.css) -- stays pinned to the bottom of the form area regardless
+    // of which section/step is showing.
+    const actionBar = el("div", { class: "report-form-actions" });
+    actionBar.append(el("span", { class: "report-form-status", id: `${areaId}-status` }));
+    if (editable && !state.readOnly) {
+      const saveBtn = el("button", { type: "button" }, "Save draft");
+      saveBtn.addEventListener("click", () => saveDraft());
+      const submitBtn = el("button", { type: "button", class: "primary" }, "Submit");
+      submitBtn.addEventListener("click", () => submitReport());
+      actionBar.append(saveBtn, submitBtn);
+      if (state.needsReason) {
+        const reasonInput = document.createElement("textarea");
+        reasonInput.className = "report-reason-input";
+        reasonInput.placeholder = "Reason for submitting with warnings";
+        const reasonBtn = el("button", { type: "button", class: "primary" }, "Submit with reason");
+        reasonBtn.addEventListener("click", () => submitReport({ reason: reasonInput.value }));
+        actionBar.append(reasonInput, reasonBtn);
+      }
+    } else {
+      actionBar.append(el("span", { class: "item-subtitle" }, `Status: ${state.status || "unknown"}`));
+    }
+    host.append(actionBar);
+
+    renderFieldErrors();
+
+    if (typeof extra === "function") extra(host, state);
+  }
+
+  // Loads a submission via /reports/:id/detail -- the pinned-version schema
+  // route -- so a template re-publish never relabels an already-open
+  // submission (DR-14's acceptance highlight, but it benefits the DR-13 form
+  // equally: a draft opened mid-edit keeps the labels it started with even
+  // if an admin republishes the template in another tab).
+  async function open(submissionId, { forceReadOnly = false } = {}) {
+    const host = area();
+    if (!host) return;
+    if (state.autosaveTimer) {
+      clearTimeout(state.autosaveTimer);
+      state.autosaveTimer = null;
+    }
+    host.hidden = false;
+    host.textContent = "";
+    host.append(el("p", {}, "Loading report…"));
+    try {
+      const detail = await apiFetch(`/reports/${submissionId}/detail`);
+      state.submissionId = submissionId;
+      state.templateName = detail.template_name || "Report";
+      state.descriptors = fieldDescriptors(detail.schema_json);
+      state.values = { ...((detail.submission && detail.submission.payload_json) || {}) };
+      state.status = (detail.submission && detail.submission.status) || null;
+      state.readOnly = !editable || forceReadOnly || state.status !== "draft";
+      state.currentSectionIndex = 0;
+      state.saveInFlight = false;
+      state.dirty = false;
+      state.pendingAutosave = false;
+      state.needsReason = false;
+      state.fieldErrors = {};
+      state.formErrors = [];
+      state.detail = detail;
+      render();
+    } catch (error) {
+      host.textContent = "";
+      host.append(el("p", { class: "rr-error" }, `Error loading report: ${error.message}`));
+    }
+  }
+
+  function close() {
+    if (state.autosaveTimer) {
+      clearTimeout(state.autosaveTimer);
+      state.autosaveTimer = null;
+    }
+    const host = area();
+    if (host) {
+      host.hidden = true;
+      host.textContent = "";
+    }
+    state.submissionId = null;
+  }
+
+  return { open, close };
+}
+
+// DR-13's fill-a-draft form, mounted in the Daily reports panel.
+const reportFormController = createReportFormController({ areaId: "report-form-area", editable: true });
+
+// DR-14's manager review inbox detail pane: always read-only, and renders
+// attachments/validation results/PDF export after the shared field-answer
+// view via the `extra` hook.
+const inboxDetailController = createReportFormController({
+  areaId: "report-inbox-detail",
+  editable: false,
+  extra: renderInboxExtras
+});
+
+function renderInboxExtras(host, state) {
+  const detail = state.detail;
+  if (!detail) return;
+  const submission = detail.submission || {};
+
+  const meta = el("div", { class: "report-inbox-meta" });
+  meta.append(el("p", { class: "item-subtitle" }, `Report date: ${submission.report_date || "-"}`));
+  if (submission.submitted_at) {
+    meta.append(el("p", { class: "item-subtitle" }, `Submitted ${new Date(submission.submitted_at).toLocaleString()}`));
+  }
+  host.append(meta);
+
+  // warn_and_submit submissions carry {warnings, reason} on validation_results
+  // (reports-routes.mjs's submit handler) -- surface both so a reviewer sees
+  // exactly what was overridden and why.
+  const warnings = submission.validation_results && Array.isArray(submission.validation_results.warnings)
+    ? submission.validation_results.warnings
+    : [];
+  if (warnings.length > 0) {
+    const box = el("div", { class: "report-validation-warnings" });
+    box.append(el("strong", {}, "Submitted with validation warnings"));
+    for (const warning of warnings) box.append(el("p", {}, warning));
+    if (submission.validation_results.reason) {
+      box.append(el("p", { class: "item-subtitle" }, `Reason: ${submission.validation_results.reason}`));
+    }
+    host.append(box);
+  }
+
+  const attachments = detail.attachments || [];
+  const attachSection = el("div", { class: "report-inbox-attachments" });
+  attachSection.append(el("strong", {}, "Attachments"));
+  if (attachments.length === 0) {
+    attachSection.append(el("p", { class: "item-subtitle" }, "No attachments."));
+  } else {
+    const list = el("ul", { class: "attachments-items" });
+    for (const attachment of attachments) {
+      const item = el("li", { class: "attachment-item" });
+      const label = attachment.field_key
+        ? `${attachment.field_key} · ${attachment.mime_type || "file"}`
+        : attachment.mime_type || "file";
+      item.append(el("span", {}, label));
+      const downloadBtn = el("button", { type: "button" }, "Download");
+      downloadBtn.addEventListener("click", () => downloadAttachment("reports", attachment.id));
+      item.append(downloadBtn);
+      list.append(item);
+    }
+    attachSection.append(list);
+  }
+  host.append(attachSection);
+
+  const pdfSection = el("div", { class: "report-inbox-pdf" });
+  const pdfStatus = el("span", { class: "item-subtitle" });
+  const pdfBtn = el("button", { type: "button" }, "Download PDF");
+  pdfBtn.addEventListener("click", () => downloadReportPdf(submission.id, pdfBtn, pdfStatus));
+  pdfSection.append(pdfBtn, pdfStatus);
+  host.append(pdfSection);
+}
+
+// GET /reports/:id/pdf (DR-15, landing this batch from a sibling agent) hands
+// back the same {contentType, filename, body[, encoding]} export envelope
+// every other export route in this codebase uses (see
+// src/lib/http/audit-routes.mjs and admin/js/pages/export.js) because the
+// shared sendJson primitive can only ever emit application/json -- so the
+// download itself has to be completed client-side: decode `body` (base64 for
+// binary formats), wrap it in a same-typed Blob, and click a throwaway
+// object-URL anchor. If the route isn't wired yet, or the caller lacks
+// reports.export, apiFetch's normal error handling surfaces the 404/403 as
+// `error.message`, shown inline instead of a silent failure.
+async function downloadReportPdf(submissionId, button, statusEl) {
+  button.disabled = true;
+  statusEl.classList.remove("rr-error");
+  statusEl.textContent = "Preparing PDF…";
+  try {
+    const pkg = await apiFetch(`/reports/${submissionId}/pdf`);
+    if (!pkg || typeof pkg.body !== "string") throw new Error("PDF export returned no data");
+    const bytes = pkg.encoding === "base64" ? base64ToBytes(pkg.body) : pkg.body;
+    const blob = new Blob([bytes], { type: pkg.contentType || "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = pkg.filename || `report-${submissionId}.pdf`;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    statusEl.textContent = `Downloaded ${pkg.filename || "report.pdf"}.`;
+  } catch (error) {
+    statusEl.classList.add("rr-error");
+    statusEl.textContent = `PDF export unavailable: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// --- Manager review inbox (DR-14) -------------------------------------------
+// Filter bar (status/date range/department/template) driving GET
+// /facilities/:id/reports' query params, a list of matching submissions, and
+// a detail pane (inboxDetailController above) rendering labeled answers from
+// each submission's pinned schema.
+
+function buildReportsQuery() {
+  const params = new URLSearchParams();
+  const status = document.getElementById("report-filter-status")?.value;
+  const from = document.getElementById("report-filter-from")?.value;
+  const to = document.getElementById("report-filter-to")?.value;
+  const departmentId = document.getElementById("report-filter-department")?.value;
+  const templateId = document.getElementById("report-filter-template")?.value;
+  if (status) params.set("status", status);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  if (departmentId) params.set("department_id", departmentId);
+  if (templateId) params.set("template_id", templateId);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function setupReportInboxFilters() {
+  const form = document.getElementById("report-inbox-filters");
+  if (!form || form.dataset.wired === "true") return;
+  form.dataset.wired = "true";
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    inboxDetailController.close();
+    loadReportInboxList();
+  });
+}
+
+// Template options always come back (reports.read is enough for
+// ?status=all); the department dropdown is best-effort -- GET
+// /facilities/:id/departments is gated on admin.manage (admin-routes.mjs),
+// which a reports reviewer may not hold, so a 403 there just leaves the
+// dropdown at its default "All" option instead of breaking the rest of the
+// filter bar.
+async function refreshReportInboxFilterOptions() {
+  if (!currentFacility) return;
+  const templateSelect = document.getElementById("report-filter-template");
+  const departmentSelect = document.getElementById("report-filter-department");
+
+  try {
+    const templates = await apiFetch(`/facilities/${currentFacility}/report-templates?status=all`);
+    reportTemplatesById = new Map((templates || []).map((template) => [template.id, template.name]));
+    if (templateSelect) {
+      templateSelect.textContent = "";
+      templateSelect.append(el("option", { value: "" }, "All templates"));
+      for (const template of templates || []) {
+        templateSelect.append(el("option", { value: template.id }, template.name));
+      }
+    }
+  } catch (error) {
+    console.error("Failed to load report templates for filters:", error);
+  }
+
+  if (departmentSelect) {
+    departmentSelect.textContent = "";
+    departmentSelect.append(el("option", { value: "" }, "All departments"));
+    try {
+      const departments = await apiFetch(`/facilities/${currentFacility}/departments`);
+      for (const department of departments || []) {
+        departmentSelect.append(el("option", { value: department.id }, department.name));
+      }
+    } catch {
+      // Best-effort -- see comment above.
+    }
+  }
+}
+
+function renderReportInboxList(container, rows) {
+  container.textContent = "";
+  if (rows.length === 0) {
+    container.append(el("p", {}, "No submissions match these filters."));
+    return;
+  }
+  for (const row of rows) {
+    const item = el("div", { class: "module-item" });
+    const templateName = reportTemplatesById.get(row.template_id) || "Report";
+    item.append(el("div", { class: "item-title" }, `${templateName} · ${row.status} · ${row.report_date}`));
+    if (row.submitted_at) {
+      item.append(el("div", { class: "item-subtitle" }, `Submitted ${new Date(row.submitted_at).toLocaleString()}`));
+    }
+    const viewBtn = el("button", { type: "button", class: "primary" }, "View");
+    viewBtn.addEventListener("click", () => inboxDetailController.open(row.id, { forceReadOnly: true }));
+    item.append(viewBtn);
+    container.append(item);
+  }
+}
+
+async function loadReportInboxList() {
+  const container = document.getElementById("report-inbox-list");
+  if (!container || !currentFacility) return;
+  setLoading(container, true);
+  try {
+    const rows = await apiFetch(`/facilities/${currentFacility}/reports${buildReportsQuery()}`);
+    renderReportInboxList(container, rows || []);
+  } catch (error) {
+    setError(container, error.message);
+  }
+}
+
+async function loadReportInbox() {
+  if (!document.getElementById("report-inbox-list")) return;
+  setupReportInboxFilters();
+  await refreshReportInboxFilterOptions();
+  await loadReportInboxList();
 }
 
 // Schedule module

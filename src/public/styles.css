@@ -276,3 +276,191 @@ a.primary:focus-visible {
   color: #d32f2f;
 }
 
+/* --- Report entry form (DR-13) & manager review inbox detail pane (DR-14) --
+   Both src/public/js/app.js's createReportFormController instances (one
+   editable, mounted at #report-form-area; one read-only, mounted at
+   #report-inbox-detail) share this styling. */
+
+.report-form-area {
+  margin-top: 16px;
+  border: 1px solid #dce5f2;
+  border-radius: 18px;
+  padding: 20px;
+  background: #f9fbfe;
+  display: grid;
+  gap: 16px;
+}
+
+.report-form-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.report-form-header h3 {
+  margin: 0;
+}
+
+.report-form-banner {
+  border: 1px solid #f0a0a0;
+  background: #fff1f1;
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.report-form-banner p {
+  margin: 0;
+}
+
+.report-form-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.report-step-btn {
+  background: #eef4ff;
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+}
+
+.report-step-btn.active {
+  background: #1c6dd0;
+  color: #ffffff;
+  border-color: #1c6dd0;
+}
+
+.report-step-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.report-field {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.report-field legend {
+  font-weight: 700;
+  padding: 0;
+}
+
+.report-field textarea {
+  min-height: 90px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.report-field-multiselect {
+  display: grid;
+  gap: 6px;
+}
+
+.report-field-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+}
+
+.report-field-file {
+  display: grid;
+  gap: 8px;
+}
+
+.field-error {
+  min-height: 1em;
+  font-size: 0.9em;
+}
+
+.report-form-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #ffffff;
+  border: 1px solid #dce5f2;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 -6px 16px rgba(23, 32, 51, 0.06);
+}
+
+.report-form-status {
+  font-size: 0.9em;
+  color: #52647a;
+  margin-right: auto;
+}
+
+.report-reason-input {
+  min-width: 220px;
+  flex: 1 1 220px;
+  font-family: inherit;
+  min-height: 40px;
+}
+
+.report-inbox {
+  display: grid;
+  gap: 16px;
+}
+
+.report-inbox-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.report-inbox-filters label {
+  display: grid;
+  gap: 6px;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.report-inbox-meta {
+  display: grid;
+  gap: 2px;
+}
+
+.report-inbox-meta p {
+  margin: 0;
+}
+
+.report-validation-warnings {
+  border: 1px solid #f2c36b;
+  background: #fff8e8;
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.report-validation-warnings p {
+  margin: 0;
+}
+
+.report-inbox-attachments,
+.report-inbox-pdf {
+  display: grid;
+  gap: 8px;
+}
+
+@media (max-width: 720px) {
+  .report-form-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .report-form-status {
+    margin-right: 0;
+  }
+}
+
