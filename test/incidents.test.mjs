@@ -8,6 +8,10 @@ import {
   isEscalationOverdue,
   canTransitionIncident,
   buildIncidentAuditEvent,
+  buildAmendment,
+  AMENDABLE_INCIDENT_FIELDS,
+  formatIncidentNo,
+  nextIncidentNo,
   INCIDENT_STATUSES
 } from "../src/lib/incidents.mjs";
 
@@ -38,6 +42,16 @@ test("escalationDueAt honors incidents.escalationSlaHours", () => {
   const now = new Date("2026-07-08T02:00:00Z");
   assert.equal(isEscalationOverdue(incident, now), false); // due at 04:00, not yet overdue
   assert.equal(isEscalationOverdue(incident, now, { "incidents.escalationSlaHours": 1 }), true);
+});
+
+test("isEscalationOverdue uses incident.dueAt verbatim when present, bypassing the SLA calculation (IN-06)", () => {
+  const now = new Date("2026-07-08T02:00:00Z");
+  // dueAt already passed -- overdue, even though this "incident" carries no
+  // reportedAt/createdAt/occurredAt at all (escalationDueAt would return
+  // null for it, i.e. never overdue, if dueAt weren't honored first).
+  assert.equal(isEscalationOverdue({ dueAt: "2026-07-08T01:00:00Z" }, now), true);
+  // dueAt not yet reached -- not overdue.
+  assert.equal(isEscalationOverdue({ dueAt: "2026-07-08T03:00:00Z" }, now), false);
 });
 
 test("classifyOshaReview only flags accident outcomes with OSHA-style triggers", () => {
@@ -245,4 +259,128 @@ test("buildIncidentAuditEvent defaults actor_user_id to null and event_payload t
   const row = buildIncidentAuditEvent({ facilityId: "fac-1", incidentId: "inc-1", eventType: "incident.submitted" });
   assert.equal(row.actor_user_id, null);
   assert.deepEqual(row.event_payload, {});
+});
+
+// --- buildAmendment (IN-04) --------------------------------------------------
+
+const BEFORE_INCIDENT = {
+  id: "inc-1",
+  facility_id: "fac-1",
+  department_id: null,
+  incident_no: "INC-2026-0001",
+  report_type: "incident",
+  status: "submitted",
+  severity: "medium",
+  occurred_at: "2026-07-18T10:00:00Z",
+  reported_at: "2026-07-18T11:00:00Z",
+  location_text: "Building A",
+  summary: "Original summary",
+  immediate_actions: null,
+  requires_osha_review: false,
+  legal_hold: false,
+  submitted_by: "user-1",
+  submitted_at: "2026-07-18T11:00:00Z",
+  created_at: "2026-07-18T11:00:00Z",
+  updated_at: "2026-07-18T11:00:00Z"
+};
+
+test("AMENDABLE_INCIDENT_FIELDS excludes status/facility_id/incident_no/ids", () => {
+  for (const excluded of ["status", "facility_id", "incident_no", "id", "department_id", "occurred_at"]) {
+    assert.ok(!AMENDABLE_INCIDENT_FIELDS.includes(excluded), `${excluded} must not be amendable`);
+  }
+  assert.deepEqual(
+    [...AMENDABLE_INCIDENT_FIELDS].sort(),
+    ["immediate_actions", "location_text", "requires_osha_review", "severity", "summary"].sort()
+  );
+});
+
+test("buildAmendment applies the patch on top of before to produce afterSnapshot, leaving before untouched", () => {
+  const built = buildAmendment(BEFORE_INCIDENT, { summary: "Revised after investigation" }, { reason: "found more detail" });
+  assert.equal(built.error, undefined);
+  assert.equal(built.beforeSnapshot.summary, "Original summary");
+  assert.equal(built.afterSnapshot.summary, "Revised after investigation");
+  // Every other field is carried through unchanged.
+  assert.equal(built.afterSnapshot.severity, BEFORE_INCIDENT.severity);
+  assert.equal(built.afterSnapshot.status, BEFORE_INCIDENT.status);
+  assert.deepEqual(built.patch, { summary: "Revised after investigation" });
+  assert.deepEqual(built.changedFields, ["summary"]);
+  assert.equal(built.reason, "found more detail");
+});
+
+test("buildAmendment is deterministic: identical inputs produce identical hashes", () => {
+  const args = [BEFORE_INCIDENT, { severity: "high" }, { reason: "reclassified", actor: "user-9" }];
+  const first = buildAmendment(...args);
+  const second = buildAmendment(...args);
+  assert.equal(first.beforeHash, second.beforeHash);
+  assert.equal(first.afterHash, second.afterHash);
+  assert.equal(first.beforeHash.length, 64); // sha256 hex
+  assert.equal(first.afterHash.length, 64);
+});
+
+test("buildAmendment hashes are content-sensitive: a different patch changes afterHash but not beforeHash", () => {
+  const a = buildAmendment(BEFORE_INCIDENT, { severity: "high" }, { reason: "r" });
+  const b = buildAmendment(BEFORE_INCIDENT, { severity: "critical" }, { reason: "r" });
+  assert.equal(a.beforeHash, b.beforeHash); // same before-state
+  assert.notEqual(a.afterHash, b.afterHash); // different after-state
+});
+
+test("buildAmendment rejects an empty patch", () => {
+  const result = buildAmendment(BEFORE_INCIDENT, {}, { reason: "no-op" });
+  assert.equal(result.error, "patch must include at least one amendable field");
+  assert.equal(result.beforeSnapshot, undefined);
+});
+
+test("buildAmendment rejects non-amendable keys, listing every offending key", () => {
+  const result = buildAmendment(
+    BEFORE_INCIDENT,
+    { status: "closed", facility_id: "fac-2", summary: "ok field mixed in" },
+    { reason: "attempted bypass" }
+  );
+  assert.match(result.error, /status/);
+  assert.match(result.error, /facility_id/);
+  assert.equal(result.beforeSnapshot, undefined);
+});
+
+test("buildAmendment rejects a missing or blank reason", () => {
+  assert.equal(buildAmendment(BEFORE_INCIDENT, { summary: "x" }, {}).error, "reason is required");
+  assert.equal(buildAmendment(BEFORE_INCIDENT, { summary: "x" }, { reason: "" }).error, "reason is required");
+  assert.equal(buildAmendment(BEFORE_INCIDENT, { summary: "x" }, { reason: "   " }).error, "reason is required");
+});
+
+test("buildAmendment trims the reason and defaults actor to null", () => {
+  const withActor = buildAmendment(BEFORE_INCIDENT, { summary: "x" }, { reason: "  spaced reason  ", actor: "user-1" });
+  assert.equal(withActor.reason, "spaced reason");
+  assert.equal(withActor.actor, "user-1");
+
+  const withoutActor = buildAmendment(BEFORE_INCIDENT, { summary: "x" }, { reason: "reason" });
+  assert.equal(withoutActor.actor, null);
+});
+
+// --- Incident number generation (IN-09) --------------------------------------
+
+test("formatIncidentNo pads the sequence to 4 digits", () => {
+  assert.equal(formatIncidentNo(1, 2026), "INC-2026-0001");
+  assert.equal(formatIncidentNo(42, 2026), "INC-2026-0042");
+  assert.equal(formatIncidentNo(10000, 2026), "INC-2026-10000"); // never truncates a 5+ digit sequence
+});
+
+test("nextIncidentNo starts at 0001 when no existing incidents match the year", () => {
+  assert.equal(nextIncidentNo([], 2026), "INC-2026-0001");
+  assert.equal(nextIncidentNo(["INC-2025-0099"], 2026), "INC-2026-0001"); // different year, ignored
+});
+
+test("nextIncidentNo returns max + 1 for the given year", () => {
+  assert.equal(nextIncidentNo(["INC-2026-0001", "INC-2026-0007", "INC-2026-0003"], 2026), "INC-2026-0008");
+});
+
+test("nextIncidentNo ignores malformed / non-matching values instead of throwing", () => {
+  assert.equal(
+    nextIncidentNo(["not-a-number", "", null, undefined, 42, "INC-2026-0002"], 2026),
+    "INC-2026-0003"
+  );
+});
+
+test("nextIncidentNo defaults year to the current UTC year when omitted", () => {
+  const year = new Date().getUTCFullYear();
+  assert.equal(nextIncidentNo([]), `INC-${year}-0001`);
 });

@@ -19,6 +19,9 @@ const LEGAL_HOLD_MANAGER = [
     permissions: ["incidents.read", "incidents.review", "incidents.legal_hold.manage"]
   }
 ];
+const TASK_CREATOR = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.tasks.create"] }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -55,6 +58,22 @@ const ESCALATION = {
   target_user_id: null,
   status: "pending",
   due_at: "2026-07-18T12:00:00Z",
+  created_at: "2026-07-18T11:00:00Z",
+  updated_at: "2026-07-18T11:00:00Z"
+};
+const ACKNOWLEDGED_ESCALATION = { ...ESCALATION, status: "acknowledged", acknowledged_at: "2026-07-18T11:30:00Z" };
+const RESOLVED_ESCALATION = { ...ESCALATION, status: "resolved", acknowledged_at: "2026-07-18T11:30:00Z" };
+
+const FOLLOWUP = {
+  id: "fu-1",
+  facility_id: "fac-1",
+  incident_id: "inc-1",
+  owner_user_id: null,
+  action_type: "corrective_action",
+  status: "open",
+  due_at: "2026-07-25T00:00:00Z",
+  description: "Fix the guard rail",
+  completed_at: null,
   created_at: "2026-07-18T11:00:00Z",
   updated_at: "2026-07-18T11:00:00Z"
 };
@@ -145,7 +164,6 @@ test("POST incidents denies a reader without incidents.manage", async (t) => {
   stubFetch(t, () => []);
   const { call } = mount({ memberships: READER });
   const result = await call("POST", "/facilities/fac-1/incidents", {
-    incidentNo: "INC-2026-001",
     reportType: "incident",
     severity: "high",
     occurredAt: "2026-07-18T10:00:00Z",
@@ -155,14 +173,14 @@ test("POST incidents denies a reader without incidents.manage", async (t) => {
   assert.equal(result.status, 403);
 });
 
-test("POST incidents happy path inserts a draft with correct shape", async (t) => {
+test("POST incidents happy path inserts a draft with a server-generated incident_no", async (t) => {
   const captured = stubFetch(t, (table, method) => {
-    if (table === "incident_reports" && method === "POST") return [{ id: "inc-1" }];
+    if (table === "incident_reports" && method === "GET") return []; // no existing incidents for this facility
+    if (table === "incident_reports" && method === "POST") return [{ id: "inc-1", incident_no: "INC-2026-0001" }];
     return [];
   });
   const { call } = mount({ userId: "user-9" });
   const result = await call("POST", "/facilities/fac-1/incidents", {
-    incidentNo: "INC-2026-001",
     reportType: "incident",
     severity: "high",
     occurredAt: "2026-07-18T10:00:00Z",
@@ -176,12 +194,123 @@ test("POST incidents happy path inserts a draft with correct shape", async (t) =
   assert.equal(result.status, 201);
   const insert = captured.find((c) => c.table === "incident_reports" && c.method === "POST");
   assert.equal(insert.body[0].facility_id, "fac-1");
-  assert.equal(insert.body[0].incident_no, "INC-2026-001");
+  assert.match(insert.body[0].incident_no, /^INC-\d{4}-0001$/);
   assert.equal(insert.body[0].report_type, "incident");
   assert.equal(insert.body[0].severity, "high");
   assert.equal(insert.body[0].status, "draft");
   assert.equal(insert.body[0].location_text, "Building A");
   assert.equal(insert.body[0].summary, "Test incident");
+});
+
+test("POST incidents ignores a client-supplied incidentNo and generates its own", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [];
+    if (table === "incident_reports" && method === "POST") return [{ id: "inc-1" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  await call("POST", "/facilities/fac-1/incidents", {
+    incidentNo: "CLIENT-SUPPLIED-999",
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident"
+  });
+  const insert = captured.find((c) => c.table === "incident_reports" && c.method === "POST");
+  assert.notEqual(insert.body[0].incident_no, "CLIENT-SUPPLIED-999");
+  assert.match(insert.body[0].incident_no, /^INC-\d{4}-\d{4}$/);
+});
+
+test("POST incidents numbers the next incident after the facility's existing max for the year", async (t) => {
+  const year = new Date().getUTCFullYear();
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") {
+      return [{ incident_no: `INC-${year}-0003` }, { incident_no: `INC-${year}-0007` }, { incident_no: `INC-${year - 1}-0099` }];
+    }
+    if (table === "incident_reports" && method === "POST") return [{ id: "inc-9" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  await call("POST", "/facilities/fac-1/incidents", {
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident"
+  });
+  const insert = captured.find((c) => c.table === "incident_reports" && c.method === "POST");
+  assert.equal(insert.body[0].incident_no, `INC-${year}-0008`);
+});
+
+test("POST incidents retries once on a unique incident_no collision and succeeds", async (t) => {
+  let insertAttempts = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    if (table === "incident_reports" && method === "GET") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([]) };
+    }
+    if (table === "incident_reports" && method === "POST") {
+      insertAttempts += 1;
+      if (insertAttempts === 1) {
+        return {
+          ok: false,
+          status: 409,
+          text: async () => JSON.stringify({ code: "23505", message: "duplicate key value" })
+        };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify([{ id: "inc-retry" }]) };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify([]) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("POST", "/facilities/fac-1/incidents", {
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(insertAttempts, 2);
+});
+
+test("POST incidents surfaces a second consecutive collision as a clean 409", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    if (table === "incident_reports" && method === "GET") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([]) };
+    }
+    if (table === "incident_reports" && method === "POST") {
+      return {
+        ok: false,
+        status: 409,
+        text: async () => JSON.stringify({ code: "23505", message: "duplicate key value" })
+      };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify([]) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("POST", "/facilities/fac-1/incidents", {
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident"
+  });
+  assert.equal(result.status, 409);
 });
 
 test("POST escalate loads incident and denies non-manager with 403", async (t) => {
@@ -399,4 +528,444 @@ test("POST status 404s when the incident is missing", async (t) => {
   const { call } = mount({ memberships: REVIEWER });
   const result = await call("POST", "/incidents/nope/status", { to: "under_review" });
   assert.equal(result.status, 404);
+});
+
+// --- POST /incidents/:id/submit: suggestedFollowUps (IN-05) -----------------
+
+test("POST submit response includes suggestedFollowUps for an auto-escalating severity", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT]; // severity: high
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.suggestedFollowUps, ["manager_review", "safety_lead_acknowledgement"]);
+});
+
+test("POST submit response has an empty suggestedFollowUps for a non-escalating incident", async (t) => {
+  const LOW_SEVERITY_INCIDENT = { ...INCIDENT, severity: "low" };
+  stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [LOW_SEVERITY_INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...LOW_SEVERITY_INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.suggestedFollowUps, []);
+});
+
+// --- POST /incidents/:id/amendments, GET /incidents/:id/amendments (IN-04) --
+
+test("POST amendments on a draft incident is rejected with 409 and no writes", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // draft
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "correcting the summary",
+    patch: { summary: "Updated summary" }
+  });
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.table === "incident_amendments"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+test("POST amendments denies an actor without incidents.manage or incidents.review", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "correcting the summary",
+    patch: { summary: "Updated summary" }
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST amendments rejects an empty patch, non-amendable fields, and a blank reason (400, no writes)", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: CREATOR });
+
+  const emptyPatch = await call("POST", "/incidents/inc-1/amendments", { reason: "why", patch: {} });
+  assert.equal(emptyPatch.status, 400);
+
+  const badField = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "why",
+    patch: { status: "closed" }
+  });
+  assert.equal(badField.status, 400);
+  assert.match(badField.payload.error, /status/);
+
+  const blankReason = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "   ",
+    patch: { summary: "x" }
+  });
+  assert.equal(blankReason.status, 400);
+
+  assert.ok(!captured.some((c) => c.table === "incident_amendments"));
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+test("POST amendments on a submitted incident writes BOTH the incident_reports UPDATE and the incident_amendments row, plus an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") {
+      return [{ ...SUBMITTED_INCIDENT, summary: "Updated after investigation" }];
+    }
+    if (table === "incident_amendments" && method === "POST") {
+      return [{ id: "amend-1", incident_id: "inc-1" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-9" });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "Investigation revealed more detail",
+    patch: { summary: "Updated after investigation" }
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.incident.summary, "Updated after investigation");
+  assert.equal(result.payload.amendment.id, "amend-1");
+
+  const incidentPatch = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
+  assert.ok(incidentPatch, "expected incident_reports to be updated");
+  assert.equal(incidentPatch.body.summary, "Updated after investigation");
+  assert.equal(Object.keys(incidentPatch.body).length, 1); // only the amended field, nothing else
+
+  const amendmentInsert = captured.find((c) => c.table === "incident_amendments" && c.method === "POST");
+  assert.ok(amendmentInsert, "expected an incident_amendments insert");
+  const amendment = amendmentInsert.body[0];
+  assert.equal(amendment.facility_id, "fac-1");
+  assert.equal(amendment.incident_id, "inc-1");
+  assert.equal(amendment.amendment_reason, "Investigation revealed more detail");
+  assert.equal(amendment.amended_by, "user-9");
+  assert.equal(amendment.before_snapshot.summary, "Test incident");
+  assert.equal(amendment.after_snapshot.summary, "Updated after investigation");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  const event = auditInsert.body[0];
+  assert.equal(event.event_type, "incident.amended");
+  assert.deepEqual(event.event_payload.fields, ["summary"]);
+  assert.equal(typeof event.event_payload.beforeHash, "string");
+  assert.equal(typeof event.event_payload.afterHash, "string");
+});
+
+test("POST amendments succeeds for an incidents.review holder (no incidents.manage)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...SUBMITTED_INCIDENT, severity: "high" }];
+    if (table === "incident_amendments" && method === "POST") return [{ id: "amend-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "reclassified after review",
+    patch: { severity: "high" }
+  });
+  assert.equal(result.status, 201);
+  assert.ok(captured.some((c) => c.table === "incident_amendments" && c.method === "POST"));
+});
+
+test("GET amendments 404s when the incident is missing and denies a non-reader", async (t) => {
+  stubFetch(t, () => []);
+  const { call: call404 } = mount({ memberships: CREATOR });
+  const missing = await call404("GET", "/incidents/nope/amendments");
+  assert.equal(missing.status, 404);
+});
+
+test("GET amendments returns the amendment history for a reader", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "incident_amendments") return [{ id: "amend-1" }, { id: "amend-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/amendments");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 2);
+});
+
+// --- Follow-up actions CRUD + permission matrix (IN-05) ----------------------
+
+test("GET followups denies a non-reader with 403", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/incidents/inc-1/followups");
+  assert.equal(result.status, 403);
+});
+
+test("GET followups lists an incident's follow-up actions for a reader", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "incident_followup_actions") return [FOLLOWUP];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/followups");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload[0].id, "fu-1");
+});
+
+test("POST followups validates shape before guarding or fetching (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: TASK_CREATOR });
+  const result = await call("POST", "/incidents/inc-1/followups", { actionType: "not_a_real_type" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST followups denies a reader without incidents.tasks.create", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/incidents/inc-1/followups", {
+    actionType: "corrective_action",
+    description: "Fix it"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST followups allows incidents.tasks.create without incidents.manage, and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_followup_actions" && method === "POST") return [{ id: "fu-9" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: TASK_CREATOR, userId: "user-4" });
+  const result = await call("POST", "/incidents/inc-1/followups", {
+    actionType: "corrective_action",
+    description: "Fix the guard rail",
+    dueAt: "2026-08-01T00:00:00Z",
+    ownerUserId: "user-owner"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.id, "fu-9");
+
+  const insert = captured.find((c) => c.table === "incident_followup_actions" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].incident_id, "inc-1");
+  assert.equal(insert.body[0].status, "open");
+  assert.equal(insert.body[0].owner_user_id, "user-owner");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert on create");
+  assert.equal(auditInsert.body[0].event_type, "incident.followup_created");
+});
+
+test("PATCH followups denies a task-creator without incidents.manage", async (t) => {
+  stubFetch(t, (table) => (table === "incident_followup_actions" ? [FOLLOWUP] : []));
+  const { call } = mount({ memberships: TASK_CREATOR });
+  const result = await call("PATCH", "/followups/fu-1", { status: "in_progress" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH followups reassigns owner/due date with no audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_followup_actions" && method === "PATCH") {
+      return [{ ...FOLLOWUP, owner_user_id: "user-new", due_at: "2026-08-05T00:00:00Z" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/followups/fu-1", { ownerUserId: "user-new", dueAt: "2026-08-05T00:00:00Z" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.owner_user_id, "user-new");
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("PATCH followups completing a task stamps completed_at server-side and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_followup_actions" && method === "PATCH") {
+      return [{ ...FOLLOWUP, status: "completed", completed_at: "2026-08-14T00:00:00.000Z" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-3" });
+  const result = await call("PATCH", "/followups/fu-1", { status: "completed" });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "completed");
+
+  const patch = captured.find((c) => c.table === "incident_followup_actions" && c.method === "PATCH");
+  assert.ok(patch.body.completed_at, "expected completed_at to be server-stamped");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert on completion");
+  assert.equal(auditInsert.body[0].event_type, "incident.followup_completed");
+});
+
+test("PATCH followups re-completing an already-completed task writes no second audit event", async (t) => {
+  const COMPLETED_FOLLOWUP = { ...FOLLOWUP, status: "completed", completed_at: "2026-08-01T00:00:00Z" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [COMPLETED_FOLLOWUP];
+    if (table === "incident_followup_actions" && method === "PATCH") return [COMPLETED_FOLLOWUP];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/followups/fu-1", { status: "completed" });
+  assert.equal(result.status, 200);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("PATCH followups rejects an invalid status (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/followups/fu-1", { status: "bogus" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH followups 404s when the follow-up is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/followups/nope", { status: "in_progress" });
+  assert.equal(result.status, 404);
+});
+
+// --- Escalation lifecycle: create/acknowledge/resolve/list (IN-06) ----------
+
+test("POST escalate validates level/targetRole/reasonCode shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/escalate", { level: 0 });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST escalate accepts custom level/targetRole/reasonCode and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-2" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-6" });
+  const result = await call("POST", "/incidents/inc-1/escalate", {
+    level: 2,
+    targetRole: "safety_director",
+    reasonCode: "sla_breach"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_escalations" && c.method === "POST");
+  assert.equal(insert.body[0].escalation_level, 2);
+  assert.equal(insert.body[0].target_role, "safety_director");
+  assert.equal(insert.body[0].reason_code, "sla_breach");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  assert.equal(auditInsert.body[0].event_type, "incident.escalated");
+});
+
+test("POST escalations/:id/acknowledge denies a reader without incidents.manage", async (t) => {
+  stubFetch(t, (table) => (table === "incident_escalations" ? [ESCALATION] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/escalations/esc-1/acknowledge");
+  assert.equal(result.status, 403);
+});
+
+test("POST escalations/:id/acknowledge happy path stamps acknowledged_at and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_escalations" && method === "GET") return [ESCALATION];
+    if (table === "incident_escalations" && method === "PATCH") return [ACKNOWLEDGED_ESCALATION];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-2" });
+  const result = await call("POST", "/escalations/esc-1/acknowledge");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "acknowledged");
+
+  const patch = captured.find((c) => c.table === "incident_escalations" && c.method === "PATCH");
+  assert.equal(patch.body.status, "acknowledged");
+  assert.ok(patch.body.acknowledged_at);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_type, "incident.escalation_acknowledged");
+});
+
+test("POST escalations/:id/acknowledge on an already-acknowledged escalation is a 409 (double-ack rejected)", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_escalations" ? [ACKNOWLEDGED_ESCALATION] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/escalations/esc-1/acknowledge");
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.method === "PATCH"));
+});
+
+test("POST escalations/:id/acknowledge 404s when the escalation is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/escalations/nope/acknowledge");
+  assert.equal(result.status, 404);
+});
+
+test("POST escalations/:id/resolve on a pending (not yet acknowledged) escalation is a 409", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_escalations" ? [ESCALATION] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/escalations/esc-1/resolve");
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.method === "PATCH"));
+});
+
+test("POST escalations/:id/resolve happy path transitions acknowledged -> resolved and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_escalations" && method === "GET") return [ACKNOWLEDGED_ESCALATION];
+    if (table === "incident_escalations" && method === "PATCH") return [RESOLVED_ESCALATION];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/escalations/esc-1/resolve");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "resolved");
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_type, "incident.escalation_resolved");
+});
+
+test("POST escalations/:id/resolve on an already-resolved escalation is a 409", async (t) => {
+  stubFetch(t, (table) => (table === "incident_escalations" ? [RESOLVED_ESCALATION] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/escalations/esc-1/resolve");
+  assert.equal(result.status, 409);
+});
+
+test("GET facilities/:id/incident-escalations denies a non-reader with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/incident-escalations");
+  assert.equal(result.status, 403);
+});
+
+test("GET facilities/:id/incident-escalations applies the ?status= filter and flags overdue pending escalations", async (t) => {
+  const PAST_DUE_PENDING = { ...ESCALATION, id: "esc-overdue", due_at: "2020-01-01T00:00:00Z" };
+  const captured = stubFetch(t, (table) => (table === "incident_escalations" ? [PAST_DUE_PENDING] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/incident-escalations?status=pending");
+  assert.equal(result.status, 200);
+  const query = captured.find((c) => c.table === "incident_escalations");
+  assert.equal(query.url.searchParams.get("status"), "eq.pending");
+  assert.equal(result.payload[0].overdue, true);
+});
+
+test("GET facilities/:id/incident-escalations does not flag a resolved escalation as overdue even if its due_at has passed", async (t) => {
+  const PAST_DUE_RESOLVED = { ...RESOLVED_ESCALATION, id: "esc-old", due_at: "2020-01-01T00:00:00Z" };
+  stubFetch(t, (table) => (table === "incident_escalations" ? [PAST_DUE_RESOLVED] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/incident-escalations");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload[0].overdue, false);
+});
+
+test("GET facilities/:id/incident-escalations does not flag a not-yet-due pending escalation as overdue", async (t) => {
+  const NOT_YET_DUE = { ...ESCALATION, id: "esc-fresh", due_at: "2099-01-01T00:00:00Z" };
+  stubFetch(t, (table) => (table === "incident_escalations" ? [NOT_YET_DUE] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/incident-escalations");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload[0].overdue, false);
 });

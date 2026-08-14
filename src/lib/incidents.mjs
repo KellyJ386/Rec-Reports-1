@@ -23,8 +23,17 @@ export function escalationDueAt(incident, config = {}) {
   return new Date(new Date(anchor).getTime() + slaHours * 60 * 60 * 1000);
 }
 
+// `incident.dueAt`, when present, is used verbatim instead of recomputing an
+// SLA-derived due date from escalationDueAt. This is what lets IN-06's
+// escalations list route reuse this same function against an
+// incident_escalations row (which already carries its own server-stamped
+// due_at from creation time) without reshaping it into an incident-like
+// object with reportedAt/createdAt/occurredAt -- callers just pass
+// { dueAt: escalation.due_at }. Existing callers that pass an incident
+// (no dueAt) are unaffected: the fallback to escalationDueAt(incident,
+// config) is exactly the prior behavior.
 export function isEscalationOverdue(incident, now = new Date(), config = {}) {
-  const dueAt = escalationDueAt(incident, config);
+  const dueAt = incident?.dueAt ? new Date(incident.dueAt) : escalationDueAt(incident, config);
   if (!dueAt) return false;
   return now > dueAt;
 }
@@ -189,4 +198,133 @@ export function buildIncidentAuditEvent({ facilityId, incidentId, actorUserId, e
     event_payload: payload ?? {}
   };
   return { ...event, event_hash: computeRowHash(null, event) };
+}
+
+// --- Amendments (IN-04) ------------------------------------------------------
+// Amendments are the module's legal-defensibility core: once an incident has
+// left draft, its material fields are frozen against plain UPDATEs (routes.js
+// enforces the 409-on-draft rule) and can only change through this append-
+// only record of what changed, why, and by whom -- before/after snapshots of
+// the *entire* row, hashed so a later reader can detect tampering with the
+// snapshot content independent of the incident_amendments table's own RLS
+// posture.
+//
+// Allow-list rationale (read against incident_reports' columns,
+// 0004_incidents.sql:1-22): only narrative/descriptive and classification
+// fields are amendable --
+//   * summary, immediate_actions, location_text -- narrative/descriptive
+//     fields that are routinely corrected or expanded as an investigation
+//     proceeds (e.g. a fuller account of what happened, a corrected room
+//     number).
+//   * severity, requires_osha_review -- classification fields that
+//     legitimately change on reclassification (e.g. an initial "medium"
+//     severity is revised to "high" after review; OSHA recordability is
+//     determined only after the fact).
+// Deliberately EXCLUDED:
+//   * status -- has its own guarded transition machine (canTransitionIncident
+//     / POST /incidents/:id/status); amending it would bypass every gate
+//     that machine enforces (closure follow-up/legal-hold checks, etc).
+//   * facility_id, incident_no, id, department_id -- identity/routing
+//     columns. Changing these would mean *re-pointing* the record at a
+//     different tenant/case/department rather than correcting its content --
+//     exactly what amendments must never be able to do.
+//   * occurred_at -- the fixed factual anchor the escalation SLA and audit
+//     timeline are computed from; correcting a mis-recorded occurrence time
+//     is a materially different (and more sensitive -- it can shift whether
+//     an SLA was breached) operation than correcting a description, so it is
+//     intentionally left out of this allow-list rather than folded in.
+//   * submitted_by, submitted_at, created_at, updated_at, deleted_at,
+//     legal_hold -- system-stamped or independently-guarded (legal_hold has
+//     its own incidents.legal_hold.manage-gated surface per IN-02).
+export const AMENDABLE_INCIDENT_FIELDS = Object.freeze([
+  "summary",
+  "immediate_actions",
+  "location_text",
+  "severity",
+  "requires_osha_review"
+]);
+
+// Pure. `before` is the current incident_reports row exactly as loaded from
+// storage (snake_case columns) -- the before/after snapshots stored in
+// incident_amendments are literal row dumps, so `patch` is keyed by the same
+// snake_case column names rather than the HTTP layer's camelCase, keeping
+// the snapshot shape, the allow-list, and the wire patch identical (one
+// fewer translation layer to get wrong in the module's legal core).
+//
+// Returns { error } for:
+//   * a missing/blank `reason` (checked first: an amendment with no stated
+//     reason is not a valid amendment regardless of what it changes)
+//   * an empty patch (nothing to amend)
+//   * any patch key outside AMENDABLE_INCIDENT_FIELDS (lists every offending
+//     key, not just the first, so a caller can fix its request in one pass)
+//
+// On success, returns the full built amendment: before/after snapshots (the
+// after snapshot is `before` with only the patch's fields applied), their
+// sha-256 hashes (via audit.mjs's computeRowHash with a null prevHash --
+// the same "self-contained content hash" shape buildIncidentAuditEvent uses
+// for event_hash), the patch to apply to incident_reports, the trimmed
+// reason, and the actor. Hashing is over the *entire* snapshot (not just the
+// changed fields) so the hash can later re-verify the full before/after
+// state, not merely the diff.
+export function buildAmendment(before, patch, { reason, actor } = {}) {
+  const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+  if (!trimmedReason) {
+    return { error: "reason is required" };
+  }
+
+  const patchEntries = Object.entries(patch ?? {});
+  if (patchEntries.length === 0) {
+    return { error: "patch must include at least one amendable field" };
+  }
+
+  const invalidKeys = patchEntries.map(([key]) => key).filter((key) => !AMENDABLE_INCIDENT_FIELDS.includes(key));
+  if (invalidKeys.length > 0) {
+    return {
+      error: `cannot amend field(s): ${invalidKeys.join(", ")} (allowed: ${AMENDABLE_INCIDENT_FIELDS.join(", ")})`
+    };
+  }
+
+  const appliedPatch = Object.fromEntries(patchEntries);
+  const beforeSnapshot = { ...before };
+  const afterSnapshot = { ...before, ...appliedPatch };
+
+  return {
+    beforeSnapshot,
+    afterSnapshot,
+    beforeHash: computeRowHash(null, beforeSnapshot),
+    afterHash: computeRowHash(null, afterSnapshot),
+    patch: appliedPatch,
+    changedFields: Object.keys(appliedPatch),
+    reason: trimmedReason,
+    actor: actor ?? null
+  };
+}
+
+// --- Incident number generation (IN-09) --------------------------------------
+// Server-generated incident_no, format INC-YYYY-NNNN, sequenced per facility
+// per calendar year (the calling route already scopes `existingIncidentNos`
+// to one facility; the year match below is what additionally partitions the
+// sequence by year within that facility's history).
+const INCIDENT_NO_PATTERN = /^INC-(\d{4})-(\d{4,})$/;
+
+export function formatIncidentNo(sequence, year) {
+  return `INC-${year}-${String(sequence).padStart(4, "0")}`;
+}
+
+// Pure. `existingIncidentNos` is a flat string[] of incident_no values already
+// used (any shape -- the route fetches them unfiltered per facility). Values
+// that don't match INC-YYYY-NNNN, or whose YYYY isn't `year`, are ignored
+// rather than throwing -- legacy/malformed numbers must never block new
+// numbering. Returns max-matching-sequence + 1 for `year`, or NNNN=0001 when
+// none exist yet.
+export function nextIncidentNo(existingIncidentNos = [], year = new Date().getUTCFullYear()) {
+  let maxSequence = 0;
+  for (const incidentNo of existingIncidentNos ?? []) {
+    const match = typeof incidentNo === "string" ? incidentNo.match(INCIDENT_NO_PATTERN) : null;
+    if (!match) continue;
+    if (Number(match[1]) !== year) continue;
+    const sequence = Number(match[2]);
+    if (sequence > maxSequence) maxSequence = sequence;
+  }
+  return formatIncidentNo(maxSequence + 1, year);
 }
