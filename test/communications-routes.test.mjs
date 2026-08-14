@@ -26,6 +26,14 @@ const MESSAGE = {
   updated_at: "2026-07-18T08:00:00Z"
 };
 
+// A not-yet-published message for the CM-03 publish-flow tests below.
+const DRAFT_MESSAGE = {
+  ...MESSAGE,
+  id: "msg-draft",
+  priority: "urgent",
+  published_at: null
+};
+
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -428,4 +436,203 @@ test("POST /messages/:id/receipt 404s when message missing", async (t) => {
   const { call } = mount({ memberships: READER });
   const result = await call("POST", "/messages/nope/receipt", { deliveredAt: "2026-07-18T10:00:00Z" });
   assert.equal(result.status, 404);
+});
+
+// --- Publish flow (CM-03) -----------------------------------------------------
+
+test("POST .../messages/:id/publish resolves department+employee audiences, publishes, and enqueues a shaped job", async (t) => {
+  const audiences = [
+    { id: "aud-1", message_id: "msg-draft", audience_type: "department", audience_ref_id: "dept-1" },
+    { id: "aud-2", message_id: "msg-draft", audience_type: "employee", audience_ref_id: "emp-5" }
+  ];
+  const employees = [
+    { id: "emp-1", department_id: "dept-1", user_id: "user-1" },
+    { id: "emp-2", department_id: "dept-2", user_id: "user-2" }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    if (table === "messages" && method === "PATCH") return [{ ...DRAFT_MESSAGE, published_at: "2026-08-13T00:00:00Z" }];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "employees" && method === "GET") return employees;
+    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {});
+  assert.equal(result.status, 200);
+  assert.ok(result.payload.publishedAt);
+  assert.equal(result.payload.recipientCount, 2);
+  assert.deepEqual(result.payload.unresolvedAudiences, []);
+
+  const patch = captured.find((c) => c.table === "messages" && c.method === "PATCH");
+  assert.ok(patch, "expected messages PATCH");
+  assert.equal(patch.url.searchParams.get("id"), "eq.msg-draft");
+  assert.ok(patch.body.published_at);
+
+  const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.ok(jobInsert, "expected notification_jobs POST");
+  assert.equal(jobInsert.body[0].facility_id, "fac-1");
+  assert.equal(jobInsert.body[0].event_type, "message.published");
+  assert.equal(jobInsert.body[0].status, "pending");
+  // department dept-1 resolves emp-1 only (emp-2 is in dept-2); employee
+  // audience emp-5 passes through directly; recipients dedup+sort.
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-1", "emp-5"]);
+  // priority 'urgent' -> in_app + push, and bypasses quiet hours.
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.channels, ["in_app", "push"]);
+  assert.equal(jobInsert.body[0].payload_jsonb.quietHoursBypass, true);
+  assert.equal(jobInsert.body[0].payload_jsonb.messageId, "msg-draft");
+});
+
+test("POST .../messages/:id/publish resolves a role audience via memberships joined to employees", async (t) => {
+  const audiences = [{ id: "aud-1", message_id: "msg-draft", audience_type: "role", audience_ref_id: "role-1" }];
+  const employees = [
+    { id: "emp-1", department_id: "dept-1", user_id: "user-1" },
+    { id: "emp-2", department_id: "dept-2", user_id: "user-2" }
+  ];
+  const memberships = [{ user_id: "user-1", role_id: "role-1" }];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    if (table === "messages" && method === "PATCH") return [DRAFT_MESSAGE];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "employees" && method === "GET") return employees;
+    if (table === "memberships" && method === "GET") return memberships;
+    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {});
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.recipientCount, 1);
+
+  const membershipLookup = captured.find((c) => c.table === "memberships" && c.method === "GET");
+  assert.ok(membershipLookup, "expected a memberships lookup for the role audience");
+  assert.equal(membershipLookup.url.searchParams.get("role_id"), "in.(role-1)");
+
+  const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-1"]);
+});
+
+test("POST .../messages/:id/publish reports shift audiences unresolved when no shiftWindow is supplied", async (t) => {
+  const audiences = [
+    { id: "aud-1", message_id: "msg-draft", audience_type: "shift", audience_ref_id: "shift-1" },
+    { id: "aud-2", message_id: "msg-draft", audience_type: "employee", audience_ref_id: "emp-5" }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    if (table === "messages" && method === "PATCH") return [DRAFT_MESSAGE];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {});
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.recipientCount, 1);
+  assert.equal(result.payload.unresolvedAudiences.length, 1);
+  assert.equal(result.payload.unresolvedAudiences[0].audienceType, "shift");
+  assert.equal(result.payload.unresolvedAudiences[0].audienceRefId, "shift-1");
+  // No shift_assignments query should have been issued without a shiftWindow.
+  assert.ok(!captured.some((c) => c.table === "shift_assignments"));
+
+  const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-5"]);
+});
+
+test("POST .../messages/:id/publish resolves shift audiences against shift_assignments when shiftWindow is supplied", async (t) => {
+  const audiences = [{ id: "aud-1", message_id: "msg-draft", audience_type: "shift", audience_ref_id: "shift-1" }];
+  const shiftAssignments = [{ shift_id: "shift-1", employee_id: "emp-9" }];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    if (table === "messages" && method === "PATCH") return [DRAFT_MESSAGE];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "shift_assignments" && method === "GET") return shiftAssignments;
+    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {
+    shiftWindow: { start: "2026-08-13T00:00:00Z", end: "2026-08-13T23:59:59Z" }
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.recipientCount, 1);
+  assert.deepEqual(result.payload.unresolvedAudiences, []);
+
+  const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-9"]);
+});
+
+test("POST .../messages/:id/publish returns 409 when the message is already published", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [MESSAGE];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-1/publish", {});
+  assert.equal(result.status, 409);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"));
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+});
+
+test("POST .../messages/:id/publish denies a non-publisher with 403", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {});
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"));
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+});
+
+test("POST .../messages/:id/publish 404s when message missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/nope/publish", {});
+  assert.equal(result.status, 404);
+});
+
+test("POST .../messages/:id/publish 404s when the message belongs to a different facility", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-2/messages/msg-draft/publish", {});
+  assert.equal(result.status, 404);
+});
+
+// --- Create route: draft-then-publish (CM-03) --------------------------------
+
+test("POST /facilities/:facilityId/messages defaults to a draft (published_at null)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "POST") return [{ id: "msg-new" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages", {
+    channelId: "ch-1",
+    subject: "Draft",
+    bodyText: "Body"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "messages" && c.method === "POST");
+  assert.equal(insert.body[0].published_at, null);
+});
+
+test("POST /facilities/:facilityId/messages publishes immediately with legacy publishNow:true", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "POST") return [{ id: "msg-new" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages", {
+    channelId: "ch-1",
+    subject: "Immediate",
+    bodyText: "Body",
+    publishNow: true
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "messages" && c.method === "POST");
+  assert.ok(insert.body[0].published_at, "expected published_at to be stamped");
 });

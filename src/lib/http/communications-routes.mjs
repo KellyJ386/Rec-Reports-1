@@ -1,5 +1,7 @@
-import { pgSelect, pgInsert } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
+import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority } from "../communications.mjs";
+import { buildNotificationJob } from "../admin/notifications.mjs";
 
 const READ = "communications.read";
 const PUBLISH = "communications.publish";
@@ -116,6 +118,14 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
 
   // Creates a message. Validates minimal shape before guard, then inserts with
   // author_employee_id = auth.claims.sub.
+  //
+  // CM-03: the create route used to accept an arbitrary caller-supplied
+  // `publishedAt` and write it straight through, so creating a message could
+  // already publish it outright. The flow is now draft-then-publish: a
+  // created message always starts as a draft (published_at null) unless the
+  // legacy `publishNow: true` body flag is set, in which case it is
+  // published immediately (server time) for backward compatibility with
+  // that prior behavior. New callers should prefer POST .../messages/:id/publish.
   router.register(
     "POST",
     "/facilities/:facilityId/messages",
@@ -141,10 +151,154 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           priority: body.payload.priority ?? "normal",
           is_required_ack: body.payload.isRequiredAck ?? false,
           ack_due_at: body.payload.ackDueAt ?? null,
-          published_at: body.payload.publishedAt ?? null
+          published_at: body.payload.publishNow === true ? new Date().toISOString() : null
         };
         const rows = await pgInsert(auth.client, "messages", [row], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // Publishes a draft message (CM-03): loads its message_audiences, resolves
+  // recipients against live rows, stamps published_at, and enqueues exactly
+  // one notification_jobs row carrying the resolved recipient list.
+  //
+  // Resolution queries (bounded, run only when the corresponding audience
+  // type is present on the message -- never one query per audience row):
+  //   - employees   (facility-scoped: id, department_id, user_id) -- needed
+  //     to resolve 'department' audiences directly, and to join memberships
+  //     -> employees for 'role' audiences.
+  //   - memberships (facility-scoped, role_id in <role audience ref ids>,
+  //     status='active': user_id, role_id) -- only when a 'role' audience is
+  //     present; joined in-process against the employees roster above (via
+  //     user_id) to build resolveMessageAudience's roleAssignments context,
+  //     since memberships key off the auth user id, not employees.id.
+  //   - shift_assignments (facility-scoped, shift_id in <shift audience ref
+  //     ids>, status in pending/approved: shift_id, employee_id) -- only
+  //     when the request body supplies a `shiftWindow` AND a 'shift'
+  //     audience is present. `shiftWindow` is accepted as a simple presence
+  //     gate for now (its contents are not yet used to filter by date/time
+  //     range) -- full "current/next shift" window computation is CM-12.
+  //     'shift' audiences with no shiftWindow are reported unresolved
+  //     rather than silently dropped.
+  //   - 'employee' audiences need no query: audience_ref_id is the employee
+  //     id directly.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/messages/:id/publish",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const message = await loadMessage(auth.client, params.id);
+        if (!message || message.facility_id !== params.facilityId) {
+          return sendJson(response, 404, { error: "message not found" });
+        }
+        if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
+        if (message.published_at) {
+          return sendJson(response, 409, { error: "message already published" });
+        }
+
+        const audiences = (await pgSelect(auth.client, "message_audiences", {
+          filters: { message_id: params.id },
+          select: MESSAGE_AUDIENCES_COLUMNS
+        })) ?? [];
+
+        const shiftWindow = body.payload.shiftWindow ?? null;
+        const resolvableAudiences = [];
+        const unresolvedAudiences = [];
+        for (const audience of audiences) {
+          if (audience.audience_type === "shift" && !shiftWindow) {
+            unresolvedAudiences.push({
+              id: audience.id,
+              audienceType: audience.audience_type,
+              audienceRefId: audience.audience_ref_id,
+              reason: "shiftWindow not supplied"
+            });
+            continue;
+          }
+          resolvableAudiences.push(audience);
+        }
+
+        const needsEmployees = resolvableAudiences.some(
+          (audience) => audience.audience_type === "department" || audience.audience_type === "role"
+        );
+        const roleRefIds = [
+          ...new Set(
+            resolvableAudiences.filter((audience) => audience.audience_type === "role").map((audience) => audience.audience_ref_id)
+          )
+        ];
+        const shiftRefIds = [
+          ...new Set(
+            resolvableAudiences
+              .filter((audience) => audience.audience_type === "shift")
+              .map((audience) => audience.audience_ref_id)
+          )
+        ];
+
+        const employees = needsEmployees
+          ? (await pgSelect(auth.client, "employees", {
+              filters: { facility_id: message.facility_id },
+              select: "id,department_id,user_id"
+            })) ?? []
+          : [];
+
+        let roleAssignments = [];
+        if (roleRefIds.length > 0) {
+          const memberships =
+            (await pgSelect(auth.client, "memberships", {
+              filters: { facility_id: message.facility_id, role_id: { in: roleRefIds }, status: "active" },
+              select: "user_id,role_id"
+            })) ?? [];
+          const employeeIdByUserId = new Map(employees.map((employee) => [employee.user_id, employee.id]));
+          roleAssignments = memberships
+            .map((membership) => ({
+              role_id: membership.role_id,
+              employee_id: employeeIdByUserId.get(membership.user_id) ?? null
+            }))
+            .filter((assignment) => assignment.employee_id);
+        }
+
+        let shiftAssignments = [];
+        if (shiftRefIds.length > 0) {
+          shiftAssignments =
+            (await pgSelect(auth.client, "shift_assignments", {
+              filters: { facility_id: message.facility_id, shift_id: { in: shiftRefIds }, status: { in: ["pending", "approved"] } },
+              select: "shift_id,employee_id"
+            })) ?? [];
+        }
+
+        const recipients = resolveMessageAudience(
+          { audiences: resolvableAudiences },
+          { employees, roleAssignments, shiftAssignments }
+        );
+
+        const publishedAt = new Date().toISOString();
+        await pgUpdate(
+          auth.client,
+          "messages",
+          { id: params.id },
+          { published_at: publishedAt, updated_at: publishedAt },
+          { returning: true }
+        );
+
+        const bypassQuietHours = shouldBypassQuietHours(message);
+        const route = {
+          id: null,
+          facility_id: message.facility_id,
+          priority: message.priority,
+          route_jsonb: { channels: channelsForPriority(message.priority) }
+        };
+        const job = buildNotificationJob("message.published", route, recipients);
+        job.payload_jsonb.messageId = params.id;
+        job.payload_jsonb.quietHoursBypass = bypassQuietHours;
+        await pgInsert(auth.client, "notification_jobs", [job], { returning: true });
+
+        return sendJson(response, 200, {
+          publishedAt,
+          recipientCount: recipients.length,
+          unresolvedAudiences
+        });
       })
   );
 
