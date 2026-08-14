@@ -620,6 +620,218 @@ test("POST /facilities/:facilityId/messages defaults to a draft (published_at nu
   assert.equal(insert.body[0].published_at, null);
 });
 
+// --- Device tokens (CM-07) ----------------------------------------------------
+
+test("POST /me/device-tokens registers the caller's own token, resolved via loadCallerEmployeeId", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_device_tokens" && method === "POST") return [{ id: "dt-1", token: "tok-abc" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("POST", "/me/device-tokens", { facilityId: "fac-1", platform: "ios", token: "tok-abc" });
+  assert.equal(result.status, 201);
+
+  const employeeLookup = captured.find((c) => c.table === "employees" && c.method === "GET");
+  assert.equal(employeeLookup.url.searchParams.get("user_id"), "eq.user-42");
+
+  const insert = captured.find((c) => c.table === "employee_device_tokens" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  // employee_id must be the resolved employees.id, never the caller's raw auth user id.
+  assert.equal(insert.body[0].employee_id, "emp-own-row");
+  assert.equal(insert.body[0].platform, "ios");
+  assert.equal(insert.body[0].token, "tok-abc");
+  assert.ok(insert.body[0].last_seen_at);
+  assert.equal(insert.body[0].revoked_at, null);
+  // Re-registering the same token must upsert on the token column, not duplicate.
+  assert.equal(insert.url.searchParams.get("on_conflict"), "token");
+});
+
+test("POST /me/device-tokens ignores a body-supplied employeeId and always resolves the caller's own row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-real-owner" }];
+    if (table === "employee_device_tokens" && method === "POST") return [{ id: "dt-1" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  await call("POST", "/me/device-tokens", {
+    facilityId: "fac-1",
+    platform: "android",
+    token: "tok-xyz",
+    employeeId: "emp-someone-else"
+  });
+  const insert = captured.find((c) => c.table === "employee_device_tokens" && c.method === "POST");
+  assert.equal(insert.body[0].employee_id, "emp-real-owner");
+  assert.notEqual(insert.body[0].employee_id, "emp-someone-else");
+});
+
+test("POST /me/device-tokens validates shape before any facility check", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/me/device-tokens", { platform: "ios" });
+  assert.equal(result.status, 400);
+  assert.ok(result.payload.errors.some((e) => e.includes("facilityId")));
+  assert.ok(result.payload.errors.some((e) => e.includes("token")));
+  assert.equal(captured.length, 0);
+});
+
+test("POST /me/device-tokens denies a caller who is not a member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("POST", "/me/device-tokens", { facilityId: "fac-1", platform: "ios", token: "tok-1" });
+  assert.equal(result.status, 403);
+});
+
+test("POST /me/device-tokens denies with 403 when the caller has no employee record in the facility", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "employees" ? [] : []));
+  const { call } = mount({ userId: "user-no-employee" });
+  const result = await call("POST", "/me/device-tokens", { facilityId: "fac-1", platform: "ios", token: "tok-1" });
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "employee_device_tokens"));
+});
+
+test("DELETE /me/device-tokens/:id revokes the caller's own token, scoped by their resolved employee id", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_device_tokens" && method === "PATCH") return [{ id: "dt-1", revoked_at: "2026-08-14T00:00:00Z" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("DELETE", "/me/device-tokens/dt-1?facilityId=fac-1");
+  assert.equal(result.status, 200);
+
+  const patch = captured.find((c) => c.table === "employee_device_tokens" && c.method === "PATCH");
+  assert.equal(patch.url.searchParams.get("id"), "eq.dt-1");
+  assert.equal(patch.url.searchParams.get("employee_id"), "eq.emp-own-row");
+  assert.ok(patch.body.revoked_at);
+});
+
+test("DELETE /me/device-tokens/:id 404s when the update matches no row (not owned by the caller)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_device_tokens" && method === "PATCH") return []; // employee_id filter matched nothing
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("DELETE", "/me/device-tokens/dt-not-mine?facilityId=fac-1");
+  assert.equal(result.status, 404);
+});
+
+test("DELETE /me/device-tokens/:id requires a facilityId query parameter", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("DELETE", "/me/device-tokens/dt-1");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("DELETE /me/device-tokens/:id denies a caller who is not a member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("DELETE", "/me/device-tokens/dt-1?facilityId=fac-1");
+  assert.equal(result.status, 403);
+});
+
+// --- Notification preferences (CM-07) -------------------------------------------
+
+test("GET /me/notification-preferences returns shipped defaults when no row exists yet", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("GET", "/me/notification-preferences?facilityId=fac-1");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.push_enabled, true);
+  assert.equal(result.payload.quiet_hours_start, null);
+  assert.equal(result.payload.employee_id, "emp-own-row");
+});
+
+test("GET /me/notification-preferences returns the caller's existing row when one exists", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_notification_preferences" && method === "GET") {
+      return [{ id: "pref-1", facility_id: "fac-1", employee_id: "emp-own-row", push_enabled: false }];
+    }
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("GET", "/me/notification-preferences?facilityId=fac-1");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.id, "pref-1");
+  assert.equal(result.payload.push_enabled, false);
+});
+
+test("GET /me/notification-preferences requires a facilityId query parameter", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("GET", "/me/notification-preferences");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET /me/notification-preferences denies a caller who is not a member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/me/notification-preferences?facilityId=fac-1");
+  assert.equal(result.status, 403);
+});
+
+test("PUT /me/notification-preferences upserts the caller's own row (round trip)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
+    if (table === "employee_notification_preferences" && method === "POST") {
+      return [{ id: "pref-1", facility_id: "fac-1", employee_id: "emp-own-row", push_enabled: false, quiet_hours_start: "20:00", quiet_hours_end: "07:00" }];
+    }
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  const result = await call("PUT", "/me/notification-preferences", {
+    facilityId: "fac-1",
+    pushEnabled: false,
+    quietHoursStart: "20:00",
+    quietHoursEnd: "07:00"
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.push_enabled, false);
+
+  const upsert = captured.find((c) => c.table === "employee_notification_preferences" && c.method === "POST");
+  assert.equal(upsert.body[0].facility_id, "fac-1");
+  assert.equal(upsert.body[0].employee_id, "emp-own-row");
+  assert.equal(upsert.body[0].push_enabled, false);
+  assert.equal(upsert.body[0].quiet_hours_start, "20:00");
+  assert.equal(upsert.body[0].in_app_enabled, true); // omitted -> shipped default
+  assert.equal(upsert.url.searchParams.get("on_conflict"), "facility_id,employee_id");
+});
+
+test("PUT /me/notification-preferences ignores a body-supplied employeeId and always resolves the caller's own row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-real-owner" }];
+    if (table === "employee_notification_preferences" && method === "POST") return [{ id: "pref-1" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-42" });
+  await call("PUT", "/me/notification-preferences", { facilityId: "fac-1", employeeId: "emp-someone-else", pushEnabled: true });
+  const upsert = captured.find((c) => c.table === "employee_notification_preferences" && c.method === "POST");
+  assert.equal(upsert.body[0].employee_id, "emp-real-owner");
+});
+
+test("PUT /me/notification-preferences requires facilityId in the body", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("PUT", "/me/notification-preferences", { pushEnabled: true });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PUT /me/notification-preferences denies a caller who is not a member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("PUT", "/me/notification-preferences", { facilityId: "fac-1", pushEnabled: true });
+  assert.equal(result.status, 403);
+});
+
 test("POST /facilities/:facilityId/messages publishes immediately with legacy publishNow:true", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "messages" && method === "POST") return [{ id: "msg-new" }];

@@ -423,3 +423,177 @@ test("drainOutboxOnce claims via a conditional pending->processing update, same 
   assert.deepEqual(summary, { claimed: 0, routed: 0, skipped: 0, retried: 0, failed: 0 });
   assert.ok(!captured.some((c) => c.table === "notification_events"));
 });
+
+// --- CM-07: push delivery channel -------------------------------------------
+
+function basePushJob(overrides = {}) {
+  return baseJob({
+    event_type: "message.published",
+    payload_jsonb: { recipients: ["emp-1"], channels: ["push"] },
+    ...overrides
+  });
+}
+
+const DEVICE_TOKEN_1 = { id: "tok-row-1", facility_id: "fac-1", employee_id: "emp-1", platform: "ios", token: "tok-1", revoked_at: null };
+
+test("processJob delivers push via the default (no-op) adapter and marks the delivery sent", async (t) => {
+  const job = basePushJob();
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  assert.equal(insert.body.length, 1);
+  assert.equal(insert.body[0].employee_id, "emp-1");
+  assert.equal(insert.body[0].channel, "push");
+  assert.equal(insert.body[0].status, "sent");
+  assert.ok(insert.body[0].sent_at);
+
+  const tokenLookup = captured.find((c) => c.table === "employee_device_tokens" && c.method === "GET");
+  assert.equal(tokenLookup.url.searchParams.get("revoked_at"), "is.null");
+  assert.equal(tokenLookup.url.searchParams.get("employee_id"), "in.(emp-1)");
+  assert.ok(!captured.some((c) => c.table === "employee_device_tokens" && c.method === "PATCH"), "no-op adapter never revokes");
+});
+
+test("a push job with no quietHoursBypass reschedules the whole job during quiet hours, without ever querying device tokens", async (t) => {
+  const job = basePushJob();
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "pending" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: QUIET });
+
+  assert.equal(result.outcome, "rescheduled");
+  assert.ok(!captured.some((c) => c.table === "employee_device_tokens"));
+  assert.ok(!captured.some((c) => c.table === "notification_deliveries"));
+});
+
+test("quietHoursBypass (set by CM-03 for urgent/emergency) lets a push job proceed instead of rescheduling during quiet hours", async (t) => {
+  const job = basePushJob({ payload_jsonb: { recipients: ["emp-1"], channels: ["push"], quietHoursBypass: true } });
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: QUIET });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  assert.equal(insert.body[0].status, "sent");
+});
+
+test("a recipient with no active device token is marked failed for push, without failing the job", async (t) => {
+  const job = basePushJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["push"] } });
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1]; // only emp-1 has a token
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "sent");
+  assert.equal(byEmployee["emp-2"].status, "failed");
+  assert.equal(byEmployee["emp-2"].sent_at, null);
+});
+
+test("a permanently rejected token is revoked and its recipient's push delivery marked bounced", async (t) => {
+  const job = basePushJob();
+  const fakeAdapter = { send: async ({ tokens }) => tokens.map((token) => ({ token, code: "unregistered" })) };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "employee_device_tokens" && method === "PATCH") return [{ ...DEVICE_TOKEN_1, revoked_at: "2026-08-13T15:00:00.000Z" }];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON, config: { pushAdapter: fakeAdapter } });
+
+  assert.equal(result.outcome, "sent");
+  const revokePatch = captured.find((c) => c.table === "employee_device_tokens" && c.method === "PATCH");
+  assert.ok(revokePatch, "expected the permanently-rejected token to be revoked");
+  assert.equal(revokePatch.url.searchParams.get("token"), "in.(tok-1)");
+  assert.ok(revokePatch.body.revoked_at);
+
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  assert.equal(insert.body[0].status, "bounced");
+  assert.equal(insert.body[0].sent_at, null);
+});
+
+test("a recipient's push_enabled=false preference suppresses only their push delivery", async (t) => {
+  const job = basePushJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["push"] } });
+  const tokenForEmp2 = { ...DEVICE_TOKEN_1, id: "tok-row-2", employee_id: "emp-2", token: "tok-2" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1, tokenForEmp2];
+    if (table === "employee_notification_preferences" && method === "GET") {
+      return [{ facility_id: "fac-1", employee_id: "emp-1", push_enabled: false }];
+    }
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "failed"); // opted out, never contacted
+  assert.equal(byEmployee["emp-2"].status, "sent");
+});
+
+test("a recipient's personal quiet-hours override suppresses their push even outside the facility's default quiet window", async (t) => {
+  const job = basePushJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["push"] } });
+  const tokenForEmp2 = { ...DEVICE_TOKEN_1, id: "tok-row-2", employee_id: "emp-2", token: "tok-2" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1, tokenForEmp2];
+    if (table === "employee_notification_preferences" && method === "GET") {
+      // emp-1's own quiet window (10:00-20:00) covers NOON (15:00 UTC) even
+      // though NOON is well outside the facility's default 22:00-06:00 window.
+      return [{ facility_id: "fac-1", employee_id: "emp-1", quiet_hours_start: "10:00", quiet_hours_end: "20:00" }];
+    }
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "failed"); // personally in quiet hours
+  assert.equal(byEmployee["emp-2"].status, "sent");
+});
+
+test("a job whose resolved channels do not include push never queries device tokens or preferences", async (t) => {
+  const job = baseJob(); // channels: ["in_app", "email"]
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    return [];
+  });
+
+  await processJob({ client: client(), job, now: NOON });
+
+  assert.ok(!captured.some((c) => c.table === "employee_device_tokens"));
+  assert.ok(!captured.some((c) => c.table === "employee_notification_preferences"));
+});

@@ -45,12 +45,17 @@ import {
   buildNotificationJob
 } from "../admin/notifications.mjs";
 import { configValue } from "../settings-registry.mjs";
+import { sendPush } from "./push.mjs";
 
 const JOB_COLUMNS =
   "id,facility_id,event_type,payload_jsonb,scheduled_for,status,attempts,last_error,next_attempt_at,created_at,updated_at";
 
 const OUTBOX_COLUMNS =
   "id,facility_id,event_type,payload,status,attempts,available_at,processed_at,last_error,next_attempt_at,created_at";
+
+const DEVICE_TOKEN_COLUMNS = "id,facility_id,employee_id,platform,token,last_seen_at,revoked_at";
+const PREFERENCE_COLUMNS =
+  "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end";
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const BASE_BACKOFF_MS = 2 * 60 * 1000; // 2 minutes
@@ -223,21 +228,162 @@ export async function claimDueJobs({ client, now = new Date(), limit = 25 }) {
   return claimed;
 }
 
+// Resolves, for every recipient of a channel='push' delivery, whether they
+// are eligible to receive it right now and (if so) which active device
+// tokens to send to. Three ways a recipient can be ruled out before a
+// provider is ever contacted, each recorded as a distinct `reason` purely
+// for in-process bookkeeping (see buildPushDeliveryStatuses -- the
+// notification_deliveries row itself has no reason column, see that
+// function's comment for why 'failed' is what actually gets persisted):
+//   - "opted_out"   -- employee_notification_preferences.push_enabled = false.
+//   - "quiet_hours" -- the employee's OWN quiet_hours_start/end override
+//     (independent of the facility-wide default processJob already gated
+//     the whole job on) says "quiet now". Only consulted when the job is
+//     NOT bypassing quiet hours -- an urgent/emergency job's
+//     quietHoursBypass overrides a personal preference the same way it
+//     overrides the facility default, since the entire point of "urgent"
+//     is reaching people who would otherwise be left alone.
+//   - "no_token"    -- no active (revoked_at is null) device token on file.
+// Recipients that clear all three carry their token list forward for
+// sendPush to actually contact.
+async function resolvePushPlan({ client, job, recipients, now }) {
+  const bypass = job.payload_jsonb?.quietHoursBypass === true;
+  const nowHHMM = toHHMM(now);
+
+  const [tokenRows, prefRows] = await Promise.all([
+    pgSelect(client, "employee_device_tokens", {
+      filters: { facility_id: job.facility_id, employee_id: { in: recipients } },
+      select: DEVICE_TOKEN_COLUMNS,
+      extra: { revoked_at: "is.null" }
+    }),
+    pgSelect(client, "employee_notification_preferences", {
+      filters: { facility_id: job.facility_id, employee_id: { in: recipients } },
+      select: PREFERENCE_COLUMNS
+    })
+  ]);
+
+  const tokensByEmployee = new Map();
+  for (const row of tokenRows ?? []) {
+    if (!row?.employee_id || !row?.token) continue;
+    if (!tokensByEmployee.has(row.employee_id)) tokensByEmployee.set(row.employee_id, []);
+    tokensByEmployee.get(row.employee_id).push(row.token);
+  }
+  const prefsByEmployee = new Map((prefRows ?? []).map((row) => [row.employee_id, row]));
+
+  const plan = new Map();
+  const allTokens = [];
+  for (const employeeId of recipients) {
+    const pref = prefsByEmployee.get(employeeId) ?? null;
+    if (pref?.push_enabled === false) {
+      plan.set(employeeId, { eligible: false, reason: "opted_out", tokens: [] });
+      continue;
+    }
+    if (!bypass && pref?.quiet_hours_start && pref?.quiet_hours_end && isWithinQuietHours(nowHHMM, pref.quiet_hours_start, pref.quiet_hours_end)) {
+      plan.set(employeeId, { eligible: false, reason: "quiet_hours", tokens: [] });
+      continue;
+    }
+    const tokens = tokensByEmployee.get(employeeId) ?? [];
+    if (tokens.length === 0) {
+      plan.set(employeeId, { eligible: false, reason: "no_token", tokens: [] });
+      continue;
+    }
+    plan.set(employeeId, { eligible: true, reason: null, tokens });
+    allTokens.push(...tokens);
+  }
+
+  return { plan, allTokens: [...new Set(allTokens)] };
+}
+
+// Builds { employeeId -> { status, sent_at } } for every recipient's push
+// delivery row, sending through the adapter (once, batched across every
+// eligible recipient's tokens -- one job means one notification, so every
+// eligible token gets the identical title/body) and revoking any
+// permanently-rejected token as a side effect. Only called when the job's
+// resolved channel list actually includes 'push', so a job with no push
+// recipients never issues the extra device-token/preferences queries.
+//
+// Status choice for a ruled-out recipient (opted out / personally in quiet
+// hours / no active token): 0006's notification_deliveries.status CHECK
+// constraint allows only ('queued', 'sent', 'failed', 'bounced') -- there is
+// no 'skipped' value, and the table has no free-text reason column to carry
+// one alongside a different status. 'queued' is wrong (it means "an adapter
+// will still attempt this," which none will -- there is no retry-by-
+// delivery-row mechanism here, only retry-by-job). 'bounced' is reserved
+// below for a provider's permanent rejection of a specific token, which is
+// a materially different fact (the token itself is bad) from "we chose not
+// to contact a token-holder this round." That leaves 'failed': it is the
+// closest fit the constraint allows for "this recipient did not receive a
+// push this round," and per the CM-07 requirement this must NOT fail the
+// notification_jobs row itself -- only the per-recipient delivery row is
+// marked 'failed'; resolveDelivery already guarantees recipients.length > 0
+// before this runs, so a ruled-out push recipient never becomes "no
+// recipients resolved" for the job as a whole.
+async function buildPushDeliveryStatuses({ client, job, recipients, channels, now, config }) {
+  const statuses = new Map();
+  if (!channels.includes("push") || recipients.length === 0) return statuses;
+
+  const nowIso = toIso(now);
+  const { plan, allTokens } = await resolvePushPlan({ client, job, recipients, now });
+
+  let outcomeByToken = new Map();
+  if (allTokens.length > 0) {
+    const sendOptions = config.pushAdapter ? { adapter: config.pushAdapter } : {};
+    const title = job.payload_jsonb?.title ?? job.event_type;
+    const body = job.payload_jsonb?.body ?? "";
+    const result = await sendPush(
+      { tokens: allTokens, title, body, data: { jobId: job.id, eventType: job.event_type } },
+      sendOptions
+    );
+    outcomeByToken = new Map(result.results.map((entry) => [entry.token, entry.outcome]));
+
+    if (result.revokeTokens.length > 0) {
+      await pgUpdate(
+        client,
+        "employee_device_tokens",
+        { token: { in: result.revokeTokens } },
+        { revoked_at: nowIso },
+        { returning: true }
+      );
+    }
+  }
+
+  for (const [employeeId, entry] of plan.entries()) {
+    if (!entry.eligible) {
+      statuses.set(employeeId, { status: "failed", sent_at: null });
+      continue;
+    }
+    const outcomes = entry.tokens.map((token) => outcomeByToken.get(token) ?? "retryable");
+    let status;
+    if (outcomes.includes("sent")) status = "sent";
+    else if (outcomes.includes("retryable")) status = "failed";
+    else status = "bounced"; // every token for this recipient was permanently rejected
+    statuses.set(employeeId, { status, sent_at: status === "sent" ? nowIso : null });
+  }
+  return statuses;
+}
+
 // Processes one already-claimed (status='processing') job: quiet-hours jobs
 // are rescheduled (status back to 'pending', next_attempt_at = next window
-// end) rather than dropped or failed. Otherwise recipients are resolved, one
-// notification_deliveries row is written per recipient per channel (in_app is
-// immediately 'sent'; every other channel is written 'queued', awaiting a
-// future channel adapter), and the job moves to 'sent'. Any error along the
-// way (including "no recipients resolved") is routed through the retry/
-// dead-letter failure path instead of throwing.
+// end) rather than dropped or failed -- UNLESS the job carries
+// quietHoursBypass=true (CM-03 stamps this for urgent/emergency messages via
+// shouldBypassQuietHours), in which case delivery proceeds immediately
+// regardless of the facility's quiet-hours window; that is the entire
+// purpose of the flag CM-03 already computes and stores, previously unread
+// by anything. Otherwise recipients are resolved, one notification_deliveries
+// row is written per recipient per channel (in_app is immediately 'sent';
+// push is resolved synchronously via the adapter -- see
+// buildPushDeliveryStatuses; every other channel is still written 'queued',
+// awaiting a future channel adapter), and the job moves to 'sent'. Any error
+// along the way (including "no recipients resolved") is routed through the
+// retry/dead-letter failure path instead of throwing.
 export async function processJob({ client, job, now = new Date(), config = {} }) {
   const nowIso = toIso(now);
   const maxAttempts = config.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const quietStart = config.quietHoursStart ?? configValue({}, "reports.quietHoursStart");
   const quietEnd = config.quietHoursEnd ?? configValue({}, "reports.quietHoursEnd");
+  const bypassQuietHours = job.payload_jsonb?.quietHoursBypass === true;
 
-  if (isWithinQuietHours(toHHMM(now), quietStart, quietEnd)) {
+  if (!bypassQuietHours && isWithinQuietHours(toHHMM(now), quietStart, quietEnd)) {
     const nextAttemptAt = nextQuietWindowEnd(now, quietEnd);
     await pgUpdate(
       client,
@@ -255,9 +401,23 @@ export async function processJob({ client, job, now = new Date(), config = {} })
       throw new Error(`no recipients resolved for notification job ${job.id}`);
     }
 
+    const pushStatuses = await buildPushDeliveryStatuses({ client, job, recipients, channels, now, config });
+
     const deliveryRows = [];
     for (const employeeId of recipients) {
       for (const channel of channels) {
+        if (channel === "push") {
+          const resolved = pushStatuses.get(employeeId) ?? { status: "failed", sent_at: null };
+          deliveryRows.push({
+            facility_id: job.facility_id,
+            job_id: job.id,
+            employee_id: employeeId,
+            channel,
+            status: resolved.status,
+            sent_at: resolved.sent_at
+          });
+          continue;
+        }
         deliveryRows.push({
           facility_id: job.facility_id,
           job_id: job.id,

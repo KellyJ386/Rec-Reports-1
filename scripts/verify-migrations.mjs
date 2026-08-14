@@ -77,6 +77,8 @@ const requiredRlsTables = [
   "certification_policies",
   "feature_flags",
   "feature_flag_rules",
+  "employee_device_tokens",
+  "employee_notification_preferences",
   "subscription_plans",
   "tenant_subscriptions",
   "usage_counters"

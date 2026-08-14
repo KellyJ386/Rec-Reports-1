@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
 import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority } from "../communications.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
@@ -13,6 +13,9 @@ const MESSAGE_ACKNOWLEDGEMENTS_COLUMNS =
   "id,facility_id,message_id,employee_id,ack_state,acknowledged_at,ack_method,signature_path,created_at,updated_at";
 const CHANNEL_COLUMNS = "id,facility_id,name,channel_type,department_id,shift_scoped,emergency_enabled,created_at,updated_at";
 const MESSAGE_RECEIPTS_COLUMNS = "id,facility_id,message_id,employee_id,delivered_at,read_at,created_at";
+const DEVICE_TOKEN_COLUMNS = "id,facility_id,employee_id,platform,token,last_seen_at,revoked_at,created_at";
+const NOTIFICATION_PREFERENCE_COLUMNS =
+  "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end,created_at,updated_at";
 
 // Registers the end-user Communications API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
@@ -486,6 +489,179 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
 
         const rows = await pgInsert(auth.client, "message_receipts", [row], {
           onConflict: "message_id,employee_id",
+          merge: true,
+          returning: true
+        });
+        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Device tokens (CM-07) ----------------------------------------------------
+  // Registers or refreshes the caller's OWN push device token. There is no
+  // :facilityId path segment on a /me route, so facilityId is required in the
+  // body purely to resolve the caller's employees.id via loadCallerEmployeeId
+  // -- exactly like every other self-service write in this file, the
+  // employee id itself is NEVER trusted from the body. Upserts on the
+  // table's unique `token` column (0037) so re-registering the same token
+  // (app relaunch, a refreshed provider token that happens to collide, a
+  // duplicate register call) updates last_seen_at/facility/employee in place
+  // rather than creating a second row, and un-revokes it (revoked_at ->
+  // null) since sending a token again means the client is actively using it.
+  router.register(
+    "POST",
+    "/me/device-tokens",
+    (request, response, { env }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const { facilityId, platform, token } = body.payload;
+        const shape = [];
+        if (!facilityId) shape.push("facilityId is required");
+        if (!platform) shape.push("platform is required");
+        if (!token) shape.push("token is required");
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        if (!authCanAccessFacility(auth, facilityId)) {
+          return sendJson(response, 403, { error: "not a member of this facility" });
+        }
+        const employeeId = await loadCallerEmployeeId(auth.client, facilityId, auth.claims.sub);
+        if (!employeeId) {
+          return sendJson(response, 403, { error: "no employee record for this facility" });
+        }
+
+        const row = {
+          facility_id: facilityId,
+          employee_id: employeeId,
+          platform,
+          token,
+          last_seen_at: new Date().toISOString(),
+          revoked_at: null
+        };
+        const rows = await pgInsert(auth.client, "employee_device_tokens", [row], {
+          onConflict: "token",
+          merge: true,
+          returning: true
+        });
+        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // Revokes one of the caller's OWN device tokens (soft: sets revoked_at,
+  // never a hard delete -- the worker only ever needs "is this token
+  // currently active", which `revoked_at is null` answers without losing
+  // history). facilityId comes from the query string, mirroring the
+  // ?facilityId= convention GET /me/training-assignments already uses for
+  // /me routes. The UPDATE filters on employee_id = the caller's own
+  // resolved employees.id (never the bare :id path alone), so a token owned
+  // by a different employee simply matches zero rows -- 404, the same
+  // outcome RLS alone would already produce.
+  router.register(
+    "DELETE",
+    "/me/device-tokens/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const facilityId = queryParams(request).get("facilityId");
+        if (!facilityId) return sendJson(response, 400, { error: "facilityId query parameter is required" });
+        if (!authCanAccessFacility(auth, facilityId)) {
+          return sendJson(response, 403, { error: "not a member of this facility" });
+        }
+        const employeeId = await loadCallerEmployeeId(auth.client, facilityId, auth.claims.sub);
+        if (!employeeId) {
+          return sendJson(response, 403, { error: "no employee record for this facility" });
+        }
+
+        const rows = await pgUpdate(
+          auth.client,
+          "employee_device_tokens",
+          { id: params.id, employee_id: employeeId },
+          { revoked_at: new Date().toISOString() },
+          { returning: true }
+        );
+        if (!Array.isArray(rows) || rows.length === 0) {
+          return sendJson(response, 404, { error: "device token not found" });
+        }
+        return sendJson(response, 200, rows[0]);
+      })
+  );
+
+  // --- Notification preferences (CM-07) -------------------------------------------
+  // Reads the caller's own per-employee notification preferences. When no
+  // row exists yet (the employee never visited a preferences screen), a
+  // shipped-default shape is synthesized -- every channel enabled, no
+  // personal quiet-hours override -- rather than 404ing, matching
+  // employee_notification_preferences' "missing row = defaults" semantics
+  // the worker (src/lib/notifications/worker.mjs) relies on too.
+  router.register(
+    "GET",
+    "/me/notification-preferences",
+    (request, response, { env }) =>
+      withAuth(request, response, env, async (auth) => {
+        const facilityId = queryParams(request).get("facilityId");
+        if (!facilityId) return sendJson(response, 400, { error: "facilityId query parameter is required" });
+        if (!authCanAccessFacility(auth, facilityId)) {
+          return sendJson(response, 403, { error: "not a member of this facility" });
+        }
+        const employeeId = await loadCallerEmployeeId(auth.client, facilityId, auth.claims.sub);
+        if (!employeeId) {
+          return sendJson(response, 403, { error: "no employee record for this facility" });
+        }
+
+        const rows = await pgSelect(auth.client, "employee_notification_preferences", {
+          filters: { facility_id: facilityId, employee_id: employeeId },
+          select: NOTIFICATION_PREFERENCE_COLUMNS,
+          limit: 1
+        });
+        const existing = (rows ?? [])[0];
+        if (existing) return sendJson(response, 200, existing);
+        return sendJson(response, 200, {
+          id: null,
+          facility_id: facilityId,
+          employee_id: employeeId,
+          in_app_enabled: true,
+          email_enabled: true,
+          sms_enabled: true,
+          push_enabled: true,
+          quiet_hours_start: null,
+          quiet_hours_end: null
+        });
+      })
+  );
+
+  // Upserts the caller's own notification preferences (onConflict on the
+  // table's (facility_id, employee_id) unique pair, 0037 -- the same
+  // upsert/merge pattern the CM-05 receipt route uses). A PUT replaces the
+  // whole resource, so an omitted channel flag falls back to its
+  // shipped-enabled default rather than silently carrying forward whatever
+  // a partial body happened to send.
+  router.register(
+    "PUT",
+    "/me/notification-preferences",
+    (request, response, { env }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const facilityId = body.payload.facilityId;
+        if (!facilityId) return sendJson(response, 400, { error: "facilityId is required" });
+        if (!authCanAccessFacility(auth, facilityId)) {
+          return sendJson(response, 403, { error: "not a member of this facility" });
+        }
+        const employeeId = await loadCallerEmployeeId(auth.client, facilityId, auth.claims.sub);
+        if (!employeeId) {
+          return sendJson(response, 403, { error: "no employee record for this facility" });
+        }
+
+        const row = {
+          facility_id: facilityId,
+          employee_id: employeeId,
+          in_app_enabled: body.payload.inAppEnabled ?? true,
+          email_enabled: body.payload.emailEnabled ?? true,
+          sms_enabled: body.payload.smsEnabled ?? true,
+          push_enabled: body.payload.pushEnabled ?? true,
+          quiet_hours_start: body.payload.quietHoursStart ?? null,
+          quiet_hours_end: body.payload.quietHoursEnd ?? null
+        };
+        const rows = await pgInsert(auth.client, "employee_notification_preferences", [row], {
+          onConflict: "facility_id,employee_id",
           merge: true,
           returning: true
         });
