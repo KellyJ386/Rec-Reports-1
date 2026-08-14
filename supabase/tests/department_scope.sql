@@ -99,4 +99,130 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- DR-11: report_templates SELECT + report_submissions INSERT/UPDATE now use
+-- the 4-arg has_permission overload keyed off each row's own department_id
+-- (0033). Reuses facility c0 and departments da (Aquatics) / db (Fitness)
+-- from above. A dept-A-scoped filer can file (create + submit) for dept A's
+-- template and is denied dept B's; a facility-wide filer is unaffected
+-- either way.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('d0000000-0000-0000-0000-0000000000ac', 'deptfiler-a@test'),
+  ('d0000000-0000-0000-0000-0000000000ad', 'facfiler@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('d0000000-0000-0000-0000-0000000000ac', 'Dept A Filer', 'deptfiler-a@test'),
+  ('d0000000-0000-0000-0000-0000000000ad', 'Facility-wide Filer', 'facfiler@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('d0000000-0000-0000-0000-0000000000d2', 'd0000000-0000-0000-0000-0000000000c0', 'Report Filer Role')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('d0000000-0000-0000-0000-0000000000d2', 'reports.create'),
+  ('d0000000-0000-0000-0000-0000000000d2', 'reports.submit'),
+  ('d0000000-0000-0000-0000-0000000000d2', 'reports.read')
+on conflict do nothing;
+-- User AC: reports.create/submit/read scoped to the Aquatics department only.
+insert into memberships (id, user_id, facility_id, role_id, status, department_id) values
+  ('d0000000-0000-0000-0000-0000000000e2', 'd0000000-0000-0000-0000-0000000000ac', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000d2', 'active', 'd0000000-0000-0000-0000-0000000000da')
+on conflict (id) do nothing;
+-- User AD: facility-wide reports.create/submit/read (department_id null).
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('d0000000-0000-0000-0000-0000000000e3', 'd0000000-0000-0000-0000-0000000000ad', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000d2', 'active')
+on conflict (id) do nothing;
+
+insert into report_templates (id, facility_id, department_id, code, name, status, active_version) values
+  ('d0000000-0000-0000-0000-0000000000f0', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'dept_a_rpt', 'Aquatics Report', 'published', 1),
+  ('d0000000-0000-0000-0000-0000000000f1', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'dept_b_rpt', 'Fitness Report', 'published', 1)
+on conflict (id) do nothing;
+insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published) values
+  ('d0000000-0000-0000-0000-0000000000f2', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000f0', 1, '{"sections":[]}'::jsonb, true),
+  ('d0000000-0000-0000-0000-0000000000f3', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000f1', 1, '{"sections":[]}'::jsonb, true)
+on conflict (id) do nothing;
+
+-- Reader scoping: the dept-A filer can see the Aquatics template but not the
+-- Fitness template; the facility-wide filer sees both.
+select set_config('request.jwt.claims', '{"sub":"d0000000-0000-0000-0000-0000000000ac","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  if not exists (select 1 from report_templates where id = 'd0000000-0000-0000-0000-0000000000f0') then
+    raise exception 'DEPT FAIL: dept-A filer could not read their own department''s template';
+  end if;
+  if exists (select 1 from report_templates where id = 'd0000000-0000-0000-0000-0000000000f1') then
+    raise exception 'DEPT FAIL: dept-A filer could read a sibling department''s template';
+  end if;
+end;
+$$;
+reset role;
+
+-- Write scoping: the dept-A filer can create + submit a draft against their
+-- own department's template, and cannot create one against the sibling
+-- department's template at all (INSERT WITH CHECK raises).
+select set_config('request.jwt.claims', '{"sub":"d0000000-0000-0000-0000-0000000000ac","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v_dept_a_submission_id uuid;
+begin
+  insert into report_submissions (facility_id, department_id, template_id, template_version_id, report_date, status)
+  values ('d0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'd0000000-0000-0000-0000-0000000000f0', 'd0000000-0000-0000-0000-0000000000f2', '2026-08-01', 'draft')
+  returning id into v_dept_a_submission_id;
+
+  update report_submissions set status = 'submitted' where id = v_dept_a_submission_id;
+  if not exists (select 1 from report_submissions where id = v_dept_a_submission_id and status = 'submitted') then
+    raise exception 'DEPT FAIL: dept-A filer could not submit their own department''s draft';
+  end if;
+
+  begin
+    insert into report_submissions (facility_id, department_id, template_id, template_version_id, report_date, status)
+    values ('d0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'd0000000-0000-0000-0000-0000000000f1', 'd0000000-0000-0000-0000-0000000000f3', '2026-08-01', 'draft');
+    raise exception 'DEPT FAIL: dept-A filer created a submission for a sibling department';
+  exception
+    when insufficient_privilege then null; -- expected: 4-arg policy denies it
+  end;
+end;
+$$;
+reset role;
+
+-- A dept-B draft (created by the facility-wide filer) is invisible to the
+-- UPDATE policy from the dept-A filer's session: the USING clause filters it
+-- out, so the UPDATE matches zero rows instead of raising.
+select set_config('request.jwt.claims', '{"sub":"d0000000-0000-0000-0000-0000000000ad","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v_dept_b_submission_id uuid;
+begin
+  insert into report_submissions (facility_id, department_id, template_id, template_version_id, report_date, status)
+  values ('d0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'd0000000-0000-0000-0000-0000000000f1', 'd0000000-0000-0000-0000-0000000000f3', '2026-08-02', 'draft')
+  returning id into v_dept_b_submission_id;
+  perform set_config('report_dept_test.dept_b_submission_id', v_dept_b_submission_id::text, true);
+
+  -- The facility-wide filer, unaffected by 0033, can submit it themselves.
+  update report_submissions set status = 'submitted' where id = v_dept_b_submission_id;
+  if not exists (select 1 from report_submissions where id = v_dept_b_submission_id and status = 'submitted') then
+    raise exception 'DEPT FAIL: facility-wide filer could not submit a draft outside any department scope';
+  end if;
+  -- Revert to draft so the next block's negative case is meaningful.
+  update report_submissions set status = 'draft' where id = v_dept_b_submission_id;
+end;
+$$;
+reset role;
+
+select set_config('request.jwt.claims', '{"sub":"d0000000-0000-0000-0000-0000000000ac","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v_dept_b_submission_id uuid := current_setting('report_dept_test.dept_b_submission_id')::uuid;
+begin
+  update report_submissions set status = 'submitted' where id = v_dept_b_submission_id;
+  if exists (select 1 from report_submissions where id = v_dept_b_submission_id and status = 'submitted') then
+    raise exception 'DEPT FAIL: dept-A filer moved a sibling department''s draft to submitted';
+  end if;
+end;
+$$;
+reset role;
+
 rollback;

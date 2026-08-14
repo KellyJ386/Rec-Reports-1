@@ -1,14 +1,21 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
+import { hasDepartmentPermission } from "../permissions.mjs";
 import {
   validateReportSubmission,
   validateReportSubmissionPartial,
   unknownPayloadKeys
 } from "../report-schema.mjs";
+import { computeCompliance, dateRange } from "../reports-compliance.mjs";
+import { buildReportPdfPackage } from "../admin/report-pdf.mjs";
+import { loadModuleConfig } from "./module-config.mjs";
+import { flagState } from "../admin/entitlements.mjs";
 
 const READ = "reports.read";
 const CREATE = "reports.create";
 const SUBMIT = "reports.submit";
+const EXPORT = "reports.export";
+const PDF_EXPORT_FLAG = "reports.pdf_export";
 
 const TEMPLATE_COLUMNS =
   "id,facility_id,department_id,code,name,description,status,active_version,created_at,updated_at";
@@ -78,6 +85,48 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     return true;
   }
 
+  // --- Department-scoped guards (DR-11) ---------------------------------
+  // 0033 switched report_templates SELECT and report_submissions
+  // INSERT/UPDATE to the 4-arg has_permission(user, facility, department,
+  // code) overload (0023), so a membership scoped to one department can file
+  // and read reports for that department without being a facility-wide
+  // member. These mirror that at the route layer with hasDepartmentPermission
+  // on the row's own department_id -- template.department_id for templates,
+  // submission.department_id for submissions. A null department_id (a
+  // facility-wide template/submission) only ever passes for a facility-wide
+  // membership, exactly like the SQL overload (0023's own doc comment).
+  //
+  // requireAnyPermission is a coarse PRE-fetch gate: "does this caller hold
+  // `code` via ANY active membership in this facility, department-scoped or
+  // not" -- used before the row (and its department_id) is known, so a
+  // caller with no membership/permission at all still gets a fast 403
+  // without an extra round trip, exactly like the old facility-wide-only
+  // check did. It does not by itself decide access to a specific row; that
+  // is requireRowDeptPermission's job once the row is loaded.
+  function requireAnyPermission(auth, facilityId, code, response) {
+    if (auth?.platformAdmin === true) return true;
+    const ok = (auth?.memberships ?? []).some(
+      (membership) =>
+        membership.facilityId === facilityId &&
+        membership.status === "active" &&
+        (membership.permissions ?? []).includes(code)
+    );
+    if (!ok) {
+      sendJson(response, 403, { error: `missing permission: ${code}` });
+      return false;
+    }
+    return true;
+  }
+
+  function requireRowDeptPermission(auth, facilityId, departmentId, code, response) {
+    if (auth?.platformAdmin === true) return true;
+    if (hasDepartmentPermission(auth?.memberships ?? [], facilityId, departmentId ?? null, code)) {
+      return true;
+    }
+    sendJson(response, 403, { error: `missing permission: ${code}` });
+    return false;
+  }
+
   function queryParams(request) {
     return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
@@ -129,13 +178,16 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
 
   // --- Templates -------------------------------------------------------------
   // Lists templates a member may fill. Defaults to published only; ?status=all
-  // returns every status for authors building/reviewing templates.
+  // returns every status for authors building/reviewing templates. Gated by
+  // the coarse requireAnyPermission (DR-11): a department-scoped member's
+  // read is narrowed per-row by 0033's RLS policy, not by this list guard,
+  // since a list has no single row to test hasDepartmentPermission against.
   router.register(
     "GET",
     "/facilities/:facilityId/report-templates",
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
-        if (!requireRead(auth, params.facilityId, response)) return;
+        if (!requireAnyPermission(auth, params.facilityId, READ, response)) return;
         const wantAll = queryParams(request).get("status") === "all";
         const filters = { facility_id: params.facilityId };
         if (!wantAll) filters.status = "published";
@@ -149,15 +201,20 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
   );
 
   // Returns a single template together with its active published version schema,
-  // so the client can render the fill form.
+  // so the client can render the fill form. Two-phase guard (DR-11): a coarse
+  // requireAnyPermission before the fetch (so a caller with no reports.read
+  // membership at all still gets a fast 403), then requireRowDeptPermission
+  // once the template's own department_id is known, mirroring 0033's
+  // department-scoped SELECT policy on report_templates.
   router.register(
     "GET",
     "/facilities/:facilityId/report-templates/:templateId",
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
-        if (!requireRead(auth, params.facilityId, response)) return;
+        if (!requireAnyPermission(auth, params.facilityId, READ, response)) return;
         const template = await loadTemplate(auth.client, params.facilityId, params.templateId);
         if (!template) return sendJson(response, 404, { error: "report template not found" });
+        if (!requireRowDeptPermission(auth, params.facilityId, template.department_id, READ, response)) return;
         const active = await loadActiveVersion(auth.client, template);
         return sendJson(response, 200, {
           ...template,
@@ -310,10 +367,15 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           shape.push("reportDate is required (YYYY-MM-DD)");
         }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
-        if (!requirePerm(auth, params.facilityId, CREATE, response)) return;
+        // Coarse pre-fetch gate (DR-11): a caller without reports.create via
+        // ANY membership in this facility never reaches the template lookup.
+        // The precise, department-scoped decision (mirroring 0033's INSERT
+        // policy) happens below once the template's department_id is known.
+        if (!requireAnyPermission(auth, params.facilityId, CREATE, response)) return;
 
         const template = await loadTemplate(auth.client, params.facilityId, templateId);
         if (!template) return sendJson(response, 404, { error: "report template not found" });
+        if (!requireRowDeptPermission(auth, params.facilityId, template.department_id, CREATE, response)) return;
         if (template.status !== "published") {
           return sendJson(response, 409, { error: "report template is not published" });
         }
@@ -354,7 +416,11 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const submission = await loadSubmission(auth.client, params.id);
       if (!submission) return sendJson(response, 404, { error: "report not found" });
-      if (!requirePerm(auth, submission.facility_id, SUBMIT, response)) return;
+      // Department-scoped (DR-11): mirrors 0033's UPDATE policy, keyed off
+      // this submission's own department_id.
+      if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, SUBMIT, response)) {
+        return;
+      }
       if (submission.status !== "draft") {
         return sendJson(response, 409, { error: "only draft reports can be edited" });
       }
@@ -397,7 +463,11 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const submission = await loadSubmission(auth.client, params.id);
       if (!submission) return sendJson(response, 404, { error: "report not found" });
-      if (!requirePerm(auth, submission.facility_id, SUBMIT, response)) return;
+      // Department-scoped (DR-11): mirrors 0033's UPDATE policy, keyed off
+      // this submission's own department_id.
+      if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, SUBMIT, response)) {
+        return;
+      }
       if (submission.status !== "draft") {
         return sendJson(response, 409, { error: "only draft reports can be submitted" });
       }
@@ -442,6 +512,163 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
         returning: true
       });
       return sendJson(response, 200, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  // --- Compliance (DR-12) -----------------------------------------------
+  // GET /facilities/:facilityId/reports/compliance?from=&to= : per published
+  // template per date in [from, to], {expected, submitted, missing,
+  // overdue}. Read-guarded (facility-wide reports.read -- the
+  // report_submissions SELECT policy this reads through was NOT changed by
+  // 0033, so this stays facility-wide too, matching "facility-wide members
+  // unaffected"). See reports-compliance.mjs for the pure computation and
+  // its documented UTC timezone basis.
+  const MAX_COMPLIANCE_DAYS = 366;
+  router.register(
+    "GET",
+    "/facilities/:facilityId/reports/compliance",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        if (!requireRead(auth, params.facilityId, response)) return;
+        const qp = queryParams(request);
+        const from = qp.get("from");
+        const to = qp.get("to");
+        if (!from || !DATE_PATTERN.test(from)) {
+          return sendJson(response, 400, { error: "from is required (YYYY-MM-DD)" });
+        }
+        if (!to || !DATE_PATTERN.test(to)) {
+          return sendJson(response, 400, { error: "to is required (YYYY-MM-DD)" });
+        }
+        if (to < from) return sendJson(response, 400, { error: "to must not be before from" });
+        if (dateRange(from, to).length > MAX_COMPLIANCE_DAYS) {
+          return sendJson(response, 400, { error: `date range too large (max ${MAX_COMPLIANCE_DAYS} days)` });
+        }
+
+        const [templates, submissions, config] = await Promise.all([
+          pgSelect(auth.client, "report_templates", {
+            filters: { facility_id: params.facilityId, status: "published" },
+            select: "id,code,name,department_id,status,created_at"
+          }),
+          pgSelect(auth.client, "report_submissions", {
+            filters: { facility_id: params.facilityId, report_date: { gte: from, lte: to } },
+            select: "template_id,report_date,status"
+          }),
+          loadModuleConfig({ client: auth.client, facilityId: params.facilityId, moduleCode: "daily_reports" })
+        ]);
+
+        const result = computeCompliance({
+          templates: templates ?? [],
+          submissions: submissions ?? [],
+          from,
+          to,
+          config
+        });
+        return sendJson(response, 200, result);
+      })
+  );
+
+  // --- PDF export (DR-15) -------------------------------------------------
+  // GET /reports/:id/pdf : renders the PINNED version's schema + payload as a
+  // sectioned Q/A PDF (report-pdf.mjs), gated on BOTH reports.export (facility
+  // scope -- matches 0021's reports.export read regression, unchanged by
+  // 0033) AND the reports.pdf_export feature flag (0018; percentage rollout,
+  // default_state false -- see supabase/seed.sql:317, no rule seeded, so this
+  // is closed by default until a facility/org rule turns it on). Draft
+  // submissions have nothing pinned to render meaningfully yet, so 409.
+  router.register("GET", "/reports/:id/pdf", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const submission = await loadSubmission(auth.client, params.id);
+      if (!submission) return sendJson(response, 404, { error: "report not found" });
+      if (!requirePerm(auth, submission.facility_id, EXPORT, response)) return;
+      if (submission.status === "draft") {
+        return sendJson(response, 409, { error: "draft reports cannot be exported to PDF" });
+      }
+
+      const facilityRows = await pgSelect(auth.client, "facilities", {
+        filters: { id: submission.facility_id },
+        select: "id,name,organization_id",
+        limit: 1
+      });
+      const facility = (facilityRows ?? [])[0] ?? null;
+      if (!facility) return sendJson(response, 404, { error: "facility not found" });
+
+      const [flags, rules] = await Promise.all([
+        pgSelect(auth.client, "feature_flags", {
+          filters: { key: PDF_EXPORT_FLAG },
+          select: "id,key,description,rollout_type,default_state",
+          limit: 1
+        }),
+        pgSelect(auth.client, "feature_flag_rules", {
+          select: "id,feature_flag_id,scope_type,scope_id,state,rollout_percentage,starts_at,ends_at"
+        })
+      ]);
+      const flag = (flags ?? [])[0] ?? null;
+      const flagRules = (rules ?? []).filter((rule) => rule.feature_flag_id === flag?.id);
+      const enabled = flagState(flag, flagRules, {
+        organizationId: facility.organization_id,
+        facilityId: submission.facility_id,
+        bucket: 0,
+        now: new Date()
+      });
+      if (!enabled) {
+        return sendJson(response, 403, { error: `feature not enabled: ${PDF_EXPORT_FLAG}` });
+      }
+
+      // Pinned version, not the template's current active version -- a
+      // re-publish after this submission was filed must not relabel it.
+      const version = await loadVersionById(auth.client, submission.template_version_id);
+      if (!version) return sendJson(response, 409, { error: "template version not found" });
+
+      const templateRows = await pgSelect(auth.client, "report_templates", {
+        filters: { id: submission.template_id },
+        select: "id,name,code",
+        limit: 1
+      });
+      const template = (templateRows ?? [])[0] ?? null;
+
+      let departmentName = null;
+      if (submission.department_id) {
+        const deptRows = await pgSelect(auth.client, "departments", {
+          filters: { id: submission.department_id },
+          select: "id,name",
+          limit: 1
+        });
+        departmentName = (deptRows ?? [])[0]?.name ?? null;
+      }
+
+      let submitterName = null;
+      if (submission.submitted_by) {
+        const userRows = await pgSelect(auth.client, "app_users", {
+          filters: { id: submission.submitted_by },
+          select: "id,full_name",
+          limit: 1
+        });
+        submitterName = (userRows ?? [])[0]?.full_name ?? null;
+      }
+
+      const pkg = buildReportPdfPackage({
+        submissionId: submission.id,
+        facilityName: facility.name,
+        departmentName,
+        templateName: template?.name ?? null,
+        templateCode: template?.code ?? null,
+        reportDate: submission.report_date,
+        shiftRef: submission.shift_ref,
+        status: submission.status,
+        schema: version.schema_json,
+        payload: submission.payload_json ?? {},
+        submitterName,
+        submittedAt: submission.submitted_at,
+        // DR-24 (lock/revise) has not landed yet -- there is no revision_of
+        // chain to inspect, so this only distinguishes a 'revised' status
+        // row from everything else, and always reads "Original" until then.
+        revisionMarker: submission.status === "revised" ? "Revised" : "Original"
+      });
+
+      return sendJson(response, 200, {
+        ...pkg,
+        contentDisposition: `attachment; filename="${pkg.filename}"`
+      });
     })
   );
 
