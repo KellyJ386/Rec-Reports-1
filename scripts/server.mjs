@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
@@ -109,6 +110,11 @@ async function authenticate(request, env) {
   if (!claims || !claims.sub) {
     return { error: { status: 401, body: { error: "invalid or expired token" } } };
   }
+  // Record the verified subject for the request log (see logRequest). Stashing
+  // it here rather than re-verifying the token in handleRequest keeps a single
+  // verification per request and guarantees the log only ever attributes a
+  // request to an identity this function actually accepted.
+  request.authenticatedUserId = claims.sub;
   const client = buildClient(env, token);
   const memberships = await loadMemberships(client, claims.sub);
   const platformAdmin = await loadPlatformAdmin(client, claims.sub);
@@ -272,6 +278,22 @@ registerAttachmentRoutes(userRouter, { authenticate, sendJson });
 // invocation.
 registerInternalRoutes(userRouter, { sendJson });
 
+function logRequest(request, path, status, startTime, requestId, userId) {
+  try {
+    const duration = Date.now() - startTime;
+    console.log(JSON.stringify({
+      method: request.method,
+      path,
+      status,
+      duration_ms: duration,
+      request_id: requestId,
+      user_id: userId
+    }));
+  } catch {
+    // Never let logging errors bubble up
+  }
+}
+
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
   if (requestedPath.includes("..")) {
@@ -319,37 +341,66 @@ function serveStatic(request, response) {
 // through to static file serving (used only by the Node server — on Vercel the
 // platform serves dist/ and this function only ever receives /api/* requests).
 export async function handleRequest(request, response) {
-  const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-  const matchesPrefix = (prefix) =>
-    url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
-  // Admin prefix is checked first; the two prefixes are disjoint
-  // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
-  const active = matchesPrefix(apiPrefix)
-    ? { prefix: apiPrefix, router }
-    : matchesPrefix(userApiPrefix)
-      ? { prefix: userApiPrefix, router: userRouter }
-      : null;
-  if (!active) {
-    serveStatic(request, response);
-    return;
-  }
+  const startTime = Date.now();
+  const requestId = randomUUID();
+  let path = null;
 
-  const { env, error: envError } = loadEnv();
-  if (envError) {
-    sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
-    return;
-  }
 
-  const routeUrl = url.pathname.slice(active.prefix.length) || "/";
-  const { handler, params } = active.router.match({
-    method: request.method,
-    url: `${routeUrl}${url.search}`
-  });
-  if (!handler) {
-    sendJson(response, 404, { error: "not found" });
-    return;
+  try {
+    const url = new URL(request.url ?? "/", `http://localhost:${port}`);
+    const matchesPrefix = (prefix) =>
+      url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
+    // Admin prefix is checked first; the two prefixes are disjoint
+    // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
+    path = url.pathname;
+    const active = matchesPrefix(apiPrefix)
+      ? { prefix: apiPrefix, router }
+      : matchesPrefix(userApiPrefix)
+        ? { prefix: userApiPrefix, router: userRouter }
+        : null;
+    if (!active) {
+      serveStatic(request, response);
+      return;
+    }
+
+    const { env, error: envError } = loadEnv();
+    if (envError) {
+      sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
+      return;
+    }
+
+    const routeUrl = url.pathname.slice(active.prefix.length) || "/";
+    const matchResult = active.router.match({
+      method: request.method,
+      url: `${routeUrl}${url.search}`
+    });
+    if (!matchResult.handler) {
+      sendJson(response, 404, { error: "not found" });
+      return;
+    }
+
+    // Use the matched route template, or fall back to the pathname
+    path = matchResult.template || url.pathname;
+
+    await matchResult.handler(request, response, { env, params: matchResult.params });
+  } finally {
+    // Always log, even if the handler threw. Never log request bodies, query
+    // strings, auth headers, or env values — only the fields below.
+    //
+    // The user id comes from authenticate(), which stashes the subject it
+    // verified on the request. Re-verifying the token here would both double
+    // the crypto work on every authenticated request and risk logging an
+    // identity the route itself rejected; unauthenticated (or rejected)
+    // requests simply log null.
+    logRequest(
+      request,
+      path || "/",
+      response.statusCode || 500,
+      startTime,
+      requestId,
+      request.authenticatedUserId ?? null
+    );
   }
-  await handler(request, response, { env, params });
 }
 
 export function createApp() {

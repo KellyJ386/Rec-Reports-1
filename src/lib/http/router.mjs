@@ -14,7 +14,7 @@ export function createRouter() {
         return segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       });
     const regex = new RegExp(`^/${segments.join("/")}/?$`);
-    routes.push({ method: method.toUpperCase(), regex, paramNames, handler });
+    routes.push({ method: method.toUpperCase(), regex, paramNames, handler, pattern });
   }
 
   function match(req) {
@@ -28,9 +28,9 @@ export function createRouter() {
       route.paramNames.forEach((name, index) => {
         params[name] = decodeURIComponent(result[index + 1]);
       });
-      return { handler: route.handler, params };
+      return { handler: route.handler, params, template: route.pattern };
     }
-    return { handler: null, params: {} };
+    return { handler: null, params: {}, template: null };
   }
 
   return { register, match };
