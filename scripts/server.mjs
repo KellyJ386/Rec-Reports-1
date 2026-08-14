@@ -23,6 +23,7 @@ import { registerCommunicationRoutes } from "../src/lib/http/communications-rout
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
+import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
 import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 
@@ -258,6 +259,10 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Attachments (OP-17): upload/list/signed-url for reports, incidents, and
+// work orders. No readBody -- uploads are raw binary read directly off the
+// request stream, never JSON.
+registerAttachmentRoutes(userRouter, { authenticate, sendJson });
 
 // Internal, CRON_SECRET-guarded notification drain (OP-13/OP-14): POST and
 // GET /api/v1/internal/notifications/drain. Deliberately bypasses the

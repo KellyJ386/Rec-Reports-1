@@ -143,6 +143,186 @@ async function loadAllModules() {
   }
 }
 
+// --- Attachments (OP-17/OP-18) ---------------------------------------------
+// Shared by the reports, incidents, and work-orders panels below: an
+// "Attachments" toggle per item that lazily lists existing attachments and
+// offers a file picker to add one. Uploads send the file's raw bytes as the
+// request body (never JSON -- apiFetch's body-is-object => JSON.stringify
+// would corrupt a binary body) with an x-file-name header carrying the
+// percent-encoded filename, matching src/lib/http/attachments-routes.mjs's
+// decodeFilenameHeader. Downloads never link straight to storage: they fetch
+// a short-TTL signed url from the BFF, then open that.
+const ATTACHMENT_ACCEPT = "image/jpeg,image/png,image/gif,image/webp,image/heic,application/pdf";
+
+// Uploads a file's raw bytes to `${API_BASE}${path}`. Deliberately bypasses
+// apiFetch (whose automatic JSON body handling is wrong for a binary body)
+// but mirrors its auth/401/error-shape handling.
+async function uploadAttachmentFile(path, file) {
+  const token = getToken();
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": file.type || "application/octet-stream",
+    "x-file-name": encodeURIComponent(file.name || "upload")
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers,
+      body: await file.arrayBuffer()
+    });
+  } catch (error) {
+    throw new Error(`Network error: ${error.message}`);
+  }
+
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+
+  if (response.status === 401) {
+    clearAuthAndRedirect();
+    return null;
+  }
+
+  if (!response.ok) {
+    const message =
+      (data && (data.error || (Array.isArray(data.errors) && data.errors.join(", ")))) ||
+      `Upload failed with status ${response.status}`;
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+// Fetches a short-TTL signed url for one attachment and opens it in a new
+// tab -- the BFF route 404s (rather than 403) for a caller who can't read
+// the attachment's facility, so a failure here surfaces as a normal error.
+async function downloadAttachment(moduleSegment, attachmentId) {
+  try {
+    const data = await apiFetch(`/${moduleSegment}/attachments/${attachmentId}/url`);
+    if (data && data.url) {
+      window.open(data.url, "_blank", "noopener");
+    }
+  } catch (error) {
+    console.error("Failed to get attachment download url:", error);
+  }
+}
+
+// Markup for one item's collapsed "Attachments" toggle + its (initially
+// empty, lazily-filled) panel. canUpload gates whether the panel offers a
+// file picker once expanded -- reports pass false once a submission has
+// left draft (DR-09: uploads are draft-only, though existing evidence stays
+// visible after submit).
+function attachmentsToggleMarkup(moduleSegment, parentId, { canUpload = true } = {}) {
+  const panelId = `attachments-${moduleSegment}-${parentId}`;
+  return (
+    '<div class="attachments-block">' +
+    `<button type="button" class="attachments-toggle-btn" data-module="${escapeHtml(moduleSegment)}" data-id="${escapeHtml(parentId)}" data-panel="${escapeHtml(panelId)}" data-can-upload="${canUpload ? "true" : "false"}">Attachments</button>` +
+    `<div class="attachments-panel" id="${escapeHtml(panelId)}" hidden></div>` +
+    "</div>"
+  );
+}
+
+// Wires every "Attachments" toggle rendered inside `container` (called once
+// after each module's innerHTML is set, same pattern as the ack/complete
+// button wiring below). Expanding a panel for the first time lazily loads
+// its attachment list; later toggles just show/hide the already-loaded DOM.
+function wireAttachmentToggles(container) {
+  container.querySelectorAll(".attachments-toggle-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const panel = document.getElementById(btn.dataset.panel);
+      if (!panel) return;
+      const willShow = panel.hidden;
+      panel.hidden = !willShow;
+      if (willShow && panel.dataset.loaded !== "true") {
+        panel.dataset.loaded = "true";
+        loadAttachmentsPanel(btn.dataset.module, btn.dataset.id, panel, btn.dataset.canUpload === "true");
+      }
+    });
+  });
+}
+
+async function loadAttachmentsPanel(moduleSegment, parentId, panel, canUpload) {
+  panel.innerHTML = "<p>Loading attachments…</p>";
+  try {
+    const attachments = await apiFetch(`/${moduleSegment}/${parentId}/attachments`);
+    renderAttachmentsPanel(panel, moduleSegment, parentId, attachments || [], canUpload);
+  } catch (error) {
+    panel.innerHTML = `<p class="rr-error">Error: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderAttachmentsPanel(panel, moduleSegment, parentId, attachments, canUpload) {
+  let html = '<div class="attachments-body">';
+  if (attachments.length === 0) {
+    html += "<p>No attachments yet.</p>";
+  } else {
+    html += '<ul class="attachments-items">';
+    for (const attachment of attachments) {
+      const label = attachment.mime_type || attachment.attachment_type || "file";
+      const when = attachment.created_at ? new Date(attachment.created_at).toLocaleString() : "";
+      html += '<li class="attachment-item">';
+      html += `<span>${escapeHtml(label)}${when ? ` · ${escapeHtml(when)}` : ""}</span>`;
+      html += `<button type="button" class="attachment-download-btn" data-module="${escapeHtml(moduleSegment)}" data-attachment-id="${escapeHtml(attachment.id)}">Download</button>`;
+      html += "</li>";
+    }
+    html += "</ul>";
+  }
+
+  if (canUpload) {
+    html += '<label class="attachment-upload">';
+    html += "<span>Add attachment</span>";
+    html += `<input type="file" class="attachment-file-input" accept="${ATTACHMENT_ACCEPT}">`;
+    html += "</label>";
+    html += '<p class="attachment-status" hidden></p>';
+  } else {
+    html += "<p class=\"item-subtitle\">Only draft reports accept new attachments.</p>";
+  }
+
+  html += "</div>";
+  panel.innerHTML = html;
+
+  panel.querySelectorAll(".attachment-download-btn").forEach((btn) => {
+    btn.addEventListener("click", () => downloadAttachment(btn.dataset.module, btn.dataset.attachmentId));
+  });
+
+  const fileInput = panel.querySelector(".attachment-file-input");
+  if (fileInput) {
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const statusEl = panel.querySelector(".attachment-status");
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.classList.remove("rr-error");
+        statusEl.textContent = "Uploading…";
+      }
+      try {
+        await uploadAttachmentFile(`/${moduleSegment}/${parentId}/attachments`, file);
+        fileInput.value = "";
+        panel.dataset.loaded = "false";
+        await loadAttachmentsPanel(moduleSegment, parentId, panel, canUpload);
+      } catch (error) {
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.add("rr-error");
+          statusEl.textContent = `Error: ${error.message}`;
+        }
+      }
+    });
+  }
+}
+
 // Reports module
 async function loadReports() {
   const container = document.getElementById("reports-list");
@@ -185,11 +365,13 @@ async function loadReports() {
         if (report.submitted_at) {
           html += `<div class="item-subtitle">Submitted ${new Date(report.submitted_at).toLocaleDateString()}</div>`;
         }
+        html += attachmentsToggleMarkup("reports", report.id, { canUpload: report.status === "draft" });
         html += '</div>';
       }
     }
 
     container.innerHTML = html;
+    wireAttachmentToggles(container);
   } catch (error) {
     setError(container, error.message);
   }
@@ -294,10 +476,12 @@ async function loadIncidents() {
       if (incident.requires_osha_review) {
         html += '<div class="osha-warning">OSHA review required</div>';
       }
+      html += attachmentsToggleMarkup("incidents", incident.id);
       html += '</div>';
     }
 
     container.innerHTML = html;
+    wireAttachmentToggles(container);
   } catch (error) {
     setError(container, error.message);
   }
@@ -326,10 +510,12 @@ async function loadWorkOrders() {
       if (wo.due_at) {
         html += `<div class="item-subtitle">Due ${new Date(wo.due_at).toLocaleDateString()}</div>`;
       }
+      html += attachmentsToggleMarkup("work-orders", wo.id);
       html += '</div>';
     }
 
     container.innerHTML = html;
+    wireAttachmentToggles(container);
   } catch (error) {
     setError(container, error.message);
   }
