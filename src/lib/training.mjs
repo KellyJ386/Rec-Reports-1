@@ -24,3 +24,31 @@ export function trainingAssignmentState(assignment, now = new Date()) {
 export function certificationBlocksSchedule(certification, now = new Date(), config = {}) {
   return ["expired", "revoked"].includes(certificationStatus(certification, now, config));
 }
+
+// TR-06: decides whether a training assignment is ready to be marked
+// 'passed', based on real per-module progress rather than caller assertion.
+// An assignment is ready only when every REQUIRED module has a
+// training_progress row in state 'completed' for that assignment.
+//
+// A module counts as required unless it is explicitly marked
+// `required: false` (matches the course_modules default of required=true) --
+// non-required modules are never checked. A course with zero required
+// modules (all-optional content, or no modules at all) is vacuously ready:
+// there is nothing left to gate completion on.
+//
+//   modules: [{ id, required, title? }] -- a course's course_modules rows
+//   progressRows: [{ moduleId, state }] -- an assignment's training_progress
+//     rows; a required module absent from this list has never been started
+//     and is treated the same as any other non-'completed' state
+//
+// Returns { ready, outstandingModules } rather than a bare boolean so the
+// caller (the /complete route) can explain the refusal by naming exactly
+// which required modules are still outstanding.
+export function assignmentReadyToComplete(modules, progressRows) {
+  const stateByModuleId = new Map((progressRows ?? []).map((row) => [row.moduleId, row.state]));
+  const outstandingModules = (modules ?? [])
+    .filter((module) => module.required !== false)
+    .filter((module) => stateByModuleId.get(module.id) !== "completed")
+    .map((module) => ({ id: module.id, title: module.title ?? null }));
+  return { ready: outstandingModules.length === 0, outstandingModules };
+}

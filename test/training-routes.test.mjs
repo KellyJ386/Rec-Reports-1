@@ -265,6 +265,227 @@ test("POST training-assignments/complete happy path inserts a completion row", a
   assert.equal(insert.body[0].final_score_pct, 92.5);
 });
 
+// --- TR-06: module progress + progress-aware completion --------------------
+
+const MODULE_REQUIRED = {
+  id: "module-1",
+  facility_id: "fac-1",
+  course_id: "course-1",
+  module_type: "sop_link",
+  title: "Required Module",
+  order_no: 1,
+  content_jsonb: {},
+  required: true,
+  created_at: "2026-07-18T00:00:00Z",
+  updated_at: "2026-07-18T00:00:00Z"
+};
+
+const MODULE_OPTIONAL = {
+  ...MODULE_REQUIRED,
+  id: "module-2",
+  title: "Optional Module",
+  order_no: 2,
+  required: false
+};
+
+const OTHER_COURSE_MODULE = {
+  ...MODULE_REQUIRED,
+  id: "module-other-course",
+  course_id: "course-2"
+};
+
+test("POST module progress 404s when the assignment is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/training-assignments/nope/modules/module-1/progress", {
+    state: "in_progress"
+  });
+  assert.equal(result.status, 404);
+});
+
+test("POST module progress 404s when the module does not belong to the assignment's course", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [OTHER_COURSE_MODULE];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-other-course/progress", {
+    state: "in_progress"
+  });
+  assert.equal(result.status, 404);
+});
+
+test("POST module progress rejects a state outside the 0007 check constraint", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "bogus"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.find((c) => c.table === "training_progress"), undefined);
+});
+
+test("POST module progress requires a state field", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {});
+  assert.equal(result.status, 400);
+});
+
+test("POST module progress denies a caller who is neither the assignment's own employee nor training.manage", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT]; // employee_id: emp-1
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    if (table === "employees") return [{ id: "emp-2" }]; // caller's own employee row is NOT emp-1
+    return [];
+  });
+  const { call } = mount({ memberships: READER, userId: "user-2" });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "in_progress"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST module progress denies self-write when the caller lacks training.read entirely", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    if (table === "employees") return [{ id: "emp-1" }]; // this IS the assignment's own employee
+    return [];
+  });
+  const { call } = mount({ memberships: NO_PERMS, userId: "user-1" });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "in_progress"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST module progress self-write happy path: the assignment's own employee upserts their progress", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    if (table === "employees") return [{ id: "emp-1" }]; // matches TRAINING_ASSIGNMENT.employee_id
+    if (table === "training_progress" && method === "POST") {
+      return [{ id: "progress-1", assignment_id: "assign-1", module_id: "module-1", state: "completed" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "completed",
+    completedAt: "2026-08-01T00:00:00Z",
+    scorePct: 95,
+    attempts: 1
+  });
+  assert.equal(result.status, 200);
+  const insert = captured.find((c) => c.table === "training_progress" && c.method === "POST");
+  assert.ok(insert, "expected a training_progress upsert");
+  assert.equal(insert.url.search.includes("on_conflict=assignment_id%2Cmodule_id"), true);
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].assignment_id, "assign-1");
+  assert.equal(insert.body[0].module_id, "module-1");
+  assert.equal(insert.body[0].state, "completed");
+  assert.equal(insert.body[0].completed_at, "2026-08-01T00:00:00Z");
+  assert.equal(insert.body[0].score_pct, 95);
+  assert.equal(insert.body[0].attempts, 1);
+});
+
+test("POST module progress manager override: training.manage can record progress for another employee", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT]; // employee_id: emp-1
+    if (table === "course_modules") return [MODULE_REQUIRED];
+    if (table === "training_progress" && method === "POST") return [{ id: "progress-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER, userId: "manager-user" });
+  const result = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "in_progress"
+  });
+  assert.equal(result.status, 200);
+  const insert = captured.find((c) => c.table === "training_progress" && c.method === "POST");
+  assert.ok(insert, "expected a training_progress upsert");
+  // The manager path never needs to resolve the caller's own employee row.
+  assert.equal(captured.find((c) => c.table === "employees"), undefined);
+});
+
+test("POST training-assignments/complete refuses 'passed' with outstanding required modules named", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED, MODULE_OPTIONAL];
+    if (table === "training_progress") {
+      // Only the optional module has progress; the required one has none.
+      return [{ module_id: "module-2", state: "completed" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "passed"
+  });
+  assert.equal(result.status, 400);
+  assert.deepEqual(result.payload.outstandingModules, [{ id: "module-1", title: "Required Module" }]);
+});
+
+test("POST training-assignments/complete allows 'passed' once every required module is completed", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [MODULE_REQUIRED, MODULE_OPTIONAL];
+    if (table === "training_progress") return [{ module_id: "module-1", state: "completed" }];
+    if (table === "training_completions" && method === "POST") return [{ id: "comp-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "passed"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "training_completions" && c.method === "POST");
+  assert.equal(insert.body[0].completion_status, "passed");
+});
+
+test("POST training-assignments/complete allows 'passed' immediately for a course with zero modules", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [];
+    if (table === "training_progress") return [];
+    if (table === "training_completions" && method === "POST") return [{ id: "comp-3" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "passed"
+  });
+  assert.equal(result.status, 201);
+  assert.ok(captured.find((c) => c.table === "training_completions" && c.method === "POST"));
+});
+
+test("POST training-assignments/complete skips the readiness gate entirely for a non-'passed' status", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "training_completions" && method === "POST") return [{ id: "comp-4" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "waived"
+  });
+  assert.equal(result.status, 201);
+  // Neither course_modules nor training_progress is even queried for a
+  // non-'passed' completion -- the gate only applies to the "did the work"
+  // claim.
+  assert.equal(captured.find((c) => c.table === "course_modules"), undefined);
+  assert.equal(captured.find((c) => c.table === "training_progress"), undefined);
+});
+
 // --- TR-01: employee-scoped queries + derived state -------------------------
 
 test("GET training-assignments filters by employeeId", async (t) => {

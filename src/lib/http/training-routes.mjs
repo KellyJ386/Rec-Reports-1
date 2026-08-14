@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
-import { trainingAssignmentState, certificationStatus } from "../training.mjs";
+import { trainingAssignmentState, certificationStatus, assignmentReadyToComplete } from "../training.mjs";
 import {
   validateCourseInput,
   validateCourseUpdateInput,
@@ -35,6 +35,10 @@ const TRAINING_ASSIGNMENTS_COLUMNS =
   "reason_code,source_type,source_ref_id,created_at,updated_at";
 const TRAINING_COMPLETIONS_COLUMNS =
   "id,facility_id,assignment_id,completed_at,final_score_pct,completion_status,created_at";
+const TRAINING_PROGRESS_COLUMNS =
+  "id,facility_id,assignment_id,module_id,state,started_at,completed_at,score_pct,attempts,created_at,updated_at";
+// Matches the 0007 training_progress.state check constraint exactly.
+const TRAINING_PROGRESS_STATES = ["not_started", "in_progress", "completed", "failed"];
 const EMPLOYEE_CERT_COLUMNS =
   "id,facility_id,employee_id,certification_type_id,issued_at,expires_at,evidence_path,status,created_at,updated_at";
 const CERT_TYPE_COLUMNS = "id,facility_id,code,name,renewal_window_days,created_at,updated_at";
@@ -173,6 +177,38 @@ export function registerTrainingRoutes(
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
+  }
+
+  // Loads a single course_modules row by id, unscoped -- callers cross-check
+  // its facility_id/course_id against the parent they expect (see the
+  // progress route below) rather than trusting a client-supplied facility.
+  async function loadCourseModule(client, moduleId) {
+    const rows = await pgSelect(client, "course_modules", {
+      filters: { id: moduleId },
+      select: COURSE_MODULES_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // All of a course's modules (TR-06: feeds assignmentReadyToComplete).
+  async function loadModulesForCourse(client, facilityId, courseId) {
+    const rows = await pgSelect(client, "course_modules", {
+      filters: { facility_id: facilityId, course_id: courseId },
+      select: COURSE_MODULES_COLUMNS,
+      order: "order_no.asc"
+    });
+    return rows ?? [];
+  }
+
+  // All of an assignment's training_progress rows (TR-06: feeds
+  // assignmentReadyToComplete).
+  async function loadProgressForAssignment(client, facilityId, assignmentId) {
+    const rows = await pgSelect(client, "training_progress", {
+      filters: { facility_id: facilityId, assignment_id: assignmentId },
+      select: TRAINING_PROGRESS_COLUMNS
+    });
+    return rows ?? [];
   }
 
   // Appends a certification_events row (0007 columns: facility_id,
@@ -507,7 +543,82 @@ export function registerTrainingRoutes(
       })
   );
 
+  // --- Module progress (TR-06) --------------------------------------------
+  // Upserts a training_progress row (state, started_at, completed_at,
+  // score_pct, attempts) for one module of a training assignment. Unique on
+  // (assignment_id, module_id) (0007), so this is a merge-upsert exactly
+  // like communications-routes.mjs's POST /messages/:id/receipt -- only the
+  // fields the caller actually sends are included in the row, so a partial
+  // update (e.g. just bumping attempts) never clobbers a previously recorded
+  // started_at/completed_at.
+  //
+  // Self-service: the caller may write only their OWN progress (their
+  // employees.id must equal the assignment's employee_id) unless they hold
+  // training.manage, mirroring the 0036 RLS policy shape exactly -- this is
+  // a defense-in-depth application-layer check on top of that DB policy, not
+  // a substitute for it.
+  router.register(
+    "POST",
+    "/training-assignments/:id/modules/:moduleId/progress",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const assignment = await loadAssignment(auth.client, params.id);
+        if (!assignment) return sendJson(response, 404, { error: "training assignment not found" });
+
+        const module = await loadCourseModule(auth.client, params.moduleId);
+        if (!module || module.course_id !== assignment.course_id || module.facility_id !== assignment.facility_id) {
+          return sendJson(response, 404, { error: "module not found for this training assignment" });
+        }
+
+        const { state } = body.payload;
+        if (state === undefined || !TRAINING_PROGRESS_STATES.includes(state)) {
+          return sendJson(response, 400, {
+            error: `state must be one of: ${TRAINING_PROGRESS_STATES.join(", ")}`
+          });
+        }
+
+        const manageGuard = requireAuthPermission(auth, assignment.facility_id, MANAGE);
+        let allowed = manageGuard.allowed;
+        if (!allowed) {
+          const readGuard = requireAuthPermission(auth, assignment.facility_id, READ);
+          const callerEmployeeId = await loadCallerEmployeeId(auth.client, assignment.facility_id, auth.claims.sub);
+          allowed = readGuard.allowed && callerEmployeeId !== null && callerEmployeeId === assignment.employee_id;
+        }
+        if (!allowed) {
+          return sendJson(response, 403, { error: "cannot record progress for another employee's training assignment" });
+        }
+
+        const row = {
+          facility_id: assignment.facility_id,
+          assignment_id: assignment.id,
+          module_id: params.moduleId,
+          state
+        };
+        if (body.payload.startedAt !== undefined) row.started_at = body.payload.startedAt;
+        if (body.payload.completedAt !== undefined) row.completed_at = body.payload.completedAt;
+        if (body.payload.scorePct !== undefined) row.score_pct = body.payload.scorePct;
+        if (body.payload.attempts !== undefined) row.attempts = body.payload.attempts;
+
+        const rows = await pgInsert(auth.client, "training_progress", [row], {
+          onConflict: "assignment_id,module_id",
+          merge: true,
+          returning: true
+        });
+        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
   // Marks a training assignment complete. Inserts a training_completions row.
+  // TR-06: a completion_status of 'passed' is refused with a 400 (naming the
+  // outstanding modules) unless every required module already has a
+  // training_progress row in state 'completed' for this assignment
+  // (assignmentReadyToComplete) -- completion no longer rests on caller
+  // assertion alone. A course with zero required modules has nothing to gate
+  // on and is completable immediately. 'failed'/'waived' completions skip
+  // this gate entirely: those statuses are never a claim of "did the work".
   router.register(
     "POST",
     "/training-assignments/:id/complete",
@@ -519,11 +630,29 @@ export function registerTrainingRoutes(
         if (!assignment) return sendJson(response, 404, { error: "training assignment not found" });
         if (!requireRead(auth, assignment.facility_id, response)) return;
 
+        const completionStatus = body.payload.completionStatus ?? "passed";
+        if (completionStatus === "passed") {
+          const [modules, progressRows] = await Promise.all([
+            loadModulesForCourse(auth.client, assignment.facility_id, assignment.course_id),
+            loadProgressForAssignment(auth.client, assignment.facility_id, assignment.id)
+          ]);
+          const readiness = assignmentReadyToComplete(
+            modules.map((m) => ({ id: m.id, required: m.required, title: m.title })),
+            progressRows.map((p) => ({ moduleId: p.module_id, state: p.state }))
+          );
+          if (!readiness.ready) {
+            return sendJson(response, 400, {
+              error: "cannot mark this assignment passed: required modules are not yet completed",
+              outstandingModules: readiness.outstandingModules
+            });
+          }
+        }
+
         const completionRow = {
           facility_id: assignment.facility_id,
           assignment_id: params.id,
           final_score_pct: body.payload.finalScorePct ?? null,
-          completion_status: body.payload.completionStatus ?? "passed"
+          completion_status: completionStatus
         };
         const rows = await pgInsert(auth.client, "training_completions", [completionRow], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
