@@ -1,6 +1,10 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { requireAuthPermission } from "./guard.mjs";
-import { validateReportSubmission } from "../report-schema.mjs";
+import {
+  validateReportSubmission,
+  validateReportSubmissionPartial,
+  unknownPayloadKeys
+} from "../report-schema.mjs";
 
 const READ = "reports.read";
 const CREATE = "reports.create";
@@ -9,12 +13,27 @@ const SUBMIT = "reports.submit";
 const TEMPLATE_COLUMNS =
   "id,facility_id,department_id,code,name,description,status,active_version,created_at,updated_at";
 const VERSION_COLUMNS =
-  "id,facility_id,template_id,version_number,schema_json,is_published,created_at";
+  "id,facility_id,template_id,version_number,schema_json,validation_json,is_published,created_at";
 const SUBMISSION_COLUMNS =
   "id,facility_id,department_id,template_id,template_version_id,report_date,shift_ref,status," +
-  "submitted_by,submitted_at,payload_json,source,created_at,updated_at";
+  "submitted_by,submitted_at,payload_json,validation_results,source,created_at,updated_at";
+const ATTACHMENT_COLUMNS =
+  "id,facility_id,submission_id,field_key,storage_path,mime_type,checksum,metadata,created_at";
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+// Matches the report_submissions.status check constraint in 0002.
+const VALID_STATUSES = new Set(["draft", "submitted", "locked", "revised"]);
+const DEFAULT_LIST_LIMIT = 50;
+const MAX_LIST_LIMIT = 200;
+const DEFAULT_SUBMIT_POLICY = "strict_block";
+
+// Returns the payload key -> error-message helper shape used by every
+// unknown-key rejection below, so create/PATCH/submit report the same way.
+function unknownKeysError(schema, payload) {
+  const unknown = unknownPayloadKeys(schema, payload);
+  if (unknown.length === 0) return null;
+  return { errors: [`payload has unknown keys not defined on the template version: ${unknown.join(", ")}`] };
+}
 
 // Registers the end-user Daily Reports API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
@@ -95,6 +114,19 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     return (rows ?? [])[0] ?? null;
   }
 
+  // Loads the exact template version a submission is pinned to (as opposed to
+  // loadActiveVersion, which resolves the template's *current* active
+  // version). Used to validate/edit a draft, and to render/inspect a
+  // submission against the schema it was actually filled against.
+  async function loadVersionById(client, versionId) {
+    const rows = await pgSelect(client, "report_template_versions", {
+      filters: { id: versionId },
+      select: VERSION_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
   // --- Templates -------------------------------------------------------------
   // Lists templates a member may fill. Defaults to published only; ?status=all
   // returns every status for authors building/reviewing templates.
@@ -136,8 +168,11 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
   );
 
   // --- Submissions -----------------------------------------------------------
-  // Lists submissions for a facility. Optional ?status= and ?template_id= narrow
-  // the list; newest report_date first.
+  // Lists submissions for a facility. Optional ?status=, ?template_id=,
+  // ?department_id=, ?submitted_by= narrow the list; ?from=/?to= bound
+  // report_date (inclusive, YYYY-MM-DD); ?limit=/?offset= page the results —
+  // limit defaults to 50 and is capped at 200 so a list can never come back
+  // unbounded. Newest report_date first.
   router.register(
     "GET",
     "/facilities/:facilityId/reports",
@@ -146,14 +181,63 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
         if (!requireRead(auth, params.facilityId, response)) return;
         const qp = queryParams(request);
         const filters = { facility_id: params.facilityId };
+
         const status = qp.get("status");
+        if (status) {
+          if (!VALID_STATUSES.has(status)) {
+            return sendJson(response, 400, {
+              error: `invalid status; must be one of: ${[...VALID_STATUSES].join(", ")}`
+            });
+          }
+          filters.status = status;
+        }
+
         const templateId = qp.get("template_id");
-        if (status) filters.status = status;
         if (templateId) filters.template_id = templateId;
+
+        const departmentId = qp.get("department_id");
+        if (departmentId) filters.department_id = departmentId;
+
+        const submittedBy = qp.get("submitted_by");
+        if (submittedBy) filters.submitted_by = submittedBy;
+
+        const from = qp.get("from");
+        if (from) {
+          if (!DATE_PATTERN.test(from)) return sendJson(response, 400, { error: "from must be YYYY-MM-DD" });
+          filters.report_date = { ...(filters.report_date ?? {}), gte: from };
+        }
+        const to = qp.get("to");
+        if (to) {
+          if (!DATE_PATTERN.test(to)) return sendJson(response, 400, { error: "to must be YYYY-MM-DD" });
+          filters.report_date = { ...(filters.report_date ?? {}), lte: to };
+        }
+
+        let limit = DEFAULT_LIST_LIMIT;
+        const limitParam = qp.get("limit");
+        if (limitParam !== null) {
+          const parsed = Number(limitParam);
+          if (!Number.isInteger(parsed) || parsed <= 0) {
+            return sendJson(response, 400, { error: "limit must be a positive integer" });
+          }
+          limit = Math.min(parsed, MAX_LIST_LIMIT);
+        }
+
+        let offset;
+        const offsetParam = qp.get("offset");
+        if (offsetParam !== null) {
+          const parsed = Number(offsetParam);
+          if (!Number.isInteger(parsed) || parsed < 0) {
+            return sendJson(response, 400, { error: "offset must be a non-negative integer" });
+          }
+          offset = parsed;
+        }
+
         const rows = await pgSelect(auth.client, "report_submissions", {
           filters,
           select: SUBMISSION_COLUMNS,
-          order: "report_date.desc"
+          order: "report_date.desc",
+          limit,
+          offset
         });
         return sendJson(response, 200, rows ?? []);
       })
@@ -171,9 +255,47 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       })
   );
 
-  // Creates a draft submission. Validates only required fields (templateId,
-  // reportDate); the payload is not validated on create. Full payload validation
-  // is enforced only when the draft is submitted.
+  // Detail view: the submission plus its *pinned* version's schema (so a
+  // re-published template never relabels an old submission), the template's
+  // name, and the submission's attachments.
+  router.register(
+    "GET",
+    "/reports/:id/detail",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const submission = await loadSubmission(auth.client, params.id);
+        if (!submission) return sendJson(response, 404, { error: "report not found" });
+        if (!requireRead(auth, submission.facility_id, response)) return;
+
+        const version = await loadVersionById(auth.client, submission.template_version_id);
+        const templateRows = await pgSelect(auth.client, "report_templates", {
+          filters: { id: submission.template_id },
+          select: "id,name,code",
+          limit: 1
+        });
+        const template = (templateRows ?? [])[0] ?? null;
+        const attachments = await pgSelect(auth.client, "report_submission_attachments", {
+          filters: { submission_id: submission.id },
+          select: ATTACHMENT_COLUMNS,
+          order: "created_at.asc"
+        });
+
+        return sendJson(response, 200, {
+          submission,
+          schema_json: version?.schema_json ?? null,
+          template_name: template?.name ?? null,
+          attachments: attachments ?? []
+        });
+      })
+  );
+
+  // Creates a draft submission. Required fields (templateId, reportDate) are
+  // shape-checked before anything else; the answer payload, if any, is
+  // partially validated against the resolved active version's schema —
+  // fields the caller hasn't answered yet are fine on a draft, but whatever
+  // is supplied must satisfy that field's rules and must be a key the pinned
+  // schema actually declares. Full (all-fields-required) validation is
+  // enforced only when the draft is submitted.
   router.register(
     "POST",
     "/facilities/:facilityId/reports",
@@ -199,6 +321,11 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
         if (!active) return sendJson(response, 409, { error: "report template has no published version" });
 
         const payload = body.payload.payload ?? {};
+        const unknownKeys = unknownKeysError(active.schema, payload);
+        if (unknownKeys) return sendJson(response, 422, unknownKeys);
+        const partialErrors = validateReportSubmissionPartial(active.schema, payload);
+        if (partialErrors.length > 0) return sendJson(response, 422, { errors: partialErrors });
+
         const row = {
           facility_id: params.facilityId,
           department_id: template.department_id ?? null,
@@ -208,6 +335,8 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           shift_ref: body.payload.shiftRef ?? null,
           status: "draft",
           payload_json: payload,
+          // source is always server-set to "web" for this route — a
+          // client-sent `source` in the body is ignored, never trusted.
           source: "web"
         };
         const rows = await pgInsert(auth.client, "report_submissions", [row], { returning: true });
@@ -216,7 +345,9 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
   );
 
   // Edits a draft submission's payload/shift in place. Non-drafts are immutable
-  // (409); the guard runs on the loaded row's facility.
+  // (409); the guard runs on the loaded row's facility. When a payload is
+  // supplied it is validated the same way create validates one: partially,
+  // and only against keys the pinned version's schema actually declares.
   router.register("PATCH", "/reports/:id", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
       const body = await parseJsonBody(request);
@@ -226,6 +357,14 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       if (!requirePerm(auth, submission.facility_id, SUBMIT, response)) return;
       if (submission.status !== "draft") {
         return sendJson(response, 409, { error: "only draft reports can be edited" });
+      }
+      if (body.payload.payload !== undefined) {
+        const version = await loadVersionById(auth.client, submission.template_version_id);
+        if (!version) return sendJson(response, 409, { error: "template version not found" });
+        const unknownKeys = unknownKeysError(version.schema_json, body.payload.payload);
+        if (unknownKeys) return sendJson(response, 422, unknownKeys);
+        const partialErrors = validateReportSubmissionPartial(version.schema_json, body.payload.payload);
+        if (partialErrors.length > 0) return sendJson(response, 422, { errors: partialErrors });
       }
       const patch = {};
       if (body.payload.payload !== undefined) patch.payload_json = body.payload.payload;
@@ -241,26 +380,43 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     })
   );
 
-  // Finalizes a draft: validates the full payload against the template version
-  // schema, then flips status to 'submitted' and stamps the submitter. Only
-  // drafts can be submitted; after this the row is immutable.
+  // Finalizes a draft: verifies the pinned version still belongs to the
+  // submission's template, rejects unknown payload keys, then validates the
+  // full payload against the pinned version's schema. How validation errors
+  // are handled depends on the pinned version's validation_json.submit_policy:
+  //   - 'strict_block' (default, and anything unrecognized): errors block the
+  //     submit with 422, exactly as before.
+  //   - 'warn_and_submit': errors are downgraded to warnings and the submit
+  //     proceeds, but only if the caller supplies a non-empty `reason` in the
+  //     body (422 without one); {warnings, reason} is persisted onto
+  //     validation_results.
+  // Only drafts can be submitted; after this the row is immutable.
   router.register("POST", "/reports/:id/submit", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
+      const body = await parseJsonBody(request);
+      if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const submission = await loadSubmission(auth.client, params.id);
       if (!submission) return sendJson(response, 404, { error: "report not found" });
       if (!requirePerm(auth, submission.facility_id, SUBMIT, response)) return;
       if (submission.status !== "draft") {
         return sendJson(response, 409, { error: "only draft reports can be submitted" });
       }
-      const versionRows = await pgSelect(auth.client, "report_template_versions", {
-        filters: { id: submission.template_version_id },
-        select: VERSION_COLUMNS,
-        limit: 1
-      });
-      const version = (versionRows ?? [])[0] ?? null;
+
+      const version = await loadVersionById(auth.client, submission.template_version_id);
       if (!version) return sendJson(response, 409, { error: "template version not found" });
-      const errors = validateReportSubmission(version.schema_json, submission.payload_json ?? {});
-      if (errors.length > 0) return sendJson(response, 422, { errors });
+      if (version.template_id !== submission.template_id) {
+        return sendJson(response, 409, {
+          error: "pinned template version no longer belongs to this submission's template"
+        });
+      }
+
+      const payload = submission.payload_json ?? {};
+      const unknownKeys = unknownKeysError(version.schema_json, payload);
+      if (unknownKeys) return sendJson(response, 422, unknownKeys);
+
+      const errors = validateReportSubmission(version.schema_json, payload);
+      const submitPolicy =
+        version.validation_json?.submit_policy === "warn_and_submit" ? "warn_and_submit" : DEFAULT_SUBMIT_POLICY;
 
       const patch = {
         status: "submitted",
@@ -268,6 +424,20 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
         submitted_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       };
+
+      if (errors.length > 0) {
+        if (submitPolicy !== "warn_and_submit") {
+          return sendJson(response, 422, { errors });
+        }
+        const reason = typeof body.payload.reason === "string" ? body.payload.reason.trim() : "";
+        if (!reason) {
+          return sendJson(response, 422, {
+            error: "reason is required to submit with validation warnings under warn_and_submit"
+          });
+        }
+        patch.validation_results = { warnings: errors, reason };
+      }
+
       const rows = await pgUpdate(auth.client, "report_submissions", { id: params.id }, patch, {
         returning: true
       });

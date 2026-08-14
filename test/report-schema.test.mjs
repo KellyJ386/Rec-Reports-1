@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateReportSubmission, validateReportTemplateSchema } from "../src/lib/report-schema.mjs";
+import {
+  validateReportSubmission,
+  validateReportSubmissionPartial,
+  validateReportTemplateSchema,
+  unknownPayloadKeys
+} from "../src/lib/report-schema.mjs";
 
 const openingChecklist = {
   sections: [
@@ -96,4 +101,53 @@ test("required photo/signature must be a non-empty file reference", () => {
   assert.deepEqual(validateReportSubmission(richSchema, { ...validRich, supervisor_sig: "   " }), [
     "Supervisor signature must reference an uploaded file"
   ]);
+});
+
+// --- validateReportSubmissionPartial ----------------------------------------
+
+test("partial validation skips fields whose key is entirely absent from the payload", () => {
+  assert.deepEqual(validateReportSubmissionPartial(openingChecklist, {}), []);
+  assert.deepEqual(validateReportSubmissionPartial(openingChecklist, { pool_ready: "pass" }), []);
+});
+
+test("partial validation still enforces type/option rules on keys that ARE supplied", () => {
+  assert.deepEqual(validateReportSubmissionPartial(openingChecklist, { pool_ready: "maybe" }), [
+    "Pool ready must be one of: pass, fail"
+  ]);
+  assert.deepEqual(validateReportSubmissionPartial(openingChecklist, { attendance: "many" }), [
+    "Expected attendance must be a number"
+  ]);
+});
+
+test("partial validation still flags a required field that is present but empty", () => {
+  assert.deepEqual(validateReportSubmissionPartial(openingChecklist, { pool_ready: "" }), [
+    "Pool ready is required"
+  ]);
+});
+
+test("partial validation reports the same error shape (array of strings) as the full validator", () => {
+  const errors = validateReportSubmissionPartial(richSchema, { hazards: "wet", signed_off: "yes" });
+  assert.ok(Array.isArray(errors));
+  assert.deepEqual(errors, ["Hazards must be a list of selections", "Signed off must be true or false"]);
+});
+
+test("partial validation on a fully valid partial payload still returns []", () => {
+  assert.deepEqual(
+    validateReportSubmissionPartial(richSchema, { hazards: ["wet"], signed_off: true }),
+    []
+  );
+});
+
+// --- unknownPayloadKeys ------------------------------------------------------
+
+test("unknownPayloadKeys is empty when every payload key is a declared field", () => {
+  assert.deepEqual(unknownPayloadKeys(openingChecklist, { pool_ready: "pass", attendance: 5 }), []);
+  assert.deepEqual(unknownPayloadKeys(openingChecklist, {}), []);
+});
+
+test("unknownPayloadKeys reports keys the schema doesn't declare, sorted for a stable message", () => {
+  assert.deepEqual(
+    unknownPayloadKeys(openingChecklist, { pool_ready: "pass", zeta: 1, alpha: 2 }),
+    ["alpha", "zeta"]
+  );
 });

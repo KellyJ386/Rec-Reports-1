@@ -167,8 +167,13 @@ test("POST reports happy path inserts a draft with the resolved version", async 
 test("PATCH report edits a draft's payload", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") {
-      return [{ id: "sub-1", facility_id: "fac-1", status: "draft" }];
+      return [
+        { id: "sub-1", facility_id: "fac-1", status: "draft", template_id: "tpl-1", template_version_id: "ver-3" }
+      ];
     }
+    // PATCH now validates a supplied payload against the pinned version's
+    // schema, so the stub must serve that version.
+    if (table === "report_template_versions") return [VERSION];
     if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1" }];
     return [];
   });
@@ -198,6 +203,7 @@ test("POST submit 422s when required fields are missing", async (t) => {
           id: "sub-1",
           facility_id: "fac-1",
           status: "draft",
+          template_id: "tpl-1",
           template_version_id: "ver-3",
           payload_json: { supervisor: "Sam" }
         }
@@ -220,6 +226,7 @@ test("POST submit finalizes a valid draft and stamps the submitter", async (t) =
           id: "sub-1",
           facility_id: "fac-1",
           status: "draft",
+          template_id: "tpl-1",
           template_version_id: "ver-3",
           payload_json: { supervisor: "Sam", attendance: 42 }
         }
