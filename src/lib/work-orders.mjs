@@ -4,6 +4,10 @@ import { configValue } from "./settings-registry.mjs";
 export const WORK_ORDER_STATUSES = ["open", "in_progress", "on_hold", "resolved", "closed", "cancelled"];
 export const WORK_ORDER_PRIORITIES = ["low", "medium", "high", "urgent"];
 export const OPEN_STATUSES = ["open", "in_progress", "on_hold"];
+// Manual-create-only enum (0005_work_orders.sql's source_type check
+// constraint); the incident/report routes stamp their own source_type
+// server-side and never accept it from a request body.
+export const WORK_ORDER_SOURCE_TYPES = ["manual", "report", "incident"];
 // Statuses that stamp completed_at when entered.
 const COMPLETING_STATUSES = new Set(["resolved", "closed", "cancelled"]);
 

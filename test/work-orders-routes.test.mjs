@@ -93,6 +93,7 @@ test("POST work-orders denies a reader without work_orders.manage", async (t) =>
 
 test("POST work-orders happy path inserts a shaped row", async (t) => {
   const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-5", facility_id: "fac-1" }];
     if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
     return [];
   });
@@ -152,6 +153,7 @@ test("PATCH work-order updates assignment", async (t) => {
     if (table === "work_orders" && method === "GET") {
       return [{ id: "wo-1", facility_id: "fac-1" }];
     }
+    if (table === "employees" && method === "GET") return [{ id: "emp-7", facility_id: "fac-1" }];
     if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1" }];
     return [];
   });
@@ -300,6 +302,7 @@ test("PATCH work-order assignment change writes an assignment_change history row
     if (table === "work_orders" && method === "GET") {
       return [{ id: "wo-1", facility_id: "fac-1", assigned_to_employee_id: "emp-1" }];
     }
+    if (table === "employees" && method === "GET") return [{ id: "emp-7", facility_id: "fac-1" }];
     if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1" }];
     return [];
   });
@@ -338,6 +341,7 @@ test("PATCH work-order changing status, assignee and priority together writes on
     if (table === "work_orders" && method === "GET") {
       return [{ id: "wo-1", facility_id: "fac-1", status: "open", priority: "low", assigned_to_employee_id: null }];
     }
+    if (table === "employees" && method === "GET") return [{ id: "emp-3", facility_id: "fac-1" }];
     if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1" }];
     return [];
   });
@@ -689,6 +693,7 @@ test("POST incidents/:id/work-orders honors title/description/assignee/dueAt ove
     if (incident) return incident;
     if (table === "modules" && method === "GET") return [{ id: "mod-wo", code: "work_orders" }];
     if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "employees" && method === "GET") return [{ id: "emp-3", facility_id: "fac-1" }];
     if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
     return [];
   });
@@ -705,4 +710,147 @@ test("POST incidents/:id/work-orders honors title/description/assignee/dueAt ove
   assert.equal(insert.body[0].description, "Custom description");
   assert.equal(insert.body[0].assigned_to_employee_id, "emp-3");
   assert.equal(insert.body[0].due_at, "2026-09-01T00:00:00Z");
+});
+
+// --- WO-09: input hardening -------------------------------------------------
+
+test("POST work-orders rejects an unknown priority with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "critical"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST work-orders rejects an unknown source_type with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    source_type: "bogus"
+  });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST work-orders ignores a body-supplied facility_id, always using the path facility", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    facility_id: "fac-evil"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+});
+
+test("POST work-orders rejects a cross-facility asset_id with 400, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "assets" && method === "GET") return [{ id: "asset-1", facility_id: "fac-2" }];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    asset_id: "asset-1"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /asset_id/);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
+});
+
+test("POST work-orders 404s on a nonexistent asset_id, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "assets" && method === "GET") return [];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    asset_id: "asset-nope"
+  });
+  assert.equal(result.status, 404);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
+});
+
+test("POST work-orders rejects a cross-facility department_id with 400, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "departments" && method === "GET") return [{ id: "dept-1", facility_id: "fac-2" }];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    department_id: "dept-1"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /department_id/);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
+});
+
+test("POST work-orders rejects a cross-facility assigned_to_employee_id with 400, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-9", facility_id: "fac-2" }];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    assigned_to_employee_id: "emp-9"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /assigned_to_employee_id/);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
+});
+
+test("PATCH work-order rejects a cross-facility assigned_to_employee_id with 400, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") return [{ id: "wo-1", facility_id: "fac-1" }];
+    if (table === "employees" && method === "GET") return [{ id: "emp-9", facility_id: "fac-2" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { assigned_to_employee_id: "emp-9" });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /assigned_to_employee_id/);
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "PATCH"), "must not attempt the update");
+});
+
+test("POST incidents/:id/work-orders rejects a cross-facility assignee override with 400, not a 500", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const incident = stubIncident(table, method);
+    if (incident) return incident;
+    if (table === "employees" && method === "GET") return [{ id: "emp-9", facility_id: "fac-other" }];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { assignee: "emp-9" });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /assigned_to_employee_id/);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
 });

@@ -4,6 +4,7 @@ import { loadModuleConfig } from "./module-config.mjs";
 import {
   WORK_ORDER_STATUSES,
   WORK_ORDER_PRIORITIES,
+  WORK_ORDER_SOURCE_TYPES,
   OPEN_STATUSES,
   canTransition,
   applyStatusChange,
@@ -28,6 +29,7 @@ const WORK_ORDER_UPDATE_COLUMNS =
 
 const STATUS_SET = new Set(WORK_ORDER_STATUSES);
 const PRIORITY_SET = new Set(WORK_ORDER_PRIORITIES);
+const SOURCE_TYPE_SET = new Set(WORK_ORDER_SOURCE_TYPES);
 
 // ?order= allowlist for the work orders list endpoint.
 const ORDERABLE_COLUMNS = new Set([
@@ -105,6 +107,52 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
+  }
+
+  // --- WO-09: facility-scope resolution for body-supplied foreign keys ------
+  // asset_id / department_id / assigned_to_employee_id are all FKs into
+  // facility-scoped tables. The DB only guards asset_id (0026's
+  // fn_assert_same_facility in work_orders' WITH CHECK) -- department_id and
+  // assigned_to_employee_id have NO cross-facility guard at all today (a
+  // cross-facility value is silently accepted, verified empirically against
+  // a live Postgres instance while auditing this route). Even where the DB
+  // does guard it, a raw RLS/FK rejection surfaces as an uncaught
+  // PostgrestError -> an unhandled 500 from scripts/server.mjs's catch-all,
+  // not a clean 400/404. Resolving every one of the three here, in JS, before
+  // any insert/update is issued closes both gaps at once: a nonexistent id
+  // 404s, a cross-facility id 400s, and Postgres never sees either case.
+  const FACILITY_REF_TABLES = {
+    asset_id: { table: "assets", label: "asset_id" },
+    department_id: { table: "departments", label: "department_id" },
+    assigned_to_employee_id: { table: "employees", label: "assigned_to_employee_id" }
+  };
+
+  async function resolveFacilityRef(client, field, id, facilityId) {
+    if (id === undefined || id === null) return { ok: true };
+    const { table, label } = FACILITY_REF_TABLES[field];
+    const rows = await pgSelect(client, table, {
+      filters: { id },
+      select: "id,facility_id",
+      limit: 1
+    });
+    const row = (rows ?? [])[0];
+    if (!row) return { ok: false, status: 404, error: `${label} not found` };
+    if (row.facility_id !== facilityId) {
+      return { ok: false, status: 400, error: `${label} does not belong to this facility` };
+    }
+    return { ok: true };
+  }
+
+  // Resolves each { field: id } pair in refs against facilityId in turn,
+  // short-circuiting (and issuing no further fetches) on the first invalid
+  // one. Absent/null ids are always ok (nothing to check -- e.g. clearing an
+  // assignment or never setting a department).
+  async function resolveFacilityRefs(client, facilityId, refs) {
+    for (const [field, id] of Object.entries(refs)) {
+      const result = await resolveFacilityRef(client, field, id, facilityId);
+      if (!result.ok) return result;
+    }
+    return { ok: true };
   }
 
   // Parses and validates the list endpoint's query params entirely from the
@@ -254,6 +302,11 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           });
         }
 
+        const refCheck = await resolveFacilityRefs(auth.client, incident.facility_id, {
+          assigned_to_employee_id: assignee
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
         const config = await loadModuleConfig({
           client: auth.client,
           facilityId: incident.facility_id,
@@ -311,8 +364,15 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       })
   );
 
-  // Creates a new work order. Requires title, description, and priority; validates
-  // shape first (400 before guard), no fetch if invalid.
+  // Creates a new work order. Requires title, description, and priority;
+  // validates shape -- including that priority and an optional source_type
+  // match their DB check-constraint enums -- entirely from the body first
+  // (400 before any fetch, before the guard). A body-supplied facility_id is
+  // never read: facility_id always comes from the :facilityId path param.
+  // asset_id / department_id / assigned_to_employee_id are resolved against
+  // this facility (WO-09) after the permission guard, before insert, so a
+  // cross-facility or nonexistent reference 400s/404s cleanly rather than
+  // surfacing a raw Postgres FK/RLS/check-constraint error as a 500.
   router.register(
     "POST",
     "/facilities/:facilityId/work-orders",
@@ -320,19 +380,30 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       withAuth(request, response, env, async (auth) => {
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-        const { title, description, priority } = body.payload;
+        const { title, description, priority, source_type: sourceType } = body.payload;
         const shape = [];
         if (!title) shape.push("title is required");
         if (!description) shape.push("description is required");
         if (!priority) shape.push("priority is required");
+        else if (!PRIORITY_SET.has(priority)) shape.push(`unknown priority: ${priority}`);
+        if (sourceType !== undefined && sourceType !== null && !SOURCE_TYPE_SET.has(sourceType)) {
+          shape.push(`unknown source_type: ${sourceType}`);
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
+          asset_id: body.payload.asset_id,
+          department_id: body.payload.department_id,
+          assigned_to_employee_id: body.payload.assigned_to_employee_id
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
 
         const row = {
           facility_id: params.facilityId,
           department_id: body.payload.department_id ?? null,
           asset_id: body.payload.asset_id ?? null,
-          source_type: body.payload.source_type ?? null,
+          source_type: sourceType ?? null,
           source_id: body.payload.source_id ?? null,
           title,
           description,
@@ -374,6 +445,16 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         const workOrder = await loadWorkOrder(auth.client, params.id);
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requirePerm(auth, workOrder.facility_id, MANAGE, response)) return;
+
+        // WO-09: a reassignment must resolve to an employee in the SAME
+        // facility as the work order -- the DB has no guard on
+        // assigned_to_employee_id at all (only asset_id is), so this JS check
+        // is the only thing standing between a cross-facility reassignment
+        // and a silent write.
+        const refCheck = await resolveFacilityRefs(auth.client, workOrder.facility_id, {
+          assigned_to_employee_id: nextAssignee
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
 
         if (nextStatus !== undefined && !canTransition(workOrder.status, nextStatus)) {
           return sendJson(response, 409, { error: `illegal status transition: ${workOrder.status} -> ${nextStatus}` });
