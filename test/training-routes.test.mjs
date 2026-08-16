@@ -246,13 +246,14 @@ test("POST training-assignments/complete 404s when assignment missing", async (t
   assert.equal(result.status, 404);
 });
 
-test("POST training-assignments/complete happy path inserts a completion row", async (t) => {
+test("POST training-assignments/complete self-complete happy path inserts a completion row", async (t) => {
   const captured = stubFetch(t, (table, method) => {
-    if (table === "training_assignments" && method === "GET") return [TRAINING_ASSIGNMENT];
+    if (table === "training_assignments" && method === "GET") return [TRAINING_ASSIGNMENT]; // employee_id: emp-1
+    if (table === "employees") return [{ id: "emp-1" }]; // matches TRAINING_ASSIGNMENT.employee_id
     if (table === "training_completions" && method === "POST") return [{ id: "comp-1" }];
     return [];
   });
-  const { call } = mount({ memberships: READER });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
     completionStatus: "passed",
     finalScorePct: 92.5
@@ -263,6 +264,36 @@ test("POST training-assignments/complete happy path inserts a completion row", a
   assert.equal(insert.body[0].assignment_id, "assign-1");
   assert.equal(insert.body[0].completion_status, "passed");
   assert.equal(insert.body[0].final_score_pct, 92.5);
+});
+
+test("POST training-assignments/complete denies a training.read-only holder completing another employee's assignment", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT]; // employee_id: emp-1
+    if (table === "employees") return [{ id: "emp-2" }]; // caller's own employee row is NOT emp-1
+    return [];
+  });
+  const { call } = mount({ memberships: READER, userId: "user-2" });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "passed"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST training-assignments/complete allows a training.manage holder to complete another employee's assignment", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments" && method === "GET") return [TRAINING_ASSIGNMENT]; // employee_id: emp-1
+    if (table === "training_completions" && method === "POST") return [{ id: "comp-manager" }];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGER, userId: "manager-user" });
+  const result = await call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "passed"
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "training_completions" && c.method === "POST");
+  assert.equal(insert.body[0].assignment_id, "assign-1");
+  // The manager path never needs to resolve the caller's own employee row.
+  assert.equal(captured.find((c) => c.table === "employees"), undefined);
 });
 
 // --- TR-06: module progress + progress-aware completion --------------------
@@ -420,6 +451,7 @@ test("POST module progress manager override: training.manage can record progress
 test("POST training-assignments/complete refuses 'passed' with outstanding required modules named", async (t) => {
   stubFetch(t, (table) => {
     if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "employees") return [{ id: "emp-1" }]; // self-complete: matches TRAINING_ASSIGNMENT.employee_id
     if (table === "course_modules") return [MODULE_REQUIRED, MODULE_OPTIONAL];
     if (table === "training_progress") {
       // Only the optional module has progress; the required one has none.
@@ -427,7 +459,7 @@ test("POST training-assignments/complete refuses 'passed' with outstanding requi
     }
     return [];
   });
-  const { call } = mount({ memberships: READER });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
     completionStatus: "passed"
   });
@@ -438,12 +470,13 @@ test("POST training-assignments/complete refuses 'passed' with outstanding requi
 test("POST training-assignments/complete allows 'passed' once every required module is completed", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "employees") return [{ id: "emp-1" }]; // self-complete: matches TRAINING_ASSIGNMENT.employee_id
     if (table === "course_modules") return [MODULE_REQUIRED, MODULE_OPTIONAL];
     if (table === "training_progress") return [{ module_id: "module-1", state: "completed" }];
     if (table === "training_completions" && method === "POST") return [{ id: "comp-2" }];
     return [];
   });
-  const { call } = mount({ memberships: READER });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
     completionStatus: "passed"
   });
@@ -455,12 +488,13 @@ test("POST training-assignments/complete allows 'passed' once every required mod
 test("POST training-assignments/complete allows 'passed' immediately for a course with zero modules", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "employees") return [{ id: "emp-1" }]; // self-complete: matches TRAINING_ASSIGNMENT.employee_id
     if (table === "course_modules") return [];
     if (table === "training_progress") return [];
     if (table === "training_completions" && method === "POST") return [{ id: "comp-3" }];
     return [];
   });
-  const { call } = mount({ memberships: READER });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
     completionStatus: "passed"
   });
@@ -471,10 +505,11 @@ test("POST training-assignments/complete allows 'passed' immediately for a cours
 test("POST training-assignments/complete skips the readiness gate entirely for a non-'passed' status", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "employees") return [{ id: "emp-1" }]; // self-complete: matches TRAINING_ASSIGNMENT.employee_id
     if (table === "training_completions" && method === "POST") return [{ id: "comp-4" }];
     return [];
   });
-  const { call } = mount({ memberships: READER });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
     completionStatus: "waived"
   });

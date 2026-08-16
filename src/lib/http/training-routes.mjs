@@ -619,6 +619,16 @@ export function registerTrainingRoutes(
   // assertion alone. A course with zero required modules has nothing to gate
   // on and is completable immediately. 'failed'/'waived' completions skip
   // this gate entirely: those statuses are never a claim of "did the work".
+  //
+  // Ownership (closes the gap plans/RLS_AUDIT.md escalated and
+  // 0039_training_completion_ownership.sql now enforces at the DB layer):
+  // the caller may record a completion only for their OWN training
+  // assignment (their employees.id must equal the assignment's employee_id)
+  // unless they hold training.manage, mirroring the 0039 RLS policy shape
+  // exactly -- and the same self-vs-manager check the module progress route
+  // above (TR-06) already uses. This is a defense-in-depth application-layer
+  // check on top of that DB policy, not a substitute for it -- it exists so
+  // the API returns a clean 403 rather than an opaque RLS denial.
   router.register(
     "POST",
     "/training-assignments/:id/complete",
@@ -628,7 +638,19 @@ export function registerTrainingRoutes(
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
         const assignment = await loadAssignment(auth.client, params.id);
         if (!assignment) return sendJson(response, 404, { error: "training assignment not found" });
-        if (!requireRead(auth, assignment.facility_id, response)) return;
+
+        const manageGuard = requireAuthPermission(auth, assignment.facility_id, MANAGE);
+        let allowed = manageGuard.allowed;
+        if (!allowed) {
+          const readGuard = requireAuthPermission(auth, assignment.facility_id, READ);
+          const callerEmployeeId = await loadCallerEmployeeId(auth.client, assignment.facility_id, auth.claims.sub);
+          allowed = readGuard.allowed && callerEmployeeId !== null && callerEmployeeId === assignment.employee_id;
+        }
+        if (!allowed) {
+          return sendJson(response, 403, {
+            error: "cannot record a completion for another employee's training assignment"
+          });
+        }
 
         const completionStatus = body.payload.completionStatus ?? "passed";
         if (completionStatus === "passed") {
