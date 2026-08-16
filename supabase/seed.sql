@@ -136,8 +136,14 @@ insert into departments (id, facility_id, name, code) values
   ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-000000000201', 'Arena Operations', 'arena_ops')
 on conflict (id) do nothing;
 
-insert into report_templates (id, facility_id, department_id, code, name, description, status, active_version) values
-  ('00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'opening_checklist', 'Opening Checklist', 'Daily opening readiness report for aquatics operations.', 'published', 1)
+-- active_version is intentionally omitted here (left null): 0028's
+-- fn_report_template_active_version_published trigger requires that a
+-- non-null active_version already name an existing PUBLISHED version of this
+-- same template, which cannot be true until the report_template_versions row
+-- below exists. Insert the template first with no active version, publish
+-- the version, then UPDATE active_version onto the template.
+insert into report_templates (id, facility_id, department_id, code, name, description, status) values
+  ('00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'opening_checklist', 'Opening Checklist', 'Daily opening readiness report for aquatics operations.', 'published')
 on conflict (id) do nothing;
 
 insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, validation_json, workflow_json, is_published) values
@@ -152,6 +158,11 @@ insert into report_template_versions (id, facility_id, template_id, version_numb
     true
   )
 on conflict (id) do nothing;
+
+update report_templates
+  set active_version = 1
+  where id = '00000000-0000-0000-0000-000000000401'
+    and active_version is distinct from 1;
 
 
 insert into employees (id, facility_id, department_id, employee_no, first_name, last_name) values

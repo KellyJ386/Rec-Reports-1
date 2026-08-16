@@ -37,6 +37,19 @@ jobs:
       - run: npm run test
       - run: npm run build
       - run: npm run db:verify
+      # db:verify:seed does two things: (1) the textual checks it always did,
+      # and (2) since DATABASE_URL is set (job-level env above) and the
+      # postgres:16 service is already healthy at this point, it also
+      # self-bootstraps its OWN disposable scratch database (bootstrap-pre +
+      # every supabase/migrations/*.sql + bootstrap-post) and actually
+      # applies supabase/seed.sql (twice, to prove idempotency) against it,
+      # then drops the scratch database. This is what makes a seed.sql that
+      # is textually fine but violates a real trigger/constraint (e.g. a
+      # write-ordering bug against a later migration's trigger) fail CI here
+      # directly, instead of only surfacing downstream as a misleading
+      # RLS-suite failure once db:test:rls runs against a half-seeded
+      # database. It never touches the shared rec_reports_rls database the
+      # steps below build up -- see scripts/verify-seed.mjs.
       - run: npm run db:verify:seed
       # The postgres:16 service above is a bare Postgres, not a Supabase
       # project, so it's missing the `authenticated` role, the `auth` schema,

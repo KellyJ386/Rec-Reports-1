@@ -7,7 +7,18 @@
 --      message_receipts/employee_certifications/incident_amendments bug
 --      class found earlier).
 --   2. Class A: training_completions now has a working INSERT path (same
---      bug class).
+--      bug class). 0038's own policy for this ("training readers can insert
+--      completions") gated on training.read alone, with no ownership check --
+--      flagged in 0038's own comments and plans/RLS_AUDIT.md as a decision to
+--      revisit. 0039_training_completion_ownership.sql has since replaced it
+--      with a self-service-or-training.manage rule (mirroring 0036's
+--      training_progress shape): a training.read holder may INSERT a
+--      completion for their OWN training_assignments row (joined via
+--      employees.user_id = auth.uid()) but not another employee's, while a
+--      training.manage holder may record a completion for anyone. This test
+--      asserts THAT (0039) shape, not 0038's superseded, ownership-free one --
+--      see supabase/tests/training_completions.sql for the exhaustive version
+--      of this same probe (self/other/manager/cross-facility/no-perm).
 --   3. Class B (privilege escalation): memberships.role_id can no longer
 --      name a role belonging to a DIFFERENT facility than the membership's
 --      own claimed facility_id -- closing a path where an admin.manage
@@ -83,9 +94,15 @@ insert into departments (id, facility_id, name) values
   ('38000000-0000-0000-0000-000000000f01', '38000000-0000-0000-0000-0000000000c1', 'Audit Dept B')
 on conflict (id) do nothing;
 
-insert into employees (id, facility_id, department_id, employee_no, first_name, last_name) values
-  ('38000000-0000-0000-0000-000000001000', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000000f00', 'RA-1', 'Facility', 'A'),
-  ('38000000-0000-0000-0000-000000001001', '38000000-0000-0000-0000-0000000000c1', '38000000-0000-0000-0000-000000000f01', 'RB-1', 'Facility', 'B')
+-- Employee 1000's user_id is deliberately Actor A's own auth.users id -- the
+-- training_completions self-service probe below (item 2) needs a real
+-- employees.user_id = auth.uid() row for Actor A to own. Employee 1002 is a
+-- second Facility A employee NOT owned by Actor A, used as the "another
+-- employee's assignment" negative target for that same probe.
+insert into employees (id, facility_id, department_id, user_id, employee_no, first_name, last_name) values
+  ('38000000-0000-0000-0000-000000001000', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000000f00', '38000000-0000-0000-0000-000000000a01', 'RA-1', 'Facility', 'A'),
+  ('38000000-0000-0000-0000-000000001001', '38000000-0000-0000-0000-0000000000c1', '38000000-0000-0000-0000-000000000f01', null, 'RB-1', 'Facility', 'B'),
+  ('38000000-0000-0000-0000-000000001002', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000000f00', null, 'RA-2', 'Other', 'Employee')
 on conflict (id) do nothing;
 
 insert into assets (id, facility_id, name) values
@@ -96,7 +113,29 @@ insert into courses (id, facility_id, code, title, status) values
   ('38000000-0000-0000-0000-000000001200', '38000000-0000-0000-0000-0000000000c0', 'audit_course', 'Audit Course', 'published')
 on conflict (id) do nothing;
 insert into training_assignments (id, facility_id, employee_id, course_id) values
-  ('38000000-0000-0000-0000-000000001300', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001000', '38000000-0000-0000-0000-000000001200')
+  ('38000000-0000-0000-0000-000000001300', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001000', '38000000-0000-0000-0000-000000001200'),
+  ('38000000-0000-0000-0000-000000001301', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001002', '38000000-0000-0000-0000-000000001200')
+on conflict (id) do nothing;
+
+-- A second actor, holding training.manage (not just training.read) on
+-- Facility A, used by the training_completions probe (item 2) to prove a
+-- training.manage holder MAY record a completion for someone else's
+-- assignment -- the supervisor-override branch of 0039's policy.
+insert into auth.users (id, email) values
+  ('38000000-0000-0000-0000-000000000a04', 'audit-training-mgr@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('38000000-0000-0000-0000-000000000a04', 'Audit Training Manager', 'audit-training-mgr@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('38000000-0000-0000-0000-0000000000d3', '38000000-0000-0000-0000-0000000000c0', 'Audit Training Manager Role')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('38000000-0000-0000-0000-0000000000d3', 'training.manage'),
+  ('38000000-0000-0000-0000-0000000000d3', 'training.read')
+on conflict do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('38000000-0000-0000-0000-0000000000e2', '38000000-0000-0000-0000-000000000a04', '38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-0000000000d3', 'active')
 on conflict (id) do nothing;
 
 insert into incident_reports (id, facility_id, incident_no, report_type, status, severity, occurred_at, location_text, summary) values
@@ -141,7 +180,11 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 2. Class A: training_completions INSERT now works.
+-- 2. Class A: training_completions INSERT now works, per 0039's
+-- self-service-or-training.manage shape. Actor A (training.read, no
+-- training.manage, owns employees row 1000 via user_id) can complete their
+-- OWN assignment (1300) but is denied completing employee 1002's assignment
+-- (1301), which belongs to someone else.
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -151,10 +194,45 @@ begin
   values ('38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001300', 'passed')
   returning id into new_id;
   if new_id is null then
-    raise exception 'RLS AUDIT FAIL: training_completions INSERT is still inert (0038 Class A fix did not apply)';
+    raise exception 'RLS AUDIT FAIL: training_completions INSERT is still inert (0039 self-service fix did not apply)';
+  end if;
+
+  begin
+    insert into training_completions (facility_id, assignment_id, completion_status)
+    values ('38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001301', 'passed');
+    raise exception 'RLS AUDIT FAIL: a training.read-only holder completed another employee''s assignment (0039 ownership check did not apply)';
+  exception
+    when insufficient_privilege then null; -- expected: assignment 1301 belongs to employee 1002, not Actor A, and Actor A lacks training.manage
+  end;
+end;
+$$;
+
+reset role;
+
+-- Training-manager override: a training.manage holder MAY record a
+-- completion for someone else's assignment (the supervisor branch of 0039's
+-- policy) -- here, employee 1002's assignment that Actor A was just denied.
+select set_config('request.jwt.claims', '{"sub":"38000000-0000-0000-0000-000000000a04","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+declare
+  new_id uuid;
+begin
+  insert into training_completions (facility_id, assignment_id, completion_status)
+  values ('38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001301', 'passed')
+  returning id into new_id;
+  if new_id is null then
+    raise exception 'RLS AUDIT FAIL: a training.manage holder was denied completing another employee''s assignment';
   end if;
 end;
 $$;
+
+reset role;
+
+-- Resume as Actor A for the remaining Class B probes below.
+select set_config('request.jwt.claims', '{"sub":"38000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
 
 -- ---------------------------------------------------------------------------
 -- 4. Class B positive control: same-facility department_id/employee_id/
