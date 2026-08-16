@@ -22,6 +22,9 @@ const LEGAL_HOLD_MANAGER = [
 const TASK_CREATOR = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.tasks.create"] }
 ];
+const EXPORTER = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.export.pdf"] }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -968,4 +971,113 @@ test("GET facilities/:id/incident-escalations does not flag a not-yet-due pendin
   const result = await call("GET", "/facilities/fac-1/incident-escalations");
   assert.equal(result.status, 200);
   assert.equal(result.payload[0].overdue, false);
+});
+
+// --- GET /incidents/:id/export.pdf (IN-08) -----------------------------------
+
+test("GET export.pdf denies a reader without incidents.export.pdf with 403 and writes nothing", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER }); // incidents.read only, not incidents.export.pdf
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("GET export.pdf 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: EXPORTER });
+  const result = await call("GET", "/incidents/nope/export.pdf");
+  assert.equal(result.status, 404);
+});
+
+test("GET export.pdf happy path returns the standard export envelope", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "facilities") return [{ id: "fac-1", name: "Riverside Rec Center" }];
+    if (table === "incident_people") return [];
+    if (table === "incident_followup_actions") return [FOLLOWUP];
+    if (table === "incident_escalations") return [ESCALATION];
+    if (table === "incident_amendments") return [];
+    if (table === "incident_audit_events") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.contentType, "application/pdf");
+  assert.equal(result.payload.encoding, "base64");
+  assert.match(result.payload.filename, /^incident-INC-2026-001-.+\.pdf$/);
+  assert.match(result.payload.contentDisposition, /^attachment; filename="incident-INC-2026-001-.+\.pdf"$/);
+  // documentHash travels with the internal package for the audit event only
+  // -- it is not part of the wire envelope.
+  assert.equal(result.payload.documentHash, undefined);
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.ok(bytes.startsWith("%PDF-1.4\n"));
+  assert.ok(bytes.trimEnd().endsWith("%%EOF"));
+});
+
+test("GET export.pdf writes an incident_audit_events row on every export", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "incident_followup_actions") return [FOLLOWUP];
+    if (table === "incident_escalations") return [ESCALATION];
+    return [];
+  });
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+  assert.equal(result.status, 200);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert on export");
+  const event = auditInsert.body[0];
+  assert.equal(event.facility_id, "fac-1");
+  assert.equal(event.incident_id, "inc-1");
+  assert.equal(event.actor_user_id, "user-8");
+  assert.equal(event.event_type, "incident.exported");
+  assert.equal(event.event_payload.actor, "user-8");
+  assert.equal(event.event_payload.format, "pdf");
+  assert.equal(event.event_payload.draft, false);
+  assert.equal(event.event_payload.amended, false);
+  assert.match(event.event_payload.documentHash, /^[0-9a-f]{64}$/);
+});
+
+test("GET export.pdf marks a draft export's audit event and watermarks the document", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // INCIDENT is a draft
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+  assert.equal(result.status, 200);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_payload.draft, true);
+
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.match(bytes, /\[DRAFT - NOT SUBMITTED\]/);
+});
+
+test("GET export.pdf marks an amended incident's audit event and lists amendment history in the document", async (t) => {
+  const AMENDMENT = {
+    id: "amend-1",
+    facility_id: "fac-1",
+    incident_id: "inc-1",
+    amendment_reason: "corrected the location",
+    before_snapshot: { location_text: "Building A" },
+    after_snapshot: { location_text: "Building B" },
+    amended_by: "user-3",
+    amended_at: "2026-07-19T00:00:00Z"
+  };
+  const captured = stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "incident_amendments") return [AMENDMENT];
+    return [];
+  });
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+  assert.equal(result.status, 200);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_payload.amended, true);
+
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.match(bytes, /\[AMENDED\]/);
+  assert.match(bytes, /\(Amendment 1 Reason: corrected the location\) Tj/);
 });

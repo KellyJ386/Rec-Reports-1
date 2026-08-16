@@ -10,12 +10,14 @@ import {
   requiredIncidentFollowUps,
   INCIDENT_STATUSES
 } from "../incidents.mjs";
+import { buildIncidentPdfPackage } from "../incident-pdf.mjs";
 
 const READ = "incidents.read";
 const MANAGE = "incidents.manage";
 const REVIEW = "incidents.review";
 const LEGAL_HOLD_MANAGE = "incidents.legal_hold.manage";
 const TASKS_CREATE = "incidents.tasks.create";
+const EXPORT_PDF = "incidents.export.pdf";
 
 // Follow-up action_type / status vocabularies, verbatim from the check
 // constraints on incident_followup_actions (0004_incidents.sql:74-75).
@@ -47,6 +49,9 @@ const FOLLOWUP_COLUMNS =
   "created_at,updated_at";
 const AMENDMENT_COLUMNS =
   "id,facility_id,incident_id,amendment_reason,before_snapshot,after_snapshot,amended_by,amended_at";
+const PEOPLE_COLUMNS =
+  "id,facility_id,incident_id,person_role,full_name,contact_json,injury_json,statement_text," +
+  "statement_submitted_at,created_at,updated_at";
 
 // Registers the end-user Incidents API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
@@ -847,6 +852,126 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         }
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Export (IN-08) -----------------------------------------------------
+  // Renders the incident case document as a PDF: case metadata, involved
+  // people, follow-up actions, escalation history, amendment history (when
+  // present), and an integrity block (a sha-256 content hash + the moment
+  // this export was generated). Guarded by incidents.export.pdf -- a
+  // dedicated code, distinct from incidents.read, because reading the JSON
+  // record and exporting a portable, printable legal document from it are
+  // different capabilities: incidents.read is broadly held (any reader can
+  // see the case in the app), but who may walk a copy of it out the door as
+  // a standalone file is a narrower, explicitly-granted permission (0027).
+  //
+  // Draft-export decision (IN-08 item 3): drafts ARE exportable. There is a
+  // legitimate use for a printable copy of an in-progress report (e.g. a
+  // supervisor still gathering facts wants something to hand a witness), and
+  // gating export on status != draft would just push people toward
+  // screenshotting the UI instead -- worse for provenance, not better. What
+  // must never happen is a draft PDF being mistaken for a filed, submitted
+  // report, so incident-pdf.mjs watermarks a draft's document both in the
+  // bold title line ("[DRAFT - NOT SUBMITTED]") and in an explicit body
+  // field; nothing in this route needs to special-case draft beyond passing
+  // the incident through as-is -- the watermarking is the renderer's job.
+  //
+  // Generating an export is itself an access to a legal document and is
+  // therefore auditable: every successful export writes an
+  // incident_audit_events row (event_type "incident.exported") carrying the
+  // exported document's own content hash, so the ledger records not just
+  // THAT an export happened but which exact document (by hash) was handed
+  // out. The audit write happens after rendering (so a render failure never
+  // logs a phantom export) but before the response is sent.
+  router.register(
+    "GET",
+    "/incidents/:id/export.pdf",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+        if (!requirePerm(auth, incident.facility_id, EXPORT_PDF, response)) return;
+
+        const [facilityRows, departmentRows, people, followups, escalations, amendments] = await Promise.all([
+          pgSelect(auth.client, "facilities", { filters: { id: incident.facility_id }, select: "id,name", limit: 1 }),
+          incident.department_id
+            ? pgSelect(auth.client, "departments", {
+                filters: { id: incident.department_id },
+                select: "id,name",
+                limit: 1
+              })
+            : Promise.resolve([]),
+          pgSelect(auth.client, "incident_people", {
+            filters: { incident_id: incident.id },
+            select: PEOPLE_COLUMNS,
+            order: "created_at.asc"
+          }),
+          pgSelect(auth.client, "incident_followup_actions", {
+            filters: { incident_id: incident.id },
+            select: FOLLOWUP_COLUMNS,
+            order: "due_at.asc"
+          }),
+          pgSelect(auth.client, "incident_escalations", {
+            filters: { incident_id: incident.id },
+            select: ESCALATION_COLUMNS,
+            order: "created_at.asc"
+          }),
+          pgSelect(auth.client, "incident_amendments", {
+            filters: { incident_id: incident.id },
+            select: AMENDMENT_COLUMNS,
+            order: "amended_at.asc"
+          })
+        ]);
+
+        // Stamped once, here, and threaded through as plain data --
+        // incident-pdf.mjs itself never reads the clock, which is what
+        // keeps its output reproducible for a fixed fixture (see its module
+        // header).
+        const generatedAt = new Date().toISOString();
+        const pkg = buildIncidentPdfPackage({
+          facilityName: (facilityRows ?? [])[0]?.name ?? null,
+          departmentName: (departmentRows ?? [])[0]?.name ?? null,
+          incident,
+          people: people ?? [],
+          followups: followups ?? [],
+          escalations: escalations ?? [],
+          amendments: amendments ?? [],
+          generatedAt,
+          generatedBy: auth.claims.sub
+        });
+
+        await pgInsert(
+          auth.client,
+          "incident_audit_events",
+          [
+            buildIncidentAuditEvent({
+              facilityId: incident.facility_id,
+              incidentId: incident.id,
+              actorUserId: auth.claims.sub,
+              eventType: "incident.exported",
+              payload: {
+                actor: auth.claims.sub,
+                format: "pdf",
+                draft: incident.status === "draft",
+                amended: (amendments ?? []).length > 0,
+                documentHash: pkg.documentHash
+              }
+            })
+          ],
+          { returning: false }
+        );
+
+        // documentHash traveled with pkg only so the audit event above could
+        // carry it; it is not part of the wire envelope, which matches the
+        // {contentType, filename, body, encoding, contentDisposition} shape
+        // every other export route (reports-routes.mjs, workflow-routes.mjs,
+        // audit-routes.mjs) already returns.
+        const { documentHash, ...envelope } = pkg;
+        return sendJson(response, 200, {
+          ...envelope,
+          contentDisposition: `attachment; filename="${pkg.filename}"`
+        });
       })
   );
 
