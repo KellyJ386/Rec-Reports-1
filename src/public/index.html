@@ -100,49 +100,52 @@
       <section class="panel" aria-labelledby="schedule-heading">
         <div>
           <p class="eyebrow">Scheduling workflow</p>
-          <h2 id="schedule-heading">Weekly coverage readiness</h2>
+          <h2 id="schedule-heading">Weekly schedule board</h2>
           <p>
-            The scheduling slice tracks draft periods, shifts, assignments, certifications,
-            publish versions, and conflict checks before managers publish coverage.
+            Pick a week to see its shifts grouped by day, assign or unassign staff on a shift
+            card, generate shifts from templates, and validate or publish once coverage is
+            ready. Conflict and certification badges call out anything blocking publish.
           </p>
         </div>
-        <div id="schedule-list" class="schedule-list" aria-label="Schedule readiness checks"></div>
+        <div id="schedule-workspace" class="module-workspace" aria-label="Weekly schedule board"></div>
       </section>
       <section class="panel" aria-labelledby="incident-heading">
         <div>
           <p class="eyebrow">Incident workflow</p>
           <h2 id="incident-heading">Incident reports</h2>
           <p>
-            Incident capture now has a tenant-scoped data model for people involved, evidence,
-            escalations, follow-up actions, append-only audit events, and legal-safe amendments.
-            Expand an incident's "Attachments" toggle to upload a photo or document, or download
-            evidence already on file.
+            Report a new incident, then track it from draft through submission: follow-up
+            actions, escalation acknowledgement/resolution, an immutable amendment history, and
+            evidence attachments. High/critical severity requires an immediate-actions note
+            before a report can be created.
           </p>
         </div>
-        <div id="incidents-list"></div>
+        <div id="incidents-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="work-order-heading">
         <div>
           <p class="eyebrow">Maintenance workflow</p>
           <h2 id="work-order-heading">Work orders</h2>
           <p>
-            Work orders connect operational issues to assets, assignments, due dates, updates,
-            attachments, and audit-ready status history. Expand a work order's "Attachments"
-            toggle to upload a photo or document, or download evidence already on file.
+            Filter by open/mine/overdue/priority, create a work order, and open one to see its
+            comment thread and change its status or assignee. Expand a work order's
+            "Attachments" toggle to upload a photo or document, or download evidence already on
+            file.
           </p>
         </div>
-        <div id="work-orders-list"></div>
+        <div id="work-orders-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="communications-heading">
         <div>
           <p class="eyebrow">Communications workflow</p>
           <h2 id="communications-heading">Messages</h2>
           <p>
-            Communications track channels, audiences, delivery receipts, acknowledgements,
-            notification jobs, and urgent messages that can bypass quiet hours.
+            Publishers can compose a message with a channel, priority, audience, and optional
+            required acknowledgement. Opening this panel marks each visible message delivered
+            and read; required-acknowledgement messages show their acknowledgement state.
           </p>
         </div>
-        <div id="messages-list"></div>
+        <div id="comms-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="training-heading">
         <div>

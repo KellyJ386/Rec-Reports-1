@@ -1,4 +1,36 @@
 import { fieldDescriptors, collectPayload, applyServerErrors } from "./report-form.mjs";
+import {
+  severityRequiresGating,
+  validateIncidentCapture,
+  buildIncidentCreatePayload,
+  validateFollowupInput,
+  buildFollowupPayload,
+  validateAmendmentInput,
+  buildAmendmentPayload,
+  nextEscalationAction,
+  INCIDENT_REPORT_TYPES,
+  INCIDENT_SEVERITIES,
+  FOLLOWUP_ACTION_TYPES,
+  AMENDABLE_INCIDENT_FIELDS
+} from "./incident-form.mjs";
+import { paginate } from "./list-pagination.mjs";
+import {
+  WORK_ORDER_STATUSES,
+  WORK_ORDER_PRIORITIES,
+  buildWorkOrderQuery,
+  validateWorkOrderCreate,
+  buildWorkOrderCreatePayload
+} from "./work-order-filters.mjs";
+import { weekBoundsFor, bucketShiftsByDay, deriveShiftBadges, validateShiftCreate, buildShiftCreatePayload } from "./schedule-board.mjs";
+import {
+  MESSAGE_PRIORITIES,
+  AUDIENCE_TYPES,
+  validateComposeInput,
+  buildComposePayload,
+  validateAudienceRows,
+  buildAudiencePayload,
+  deriveAckState
+} from "./comms-compose.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 const REFRESH_TOKEN_KEY = "rr_refresh_token";
@@ -8,7 +40,34 @@ const API_BASE = "/api/v1";
 let currentUser = null;
 let currentFacility = null;
 let facilities = [];
+let platformAdmin = false;
 let reportTemplatesById = new Map();
+
+// Permission gating: a user without the relevant write permission must never
+// see write controls (rule applies to every panel added this batch). Platform
+// admins bypass every permission check server-side (0022) but GET /me only
+// ever populates a facility's `permissions` array from real membership rows
+// (src/lib/http/me-route.mjs), which can be empty for a platform admin with
+// no membership in a given facility -- so the client-side gate below mirrors
+// that bypass explicitly rather than hiding controls a platform admin's
+// requests would actually be allowed to make.
+function currentFacilityRecord() {
+  return facilities.find((f) => f.id === currentFacility) || null;
+}
+
+function hasPerm(code) {
+  if (platformAdmin) return true;
+  const facility = currentFacilityRecord();
+  return !!facility && Array.isArray(facility.permissions) && facility.permissions.includes(code);
+}
+
+// Renders a 403 (or any) error as an inline message inside `container`
+// instead of leaving a panel broken/blank -- the shared failure mode every
+// write action in this batch's panels routes through.
+function renderInlineError(container, error) {
+  container.textContent = "";
+  container.append(el("p", { class: "rr-error" }, `Error: ${error && error.message ? error.message : "request failed"}`));
+}
 
 // Helper: Get token from localStorage
 function getToken() {
@@ -97,6 +156,7 @@ async function initialize() {
 
     currentUser = meData.user;
     facilities = meData.facilities || [];
+    platformAdmin = meData.platformAdmin === true;
 
     // Update header with user email
     const userEmailEl = document.getElementById("user-email");
@@ -138,20 +198,25 @@ async function initialize() {
 async function loadAllModules() {
   if (!currentFacility) return;
 
-  // A report form or inbox detail pane left open belongs to whichever
-  // facility it was opened under -- close both before switching so a
-  // (re)load never leaves a stale cross-facility submission on screen.
+  // A report form, inbox detail pane, or any of this batch's detail/compose
+  // panels left open belongs to whichever facility it was opened under --
+  // close them all before switching so a (re)load never leaves a stale
+  // cross-facility view on screen.
   reportFormController.close();
   inboxDetailController.close();
+  incidentsPanel.reset();
+  workOrdersPanel.reset();
+  schedulePanel.reset();
+  commsPanel.reset();
 
   try {
     await Promise.all([
       loadReports(),
       loadReportInbox(),
-      loadSchedule(),
-      loadIncidents(),
-      loadWorkOrders(),
-      loadMessages(),
+      schedulePanel.load(),
+      incidentsPanel.load(),
+      workOrdersPanel.load(),
+      commsPanel.load(),
       loadTraining(),
       loadCertifications()
     ]);
@@ -365,6 +430,44 @@ function renderAttachmentsPanel(panel, moduleSegment, parentId, attachments, can
       }
     });
   }
+}
+
+// Builds a Prev/Next pagination bar from a list-pagination.mjs `paginate()`
+// result. Shared by every client-side-paginated panel (incidents,
+// escalations/follow-ups/amendments, messages) as well as the work orders
+// panel's server-paginated list (WO-05) -- callers there pass an equivalent
+// { page, totalPages, hasPrev, hasNext } shape built from the response's
+// known page size rather than list-pagination.mjs's paginate(), since that
+// list is already server-sliced.
+// `info` is either a full list-pagination.mjs paginate() result (carries
+// totalPages, so the label reads "Page X of Y") or a lighter
+// { page, hasPrev, hasNext } shape a server-paginated panel builds by hand
+// (work orders: GET .../work-orders has no total-count response, so hasNext
+// is inferred from "did this page come back full" rather than a known page
+// count -- see workOrdersPanel's loadList). Renders nothing when there is
+// only ever one page either way.
+function buildPaginationBar(info, onPageChange) {
+  if (!info) return null;
+  const knowsTotal = info.totalPages !== undefined;
+  if (knowsTotal && info.totalPages <= 1) return null;
+  if (!knowsTotal && !info.hasPrev && !info.hasNext) return null;
+
+  const bar = el("div", { class: "pagination-bar" });
+  const prevBtn = el("button", { type: "button" }, "Prev");
+  prevBtn.disabled = !info.hasPrev;
+  prevBtn.addEventListener("click", () => onPageChange(info.page - 1));
+  const nextBtn = el("button", { type: "button" }, "Next");
+  nextBtn.disabled = !info.hasNext;
+  nextBtn.addEventListener("click", () => onPageChange(info.page + 1));
+  const label = knowsTotal ? `Page ${info.page} of ${info.totalPages}` : `Page ${info.page}`;
+  bar.append(prevBtn, el("span", { class: "pagination-status" }, label), nextBtn);
+  return bar;
+}
+
+// Renders a labeled badge span (conflict/cert/ack-state indicators used by
+// the schedule board and communications panels).
+function badge(text, variant) {
+  return el("span", { class: `badge badge-${variant}` }, text);
 }
 
 // Reports module ------------------------------------------------------------
@@ -1183,198 +1286,1691 @@ async function loadReportInbox() {
   await loadReportInboxList();
 }
 
-// Schedule module
-async function loadSchedule() {
-  const container = document.getElementById("schedule-list");
-  if (!container) return;
+// --- Schedule board (SC-08) --------------------------------------------------
+// Week picker, day-column shift grid, assign/unassign, create-shift form,
+// generate-from-templates, and Validate/Publish with readiness badges.
+//
+// Known API gap, worked around rather than papered over: nothing in
+// src/lib/http/scheduling-routes.mjs lists existing shift_assignments (only
+// POST to create one and PATCH to change its status exist) -- so the board
+// can only ever know about an assignment IT created or changed this session.
+// assignmentsByShiftId is that session-local cache; a shift assigned in
+// another tab/session, or before this page loaded, renders as "Unassigned"
+// with an honest caption rather than a guess.
+const schedulePanel = (function () {
+  const state = {
+    weekStartDate: null,
+    periods: [],
+    period: null,
+    shifts: [],
+    employees: [],
+    readiness: null,
+    assignmentsByShiftId: new Map(),
+    createShiftOpen: false,
+    createPeriodBusy: false,
+    formError: null
+  };
 
-  setLoading(container, true);
-  try {
-    const shifts = await apiFetch(`/facilities/${currentFacility}/shifts`);
-    const shiftsData = shifts || [];
-
-    if (shiftsData.length === 0) {
-      container.innerHTML = '<p>No shifts scheduled.</p>';
-      return;
-    }
-
-    let html = "";
-    for (const shift of shiftsData.slice(0, 5)) {
-      const startTime = new Date(shift.starts_at).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit"
-      });
-      const endTime = new Date(shift.ends_at).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit"
-      });
-      html += '<article class="shift-item">';
-      html += `<strong>${escapeHtml(shift.shift_date)} · ${startTime}–${endTime}</strong>`;
-      html += `<span class="item-subtitle">${escapeHtml(shift.role_code)}</span>`;
-      html += '</article>';
-    }
-
-    html += '<button type="button" class="primary schedule-validate-btn" id="validate-schedule-btn">Validate schedule</button>';
-    container.innerHTML = html;
-
-    const validateBtn = document.getElementById("validate-schedule-btn");
-    if (validateBtn) {
-      validateBtn.addEventListener("click", validateSchedule);
-    }
-  } catch (error) {
-    setError(container, error.message);
+  function container() {
+    return document.getElementById("schedule-workspace");
   }
-}
 
-async function validateSchedule() {
-  if (!currentFacility) return;
-  try {
-    const result = await apiFetch(`/facilities/${currentFacility}/schedule/validate`, {
-      method: "POST"
+  function employeeLabel(employeeId) {
+    const employee = state.employees.find((e) => e.id === employeeId);
+    return employee ? `${employee.first_name} ${employee.last_name}` : employeeId;
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    if (!state.weekStartDate) {
+      state.weekStartDate = weekBoundsFor(new Date().toISOString().slice(0, 10)).weekStartDate;
+    }
+    setLoading(host, true);
+    try {
+      const [periods, employees] = await Promise.all([
+        apiFetch(`/facilities/${currentFacility}/schedule-periods`),
+        apiFetch(`/facilities/${currentFacility}/employees`).catch(() => [])
+      ]);
+      state.periods = periods || [];
+      state.employees = employees || [];
+      await reloadWeek();
+    } catch (error) {
+      renderInlineError(host, error);
+    }
+  }
+
+  async function reloadWeek() {
+    state.period = state.periods.find((p) => p.week_start_date === state.weekStartDate && !p.department_id) || null;
+    state.readiness = null;
+    state.assignmentsByShiftId = new Map();
+    if (state.period) {
+      try {
+        state.shifts = (await apiFetch(`/facilities/${currentFacility}/shifts?period_id=${state.period.id}`)) || [];
+        state.formError = null;
+      } catch (error) {
+        state.shifts = [];
+        state.formError = error.message;
+      }
+    } else {
+      state.shifts = [];
+    }
+    render();
+  }
+
+  function reset() {
+    state.createShiftOpen = false;
+    state.readiness = null;
+    state.formError = null;
+    state.assignmentsByShiftId = new Map();
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  function changeWeek(deltaDays) {
+    const [y, m, d] = state.weekStartDate.split("-").map(Number);
+    const date = new Date(Date.UTC(y, m - 1, d));
+    date.setUTCDate(date.getUTCDate() + deltaDays);
+    state.weekStartDate = weekBoundsFor(date.toISOString().slice(0, 10)).weekStartDate;
+    reloadWeek();
+  }
+
+  async function createPeriod() {
+    if (!hasPerm("schedule.manage") || state.createPeriodBusy) return;
+    const { weekStartDate, weekEndDate } = weekBoundsFor(state.weekStartDate);
+    state.createPeriodBusy = true;
+    render();
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/schedule-periods`, {
+        method: "POST",
+        body: { weekStartDate, weekEndDate }
+      });
+      state.periods.push(created);
+      state.createPeriodBusy = false;
+      await reloadWeek();
+    } catch (error) {
+      state.createPeriodBusy = false;
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function generateFromTemplates() {
+    if (!state.period || !hasPerm("schedule.manage")) return;
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/schedule-periods/${state.period.id}/generate`, {
+        method: "POST"
+      });
+      state.shifts = state.shifts.concat(result.inserted || []);
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function runValidate() {
+    if (!state.period) return;
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/schedule/validate?period_id=${state.period.id}`, {
+        method: "POST"
+      });
+      state.readiness = result;
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function runPublish() {
+    if (!state.period || !hasPerm("schedule.publish")) return;
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/schedule-periods/${state.period.id}/publish`, {
+        method: "POST"
+      });
+      state.period = result.period || state.period;
+      const idx = state.periods.findIndex((p) => p.id === state.period.id);
+      if (idx >= 0) state.periods[idx] = state.period;
+      state.formError = null;
+      render();
+    } catch (error) {
+      // A blocking-readiness 409 body carries the same shape
+      // /schedule/validate returns -- reuse it so the badges stay accurate.
+      if (error.details && Array.isArray(error.details.doubleBookings)) {
+        state.readiness = error.details;
+      }
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function assignEmployee(shiftId, employeeId) {
+    if (!employeeId) return;
+    try {
+      const assignment = await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments`, {
+        method: "POST",
+        body: { employeeId }
+      });
+      state.assignmentsByShiftId.set(shiftId, {
+        id: assignment.id,
+        employeeId: assignment.employee_id,
+        label: employeeLabel(assignment.employee_id)
+      });
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function unassign(shiftId) {
+    const assignment = state.assignmentsByShiftId.get(shiftId);
+    if (!assignment) return;
+    try {
+      await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments/${assignment.id}`, {
+        method: "PATCH",
+        body: { status: "cancelled" }
+      });
+      state.assignmentsByShiftId.delete(shiftId);
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function buildCreateShiftForm() {
+    const fields = { roleCode: "", shiftDate: state.weekStartDate, startsAt: "", endsAt: "" };
+    const wrap = el("div", { class: "inline-form" });
+    const roleInput = el("input", { type: "text", placeholder: "Role code (e.g. lifeguard)" });
+    roleInput.addEventListener("input", () => (fields.roleCode = roleInput.value));
+    const dateInput = el("input", { type: "date", value: state.weekStartDate });
+    dateInput.addEventListener("input", () => (fields.shiftDate = dateInput.value));
+    const startInput = el("input", { type: "datetime-local" });
+    startInput.addEventListener("input", () => {
+      fields.startsAt = startInput.value ? new Date(startInput.value).toISOString() : "";
     });
+    const endInput = el("input", { type: "datetime-local" });
+    endInput.addEventListener("input", () => {
+      fields.endsAt = endInput.value ? new Date(endInput.value).toISOString() : "";
+    });
+    const errorEl = el("p", { class: "rr-error" });
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Add shift");
+    submitBtn.addEventListener("click", async () => {
+      const validation = validateShiftCreate(fields);
+      if (!validation.valid) {
+        errorEl.textContent = Object.values(validation.errors).join(" ");
+        return;
+      }
+      try {
+        const created = await apiFetch(`/facilities/${currentFacility}/shifts`, {
+          method: "POST",
+          body: buildShiftCreatePayload({ ...fields, schedulePeriodId: state.period.id })
+        });
+        state.shifts.push(created);
+        state.createShiftOpen = false;
+        render();
+      } catch (error) {
+        errorEl.textContent = error.message;
+      }
+    });
+    wrap.append(
+      el("label", {}, ["Role", roleInput]),
+      el("label", {}, ["Date", dateInput]),
+      el("label", {}, ["Starts", startInput]),
+      el("label", {}, ["Ends", endInput]),
+      submitBtn,
+      errorEl
+    );
+    return wrap;
+  }
 
-    const container = document.getElementById("schedule-list");
-    if (container) {
-      let html = '<div class="validation-result">';
-      html += result.canPublish
-        ? '<div class="validation-success">✓ Schedule is ready to publish</div>'
-        : '<div class="validation-error">✗ Schedule has issues</div>';
+  function buildShiftCard(shift, readiness) {
+    const badges = deriveShiftBadges(shift.id, readiness || {});
+    const card = el("article", { class: "shift-card" });
+    const start = new Date(shift.starts_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const end = new Date(shift.ends_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    card.append(el("strong", {}, `${shift.role_code} · ${start}–${end}`));
 
-      if (result.doubleBookings && result.doubleBookings.length > 0) {
-        html += '<div class="validation-issues"><strong>Double bookings:</strong>';
-        for (const booking of result.doubleBookings) {
-          html += `<div class="issue-item">Employee ${escapeHtml(booking.employeeId)}</div>`;
+    const badgeRow = el("div", { class: "badge-row" });
+    if (badges.conflict) badgeRow.append(badge("Double-booked", "danger"));
+    if (badges.certBlocking) badgeRow.append(badge("Missing cert", "danger"));
+    if (badges.certWarning) badgeRow.append(badge("Cert warning", "warning"));
+    if (badgeRow.childNodes.length > 0) card.append(badgeRow);
+
+    const assignment = state.assignmentsByShiftId.get(shift.id);
+    if (assignment) {
+      card.append(el("span", { class: "item-subtitle" }, `Assigned: ${assignment.label}`));
+      if (hasPerm("schedule.manage")) {
+        const unassignBtn = el("button", { type: "button" }, "Unassign");
+        unassignBtn.addEventListener("click", () => unassign(shift.id));
+        card.append(unassignBtn);
+      }
+    } else {
+      card.append(el("span", { class: "item-subtitle" }, "Unassigned (or assigned outside this session)"));
+      if (hasPerm("schedule.manage") && state.employees.length > 0) {
+        const select = document.createElement("select");
+        select.append(el("option", { value: "" }, "Assign to…"));
+        for (const employee of state.employees) {
+          select.append(el("option", { value: employee.id }, `${employee.first_name} ${employee.last_name}`));
         }
-        html += '</div>';
+        select.addEventListener("change", () => {
+          const employeeId = select.value;
+          select.value = "";
+          assignEmployee(shift.id, employeeId);
+        });
+        card.append(select);
       }
-
-      html += '</div>';
-
-      const scheduleList = container.querySelector("article") || container;
-      scheduleList.insertAdjacentHTML("beforebegin", html);
     }
-  } catch (error) {
-    console.error("Validation failed:", error);
+    return card;
   }
-}
 
-// Incidents module
-async function loadIncidents() {
-  const container = document.getElementById("incidents-list");
-  if (!container) return;
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
 
-  setLoading(container, true);
-  try {
-    const incidents = await apiFetch(`/facilities/${currentFacility}/incidents`);
-    const incidentsData = incidents || [];
-
-    if (incidentsData.length === 0) {
-      container.innerHTML = '<p>No incidents reported.</p>';
-      return;
-    }
-
-    let html = "";
-    for (const incident of incidentsData.slice(0, 5)) {
-      html += '<div class="incident-card">';
-      html += `<strong>${escapeHtml(incident.incident_no)} · ${escapeHtml(incident.report_type)} · ${escapeHtml(incident.severity)}</strong>`;
-      html += `<div class="item-subtitle">${escapeHtml(incident.location_text)}</div>`;
-      html += `<div class="item-subtitle">${escapeHtml(incident.summary)}</div>`;
-      if (incident.requires_osha_review) {
-        html += '<div class="osha-warning">OSHA review required</div>';
-      }
-      html += attachmentsToggleMarkup("incidents", incident.id);
-      html += '</div>';
-    }
-
-    container.innerHTML = html;
-    wireAttachmentToggles(container);
-  } catch (error) {
-    setError(container, error.message);
-  }
-}
-
-// Work orders module
-async function loadWorkOrders() {
-  const container = document.getElementById("work-orders-list");
-  if (!container) return;
-
-  setLoading(container, true);
-  try {
-    const workOrders = await apiFetch(`/facilities/${currentFacility}/work-orders`);
-    const workOrdersData = workOrders || [];
-
-    if (workOrdersData.length === 0) {
-      container.innerHTML = '<p>No work orders.</p>';
-      return;
-    }
-
-    let html = "";
-    for (const wo of workOrdersData.slice(0, 5)) {
-      html += '<div class="work-order-card">';
-      html += `<strong>${escapeHtml(wo.priority)} · ${escapeHtml(wo.title)}</strong>`;
-      html += `<div class="item-subtitle">${escapeHtml(wo.description)}</div>`;
-      if (wo.due_at) {
-        html += `<div class="item-subtitle">Due ${new Date(wo.due_at).toLocaleDateString()}</div>`;
-      }
-      html += attachmentsToggleMarkup("work-orders", wo.id);
-      html += '</div>';
-    }
-
-    container.innerHTML = html;
-    wireAttachmentToggles(container);
-  } catch (error) {
-    setError(container, error.message);
-  }
-}
-
-// Messages module
-async function loadMessages() {
-  const container = document.getElementById("messages-list");
-  if (!container) return;
-
-  setLoading(container, true);
-  try {
-    const messages = await apiFetch(`/facilities/${currentFacility}/messages`);
-    const messagesData = messages || [];
-
-    if (messagesData.length === 0) {
-      container.innerHTML = '<p>No messages.</p>';
-      return;
-    }
-
-    let html = "";
-    for (const message of messagesData.slice(0, 5)) {
-      html += '<div class="message-card">';
-      html += `<strong>${escapeHtml(message.priority)} · ${escapeHtml(message.subject)}</strong>`;
-      html += `<div class="item-subtitle">${escapeHtml(message.body_text.substring(0, 100))}</div>`;
-      if (message.is_required_ack) {
-        html += `<button type="button" class="ack-btn primary message-action-btn" data-message-id="${escapeHtml(message.id)}">Acknowledge</button>`;
-      }
-      html += '</div>';
-    }
-
-    container.innerHTML = html;
-
-    // Wire acknowledge buttons
-    document.querySelectorAll(".ack-btn").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        const messageId = e.target.getAttribute("data-message-id");
-        await acknowledgeMessage(messageId);
-      });
+    const picker = el("div", { class: "schedule-week-picker" });
+    const prevBtn = el("button", { type: "button" }, "◀ Prev week");
+    prevBtn.addEventListener("click", () => changeWeek(-7));
+    const nextBtn = el("button", { type: "button" }, "Next week ▶");
+    nextBtn.addEventListener("click", () => changeWeek(7));
+    const dateInput = el("input", { type: "date", value: state.weekStartDate });
+    dateInput.addEventListener("change", () => {
+      state.weekStartDate = weekBoundsFor(dateInput.value).weekStartDate;
+      reloadWeek();
     });
-  } catch (error) {
-    setError(container, error.message);
-  }
-}
+    picker.append(prevBtn, el("label", {}, ["Week of", dateInput]), nextBtn);
+    host.append(picker);
 
-async function acknowledgeMessage(messageId) {
-  try {
-    await apiFetch(`/messages/${messageId}/acknowledge`, { method: "POST" });
-    await loadMessages();
-  } catch (error) {
-    console.error("Failed to acknowledge message:", error);
+    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+
+    if (!state.period) {
+      const empty = el("div", { class: "module-item" });
+      empty.append(el("p", {}, `No schedule period exists yet for the week of ${state.weekStartDate}.`));
+      if (hasPerm("schedule.manage")) {
+        const createBtn = el(
+          "button",
+          { type: "button", class: "primary" },
+          state.createPeriodBusy ? "Creating…" : "Create schedule period"
+        );
+        createBtn.disabled = state.createPeriodBusy;
+        createBtn.addEventListener("click", () => createPeriod());
+        empty.append(createBtn);
+      }
+      host.append(empty);
+      return;
+    }
+
+    const actions = el("div", { class: "schedule-actions" });
+    actions.append(
+      el("span", { class: "item-subtitle" }, `Period status: ${state.period.status} · publish v${state.period.publish_version ?? 0}`)
+    );
+    if (hasPerm("schedule.manage")) {
+      const generateBtn = el("button", { type: "button" }, "Generate from templates");
+      generateBtn.addEventListener("click", () => generateFromTemplates());
+      actions.append(generateBtn);
+    }
+    const validateBtn = el("button", { type: "button" }, "Validate");
+    validateBtn.addEventListener("click", () => runValidate());
+    actions.append(validateBtn);
+    if (hasPerm("schedule.publish")) {
+      const publishBtn = el("button", { type: "button", class: "primary" }, "Publish");
+      publishBtn.addEventListener("click", () => runPublish());
+      actions.append(publishBtn);
+    }
+    if (hasPerm("schedule.manage")) {
+      const toggleBtn = el("button", { type: "button" }, state.createShiftOpen ? "Cancel new shift" : "Add shift");
+      toggleBtn.addEventListener("click", () => {
+        state.createShiftOpen = !state.createShiftOpen;
+        render();
+      });
+      actions.append(toggleBtn);
+    }
+    host.append(actions);
+
+    if (state.createShiftOpen) host.append(buildCreateShiftForm());
+
+    if (state.readiness) {
+      const panel = el("div", { class: "validation-result" });
+      panel.append(
+        el(
+          "div",
+          { class: state.readiness.canPublish ? "validation-success" : "validation-error" },
+          state.readiness.canPublish ? "✓ Ready to publish" : "✗ Not ready to publish"
+        )
+      );
+      const warnings = state.readiness.warnings || [];
+      if (warnings.length > 0) {
+        panel.append(el("p", { class: "item-subtitle" }, `${warnings.length} certification warning(s) (non-blocking).`));
+      }
+      host.append(panel);
+    }
+
+    const board = el("div", { class: "schedule-board" });
+    const days = bucketShiftsByDay(state.shifts, state.weekStartDate);
+    for (const day of days) {
+      const column = el("div", { class: "schedule-day-column" });
+      column.append(el("h4", {}, `${day.weekday} ${day.date}`));
+      if (day.shifts.length === 0) {
+        column.append(el("p", { class: "item-subtitle" }, "No shifts."));
+      } else {
+        for (const shift of day.shifts) column.append(buildShiftCard(shift, state.readiness));
+      }
+      board.append(column);
+    }
+    host.append(board);
   }
-}
+
+  return { load, reset };
+})();
+
+// --- Incidents module (IN-10) -------------------------------------------------
+// Capture form (draft -> submit), paginated list, and a detail view: status +
+// submit/status actions, follow-ups (create/complete), escalation history
+// (acknowledge/resolve), amendment history (clearly labeled immutable), and
+// attachments. A "People involved" section is intentionally a placeholder --
+// no incident_people/witness API exists anywhere in this codebase yet
+// (IN-12 is unbuilt), so nothing is fabricated for it.
+const incidentsPanel = (function () {
+  const state = {
+    items: [],
+    page: 1,
+    pageSize: 5,
+    captureOpen: false,
+    captureFields: emptyCaptureFields(),
+    captureErrors: {},
+    formError: null,
+    detailId: null,
+    detail: null,
+    detailError: null,
+    detailActionError: null,
+    followups: [],
+    followupsError: null,
+    followupOpen: false,
+    followupFields: { actionType: "", description: "", dueAt: "" },
+    followupErrors: {},
+    escalations: [],
+    escalationsError: null,
+    amendments: [],
+    amendmentsError: null,
+    amendOpen: false,
+    amendFields: { reason: "", patch: {} },
+    amendErrors: {}
+  };
+
+  function emptyCaptureFields() {
+    return {
+      reportType: "",
+      severity: "",
+      occurredAt: "",
+      locationText: "",
+      summary: "",
+      immediateActions: "",
+      requiresOshaReview: false
+    };
+  }
+
+  function container() {
+    return document.getElementById("incidents-workspace");
+  }
+
+  function refreshListItem(updated) {
+    if (!updated || !updated.id) return;
+    state.items = state.items.map((item) => (item.id === updated.id ? { ...item, ...updated } : item));
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    try {
+      state.items = (await apiFetch(`/facilities/${currentFacility}/incidents`)) || [];
+      state.page = 1;
+      render();
+    } catch (error) {
+      renderInlineError(host, error);
+    }
+  }
+
+  function reset() {
+    state.items = [];
+    state.captureOpen = false;
+    state.captureFields = emptyCaptureFields();
+    state.captureErrors = {};
+    state.formError = null;
+    state.page = 1;
+    state.detailId = null;
+    state.detail = null;
+    state.followups = [];
+    state.escalations = [];
+    state.amendments = [];
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  async function submitCapture() {
+    const validation = validateIncidentCapture(state.captureFields);
+    state.captureErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/incidents`, {
+        method: "POST",
+        body: buildIncidentCreatePayload(state.captureFields)
+      });
+      state.items.unshift(created);
+      state.captureOpen = false;
+      state.captureFields = emptyCaptureFields();
+      state.captureErrors = {};
+      state.formError = null;
+      render();
+      await openDetail(created.id);
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function openDetail(id) {
+    state.detailId = id;
+    state.detail = null;
+    state.detailError = null;
+    state.detailActionError = null;
+    state.followups = [];
+    state.followupsError = null;
+    state.escalations = [];
+    state.escalationsError = null;
+    state.amendments = [];
+    state.amendmentsError = null;
+    render();
+    try {
+      state.detail = await apiFetch(`/incidents/${id}`);
+    } catch (error) {
+      state.detailError = error.message;
+      render();
+      return;
+    }
+    const [followups, amendments] = await Promise.all([
+      apiFetch(`/incidents/${id}/followups`).catch((error) => {
+        state.followupsError = error.message;
+        return [];
+      }),
+      apiFetch(`/incidents/${id}/amendments`).catch((error) => {
+        state.amendmentsError = error.message;
+        return [];
+      })
+    ]);
+    state.followups = followups || [];
+    state.amendments = amendments || [];
+    // No per-incident escalations route exists -- the facility-wide list is
+    // filtered client-side to this incident's rows.
+    try {
+      const escalations = await apiFetch(`/facilities/${currentFacility}/incident-escalations`);
+      state.escalations = (escalations || []).filter((row) => row.incident_id === id);
+    } catch (error) {
+      state.escalationsError = error.message;
+    }
+    render();
+  }
+
+  function closeDetail() {
+    state.detailId = null;
+    state.detail = null;
+    render();
+  }
+
+  async function submitIncident() {
+    try {
+      const result = await apiFetch(`/incidents/${state.detailId}/submit`, { method: "POST" });
+      state.detail = result;
+      state.detailActionError = null;
+      refreshListItem(result);
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function changeStatus(nextStatus, reason) {
+    if (!nextStatus) return;
+    try {
+      const body = reason && reason.trim() ? { to: nextStatus, reason: reason.trim() } : { to: nextStatus };
+      const result = await apiFetch(`/incidents/${state.detailId}/status`, { method: "POST", body });
+      state.detail = result;
+      state.detailActionError = null;
+      refreshListItem(result);
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function escalate() {
+    try {
+      await apiFetch(`/incidents/${state.detailId}/escalate`, { method: "POST", body: {} });
+      const escalations = await apiFetch(`/facilities/${currentFacility}/incident-escalations`);
+      state.escalations = (escalations || []).filter((row) => row.incident_id === state.detailId);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function actOnEscalation(escalationId, action) {
+    try {
+      const updated = await apiFetch(`/escalations/${escalationId}/${action}`, { method: "POST" });
+      state.escalations = state.escalations.map((row) => (row.id === escalationId ? updated : row));
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function createFollowup() {
+    const validation = validateFollowupInput(state.followupFields);
+    state.followupErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/incidents/${state.detailId}/followups`, {
+        method: "POST",
+        body: buildFollowupPayload(state.followupFields)
+      });
+      state.followups.push(created);
+      state.followupOpen = false;
+      state.followupFields = { actionType: "", description: "", dueAt: "" };
+      state.followupErrors = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function completeFollowup(id) {
+    try {
+      const updated = await apiFetch(`/followups/${id}`, { method: "PATCH", body: { status: "completed" } });
+      state.followups = state.followups.map((row) => (row.id === id ? updated : row));
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function submitAmendment() {
+    const validation = validateAmendmentInput(state.amendFields);
+    state.amendErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const result = await apiFetch(`/incidents/${state.detailId}/amendments`, {
+        method: "POST",
+        body: buildAmendmentPayload(state.amendFields)
+      });
+      state.amendments.push(result.amendment);
+      state.detail = result.incident || state.detail;
+      state.amendOpen = false;
+      state.amendFields = { reason: "", patch: {} };
+      state.amendErrors = {};
+      state.detailActionError = null;
+      refreshListItem(state.detail);
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  function buildCaptureForm() {
+    const f = state.captureFields;
+    const errors = state.captureErrors;
+    const wrap = el("div", { class: "inline-form incident-capture-form" });
+
+    function fieldRow(labelText, input, errorKey, required) {
+      const row = el("div", { class: "report-field" });
+      row.append(el("label", {}, `${labelText}${required ? " *" : ""}`));
+      row.append(input);
+      if (errors[errorKey]) row.append(el("div", { class: "field-error rr-error" }, errors[errorKey]));
+      return row;
+    }
+
+    const typeSelect = document.createElement("select");
+    typeSelect.append(el("option", { value: "" }, "Select type"));
+    for (const type of INCIDENT_REPORT_TYPES) {
+      const opt = el("option", { value: type }, type.replace(/_/g, " "));
+      if (f.reportType === type) opt.selected = true;
+      typeSelect.append(opt);
+    }
+    typeSelect.addEventListener("change", () => {
+      f.reportType = typeSelect.value;
+      render();
+    });
+
+    const severitySelect = document.createElement("select");
+    severitySelect.append(el("option", { value: "" }, "Select severity"));
+    for (const severity of INCIDENT_SEVERITIES) {
+      const opt = el("option", { value: severity }, severity);
+      if (f.severity === severity) opt.selected = true;
+      severitySelect.append(opt);
+    }
+    severitySelect.addEventListener("change", () => {
+      f.severity = severitySelect.value;
+      render();
+    });
+
+    const occurredInput = el("input", { type: "datetime-local" });
+    occurredInput.addEventListener("input", () => {
+      f.occurredAt = occurredInput.value ? new Date(occurredInput.value).toISOString() : "";
+    });
+
+    const locationInput = el("input", { type: "text", value: f.locationText });
+    locationInput.addEventListener("input", () => (f.locationText = locationInput.value));
+
+    const summaryInput = document.createElement("textarea");
+    summaryInput.value = f.summary;
+    summaryInput.addEventListener("input", () => (f.summary = summaryInput.value));
+
+    const gated = severityRequiresGating(f.severity);
+    const actionsInput = document.createElement("textarea");
+    actionsInput.value = f.immediateActions;
+    actionsInput.addEventListener("input", () => (f.immediateActions = actionsInput.value));
+
+    const oshaCheckbox = document.createElement("input");
+    oshaCheckbox.type = "checkbox";
+    oshaCheckbox.checked = !!f.requiresOshaReview;
+    oshaCheckbox.addEventListener("change", () => (f.requiresOshaReview = oshaCheckbox.checked));
+
+    wrap.append(
+      fieldRow("Incident type", typeSelect, "reportType", true),
+      fieldRow("Severity", severitySelect, "severity", true),
+      fieldRow("Occurred at", occurredInput, "occurredAt", true),
+      fieldRow("Location", locationInput, "locationText", true),
+      fieldRow("Summary", summaryInput, "summary", true),
+      fieldRow(
+        `Immediate actions${gated ? " (required for high/critical severity)" : ""}`,
+        actionsInput,
+        "immediateActions",
+        gated
+      ),
+      el("label", { class: "report-field-option" }, [oshaCheckbox, " Requires OSHA review"])
+    );
+
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Save draft incident");
+    submitBtn.addEventListener("click", () => submitCapture());
+    wrap.append(submitBtn);
+    if (state.formError) wrap.append(el("p", { class: "rr-error" }, state.formError));
+    return wrap;
+  }
+
+  function buildFollowupForm() {
+    const wrap = el("div", { class: "inline-form" });
+    const typeSelect = document.createElement("select");
+    typeSelect.append(el("option", { value: "" }, "Action type"));
+    for (const type of FOLLOWUP_ACTION_TYPES) {
+      const opt = el("option", { value: type }, type.replace(/_/g, " "));
+      if (state.followupFields.actionType === type) opt.selected = true;
+      typeSelect.append(opt);
+    }
+    typeSelect.addEventListener("change", () => (state.followupFields.actionType = typeSelect.value));
+    const descInput = document.createElement("textarea");
+    descInput.placeholder = "Description";
+    descInput.value = state.followupFields.description;
+    descInput.addEventListener("input", () => (state.followupFields.description = descInput.value));
+    const dueInput = el("input", { type: "date" });
+    dueInput.addEventListener("input", () => {
+      state.followupFields.dueAt = dueInput.value ? new Date(dueInput.value).toISOString() : "";
+    });
+    const errorEl = el("p", { class: "rr-error" }, Object.values(state.followupErrors).join(" "));
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Create follow-up");
+    submitBtn.addEventListener("click", () => createFollowup());
+    wrap.append(typeSelect, descInput, dueInput, submitBtn, errorEl);
+    return wrap;
+  }
+
+  function buildAmendmentForm() {
+    const wrap = el("div", { class: "inline-form" });
+    const reasonInput = document.createElement("textarea");
+    reasonInput.placeholder = "Reason for this amendment";
+    reasonInput.value = state.amendFields.reason;
+    reasonInput.addEventListener("input", () => (state.amendFields.reason = reasonInput.value));
+    wrap.append(el("label", {}, ["Reason", reasonInput]));
+
+    for (const fieldKey of AMENDABLE_INCIDENT_FIELDS) {
+      const row = el("div", { class: "report-field-option" });
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      const existing = state.amendFields.patch[fieldKey];
+      checkbox.checked = existing !== undefined;
+
+      let valueControl;
+      if (fieldKey === "severity") {
+        valueControl = document.createElement("select");
+        valueControl.append(el("option", { value: "" }, "-"));
+        for (const severity of INCIDENT_SEVERITIES) valueControl.append(el("option", { value: severity }, severity));
+        if (existing !== undefined) valueControl.value = existing;
+      } else if (fieldKey === "requires_osha_review") {
+        valueControl = document.createElement("input");
+        valueControl.type = "checkbox";
+        if (existing !== undefined) valueControl.checked = !!existing;
+      } else {
+        valueControl = document.createElement("textarea");
+        if (existing !== undefined) valueControl.value = existing;
+      }
+
+      const syncPatch = () => {
+        if (!checkbox.checked) {
+          delete state.amendFields.patch[fieldKey];
+          return;
+        }
+        state.amendFields.patch[fieldKey] =
+          fieldKey === "requires_osha_review" ? valueControl.checked : valueControl.value;
+      };
+      checkbox.addEventListener("change", syncPatch);
+      valueControl.addEventListener("input", syncPatch);
+      valueControl.addEventListener("change", syncPatch);
+
+      row.append(checkbox, ` ${fieldKey.replace(/_/g, " ")} `, valueControl);
+      wrap.append(row);
+    }
+
+    const errorText = [state.amendErrors.reason, state.amendErrors.patch].filter(Boolean).join(" ");
+    if (errorText) wrap.append(el("p", { class: "rr-error" }, errorText));
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Submit amendment");
+    submitBtn.addEventListener("click", () => submitAmendment());
+    wrap.append(submitBtn);
+    return wrap;
+  }
+
+  const INCIDENT_NEXT_STATUS_CHOICES = ["under_review", "escalated", "action_pending", "closed"];
+
+  function renderDetail() {
+    const panel = el("div", { class: "report-form-area incident-detail" });
+    const header = el("div", { class: "report-form-header" });
+    header.append(el("h3", {}, state.detail ? state.detail.incident_no : "Loading incident…"));
+    const closeBtn = el("button", { type: "button" }, "Close");
+    closeBtn.addEventListener("click", () => closeDetail());
+    header.append(closeBtn);
+    panel.append(header);
+
+    if (state.detailError) {
+      panel.append(el("p", { class: "rr-error" }, state.detailError));
+      return panel;
+    }
+    if (!state.detail) {
+      panel.append(el("p", {}, "Loading…"));
+      return panel;
+    }
+    const d = state.detail;
+    if (state.detailActionError) panel.append(el("p", { class: "rr-error" }, state.detailActionError));
+
+    const meta = el("div", { class: "report-inbox-meta" });
+    meta.append(el("p", {}, `Status: ${d.status} · Severity: ${d.severity} · Type: ${d.report_type}`));
+    meta.append(el("p", { class: "item-subtitle" }, d.summary));
+    if (d.immediate_actions) meta.append(el("p", { class: "item-subtitle" }, `Immediate actions: ${d.immediate_actions}`));
+    panel.append(meta);
+
+    const actionsRow = el("div", { class: "detail-actions" });
+    if (d.status === "draft" && hasPerm("incidents.manage")) {
+      const submitBtn = el("button", { type: "button", class: "primary" }, "Submit incident");
+      submitBtn.addEventListener("click", () => submitIncident());
+      actionsRow.append(submitBtn);
+    }
+    if (hasPerm("incidents.manage")) {
+      const escalateBtn = el("button", { type: "button" }, "Escalate");
+      escalateBtn.addEventListener("click", () => escalate());
+      actionsRow.append(escalateBtn);
+    }
+    if (hasPerm("incidents.review") && d.status !== "draft" && d.status !== "closed") {
+      const select = document.createElement("select");
+      for (const status of INCIDENT_NEXT_STATUS_CHOICES) select.append(el("option", { value: status }, status));
+      const reasonInput = el("input", { type: "text", placeholder: "Reason (optional)" });
+      const changeBtn = el("button", { type: "button" }, "Change status");
+      changeBtn.addEventListener("click", () => changeStatus(select.value, reasonInput.value));
+      actionsRow.append(select, reasonInput, changeBtn);
+    }
+    if (actionsRow.childNodes.length > 0) panel.append(actionsRow);
+
+    panel.append(el("h4", {}, "People involved"));
+    panel.append(el("p", { class: "item-subtitle" }, "Person/witness tracking isn't available in this release yet."));
+
+    panel.append(el("h4", {}, "Follow-up actions"));
+    if (state.followupsError) panel.append(el("p", { class: "rr-error" }, state.followupsError));
+    if (state.followups.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No follow-up actions yet."));
+    for (const followup of state.followups) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${followup.action_type} · ${followup.status}`));
+      row.append(el("div", { class: "item-subtitle" }, followup.description));
+      if (followup.due_at) {
+        row.append(el("div", { class: "item-subtitle" }, `Due ${new Date(followup.due_at).toLocaleDateString()}`));
+      }
+      if (followup.status !== "completed" && followup.status !== "waived" && hasPerm("incidents.manage")) {
+        const completeBtn = el("button", { type: "button" }, "Mark complete");
+        completeBtn.addEventListener("click", () => completeFollowup(followup.id));
+        row.append(completeBtn);
+      }
+      panel.append(row);
+    }
+    if (hasPerm("incidents.tasks.create")) {
+      const toggleBtn = el("button", { type: "button" }, state.followupOpen ? "Cancel" : "Add follow-up");
+      toggleBtn.addEventListener("click", () => {
+        state.followupOpen = !state.followupOpen;
+        render();
+      });
+      panel.append(toggleBtn);
+      if (state.followupOpen) panel.append(buildFollowupForm());
+    }
+
+    panel.append(el("h4", {}, "Escalation history"));
+    if (state.escalationsError) panel.append(el("p", { class: "rr-error" }, state.escalationsError));
+    if (state.escalations.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No escalations."));
+    for (const escalation of state.escalations) {
+      const row = el("div", { class: "module-item" });
+      row.append(
+        el("div", { class: "item-title" }, `Level ${escalation.escalation_level} · ${escalation.target_role} · ${escalation.status}`)
+      );
+      row.append(el("div", { class: "item-subtitle" }, `Due ${new Date(escalation.due_at).toLocaleString()}`));
+      if (escalation.overdue) row.append(badge("Overdue", "danger"));
+      const action = nextEscalationAction(escalation.status);
+      if (action && hasPerm("incidents.manage")) {
+        const actionBtn = el("button", { type: "button" }, action === "acknowledge" ? "Acknowledge" : "Resolve");
+        actionBtn.addEventListener("click", () => actOnEscalation(escalation.id, action));
+        row.append(actionBtn);
+      }
+      panel.append(row);
+    }
+
+    panel.append(el("h4", {}, "Amendment history (immutable — every amendment is permanently retained)"));
+    if (state.amendmentsError) panel.append(el("p", { class: "rr-error" }, state.amendmentsError));
+    if (state.amendments.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No amendments."));
+    for (const amendment of state.amendments) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `Amended ${new Date(amendment.amended_at).toLocaleString()}`));
+      row.append(el("div", { class: "item-subtitle" }, amendment.amendment_reason));
+      const before = amendment.before_snapshot || {};
+      const after = amendment.after_snapshot || {};
+      const changed = AMENDABLE_INCIDENT_FIELDS.filter((key) => key in after && before[key] !== after[key]);
+      for (const key of changed) {
+        row.append(el("div", { class: "item-subtitle" }, `${key}: ${before[key]} → ${after[key]}`));
+      }
+      panel.append(row);
+    }
+    if ((hasPerm("incidents.manage") || hasPerm("incidents.review")) && d.status !== "draft") {
+      const toggleBtn = el("button", { type: "button" }, state.amendOpen ? "Cancel" : "Amend incident");
+      toggleBtn.addEventListener("click", () => {
+        state.amendOpen = !state.amendOpen;
+        render();
+      });
+      panel.append(toggleBtn);
+      if (state.amendOpen) panel.append(buildAmendmentForm());
+    }
+
+    panel.append(el("h4", {}, "Attachments"));
+    panel.append(buildAttachmentsToggle("incidents", d.id, hasPerm("incidents.manage")));
+    wireAttachmentToggles(panel);
+
+    return panel;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+
+    if (hasPerm("incidents.manage")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.captureOpen ? "Cancel new incident" : "Report new incident"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.captureOpen = !state.captureOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.captureOpen) host.append(buildCaptureForm());
+    }
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.items.length === 0) {
+      listWrap.append(el("p", {}, "No incidents reported."));
+    } else {
+      const { pageItems, ...pageInfo } = paginate(state.items, state.page, state.pageSize);
+      for (const incident of pageItems) {
+        const card = el("div", { class: "incident-card" });
+        card.append(el("strong", {}, `${incident.incident_no} · ${incident.report_type} · ${incident.severity}`));
+        card.append(el("div", { class: "item-subtitle" }, incident.location_text));
+        card.append(el("div", { class: "item-subtitle" }, `Status: ${incident.status}`));
+        if (incident.requires_osha_review) card.append(el("div", { class: "osha-warning" }, "OSHA review required"));
+        const viewBtn = el("button", { type: "button" }, "View");
+        viewBtn.addEventListener("click", () => openDetail(incident.id));
+        card.append(viewBtn);
+        listWrap.append(card);
+      }
+      const bar = buildPaginationBar(pageInfo, (p) => {
+        state.page = p;
+        render();
+      });
+      if (bar) listWrap.append(bar);
+    }
+    host.append(listWrap);
+
+    if (state.detailId) host.append(renderDetail());
+  }
+
+  return { load, reset };
+})();
+
+// --- Work orders module (WO-10) -----------------------------------------------
+// Filter chips (open/mine/overdue) + priority, create form, server-paginated
+// list (WO-05's ?limit=/?offset=), and a detail view with the comment thread
+// and status/assign actions.
+const workOrdersPanel = (function () {
+  const state = {
+    items: [],
+    page: 1,
+    pageSize: 10,
+    chip: "all",
+    priority: "",
+    employees: [],
+    myEmployeeId: null,
+    createOpen: false,
+    createFields: emptyCreateFields(),
+    createErrors: {},
+    formError: null,
+    detailId: null,
+    detail: null,
+    detailError: null,
+    detailActionError: null,
+    updates: [],
+    updatesError: null,
+    commentText: ""
+  };
+
+  function emptyCreateFields() {
+    return { title: "", description: "", priority: "", assetId: "", assignedToEmployeeId: "", dueAt: "" };
+  }
+
+  function container() {
+    return document.getElementById("work-orders-workspace");
+  }
+
+  function refreshListItem(updated) {
+    if (!updated || !updated.id) return;
+    state.items = state.items.map((item) => (item.id === updated.id ? { ...item, ...updated } : item));
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    // GET /facilities/:id/employees is registered by the scheduling module
+    // (gated on schedule.read) but serves as the facility's employee
+    // directory app-wide -- reused here for the assignee picker and to
+    // resolve the caller's own employee id for the "Mine" filter chip.
+    const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
+    state.employees = employees || [];
+    state.myEmployeeId = (state.employees.find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
+    await loadList();
+  }
+
+  async function loadList() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    try {
+      const params = buildWorkOrderQuery({
+        chip: state.chip,
+        priority: state.priority,
+        myEmployeeId: state.myEmployeeId,
+        page: state.page,
+        pageSize: state.pageSize
+      });
+      state.items = (await apiFetch(`/facilities/${currentFacility}/work-orders?${params.toString()}`)) || [];
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.items = [];
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function reset() {
+    state.items = [];
+    state.createOpen = false;
+    state.createFields = emptyCreateFields();
+    state.createErrors = {};
+    state.formError = null;
+    state.chip = "all";
+    state.priority = "";
+    state.page = 1;
+    state.detailId = null;
+    state.detail = null;
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  function setChip(chip) {
+    state.chip = chip;
+    state.page = 1;
+    loadList();
+  }
+
+  function setPriority(priority) {
+    state.priority = priority;
+    state.page = 1;
+    loadList();
+  }
+
+  function changePage(page) {
+    state.page = Math.max(1, page);
+    loadList();
+  }
+
+  async function createWorkOrder() {
+    const validation = validateWorkOrderCreate(state.createFields);
+    state.createErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/work-orders`, {
+        method: "POST",
+        body: buildWorkOrderCreatePayload(state.createFields)
+      });
+      state.createOpen = false;
+      state.createFields = emptyCreateFields();
+      state.createErrors = {};
+      state.formError = null;
+      await loadList();
+      await openDetail(created.id);
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function openDetail(id) {
+    state.detailId = id;
+    state.detail = null;
+    state.detailError = null;
+    state.detailActionError = null;
+    state.updates = [];
+    state.updatesError = null;
+    render();
+    try {
+      state.detail = await apiFetch(`/work-orders/${id}`);
+    } catch (error) {
+      state.detailError = error.message;
+      render();
+      return;
+    }
+    try {
+      state.updates = (await apiFetch(`/work-orders/${id}/updates`)) || [];
+    } catch (error) {
+      state.updatesError = error.message;
+    }
+    render();
+  }
+
+  function closeDetail() {
+    state.detailId = null;
+    state.detail = null;
+    render();
+  }
+
+  async function postComment() {
+    const text = (state.commentText || "").trim();
+    if (!text) return;
+    try {
+      const created = await apiFetch(`/work-orders/${state.detailId}/updates`, { method: "POST", body: { body: text } });
+      state.updates.push(created);
+      state.commentText = "";
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function changeStatus(nextStatus) {
+    try {
+      const updated = await apiFetch(`/work-orders/${state.detailId}`, { method: "PATCH", body: { status: nextStatus } });
+      state.detail = updated;
+      refreshListItem(updated);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function assign(employeeId) {
+    try {
+      const updated = await apiFetch(`/work-orders/${state.detailId}`, {
+        method: "PATCH",
+        body: { assigned_to_employee_id: employeeId || null }
+      });
+      state.detail = updated;
+      refreshListItem(updated);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  function buildCreateForm() {
+    const f = state.createFields;
+    const wrap = el("div", { class: "inline-form" });
+    const titleInput = el("input", { type: "text", value: f.title, placeholder: "Title" });
+    titleInput.addEventListener("input", () => (f.title = titleInput.value));
+    const descInput = document.createElement("textarea");
+    descInput.placeholder = "Description";
+    descInput.value = f.description;
+    descInput.addEventListener("input", () => (f.description = descInput.value));
+    const prioritySelect = document.createElement("select");
+    prioritySelect.append(el("option", { value: "" }, "Select priority"));
+    for (const priority of WORK_ORDER_PRIORITIES) prioritySelect.append(el("option", { value: priority }, priority));
+    prioritySelect.value = f.priority;
+    prioritySelect.addEventListener("change", () => (f.priority = prioritySelect.value));
+    const assetInput = el("input", { type: "text", placeholder: "Asset ID (optional)" });
+    assetInput.addEventListener("input", () => (f.assetId = assetInput.value));
+    const assigneeSelect = document.createElement("select");
+    assigneeSelect.append(el("option", { value: "" }, "Unassigned"));
+    for (const employee of state.employees) {
+      assigneeSelect.append(el("option", { value: employee.id }, `${employee.first_name} ${employee.last_name}`));
+    }
+    assigneeSelect.addEventListener("change", () => (f.assignedToEmployeeId = assigneeSelect.value));
+    const dueInput = el("input", { type: "date" });
+    dueInput.addEventListener("input", () => {
+      f.dueAt = dueInput.value ? new Date(dueInput.value).toISOString() : "";
+    });
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Create work order");
+    submitBtn.addEventListener("click", () => createWorkOrder());
+    const errorEl = el("p", { class: "rr-error" }, Object.values(state.createErrors).join(" "));
+    wrap.append(
+      el("label", {}, ["Title", titleInput]),
+      el("label", {}, ["Description", descInput]),
+      el("label", {}, ["Priority", prioritySelect]),
+      el("label", {}, ["Asset", assetInput]),
+      el("label", {}, ["Assignee", assigneeSelect]),
+      el("label", {}, ["Due date", dueInput]),
+      submitBtn,
+      errorEl
+    );
+    return wrap;
+  }
+
+  function buildCard(wo) {
+    const card = el("div", { class: "work-order-card" });
+    card.append(el("strong", {}, `${wo.priority} · ${wo.title}`));
+    card.append(el("div", { class: "item-subtitle" }, wo.description));
+    card.append(el("div", { class: "item-subtitle" }, `Status: ${wo.status}`));
+    if (wo.due_at) card.append(el("div", { class: "item-subtitle" }, `Due ${new Date(wo.due_at).toLocaleDateString()}`));
+    const viewBtn = el("button", { type: "button" }, "View");
+    viewBtn.addEventListener("click", () => openDetail(wo.id));
+    card.append(viewBtn);
+    card.append(buildAttachmentsToggle("work-orders", wo.id, hasPerm("work_orders.manage")));
+    return card;
+  }
+
+  function renderDetail() {
+    const panel = el("div", { class: "report-form-area work-order-detail" });
+    const header = el("div", { class: "report-form-header" });
+    header.append(el("h3", {}, state.detail ? state.detail.title : "Loading work order…"));
+    const closeBtn = el("button", { type: "button" }, "Close");
+    closeBtn.addEventListener("click", () => closeDetail());
+    header.append(closeBtn);
+    panel.append(header);
+
+    if (state.detailError) {
+      panel.append(el("p", { class: "rr-error" }, state.detailError));
+      return panel;
+    }
+    if (!state.detail) {
+      panel.append(el("p", {}, "Loading…"));
+      return panel;
+    }
+    const wo = state.detail;
+    if (state.detailActionError) panel.append(el("p", { class: "rr-error" }, state.detailActionError));
+
+    panel.append(el("p", { class: "item-subtitle" }, wo.description));
+    panel.append(
+      el(
+        "p",
+        {},
+        `Priority: ${wo.priority} · Status: ${wo.status}${wo.due_at ? " · Due " + new Date(wo.due_at).toLocaleDateString() : ""}`
+      )
+    );
+
+    if (hasPerm("work_orders.manage")) {
+      const actionsRow = el("div", { class: "detail-actions" });
+      const statusSelect = document.createElement("select");
+      for (const status of WORK_ORDER_STATUSES) statusSelect.append(el("option", { value: status }, status));
+      statusSelect.value = wo.status;
+      const statusBtn = el("button", { type: "button" }, "Update status");
+      statusBtn.addEventListener("click", () => changeStatus(statusSelect.value));
+      actionsRow.append(statusSelect, statusBtn);
+
+      if (state.employees.length > 0) {
+        const assignSelect = document.createElement("select");
+        assignSelect.append(el("option", { value: "" }, "Unassigned"));
+        for (const employee of state.employees) {
+          const opt = el("option", { value: employee.id }, `${employee.first_name} ${employee.last_name}`);
+          if (employee.id === wo.assigned_to_employee_id) opt.selected = true;
+          assignSelect.append(opt);
+        }
+        const assignBtn = el("button", { type: "button" }, "Assign");
+        assignBtn.addEventListener("click", () => assign(assignSelect.value));
+        actionsRow.append(assignSelect, assignBtn);
+      }
+      panel.append(actionsRow);
+    }
+
+    panel.append(el("h4", {}, "Comments"));
+    if (state.updatesError) panel.append(el("p", { class: "rr-error" }, state.updatesError));
+    if (state.updates.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No updates yet."));
+    for (const update of state.updates) {
+      const row = el("div", { class: "module-item" });
+      const label = update.update_type === "comment" ? "Comment" : update.update_type.replace(/_/g, " ");
+      row.append(el("div", { class: "item-title" }, label));
+      if (update.body) row.append(el("div", {}, update.body));
+      if (update.previous_value !== null || update.new_value !== null) {
+        row.append(el("div", { class: "item-subtitle" }, `${update.previous_value ?? "—"} → ${update.new_value ?? "—"}`));
+      }
+      row.append(el("div", { class: "item-subtitle" }, new Date(update.created_at).toLocaleString()));
+      panel.append(row);
+    }
+    if (hasPerm("work_orders.manage")) {
+      const commentBox = document.createElement("textarea");
+      commentBox.placeholder = "Add a comment";
+      commentBox.value = state.commentText;
+      commentBox.addEventListener("input", () => (state.commentText = commentBox.value));
+      const postBtn = el("button", { type: "button", class: "primary" }, "Post comment");
+      postBtn.addEventListener("click", () => postComment());
+      panel.append(commentBox, postBtn);
+    }
+
+    panel.append(el("h4", {}, "Attachments"));
+    panel.append(buildAttachmentsToggle("work-orders", wo.id, hasPerm("work_orders.manage")));
+    wireAttachmentToggles(panel);
+
+    return panel;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+
+    const chipsRow = el("div", { class: "filter-chips" });
+    const chipLabels = { all: "All", open: "Open", overdue: "Overdue" };
+    for (const chip of ["all", "open", "overdue"]) {
+      const btn = el("button", { type: "button", class: state.chip === chip ? "chip active" : "chip" }, chipLabels[chip]);
+      btn.addEventListener("click", () => setChip(chip));
+      chipsRow.append(btn);
+    }
+    if (state.myEmployeeId) {
+      const mineBtn = el("button", { type: "button", class: state.chip === "mine" ? "chip active" : "chip" }, "Mine");
+      mineBtn.addEventListener("click", () => setChip("mine"));
+      chipsRow.append(mineBtn);
+    }
+    const prioritySelect = document.createElement("select");
+    prioritySelect.append(el("option", { value: "" }, "All priorities"));
+    for (const priority of WORK_ORDER_PRIORITIES) {
+      const opt = el("option", { value: priority }, priority);
+      if (state.priority === priority) opt.selected = true;
+      prioritySelect.append(opt);
+    }
+    prioritySelect.addEventListener("change", () => setPriority(prioritySelect.value));
+    chipsRow.append(prioritySelect);
+    host.append(chipsRow);
+
+    if (hasPerm("work_orders.manage")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.createOpen ? "Cancel new work order" : "New work order"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.createOpen = !state.createOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.createOpen) host.append(buildCreateForm());
+    }
+
+    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.items.length === 0) {
+      listWrap.append(el("p", {}, "No work orders match these filters."));
+    } else {
+      for (const wo of state.items) listWrap.append(buildCard(wo));
+      wireAttachmentToggles(listWrap);
+    }
+    host.append(listWrap);
+
+    const paginationInfo = { page: state.page, hasPrev: state.page > 1, hasNext: state.items.length === state.pageSize };
+    const bar = buildPaginationBar(paginationInfo, (p) => changePage(p));
+    if (bar) host.append(bar);
+
+    if (state.detailId) host.append(renderDetail());
+  }
+
+  return { load, reset };
+})();
+
+// --- Communications module (CM-08/CM-09) --------------------------------------
+// Compose form (channel/audience/priority/required-ack) posting through the
+// draft-then-publish flow (CM-03), a paginated message list that auto-marks
+// delivered/read receipts as it renders, and a per-viewer ack-state badge.
+//
+// Known API gap, worked around rather than papered over: there is no GET for
+// message_acknowledgements, so "has THIS viewer already acknowledged" can
+// only be known for an acknowledgement made during this session
+// (ackedMessageIds) -- a message acknowledged in an earlier session still
+// renders as pending/overdue rather than a guessed "complete".
+const commsPanel = (function () {
+  const state = {
+    channels: [],
+    messages: [],
+    page: 1,
+    pageSize: 5,
+    composeOpen: false,
+    composeFields: emptyComposeFields(),
+    composeErrors: {},
+    audienceRows: [{ audienceType: "", audienceRefId: "" }],
+    audienceError: null,
+    ackedMessageIds: new Set(),
+    receiptSentIds: new Set(),
+    formError: null
+  };
+
+  function emptyComposeFields() {
+    return { channelId: "", subject: "", bodyText: "", priority: "normal", isRequiredAck: false, ackDueAt: "" };
+  }
+
+  function container() {
+    return document.getElementById("comms-workspace");
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    try {
+      state.channels = (await apiFetch(`/facilities/${currentFacility}/channels`).catch(() => [])) || [];
+      await loadMessagesList();
+    } catch (error) {
+      renderInlineError(host, error);
+    }
+  }
+
+  async function loadMessagesList() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    try {
+      state.messages = (await apiFetch(`/facilities/${currentFacility}/messages`)) || [];
+      state.page = 1;
+      state.formError = null;
+      render();
+    } catch (error) {
+      renderInlineError(host, error);
+    }
+  }
+
+  function reset() {
+    state.composeOpen = false;
+    state.composeFields = emptyComposeFields();
+    state.composeErrors = {};
+    state.audienceRows = [{ audienceType: "", audienceRefId: "" }];
+    state.audienceError = null;
+    state.formError = null;
+    state.page = 1;
+    state.ackedMessageIds = new Set();
+    state.receiptSentIds = new Set();
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  // Marks delivered/read for every message about to render, once per message
+  // id per panel load (receiptSentIds), fire-and-forget so it never blocks
+  // rendering; a 403 (e.g. no employee record for this facility) is silently
+  // swallowed rather than surfaced, since it's a background side effect, not
+  // a user-initiated action.
+  function markReceiptsForVisibleMessages(messages) {
+    const now = new Date().toISOString();
+    for (const message of messages) {
+      if (state.receiptSentIds.has(message.id)) continue;
+      state.receiptSentIds.add(message.id);
+      apiFetch(`/messages/${message.id}/receipt`, { method: "POST", body: { deliveredAt: now, readAt: now } }).catch(() => {});
+    }
+  }
+
+  async function acknowledge(id) {
+    try {
+      await apiFetch(`/messages/${id}/acknowledge`, { method: "POST" });
+      state.ackedMessageIds.add(id);
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function composeAndPublish() {
+    const validation = validateComposeInput(state.composeFields);
+    state.composeErrors = validation.errors;
+    const audienceValidation = validateAudienceRows(state.audienceRows);
+    state.audienceError = audienceValidation.valid ? null : audienceValidation.error;
+    if (!validation.valid || !audienceValidation.valid) {
+      render();
+      return;
+    }
+    try {
+      const draft = await apiFetch(`/facilities/${currentFacility}/messages`, {
+        method: "POST",
+        body: buildComposePayload(state.composeFields)
+      });
+      const audiencePayload = buildAudiencePayload(state.audienceRows);
+      if (audiencePayload.length > 0) {
+        await apiFetch(`/messages/${draft.id}/audiences`, { method: "POST", body: audiencePayload });
+      }
+      await apiFetch(`/facilities/${currentFacility}/messages/${draft.id}/publish`, { method: "POST" });
+      state.composeOpen = false;
+      state.composeFields = emptyComposeFields();
+      state.composeErrors = {};
+      state.audienceRows = [{ audienceType: "", audienceRefId: "" }];
+      state.audienceError = null;
+      state.formError = null;
+      await loadMessagesList();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function buildComposeForm() {
+    const f = state.composeFields;
+    const errors = state.composeErrors;
+    const wrap = el("div", { class: "inline-form compose-form" });
+
+    const channelSelect = document.createElement("select");
+    channelSelect.append(el("option", { value: "" }, "Select channel"));
+    for (const channel of state.channels) {
+      const opt = el("option", { value: channel.id }, channel.name);
+      if (f.channelId === channel.id) opt.selected = true;
+      channelSelect.append(opt);
+    }
+    channelSelect.addEventListener("change", () => (f.channelId = channelSelect.value));
+
+    const subjectInput = el("input", { type: "text", value: f.subject, placeholder: "Subject" });
+    subjectInput.addEventListener("input", () => (f.subject = subjectInput.value));
+
+    const bodyInput = document.createElement("textarea");
+    bodyInput.placeholder = "Message";
+    bodyInput.value = f.bodyText;
+    bodyInput.addEventListener("input", () => (f.bodyText = bodyInput.value));
+
+    const prioritySelect = document.createElement("select");
+    for (const priority of MESSAGE_PRIORITIES) {
+      const opt = el("option", { value: priority }, priority);
+      if (f.priority === priority) opt.selected = true;
+      prioritySelect.append(opt);
+    }
+    prioritySelect.addEventListener("change", () => (f.priority = prioritySelect.value));
+
+    const ackCheckbox = document.createElement("input");
+    ackCheckbox.type = "checkbox";
+    ackCheckbox.checked = !!f.isRequiredAck;
+    ackCheckbox.addEventListener("change", () => {
+      f.isRequiredAck = ackCheckbox.checked;
+      render();
+    });
+
+    wrap.append(
+      el("label", {}, ["Channel", channelSelect]),
+      el("label", {}, ["Subject", subjectInput]),
+      el("label", {}, ["Body", bodyInput]),
+      el("label", {}, ["Priority", prioritySelect]),
+      el("label", { class: "report-field-option" }, [ackCheckbox, " Require acknowledgement"])
+    );
+
+    if (f.isRequiredAck) {
+      const ackDueInput = el("input", { type: "date" });
+      ackDueInput.addEventListener("input", () => {
+        f.ackDueAt = ackDueInput.value ? new Date(ackDueInput.value).toISOString() : "";
+      });
+      wrap.append(el("label", {}, ["Acknowledgement due", ackDueInput]));
+    }
+
+    if (Object.keys(errors).length > 0) {
+      wrap.append(el("p", { class: "rr-error" }, Object.values(errors).join(" ")));
+    }
+
+    wrap.append(el("h4", {}, "Audience"));
+    const audienceWrap = el("div", { class: "audience-picker" });
+    state.audienceRows.forEach((row, index) => {
+      const rowEl = el("div", { class: "audience-row" });
+      const typeSelect = document.createElement("select");
+      typeSelect.append(el("option", { value: "" }, "Type"));
+      for (const type of AUDIENCE_TYPES) {
+        const opt = el("option", { value: type }, type);
+        if (row.audienceType === type) opt.selected = true;
+        typeSelect.append(opt);
+      }
+      typeSelect.addEventListener("change", () => (row.audienceType = typeSelect.value));
+      const refInput = el("input", { type: "text", value: row.audienceRefId, placeholder: "Target id" });
+      refInput.addEventListener("input", () => (row.audienceRefId = refInput.value));
+      const removeBtn = el("button", { type: "button" }, "Remove");
+      removeBtn.addEventListener("click", () => {
+        state.audienceRows.splice(index, 1);
+        if (state.audienceRows.length === 0) state.audienceRows.push({ audienceType: "", audienceRefId: "" });
+        render();
+      });
+      rowEl.append(typeSelect, refInput, removeBtn);
+      audienceWrap.append(rowEl);
+    });
+    wrap.append(audienceWrap);
+    const addRowBtn = el("button", { type: "button" }, "Add audience");
+    addRowBtn.addEventListener("click", () => {
+      state.audienceRows.push({ audienceType: "", audienceRefId: "" });
+      render();
+    });
+    wrap.append(addRowBtn);
+    if (state.audienceError) wrap.append(el("p", { class: "rr-error" }, state.audienceError));
+
+    const publishBtn = el("button", { type: "button", class: "primary" }, "Publish message");
+    publishBtn.addEventListener("click", () => composeAndPublish());
+    wrap.append(publishBtn);
+    return wrap;
+  }
+
+  function buildMessageCard(message) {
+    const card = el("div", { class: "message-card" });
+    card.append(el("strong", {}, `${message.priority} · ${message.subject}`));
+    card.append(el("div", { class: "item-subtitle" }, (message.body_text || "").slice(0, 140)));
+
+    const ackState = deriveAckState({
+      isRequiredAck: message.is_required_ack,
+      ackDueAt: message.ack_due_at,
+      ackedByMe: state.ackedMessageIds.has(message.id)
+    });
+    const badgeVariant = { pending: "info", overdue: "danger", complete: "success" }[ackState];
+    if (badgeVariant) card.append(badge(ackState.replace(/_/g, " "), badgeVariant));
+    if (message.is_required_ack && ackState !== "complete") {
+      const ackBtn = el("button", { type: "button", class: "primary" }, "Acknowledge");
+      ackBtn.addEventListener("click", () => acknowledge(message.id));
+      card.append(ackBtn);
+    }
+    return card;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+
+    if (hasPerm("communications.publish")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.composeOpen ? "Cancel compose" : "Compose message"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.composeOpen = !state.composeOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.composeOpen) host.append(buildComposeForm());
+    }
+
+    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.messages.length === 0) {
+      listWrap.append(el("p", {}, "No messages."));
+    } else {
+      const { pageItems, ...pageInfo } = paginate(state.messages, state.page, state.pageSize);
+      markReceiptsForVisibleMessages(pageItems);
+      for (const message of pageItems) listWrap.append(buildMessageCard(message));
+      const bar = buildPaginationBar(pageInfo, (p) => {
+        state.page = p;
+        render();
+      });
+      if (bar) listWrap.append(bar);
+    }
+    host.append(listWrap);
+  }
+
+  return { load, reset };
+})();
 
 // Training module
 async function loadTraining() {
