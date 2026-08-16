@@ -27,6 +27,7 @@ import { registerMeRoute } from "../src/lib/http/me-route.mjs";
 import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
 import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
+import { reportError } from "../src/lib/observability.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
@@ -382,7 +383,28 @@ export async function handleRequest(request, response) {
     // Use the matched route template, or fall back to the pathname
     path = matchResult.template || url.pathname;
 
-    await matchResult.handler(request, response, { env, params: matchResult.params });
+    try {
+      await matchResult.handler(request, response, { env, params: matchResult.params });
+    } catch (error) {
+      // OP-20 fire-and-forget error report. Never awaited: it must not delay
+      // (or, if it fails/times out, ever affect) the 500 response this error
+      // is about to produce via createApp's catch / the Vercel serverless
+      // catch in api/[[...path]].mjs. The error is always rethrown unchanged
+      // immediately after. Marking it here stops those outer, last-resort
+      // catches from reporting the identical error a second time, while
+      // still leaving them free to report anything that escapes from
+      // *outside* this specific try (a defense-in-depth net, not the common
+      // case -- see their own reportError calls).
+      reportError(error, {
+        dsn: env.OBSERVABILITY_DSN,
+        route: path,
+        status: 500,
+        requestId,
+        userId: request.authenticatedUserId ?? null
+      });
+      error.__observabilityReported = true;
+      throw error;
+    }
   } finally {
     // Always log, even if the handler threw. Never log request bodies, query
     // strings, auth headers, or env values — only the fields below.
@@ -408,6 +430,16 @@ export function createApp() {
     Promise.resolve()
       .then(() => handleRequest(request, response))
       .catch((error) => {
+        // Defense-in-depth net: handleRequest's own try/catch around the
+        // matched route handler already reports (and marks) the common case.
+        // This only reports something that escaped from outside that try
+        // (e.g. a bug in routing/env-loading itself) so it is not lost, and
+        // never double-reports the common case. No `env` is reliably
+        // available this far out, so this reads OBSERVABILITY_DSN directly
+        // off process.env rather than going through readServerEnv.
+        if (!error.__observabilityReported) {
+          reportError(error, { dsn: process.env.OBSERVABILITY_DSN, route: null, status: 500, requestId: null, userId: null });
+        }
         if (!response.headersSent) {
           sendJson(response, 500, { error: "internal server error", detail: error.message });
         } else {

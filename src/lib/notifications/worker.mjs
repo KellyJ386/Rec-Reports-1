@@ -46,6 +46,7 @@ import {
 } from "../admin/notifications.mjs";
 import { configValue } from "../settings-registry.mjs";
 import { sendPush } from "./push.mjs";
+import { reportError } from "../observability.mjs";
 
 const JOB_COLUMNS =
   "id,facility_id,event_type,payload_jsonb,scheduled_for,status,attempts,last_error,next_attempt_at,created_at,updated_at";
@@ -174,7 +175,15 @@ async function resolveDelivery({ client, job, config }) {
 // either schedules an exponential-backoff retry (status back to 'pending' so
 // claimDueJobs can reclaim it once next_attempt_at elapses) or dead-letters
 // the job once config.maxAttempts is reached.
-async function handleFailure({ client, job, now, nowIso, error, maxAttempts }) {
+//
+// OP-20: every failed attempt also fires a fire-and-forget error report --
+// this is "the worker's failure path" the observability plan calls out.
+// Never awaited (see src/lib/observability.mjs); config.dsn is undefined
+// unless the caller (the CRON_SECRET-guarded drain route) explicitly passes
+// one, so a caller that never wires observability config (e.g. every
+// existing worker test) gets the same silent no-op as an unset
+// OBSERVABILITY_DSN.
+async function handleFailure({ client, job, now, nowIso, error, maxAttempts, config = {} }) {
   const attempts = Number(job.attempts ?? 0) + 1;
   const lastError = error?.message ? String(error.message) : String(error);
   const deadLettered = attempts >= maxAttempts;
@@ -186,6 +195,14 @@ async function handleFailure({ client, job, now, nowIso, error, maxAttempts }) {
     next_attempt_at: deadLettered ? null : toIso(new Date(now.getTime() + computeBackoffMs(attempts)))
   };
   await pgUpdate(client, "notification_jobs", { id: job.id }, patch, { returning: true });
+  reportError(error, {
+    dsn: config.dsn,
+    fetchImpl: config.observabilityFetch,
+    route: `notifications.worker/${job.event_type ?? "unknown"}`,
+    status: deadLettered ? "dead_letter" : "retry",
+    requestId: job.id,
+    userId: null
+  });
   return {
     outcome: deadLettered ? "dead_letter" : "failed",
     job,
@@ -433,7 +450,7 @@ export async function processJob({ client, job, now = new Date(), config = {} })
     await pgUpdate(client, "notification_jobs", { id: job.id }, { status: "sent", updated_at: nowIso }, { returning: true });
     return { outcome: "sent", job, recipients, channels, deliveries: inserted ?? deliveryRows };
   } catch (error) {
-    return handleFailure({ client, job, now, nowIso, error, maxAttempts });
+    return handleFailure({ client, job, now, nowIso, error, maxAttempts, config });
   }
 }
 
@@ -574,6 +591,17 @@ async function processOutboxEvent({ client, event, now, config, maxAttempts }) {
       next_attempt_at: exhausted ? null : toIso(new Date(now.getTime() + computeBackoffMs(attempts)))
     };
     await pgUpdate(client, "outbox_events", { id: event.id }, patch, { returning: true });
+    // OP-20: same fire-and-forget failure report as the notification_jobs
+    // path above (handleFailure) -- see its comment for the config.dsn
+    // no-op-by-default contract.
+    reportError(error, {
+      dsn: config.dsn,
+      fetchImpl: config.observabilityFetch,
+      route: `notifications.worker.outbox/${event.event_type ?? "unknown"}`,
+      status: exhausted ? "failed" : "retry",
+      requestId: event.id,
+      userId: null
+    });
     return { outcome: exhausted ? "failed" : "retried", event, error: lastError, attempts };
   }
 }
