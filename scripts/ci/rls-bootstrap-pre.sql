@@ -37,3 +37,42 @@ stable
 as $$
   select (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')::uuid;
 $$;
+
+-- CI-only storage schema shim: minimal `storage` schema that
+-- 0030_storage.sql expects to exist on a real Supabase project.
+-- Supabase manages this out of the box; we recreate just enough for
+-- CI migrations to apply against bare Postgres. The `storage.objects`
+-- table only gets RLS policies (created by 0030), not any app logic.
+
+create schema if not exists storage;
+
+create table if not exists storage.buckets (
+  id text primary key,
+  name text not null,
+  public boolean not null default false
+);
+
+create table if not exists storage.objects (
+  id uuid primary key default gen_random_uuid(),
+  bucket_id text not null,
+  name text not null,
+  created_at timestamp with time zone default now(),
+  updated_at timestamp with time zone default now()
+);
+
+alter table storage.objects enable row level security;
+
+-- storage.foldername(object_name): splits an object path into folder
+-- segments, per Supabase's storage API. Returns an array of text where
+-- each element is a path component (split by '/'). Returns null if the
+-- path is empty or null.
+create or replace function storage.foldername(object_name text)
+returns text[]
+language sql
+stable
+as $$
+  select case
+    when object_name is null or object_name = '' then null
+    else string_to_array(trim(object_name, '/'), '/')
+  end;
+$$;
