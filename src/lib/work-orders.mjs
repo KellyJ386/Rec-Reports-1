@@ -1,11 +1,54 @@
 import { configValue } from "./settings-registry.mjs";
 
+// Single source of truth for the DB check-constraint enums (0005_work_orders.sql).
+export const WORK_ORDER_STATUSES = ["open", "in_progress", "on_hold", "resolved", "closed", "cancelled"];
+export const WORK_ORDER_PRIORITIES = ["low", "medium", "high", "urgent"];
+export const OPEN_STATUSES = ["open", "in_progress", "on_hold"];
+// Manual-create-only enum (0005_work_orders.sql's source_type check
+// constraint); the incident/report routes stamp their own source_type
+// server-side and never accept it from a request body.
+export const WORK_ORDER_SOURCE_TYPES = ["manual", "report", "incident"];
+// Statuses that stamp completed_at when entered.
+const COMPLETING_STATUSES = new Set(["resolved", "closed", "cancelled"]);
+
 const priorityRank = { low: 1, medium: 2, high: 3, urgent: 4 };
-const openStatuses = new Set(["open", "in_progress", "on_hold"]);
+const openStatuses = new Set(OPEN_STATUSES);
 const urgentPriorities = new Set(["high", "urgent"]);
+
+// The status lifecycle graph. `resolved` can be reopened back to
+// `in_progress` (clearing completed_at); `closed` and `cancelled` are
+// terminal. Same-status "transitions" are not legal moves.
+const STATUS_TRANSITIONS = {
+  open: new Set(["in_progress", "on_hold", "cancelled"]),
+  in_progress: new Set(["on_hold", "resolved", "cancelled"]),
+  on_hold: new Set(["in_progress", "cancelled"]),
+  resolved: new Set(["in_progress", "closed"]),
+  closed: new Set(),
+  cancelled: new Set()
+};
 
 export function isWorkOrderOpen(workOrder) {
   return openStatuses.has(workOrder.status);
+}
+
+// Whether a work order may move from status `from` to status `to`. Unknown
+// statuses and same-status "transitions" are always illegal.
+export function canTransition(from, to) {
+  if (!from || !to) return false;
+  if (from === to) return false;
+  return Boolean(STATUS_TRANSITIONS[from]?.has(to));
+}
+
+// Computes the field patch for moving a work order to `next` status. Callers
+// should gate on canTransition(workOrder.status, next) first (this function
+// does not itself validate legality — it only derives completed_at). Entering
+// a completing status (resolved/closed/cancelled) stamps completed_at; moving
+// back out of one (reopening) clears it.
+export function applyStatusChange(workOrder, next, now = new Date()) {
+  return {
+    status: next,
+    completed_at: COMPLETING_STATUSES.has(next) ? now.toISOString() : null
+  };
 }
 
 export function isWorkOrderOverdue(workOrder, now = new Date()) {

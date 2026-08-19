@@ -1,11 +1,50 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission } from "./guard.mjs";
+import { loadModuleConfig } from "./module-config.mjs";
+import {
+  WORK_ORDER_STATUSES,
+  WORK_ORDER_PRIORITIES,
+  WORK_ORDER_SOURCE_TYPES,
+  OPEN_STATUSES,
+  canTransition,
+  applyStatusChange,
+  createWorkOrderFromIncident,
+  workOrderDueAt
+} from "../work-orders.mjs";
 
 const READ = "work_orders.read";
 const MANAGE = "work_orders.manage";
+const INCIDENT_READ = "incidents.read";
 
 const WORK_ORDER_COLUMNS =
   "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status,assigned_to_employee_id,due_at,completed_at,created_by,created_at,updated_at";
+
+// Minimal incident projection needed to derive a work order (WO-03). Kept
+// separate from incidents-routes.mjs's INCIDENT_COLUMNS on purpose -- this
+// module never imports from incidents-routes.mjs.
+const INCIDENT_FOR_WORK_ORDER_COLUMNS = "id,facility_id,incident_no,severity,summary";
+
+const WORK_ORDER_UPDATE_COLUMNS =
+  "id,facility_id,work_order_id,update_type,body,previous_value,new_value,created_by,created_at";
+
+const STATUS_SET = new Set(WORK_ORDER_STATUSES);
+const PRIORITY_SET = new Set(WORK_ORDER_PRIORITIES);
+const SOURCE_TYPE_SET = new Set(WORK_ORDER_SOURCE_TYPES);
+
+// ?order= allowlist for the work orders list endpoint.
+const ORDERABLE_COLUMNS = new Set([
+  "created_at.asc",
+  "created_at.desc",
+  "due_at.asc",
+  "due_at.desc",
+  "priority.asc",
+  "priority.desc",
+  "updated_at.asc",
+  "updated_at.desc"
+]);
+const DEFAULT_ORDER = "created_at.desc";
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
 
 // Registers the end-user Work Orders API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
@@ -61,25 +100,254 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     return (rows ?? [])[0] ?? null;
   }
 
+  async function loadIncidentForWorkOrder(client, incidentId) {
+    const rows = await pgSelect(client, "incident_reports", {
+      filters: { id: incidentId },
+      select: INCIDENT_FOR_WORK_ORDER_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // --- WO-09: facility-scope resolution for body-supplied foreign keys ------
+  // asset_id / department_id / assigned_to_employee_id are all FKs into
+  // facility-scoped tables. The DB only guards asset_id (0026's
+  // fn_assert_same_facility in work_orders' WITH CHECK) -- department_id and
+  // assigned_to_employee_id have NO cross-facility guard at all today (a
+  // cross-facility value is silently accepted, verified empirically against
+  // a live Postgres instance while auditing this route). Even where the DB
+  // does guard it, a raw RLS/FK rejection surfaces as an uncaught
+  // PostgrestError -> an unhandled 500 from scripts/server.mjs's catch-all,
+  // not a clean 400/404. Resolving every one of the three here, in JS, before
+  // any insert/update is issued closes both gaps at once: a nonexistent id
+  // 404s, a cross-facility id 400s, and Postgres never sees either case.
+  const FACILITY_REF_TABLES = {
+    asset_id: { table: "assets", label: "asset_id" },
+    department_id: { table: "departments", label: "department_id" },
+    assigned_to_employee_id: { table: "employees", label: "assigned_to_employee_id" }
+  };
+
+  async function resolveFacilityRef(client, field, id, facilityId) {
+    if (id === undefined || id === null) return { ok: true };
+    const { table, label } = FACILITY_REF_TABLES[field];
+    const rows = await pgSelect(client, table, {
+      filters: { id },
+      select: "id,facility_id",
+      limit: 1
+    });
+    const row = (rows ?? [])[0];
+    if (!row) return { ok: false, status: 404, error: `${label} not found` };
+    if (row.facility_id !== facilityId) {
+      return { ok: false, status: 400, error: `${label} does not belong to this facility` };
+    }
+    return { ok: true };
+  }
+
+  // Resolves each { field: id } pair in refs against facilityId in turn,
+  // short-circuiting (and issuing no further fetches) on the first invalid
+  // one. Absent/null ids are always ok (nothing to check -- e.g. clearing an
+  // assignment or never setting a department).
+  async function resolveFacilityRefs(client, facilityId, refs) {
+    for (const [field, id] of Object.entries(refs)) {
+      const result = await resolveFacilityRef(client, field, id, facilityId);
+      if (!result.ok) return result;
+    }
+    return { ok: true };
+  }
+
+  // Parses and validates the list endpoint's query params entirely from the
+  // request URL (no I/O), so an invalid value 400s before any fetch is made.
+  // Returns { ok: true, filters, order, limit, offset } or { ok: false, body }.
+  function parseListQuery(qp, facilityId, now) {
+    const errors = [];
+    const filters = { facility_id: facilityId };
+
+    const status = qp.get("status");
+    if (status) {
+      if (!STATUS_SET.has(status)) errors.push(`unknown status: ${status}`);
+      else filters.status = status;
+    }
+
+    const priority = qp.get("priority");
+    if (priority) {
+      if (!PRIORITY_SET.has(priority)) errors.push(`unknown priority: ${priority}`);
+      else filters.priority = priority;
+    }
+
+    const assignee = qp.get("assignee");
+    if (assignee) filters.assigned_to_employee_id = assignee;
+
+    const asset = qp.get("asset");
+    if (asset) filters.asset_id = asset;
+
+    const department = qp.get("department");
+    if (department) filters.department_id = department;
+
+    const overdue = qp.get("overdue");
+    if (overdue === "true") {
+      // Only overlay the open-status set when the caller didn't already pin
+      // an explicit ?status=; an explicit status stays intersected with the
+      // overdue due_at filter instead of being widened.
+      if (!filters.status) filters.status = { in: OPEN_STATUSES };
+      filters.due_at = { lt: now.toISOString() };
+    } else if (overdue !== null && overdue !== "false") {
+      errors.push(`unknown overdue value: ${overdue}`);
+    }
+
+    let order = DEFAULT_ORDER;
+    const orderParam = qp.get("order");
+    if (orderParam) {
+      if (!ORDERABLE_COLUMNS.has(orderParam)) errors.push(`unknown order: ${orderParam}`);
+      else order = orderParam;
+    }
+
+    let limit = DEFAULT_LIMIT;
+    const limitParam = qp.get("limit");
+    if (limitParam !== null) {
+      const parsed = Number(limitParam);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        errors.push(`invalid limit: ${limitParam}`);
+      } else {
+        limit = Math.min(parsed, MAX_LIMIT);
+      }
+    }
+
+    let offset = 0;
+    const offsetParam = qp.get("offset");
+    if (offsetParam !== null) {
+      const parsed = Number(offsetParam);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        errors.push(`invalid offset: ${offsetParam}`);
+      } else {
+        offset = parsed;
+      }
+    }
+
+    if (errors.length > 0) return { ok: false, body: { errors } };
+    return { ok: true, filters, order, limit, offset };
+  }
+
   // --- Work Orders -----------------------------------------------------------
-  // Lists work orders for a facility. Optional ?status= narrows the list;
-  // ordered by creation date descending.
+  // Lists work orders for a facility. Supports ?status=, ?priority=,
+  // ?assignee=, ?asset=, ?department=, ?overdue=true, ?order=, ?limit=,
+  // ?offset=. Unknown enum values / out-of-shape pagination 400 before any
+  // fetch is issued (validated from the URL alone, ahead of the permission
+  // guard, matching the module's validate-shape-first convention).
   router.register(
     "GET",
     "/facilities/:facilityId/work-orders",
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
-        if (!requireRead(auth, params.facilityId, response)) return;
         const qp = queryParams(request);
-        const filters = { facility_id: params.facilityId };
-        const status = qp.get("status");
-        if (status) filters.status = status;
+        const query = parseListQuery(qp, params.facilityId, new Date());
+        if (!query.ok) return sendJson(response, 400, query.body);
+        if (!requireRead(auth, params.facilityId, response)) return;
         const rows = await pgSelect(auth.client, "work_orders", {
-          filters,
+          filters: query.filters,
           select: WORK_ORDER_COLUMNS,
-          order: "created_at.desc"
+          order: query.order,
+          limit: query.limit,
+          offset: query.offset
         });
         return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Creates a work order from an incident (WO-03). Dual-guards on the
+  // INCIDENT's facility -- both incidents.read AND work_orders.manage are
+  // required, so a caller holding only one of the two is denied. The
+  // incident is always loaded first and facility_id is always taken from
+  // the loaded row, never from the request body (a body-supplied
+  // facility_id is silently ignored). Optional body overrides (title,
+  // description, assignee, dueAt) are shape-validated before any fetch is
+  // issued. When dueAt is not overridden it is derived from the resolved
+  // module config's SLA hours via workOrderDueAt -- this partially delivers
+  // WO-04's route wiring ahead of that task landing the shared per-request
+  // config-loader memoization.
+  router.register(
+    "POST",
+    "/incidents/:id/work-orders",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const { title, description, assignee, dueAt } = body.payload;
+        const shape = [];
+        if (title !== undefined && (typeof title !== "string" || !title.trim())) {
+          shape.push("title must be a non-empty string");
+        }
+        if (description !== undefined && (typeof description !== "string" || !description.trim())) {
+          shape.push("description must be a non-empty string");
+        }
+        if (assignee !== undefined && (typeof assignee !== "string" || !assignee.trim())) {
+          shape.push("assignee must be a non-empty string");
+        }
+        if (dueAt !== undefined && (typeof dueAt !== "string" || Number.isNaN(new Date(dueAt).getTime()))) {
+          shape.push("dueAt must be a valid ISO date string");
+        }
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const incident = await loadIncidentForWorkOrder(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+
+        // Dual guard: evaluate BOTH permissions before responding, so a
+        // caller holding only one of the two always gets a single 403
+        // rather than a partial success.
+        const readGuard = requireAuthPermission(auth, incident.facility_id, INCIDENT_READ);
+        const manageGuard = requireAuthPermission(auth, incident.facility_id, MANAGE);
+        if (!readGuard.allowed || !manageGuard.allowed) {
+          return sendJson(response, 403, {
+            error: !readGuard.allowed ? readGuard.reason : manageGuard.reason
+          });
+        }
+
+        const refCheck = await resolveFacilityRefs(auth.client, incident.facility_id, {
+          assigned_to_employee_id: assignee
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        const config = await loadModuleConfig({
+          client: auth.client,
+          facilityId: incident.facility_id,
+          moduleCode: "work_orders"
+        });
+
+        const defaults = {};
+        if (title !== undefined) defaults.title = title;
+        if (description !== undefined) defaults.description = description;
+
+        const created = createWorkOrderFromIncident(
+          {
+            id: incident.id,
+            facilityId: incident.facility_id,
+            incidentNo: incident.incident_no,
+            severity: incident.severity,
+            summary: incident.summary
+          },
+          defaults,
+          config
+        );
+
+        const now = new Date();
+        const resolvedDueAt = dueAt ?? workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+
+        const row = {
+          facility_id: created.facilityId,
+          department_id: null,
+          asset_id: null,
+          source_type: created.sourceType,
+          source_id: created.sourceId,
+          title: created.title,
+          description: created.description,
+          priority: created.priority,
+          status: created.status,
+          assigned_to_employee_id: assignee ?? null,
+          due_at: resolvedDueAt,
+          created_by: auth.claims.sub
+        };
+        const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
+        return sendJson(response, 201, (rows ?? [])[0] ?? null);
       })
   );
 
@@ -96,8 +364,15 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       })
   );
 
-  // Creates a new work order. Requires title, description, and priority; validates
-  // shape first (400 before guard), no fetch if invalid.
+  // Creates a new work order. Requires title, description, and priority;
+  // validates shape -- including that priority and an optional source_type
+  // match their DB check-constraint enums -- entirely from the body first
+  // (400 before any fetch, before the guard). A body-supplied facility_id is
+  // never read: facility_id always comes from the :facilityId path param.
+  // asset_id / department_id / assigned_to_employee_id are resolved against
+  // this facility (WO-09) after the permission guard, before insert, so a
+  // cross-facility or nonexistent reference 400s/404s cleanly rather than
+  // surfacing a raw Postgres FK/RLS/check-constraint error as a 500.
   router.register(
     "POST",
     "/facilities/:facilityId/work-orders",
@@ -105,19 +380,30 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       withAuth(request, response, env, async (auth) => {
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-        const { title, description, priority } = body.payload;
+        const { title, description, priority, source_type: sourceType } = body.payload;
         const shape = [];
         if (!title) shape.push("title is required");
         if (!description) shape.push("description is required");
         if (!priority) shape.push("priority is required");
+        else if (!PRIORITY_SET.has(priority)) shape.push(`unknown priority: ${priority}`);
+        if (sourceType !== undefined && sourceType !== null && !SOURCE_TYPE_SET.has(sourceType)) {
+          shape.push(`unknown source_type: ${sourceType}`);
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
+          asset_id: body.payload.asset_id,
+          department_id: body.payload.department_id,
+          assigned_to_employee_id: body.payload.assigned_to_employee_id
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
 
         const row = {
           facility_id: params.facilityId,
           department_id: body.payload.department_id ?? null,
           asset_id: body.payload.asset_id ?? null,
-          source_type: body.payload.source_type ?? null,
+          source_type: sourceType ?? null,
           source_id: body.payload.source_id ?? null,
           title,
           description,
@@ -132,8 +418,11 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       })
   );
 
-  // Updates a work order's status and/or assignment. The guard runs on the
-  // loaded row's facility.
+  // Updates a work order's status, priority and/or assignment. Validates
+  // shape (enums, at-least-one-field) before any fetch; loads the row and
+  // guards on its facility next; an illegal status transition 409s before
+  // any write. Every changed field writes exactly one work_order_updates
+  // history row (status_change / assignment_change / priority_change).
   router.register(
     "PATCH",
     "/work-orders/:id",
@@ -141,24 +430,141 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       withAuth(request, response, env, async (auth) => {
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        const { status: nextStatus, priority: nextPriority, assigned_to_employee_id: nextAssignee } = body.payload;
+        if (nextStatus === undefined && nextPriority === undefined && nextAssignee === undefined) {
+          return sendJson(response, 400, {
+            error: "nothing to update (send status, priority, and/or assigned_to_employee_id)"
+          });
+        }
+        const shape = [];
+        if (nextStatus !== undefined && !STATUS_SET.has(nextStatus)) shape.push(`unknown status: ${nextStatus}`);
+        if (nextPriority !== undefined && !PRIORITY_SET.has(nextPriority)) shape.push(`unknown priority: ${nextPriority}`);
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
         const workOrder = await loadWorkOrder(auth.client, params.id);
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requirePerm(auth, workOrder.facility_id, MANAGE, response)) return;
 
+        // WO-09: a reassignment must resolve to an employee in the SAME
+        // facility as the work order -- the DB has no guard on
+        // assigned_to_employee_id at all (only asset_id is), so this JS check
+        // is the only thing standing between a cross-facility reassignment
+        // and a silent write.
+        const refCheck = await resolveFacilityRefs(auth.client, workOrder.facility_id, {
+          assigned_to_employee_id: nextAssignee
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        if (nextStatus !== undefined && !canTransition(workOrder.status, nextStatus)) {
+          return sendJson(response, 409, { error: `illegal status transition: ${workOrder.status} -> ${nextStatus}` });
+        }
+
+        const now = new Date();
         const patch = {};
-        if (body.payload.status !== undefined) patch.status = body.payload.status;
-        if (body.payload.assigned_to_employee_id !== undefined) {
-          patch.assigned_to_employee_id = body.payload.assigned_to_employee_id;
+        const history = [];
+
+        if (nextStatus !== undefined) {
+          Object.assign(patch, applyStatusChange(workOrder, nextStatus, now));
+          history.push({
+            update_type: "status_change",
+            previous_value: workOrder.status ?? null,
+            new_value: nextStatus
+          });
         }
-        if (Object.keys(patch).length === 0) {
-          return sendJson(response, 400, { error: "nothing to update (send status and/or assigned_to_employee_id)" });
+        if (nextAssignee !== undefined && nextAssignee !== workOrder.assigned_to_employee_id) {
+          patch.assigned_to_employee_id = nextAssignee;
+          history.push({
+            update_type: "assignment_change",
+            previous_value: workOrder.assigned_to_employee_id ?? null,
+            new_value: nextAssignee
+          });
         }
-        patch.updated_at = new Date().toISOString();
+        if (nextPriority !== undefined && nextPriority !== workOrder.priority) {
+          patch.priority = nextPriority;
+          history.push({
+            update_type: "priority_change",
+            previous_value: workOrder.priority ?? null,
+            new_value: nextPriority
+          });
+        }
+        patch.updated_at = now.toISOString();
 
         const rows = await pgUpdate(auth.client, "work_orders", { id: params.id }, patch, {
           returning: true
         });
+
+        if (history.length > 0) {
+          await pgInsert(
+            auth.client,
+            "work_order_updates",
+            history.map((entry) => ({
+              facility_id: workOrder.facility_id,
+              work_order_id: workOrder.id,
+              update_type: entry.update_type,
+              body: null,
+              previous_value: entry.previous_value === null ? null : String(entry.previous_value),
+              new_value: entry.new_value === null ? null : String(entry.new_value),
+              created_by: auth.claims.sub
+            })),
+            { returning: true }
+          );
+        }
+
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Work Order Updates (comment thread) ------------------------------
+  // Chronological thread for a work order. The guard always runs on the
+  // PARENT work order's facility_id — loaded first and never trusted from
+  // the request — so access can never be steered by a foreign facility_id.
+  router.register(
+    "GET",
+    "/work-orders/:id/updates",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const workOrder = await loadWorkOrder(auth.client, params.id);
+        if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
+        if (!requireRead(auth, workOrder.facility_id, response)) return;
+        const rows = await pgSelect(auth.client, "work_order_updates", {
+          filters: { work_order_id: workOrder.id },
+          select: WORK_ORDER_UPDATE_COLUMNS,
+          order: "created_at.asc"
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Posts a comment on a work order's thread. Validates the comment body
+  // first (400, zero fetches), then loads the parent and guards on its
+  // facility_id; facility_id and created_by are always stamped server-side
+  // from the parent row / auth claims, never taken from the request body.
+  router.register(
+    "POST",
+    "/work-orders/:id/updates",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const text = typeof body.payload.body === "string" ? body.payload.body.trim() : "";
+        if (!text) return sendJson(response, 400, { error: "body is required" });
+
+        const workOrder = await loadWorkOrder(auth.client, params.id);
+        if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
+        if (!requirePerm(auth, workOrder.facility_id, MANAGE, response)) return;
+
+        const row = {
+          facility_id: workOrder.facility_id,
+          work_order_id: workOrder.id,
+          update_type: "comment",
+          body: text,
+          previous_value: null,
+          new_value: null,
+          created_by: auth.claims.sub
+        };
+        const rows = await pgInsert(auth.client, "work_order_updates", [row], { returning: true });
+        return sendJson(response, 201, (rows ?? [])[0] ?? null);
       })
   );
 

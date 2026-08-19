@@ -552,6 +552,29 @@ export async function renderForms(container) {
           });
           actions.append(publish);
         }
+        // DR-06: once a daily_reports form is published, an admin can promote
+        // it into a report_templates version -- form_definitions stays the
+        // only place it's authored/edited; this just materializes the
+        // published schema into the parallel governance store the runtime
+        // submission path reads from. Only offered for module_code
+        // daily_reports, matching POST /forms/:id/promote's own guard.
+        if (version.status === "published" && version.module_code === "daily_reports") {
+          const promote = el("button", { type: "button", class: "ghost-button" }, ["Publish to Daily Reports"]);
+          promote.addEventListener("click", async () => {
+            promote.disabled = true;
+            try {
+              const result = await api.post(`/forms/${encodeURIComponent(version.id)}/promote`);
+              const templateVersion = result?.version?.version_number;
+              statusRegion.textContent = `Promoted ${formCode} v${version.version_no} to report template v${templateVersion ?? "?"}.`;
+              toast("Promoted to Daily Reports report template.", { tone: "success" });
+            } catch (error) {
+              toast(`Could not promote: ${error.message}`, { tone: "error" });
+            } finally {
+              promote.disabled = false;
+            }
+          });
+          actions.append(promote);
+        }
         list.append(el("li", { class: "version-row" }, [chips, actions]));
       }
       formsSection.querySelector("[data-region=fl-body]").append(

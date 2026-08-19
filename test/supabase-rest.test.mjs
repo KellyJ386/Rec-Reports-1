@@ -120,6 +120,135 @@ test("pgDelete removes filtered rows without returning by default", async (t) =>
   assert.equal(result, null);
 });
 
+test("pgSelect keeps emitting eq. for plain scalar filter values (backward compat)", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "modules", { filters: { organization_id: "org-1", status: "active" } });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("organization_id"), "eq.org-1");
+  assert.equal(parsed.searchParams.get("status"), "eq.active");
+});
+
+test("pgSelect supports gte/lte range filters via object-tagged values", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "report_submissions", {
+    filters: { report_date: { gte: "2026-01-01", lte: "2026-01-31" } }
+  });
+
+  const parsed = new URL(capturedUrl);
+  assert.deepEqual(parsed.searchParams.getAll("report_date"), ["gte.2026-01-01", "lte.2026-01-31"]);
+});
+
+test("pgSelect supports gt and lt filters via object-tagged values", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "work_orders", {
+    filters: { due_at: { gt: "2026-01-01T00:00:00Z" }, priority_rank: { lt: 3 } }
+  });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("due_at"), "gt.2026-01-01T00:00:00Z");
+  assert.equal(parsed.searchParams.get("priority_rank"), "lt.3");
+});
+
+test("pgSelect supports neq filters via object-tagged values", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "work_orders", { filters: { status: { neq: "cancelled" } } });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("status"), "neq.cancelled");
+});
+
+test("pgSelect supports in filters formatted as in.(a,b)", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "report_submissions", { filters: { status: { in: ["a", "b"] } } });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("status"), "in.(a,b)");
+});
+
+test("an unknown filter operator throws before any fetch is issued", async (t) => {
+  let fetchCalled = false;
+  withFetch(t, async () => {
+    fetchCalled = true;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await assert.rejects(() => pgSelect(client, "report_submissions", { filters: { status: { bogus: "x" } } }));
+  assert.equal(fetchCalled, false);
+});
+
+test("pgSelect builds offset into the query string", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "report_submissions", { limit: 50, offset: 100 });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("limit"), "50");
+  assert.equal(parsed.searchParams.get("offset"), "100");
+});
+
+test("pgSelect sets a Prefer count header when count option is given", async (t) => {
+  let capturedInit;
+  withFetch(t, async (url, init) => {
+    capturedInit = init;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "report_submissions", { count: "exact" });
+
+  assert.match(capturedInit.headers.Prefer, /count=exact/);
+});
+
+test("pgSelect omits the Prefer header entirely when no count/returning/prefer options given", async (t) => {
+  let capturedInit;
+  withFetch(t, async (url, init) => {
+    capturedInit = init;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "report_submissions", {});
+
+  assert.equal(capturedInit.headers.Prefer, undefined);
+});
+
 test("non-2xx responses throw a PostgrestError with status and body", async (t) => {
   withFetch(t, async () => ({
     ok: false,

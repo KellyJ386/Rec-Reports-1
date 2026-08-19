@@ -2,10 +2,42 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createWorkOrderFromIncident,
+  isWorkOrderOpen,
   isWorkOrderOverdue,
   sortWorkOrdersForDashboard,
-  slaHoursForPriority
+  slaHoursForPriority,
+  workOrderDueAt,
+  canTransition,
+  applyStatusChange,
+  WORK_ORDER_STATUSES
 } from "../src/lib/work-orders.mjs";
+
+test("isWorkOrderOpen treats open/in_progress/on_hold as open", () => {
+  assert.equal(isWorkOrderOpen({ status: "open" }), true);
+  assert.equal(isWorkOrderOpen({ status: "in_progress" }), true);
+  assert.equal(isWorkOrderOpen({ status: "on_hold" }), true);
+});
+
+test("isWorkOrderOpen treats resolved/closed/cancelled as not open", () => {
+  assert.equal(isWorkOrderOpen({ status: "resolved" }), false);
+  assert.equal(isWorkOrderOpen({ status: "closed" }), false);
+  assert.equal(isWorkOrderOpen({ status: "cancelled" }), false);
+});
+
+test("workOrderDueAt derives the due date from createdAt plus the priority's SLA hours", () => {
+  const workOrder = { priority: "urgent", createdAt: "2026-07-08T00:00:00Z" };
+  assert.equal(workOrderDueAt(workOrder).toISOString(), "2026-07-09T00:00:00.000Z"); // default urgent SLA = 24h
+  assert.equal(
+    workOrderDueAt(workOrder, { "workOrders.slaHoursUrgent": 6 }).toISOString(),
+    "2026-07-08T06:00:00.000Z"
+  );
+});
+
+test("workOrderDueAt anchors on `now` when createdAt is absent", () => {
+  const now = new Date("2026-07-08T00:00:00Z");
+  const dueAt = workOrderDueAt({ priority: "low" }, {}, now); // default routine SLA = 72h
+  assert.equal(dueAt.toISOString(), "2026-07-11T00:00:00.000Z");
+});
 
 test("isWorkOrderOverdue only flags open work past its due date", () => {
   const now = new Date("2026-07-08T12:00:00Z");
@@ -55,4 +87,59 @@ test("createWorkOrderFromIncident maps high severity incident context into maint
       status: "open"
     }
   );
+});
+
+// --- Status lifecycle (canTransition / applyStatusChange) ------------------
+
+test("canTransition allows the full open -> in_progress -> resolved -> closed lifecycle", () => {
+  assert.equal(canTransition("open", "in_progress"), true);
+  assert.equal(canTransition("in_progress", "resolved"), true);
+  assert.equal(canTransition("resolved", "closed"), true);
+});
+
+test("canTransition allows open to move to on_hold or cancelled", () => {
+  assert.equal(canTransition("open", "on_hold"), true);
+  assert.equal(canTransition("open", "cancelled"), true);
+});
+
+test("canTransition allows on_hold back to in_progress or cancelled", () => {
+  assert.equal(canTransition("on_hold", "in_progress"), true);
+  assert.equal(canTransition("on_hold", "cancelled"), true);
+});
+
+test("canTransition allows reopening a resolved work order back to in_progress", () => {
+  assert.equal(canTransition("resolved", "in_progress"), true);
+});
+
+test("canTransition rejects leaving closed and cancelled (terminal states)", () => {
+  for (const to of WORK_ORDER_STATUSES) {
+    assert.equal(canTransition("closed", to), false, `closed -> ${to}`);
+    assert.equal(canTransition("cancelled", to), false, `cancelled -> ${to}`);
+  }
+});
+
+test("canTransition rejects illegal skips and same-status no-ops", () => {
+  assert.equal(canTransition("closed", "in_progress"), false);
+  assert.equal(canTransition("open", "closed"), false);
+  assert.equal(canTransition("resolved", "open"), false);
+  assert.equal(canTransition("open", "open"), false);
+});
+
+test("canTransition rejects unknown statuses", () => {
+  assert.equal(canTransition("open", "bogus"), false);
+  assert.equal(canTransition("bogus", "open"), false);
+});
+
+test("applyStatusChange stamps completed_at when entering resolved/closed/cancelled", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  for (const status of ["resolved", "closed", "cancelled"]) {
+    const patch = applyStatusChange({ status: "in_progress" }, status, now);
+    assert.deepEqual(patch, { status, completed_at: "2026-07-08T12:00:00.000Z" });
+  }
+});
+
+test("applyStatusChange clears completed_at when reopening", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const patch = applyStatusChange({ status: "resolved", completed_at: "2026-07-01T00:00:00Z" }, "in_progress", now);
+  assert.deepEqual(patch, { status: "in_progress", completed_at: null });
 });

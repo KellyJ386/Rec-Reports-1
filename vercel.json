@@ -7,5 +7,9 @@
   "rewrites": [
     { "source": "/admin", "destination": "/admin/index.html" },
     { "source": "/signin", "destination": "/signin/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/v1/internal/notifications/drain", "schedule": "*/5 * * * *" },
+    { "path": "/api/v1/internal/audit/verify-all", "schedule": "0 6 * * *" }
   ]
 }

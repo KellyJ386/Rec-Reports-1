@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { acknowledgementState, resolveMessageAudience, shouldBypassQuietHours } from "../src/lib/communications.mjs";
+import {
+  acknowledgementState,
+  resolveMessageAudience,
+  shouldBypassQuietHours,
+  channelsForPriority
+} from "../src/lib/communications.mjs";
 
 test("resolveMessageAudience expands department, shift, and employee targets without duplicates", () => {
   assert.deepEqual(
@@ -47,4 +52,33 @@ test("shouldBypassQuietHours allows urgent and emergency messages", () => {
   assert.equal(shouldBypassQuietHours({ priority: "normal" }), false);
   assert.equal(shouldBypassQuietHours({ priority: "urgent" }), true);
   assert.equal(shouldBypassQuietHours({ priority: "emergency" }), true);
+});
+
+test("resolveMessageAudience resolves live rows by audience_ref_id, never the row's own id", () => {
+  // A message_audiences row carries both `id` (its own PK) and
+  // `audience_ref_id` (the target). Resolving against `id` would silently
+  // target nobody for department audiences and the audience row itself for
+  // employee ones, so the live shape must always win over the { type, id }
+  // fallback used by the pure-shape tests above.
+  assert.deepEqual(
+    resolveMessageAudience(
+      {
+        audiences: [
+          { id: "aud-1", audience_type: "department", audience_ref_id: "dept-1" },
+          { id: "aud-2", audience_type: "employee", audience_ref_id: "emp-5" },
+          { id: "aud-3", audience_type: "role", audience_ref_id: "role-9" },
+          { id: "aud-4", audience_type: "shift", audience_ref_id: "shift-7" }
+        ]
+      },
+      {
+        employees: [
+          { id: "emp-1", department_id: "dept-1" },
+          { id: "emp-2", department_id: "dept-2" }
+        ],
+        roleAssignments: [{ role_id: "role-9", employee_id: "emp-3" }],
+        shiftAssignments: [{ shift_id: "shift-7", employee_id: "emp-4" }]
+      }
+    ),
+    ["emp-1", "emp-3", "emp-4", "emp-5"]
+  );
 });

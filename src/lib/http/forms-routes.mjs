@@ -5,17 +5,24 @@ import {
   validateFormDefinition,
   buildFormDraftUpdate,
   nextVersionNo,
-  buildFormPublish
+  buildFormPublish,
+  buildFormPromotion
 } from "../admin/forms.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
 const TEMPLATE_MANAGE = "reports.template.manage";
+// Same catalog code report-templates-routes.mjs gates its publish route on
+// (DR-06): promoting a form also flips a report_template_versions row's
+// is_published straight to true, so it requires the same authority as
+// publishing one the ordinary way, on top of reports.template.manage.
+const TEMPLATE_PUBLISH = "reports.publish";
 const ENTITLEMENT = "custom_forms";
 
 const CUSTOM_FIELD_COLUMNS =
   "id,facility_id,entity_type,key,label,data_type,validation_jsonb,active,created_by,created_at,updated_at";
 const FORM_COLUMNS =
   "id,facility_id,module_code,form_code,version_no,status,schema_jsonb,created_by,created_at,updated_at";
+const REPORT_TEMPLATE_COLUMNS = "id,facility_id,code,name,active_version,status";
 
 // Registers the Phase 7 Forms & Fields (lite) API routes on a router, using the
 // same injected-primitives shape as registerWorkflowRoutes:
@@ -50,6 +57,15 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
 
   function requireManage(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, TEMPLATE_MANAGE);
+    if (!guard.allowed) {
+      sendJson(response, 403, { error: guard.reason });
+      return false;
+    }
+    return true;
+  }
+
+  function requirePublish(auth, facilityId, response) {
+    const guard = requireAuthPermission(auth, facilityId, TEMPLATE_PUBLISH);
     if (!guard.allowed) {
       sendJson(response, 403, { error: guard.reason });
       return false;
@@ -269,6 +285,104 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
         returning: true
       });
       return sendJson(response, 200, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  // POST /forms/:id/promote (DR-06) materializes a published daily_reports
+  // form into the report_templates/report_template_versions governance store
+  // (src/lib/report-templates.mjs), so the runtime submission path and
+  // downstream report tooling can consume it as an ordinary template version.
+  // form_definitions stays the only authoring surface -- this never edits the
+  // form, it only mints/updates the parallel published-template record.
+  //
+  // Guarded on reports.template.manage AND reports.publish (matching
+  // report-templates-routes.mjs's own publish route, since this route also
+  // flips a version's is_published straight to true), same as every other
+  // write here it also inherits the custom_forms entitlement gate (402) --
+  // that gate exists for form *authoring* and this route was deliberately
+  // left inside it rather than carved out; plans/DAILY_REPORTS_PLAN.md flags
+  // that packaging question for the module owner to revisit.
+  //
+  // Write ordering (required by 0028's triggers on report_templates /
+  // report_template_versions):
+  //   1. resolve the target template: load by (facility_id, code=form_code);
+  //      if none exists, INSERT a new draft report_templates row first --
+  //      its id must exist before a version can reference it via template_id.
+  //   2. INSERT the new report_template_versions row with is_published=true
+  //      directly (the immutability trigger only fires on UPDATE when
+  //      OLD.is_published, so an INSERT that is already published is legal
+  //      and skips a separate publish step).
+  //   3. UPDATE the template's active_version/status to point at that version
+  //      -- only now, because fn_report_template_active_version_published
+  //      requires a matching *published* version to already exist when
+  //      active_version is set.
+  // Re-promoting the same form_code after a re-publish repeats this against
+  // the now-existing template, minting version n+1 and moving active_version
+  // forward (buildFormPromotion numbers it via nextTemplateVersionNumber over
+  // the template's existing versions).
+  router.register("POST", "/forms/:id/promote", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const form = (
+        await pgSelect(auth.client, "form_definitions", {
+          filters: { id: params.id },
+          select: FORM_COLUMNS,
+          limit: 1
+        })
+      )?.[0];
+      if (!form) return sendJson(response, 404, { error: "form definition not found" });
+      if (!requireManage(auth, form.facility_id, response)) return;
+      if (!requirePublish(auth, form.facility_id, response)) return;
+      if (!(await requireEntitled(auth, form.facility_id, response))) return;
+
+      const existingTemplate = (
+        await pgSelect(auth.client, "report_templates", {
+          filters: { facility_id: form.facility_id, code: form.form_code },
+          select: REPORT_TEMPLATE_COLUMNS,
+          limit: 1
+        })
+      )?.[0] ?? null;
+      const existingVersions = existingTemplate
+        ? await pgSelect(auth.client, "report_template_versions", {
+            filters: { template_id: existingTemplate.id },
+            select: "version_number"
+          })
+        : [];
+
+      const plan = buildFormPromotion(form, existingTemplate, existingVersions ?? []);
+      if (plan.error) return sendJson(response, 409, { error: plan.error });
+
+      let templateId;
+      if (plan.templateRow) {
+        const templateRows = await pgInsert(auth.client, "report_templates", [plan.templateRow], {
+          returning: true
+        });
+        templateId = (templateRows ?? [])[0]?.id;
+      } else {
+        templateId = plan.templatePatch.id;
+      }
+
+      const versionRows = await pgInsert(
+        auth.client,
+        "report_template_versions",
+        [{ ...plan.versionRow, template_id: templateId }],
+        { returning: true }
+      );
+
+      const activatePatch = plan.templatePatch
+        ? plan.templatePatch.patch
+        : { active_version: plan.versionRow.version_number, status: "published" };
+      const templateRows = await pgUpdate(
+        auth.client,
+        "report_templates",
+        { id: templateId },
+        { ...activatePatch, updated_at: new Date().toISOString() },
+        { returning: true }
+      );
+
+      return sendJson(response, 201, {
+        template: (templateRows ?? [])[0] ?? null,
+        version: (versionRows ?? [])[0] ?? null
+      });
     })
   );
 

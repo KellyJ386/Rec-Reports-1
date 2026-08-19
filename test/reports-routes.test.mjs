@@ -33,6 +33,18 @@ const PUBLISHED_TEMPLATE = {
 };
 const VERSION = { id: "ver-3", template_id: "tpl-1", version_number: 3, schema_json: SCHEMA, is_published: true };
 
+// DR-11: department-scoped memberships (department_id set) and a
+// department-scoped template/submission fixture pair.
+const DEPT_A_TEMPLATE = { ...PUBLISHED_TEMPLATE, id: "tpl-dept-a", department_id: "dept-a" };
+const DEPT_A_MEMBER = [
+  {
+    facilityId: "fac-1",
+    status: "active",
+    departmentId: "dept-a",
+    permissions: ["reports.read", "reports.create", "reports.submit"]
+  }
+];
+
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -167,8 +179,13 @@ test("POST reports happy path inserts a draft with the resolved version", async 
 test("PATCH report edits a draft's payload", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") {
-      return [{ id: "sub-1", facility_id: "fac-1", status: "draft" }];
+      return [
+        { id: "sub-1", facility_id: "fac-1", status: "draft", template_id: "tpl-1", template_version_id: "ver-3" }
+      ];
     }
+    // PATCH now validates a supplied payload against the pinned version's
+    // schema, so the stub must serve that version.
+    if (table === "report_template_versions") return [VERSION];
     if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1" }];
     return [];
   });
@@ -198,6 +215,7 @@ test("POST submit 422s when required fields are missing", async (t) => {
           id: "sub-1",
           facility_id: "fac-1",
           status: "draft",
+          template_id: "tpl-1",
           template_version_id: "ver-3",
           payload_json: { supervisor: "Sam" }
         }
@@ -220,6 +238,7 @@ test("POST submit finalizes a valid draft and stamps the submitter", async (t) =
           id: "sub-1",
           facility_id: "fac-1",
           status: "draft",
+          template_id: "tpl-1",
           template_version_id: "ver-3",
           payload_json: { supervisor: "Sam", attendance: 42 }
         }
@@ -247,4 +266,217 @@ test("POST submit refuses a non-draft report (409)", async (t) => {
   const { call } = mount();
   const result = await call("POST", "/reports/sub-1/submit");
   assert.equal(result.status, 409);
+});
+
+// --- DR-11: department-scoped guards ---------------------------------------
+
+test("POST reports allows a department-scoped creator to file for their own department", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_templates") return [DEPT_A_TEMPLATE];
+    if (table === "report_template_versions") return [{ ...VERSION, template_id: "tpl-dept-a" }];
+    if (table === "report_submissions" && method === "POST") return [{ id: "sub-dept-a" }];
+    return [];
+  });
+  const { call } = mount({ memberships: DEPT_A_MEMBER });
+  const result = await call("POST", "/facilities/fac-1/reports", {
+    templateId: "tpl-dept-a",
+    reportDate: "2026-07-18",
+    payload: { supervisor: "Sam", attendance: 5 }
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "report_submissions" && c.method === "POST");
+  assert.equal(insert.body[0].department_id, "dept-a");
+});
+
+test("POST reports denies a department-scoped creator filing for a different department", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "report_templates") return [{ ...PUBLISHED_TEMPLATE, id: "tpl-dept-b", department_id: "dept-b" }];
+    return [];
+  });
+  const { call } = mount({ memberships: DEPT_A_MEMBER });
+  const result = await call("POST", "/facilities/fac-1/reports", {
+    templateId: "tpl-dept-b",
+    reportDate: "2026-07-18"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH report allows a department-scoped submitter to edit their own department's draft", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-dept-a",
+          facility_id: "fac-1",
+          department_id: "dept-a",
+          status: "draft",
+          template_id: "tpl-dept-a",
+          template_version_id: "ver-3"
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [VERSION];
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-dept-a" }];
+    return [];
+  });
+  const { call } = mount({ memberships: DEPT_A_MEMBER });
+  const result = await call("PATCH", "/reports/sub-dept-a", { payload: { supervisor: "Kim" } });
+  assert.equal(result.status, 200);
+});
+
+test("PATCH report denies a department-scoped submitter editing a different department's draft", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET"
+      ? [{ id: "sub-dept-b", facility_id: "fac-1", department_id: "dept-b", status: "draft" }]
+      : []
+  );
+  const { call } = mount({ memberships: DEPT_A_MEMBER });
+  const result = await call("PATCH", "/reports/sub-dept-b", { payload: { supervisor: "Kim" } });
+  assert.equal(result.status, 403);
+});
+
+test("POST submit denies a department-scoped submitter for a different department", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET"
+      ? [{ id: "sub-dept-b", facility_id: "fac-1", department_id: "dept-b", status: "draft" }]
+      : []
+  );
+  const { call } = mount({ memberships: DEPT_A_MEMBER });
+  const result = await call("POST", "/reports/sub-dept-b/submit");
+  assert.equal(result.status, 403);
+});
+
+test("facility-wide creator is unaffected by department scoping", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_templates") return [{ ...PUBLISHED_TEMPLATE, id: "tpl-dept-b", department_id: "dept-b" }];
+    if (table === "report_template_versions") return [{ ...VERSION, template_id: "tpl-dept-b" }];
+    if (table === "report_submissions" && method === "POST") return [{ id: "sub-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/reports", {
+    templateId: "tpl-dept-b",
+    reportDate: "2026-07-18",
+    payload: { supervisor: "Sam", attendance: 5 }
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "report_submissions" && c.method === "POST");
+  assert.equal(insert.body[0].department_id, "dept-b");
+});
+
+// --- DR-12: compliance endpoint ---------------------------------------------
+
+test("GET reports/compliance requires from and to", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const missingFrom = await call("GET", "/facilities/fac-1/reports/compliance?to=2026-08-01");
+  assert.equal(missingFrom.status, 400);
+  const missingTo = await call("GET", "/facilities/fac-1/reports/compliance?from=2026-08-01");
+  assert.equal(missingTo.status, 400);
+});
+
+test("GET reports/compliance denies a non-member with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call(
+    "GET",
+    "/facilities/fac-1/reports/compliance?from=2026-08-01&to=2026-08-02"
+  );
+  assert.equal(result.status, 403);
+});
+
+test("GET reports/compliance computes a summary from templates + submissions", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "report_templates") return [PUBLISHED_TEMPLATE];
+    if (table === "report_submissions") {
+      return [{ template_id: "tpl-1", report_date: "2026-08-01", status: "submitted" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call(
+    "GET",
+    "/facilities/fac-1/reports/compliance?from=2026-08-01&to=2026-08-02"
+  );
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.templates.length, 1);
+  assert.equal(result.payload.templates[0].templateId, "tpl-1");
+  assert.equal(result.payload.templates[0].submitted, 1);
+});
+
+// --- DR-15: single-submission PDF export ------------------------------------
+
+const ENABLED_FLAG = {
+  id: "flag-pdf",
+  key: "reports.pdf_export",
+  description: "PDF export",
+  rollout_type: "boolean",
+  default_state: true
+};
+const DISABLED_FLAG = { ...ENABLED_FLAG, default_state: false };
+
+function pdfStub(t, { flag = ENABLED_FLAG, submission } = {}) {
+  return stubFetch(t, (table) => {
+    if (table === "report_submissions") return [submission];
+    if (table === "facilities") return [{ id: "fac-1", name: "Facility One", organization_id: "org-1" }];
+    if (table === "feature_flags") return flag ? [flag] : [];
+    if (table === "feature_flag_rules") return [];
+    if (table === "report_template_versions") return [VERSION];
+    if (table === "report_templates") return [PUBLISHED_TEMPLATE];
+    if (table === "departments") return [{ id: "dept-1", name: "Aquatics" }];
+    if (table === "app_users") return [{ id: "user-1", full_name: "Sam Submitter" }];
+    return [];
+  });
+}
+
+const SUBMITTED_REPORT = {
+  id: "sub-1",
+  facility_id: "fac-1",
+  department_id: "dept-1",
+  template_id: "tpl-1",
+  template_version_id: "ver-3",
+  report_date: "2026-07-18",
+  status: "submitted",
+  submitted_by: "user-1",
+  submitted_at: "2026-07-18T20:00:00.000Z",
+  payload_json: { supervisor: "Sam", attendance: 12 }
+};
+
+test("GET reports/:id/pdf denies a caller without reports.export", async (t) => {
+  pdfStub(t, { submission: SUBMITTED_REPORT });
+  const { call } = mount({ memberships: [{ facilityId: "fac-1", status: "active", permissions: ["reports.read"] }] });
+  const result = await call("GET", "/reports/sub-1/pdf");
+  assert.equal(result.status, 403);
+});
+
+test("GET reports/:id/pdf 409s a draft submission", async (t) => {
+  pdfStub(t, { submission: { ...SUBMITTED_REPORT, status: "draft" } });
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: ["reports.export"] }]
+  });
+  const result = await call("GET", "/reports/sub-1/pdf");
+  assert.equal(result.status, 409);
+});
+
+test("GET reports/:id/pdf 403s when the pdf_export flag is off", async (t) => {
+  pdfStub(t, { flag: DISABLED_FLAG, submission: SUBMITTED_REPORT });
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: ["reports.export"] }]
+  });
+  const result = await call("GET", "/reports/sub-1/pdf");
+  assert.equal(result.status, 403);
+});
+
+test("GET reports/:id/pdf returns the export envelope for a submitted report", async (t) => {
+  pdfStub(t, { submission: SUBMITTED_REPORT });
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: ["reports.export"] }]
+  });
+  const result = await call("GET", "/reports/sub-1/pdf");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.contentType, "application/pdf");
+  assert.equal(result.payload.encoding, "base64");
+  assert.ok(result.payload.contentDisposition.includes("attachment"));
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.ok(bytes.startsWith("%PDF-1.4\n"));
 });

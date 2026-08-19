@@ -276,3 +276,375 @@ a.primary:focus-visible {
   color: #d32f2f;
 }
 
+/* --- Report entry form (DR-13) & manager review inbox detail pane (DR-14) --
+   Both src/public/js/app.js's createReportFormController instances (one
+   editable, mounted at #report-form-area; one read-only, mounted at
+   #report-inbox-detail) share this styling. */
+
+.report-form-area {
+  margin-top: 16px;
+  border: 1px solid #dce5f2;
+  border-radius: 18px;
+  padding: 20px;
+  background: #f9fbfe;
+  display: grid;
+  gap: 16px;
+}
+
+.report-form-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.report-form-header h3 {
+  margin: 0;
+}
+
+.report-form-banner {
+  border: 1px solid #f0a0a0;
+  background: #fff1f1;
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.report-form-banner p {
+  margin: 0;
+}
+
+.report-form-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.report-step-btn {
+  background: #eef4ff;
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+}
+
+.report-step-btn.active {
+  background: #1c6dd0;
+  color: #ffffff;
+  border-color: #1c6dd0;
+}
+
+.report-step-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.report-field {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.report-field legend {
+  font-weight: 700;
+  padding: 0;
+}
+
+.report-field textarea {
+  min-height: 90px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.report-field-multiselect {
+  display: grid;
+  gap: 6px;
+}
+
+.report-field-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+}
+
+.report-field-file {
+  display: grid;
+  gap: 8px;
+}
+
+.field-error {
+  min-height: 1em;
+  font-size: 0.9em;
+}
+
+.report-form-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #ffffff;
+  border: 1px solid #dce5f2;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 -6px 16px rgba(23, 32, 51, 0.06);
+}
+
+.report-form-status {
+  font-size: 0.9em;
+  color: #52647a;
+  margin-right: auto;
+}
+
+.report-reason-input {
+  min-width: 220px;
+  flex: 1 1 220px;
+  font-family: inherit;
+  min-height: 40px;
+}
+
+.report-inbox {
+  display: grid;
+  gap: 16px;
+}
+
+.report-inbox-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.report-inbox-filters label {
+  display: grid;
+  gap: 6px;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.report-inbox-meta {
+  display: grid;
+  gap: 2px;
+}
+
+.report-inbox-meta p {
+  margin: 0;
+}
+
+.report-validation-warnings {
+  border: 1px solid #f2c36b;
+  background: #fff8e8;
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.report-validation-warnings p {
+  margin: 0;
+}
+
+.report-inbox-attachments,
+.report-inbox-pdf {
+  display: grid;
+  gap: 8px;
+}
+
+@media (max-width: 720px) {
+  .report-form-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .report-form-status {
+    margin-right: 0;
+  }
+}
+
+/* --- IN-10 / WO-10 / SC-08 / CM-08-09: incidents, work orders, schedule
+   board, and communications workspaces. Each panel's #*-workspace container
+   is rendered entirely from app.js via el() (see the schedulePanel/
+   incidentsPanel/workOrdersPanel/commsPanel controllers); the classes below
+   are shared building blocks reused across all four. */
+
+.module-workspace {
+  display: grid;
+  gap: 16px;
+}
+
+.inline-form {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #dce5f2;
+  border-radius: 14px;
+  padding: 16px;
+  background: #f9fbfe;
+}
+
+.inline-form label {
+  display: grid;
+  gap: 4px;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.inline-form textarea {
+  min-height: 70px;
+  font-family: inherit;
+  resize: vertical;
+  border: 1px solid #b9c7d9;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.chip {
+  background: #eef4ff;
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.9em;
+}
+
+.chip.active {
+  background: #1c6dd0;
+  color: #ffffff;
+  border-color: #1c6dd0;
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pagination-status {
+  color: #52647a;
+  font-size: 0.9em;
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.8em;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+.badge-danger {
+  background: #fde3e3;
+  color: #a12727;
+}
+
+.badge-warning {
+  background: #fff2cf;
+  color: #7a5b09;
+}
+
+.badge-success {
+  background: #dff3e4;
+  color: #1f6b34;
+}
+
+.badge-info {
+  background: #e4ecfb;
+  color: #1c4d8f;
+}
+
+.badge-row {
+  margin: 2px 0;
+}
+
+/* Schedule board (SC-08) */
+
+.schedule-week-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+
+.schedule-week-picker label {
+  display: grid;
+  gap: 4px;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.schedule-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.schedule-board {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(160px, 1fr));
+  gap: 12px;
+  overflow-x: auto;
+}
+
+.schedule-day-column {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  border: 1px solid #dce5f2;
+  border-radius: 14px;
+  padding: 12px;
+  background: #f9fbfe;
+  min-width: 0;
+}
+
+.schedule-day-column h4 {
+  margin: 0;
+}
+
+.shift-card {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #dce5f2;
+  border-radius: 12px;
+  padding: 10px;
+  background: #ffffff;
+}
+
+@media (max-width: 900px) {
+  .schedule-board {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Communications compose (CM-08) */
+
+.audience-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.audience-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+

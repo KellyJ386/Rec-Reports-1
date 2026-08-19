@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { verifySupabaseJwt, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
@@ -11,6 +12,7 @@ import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
 import { registerWorkflowRoutes } from "../src/lib/http/workflow-routes.mjs";
 import { registerFormsRoutes } from "../src/lib/http/forms-routes.mjs";
+import { registerReportTemplatesRoutes } from "../src/lib/http/report-templates-routes.mjs";
 import { registerNotificationRoutes } from "../src/lib/http/notification-routes.mjs";
 import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
@@ -22,7 +24,10 @@ import { registerCommunicationRoutes } from "../src/lib/http/communications-rout
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
+import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
+import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
+import { reportError } from "../src/lib/observability.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
@@ -90,8 +95,8 @@ function extractBearerToken(request) {
 
 function buildClient(env, authToken) {
   return createClient({
-    url: env.NEXT_PUBLIC_SUPABASE_URL,
-    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    url: env.SUPABASE_URL,
+    key: env.SUPABASE_SERVICE_ROLE_KEY ?? env.SUPABASE_ANON_KEY,
     authToken
   });
 }
@@ -106,6 +111,11 @@ async function authenticate(request, env) {
   if (!claims || !claims.sub) {
     return { error: { status: 401, body: { error: "invalid or expired token" } } };
   }
+  // Record the verified subject for the request log (see logRequest). Stashing
+  // it here rather than re-verifying the token in handleRequest keeps a single
+  // verification per request and guarantees the log only ever attributes a
+  // request to an identity this function actually accepted.
+  request.authenticatedUserId = claims.sub;
   const client = buildClient(env, token);
   const memberships = await loadMemberships(client, claims.sub);
   const platformAdmin = await loadPlatformAdmin(client, claims.sub);
@@ -198,6 +208,12 @@ registerWorkflowRoutes(router, { authenticate, sendJson, readBody });
 // definitions, publish/retire). Logic lives in src/lib/admin/forms.mjs.
 registerFormsRoutes(router, { authenticate, sendJson, readBody });
 
+// Daily Reports template management (DR-02..DR-04): draft/publish/archive for
+// report_templates + report_template_versions. Logic lives in
+// src/lib/report-templates.mjs; writes require reports.template.manage
+// (publish additionally requires reports.publish), matching the 0028 RLS.
+registerReportTemplatesRoutes(router, { authenticate, sendJson, readBody });
+
 // Phase 7 Notifications routing routes (event catalog, distribution lists +
 // members, routes, and the test-notification sandbox). Logic lives in
 // src/lib/admin/notifications.mjs.
@@ -225,8 +241,8 @@ export const userRouter = createRouter();
 // anon key is public by design.
 userRouter.register("GET", "/public-config", (request, response, { env }) =>
   sendJson(response, 200, {
-    supabaseUrl: env.NEXT_PUBLIC_SUPABASE_URL,
-    supabaseAnonKey: env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    supabaseUrl: env.SUPABASE_URL,
+    supabaseAnonKey: env.SUPABASE_ANON_KEY
   })
 );
 
@@ -250,6 +266,34 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Attachments (OP-17): upload/list/signed-url for reports, incidents, and
+// work orders. No readBody -- uploads are raw binary read directly off the
+// request stream, never JSON.
+registerAttachmentRoutes(userRouter, { authenticate, sendJson });
+
+// Internal, CRON_SECRET-guarded notification drain (OP-13/OP-14): POST and
+// GET /api/v1/internal/notifications/drain. Deliberately bypasses the
+// `authenticate` (facility-token/JWT) pipeline every route above uses -- see
+// src/lib/http/internal-routes.mjs for the auth contract. GET exists because
+// Vercel Cron always invokes via GET; POST exists for manual/local/test
+// invocation.
+registerInternalRoutes(userRouter, { sendJson });
+
+function logRequest(request, path, status, startTime, requestId, userId) {
+  try {
+    const duration = Date.now() - startTime;
+    console.log(JSON.stringify({
+      method: request.method,
+      path,
+      status,
+      duration_ms: duration,
+      request_id: requestId,
+      user_id: userId
+    }));
+  } catch {
+    // Never let logging errors bubble up
+  }
+}
 
 function serveStatic(request, response) {
   const requestedPath = normalize(new URL(request.url ?? "/", `http://localhost:${port}`).pathname);
@@ -298,37 +342,87 @@ function serveStatic(request, response) {
 // through to static file serving (used only by the Node server — on Vercel the
 // platform serves dist/ and this function only ever receives /api/* requests).
 export async function handleRequest(request, response) {
-  const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-  const matchesPrefix = (prefix) =>
-    url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
-  // Admin prefix is checked first; the two prefixes are disjoint
-  // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
-  const active = matchesPrefix(apiPrefix)
-    ? { prefix: apiPrefix, router }
-    : matchesPrefix(userApiPrefix)
-      ? { prefix: userApiPrefix, router: userRouter }
-      : null;
-  if (!active) {
-    serveStatic(request, response);
-    return;
-  }
+  const startTime = Date.now();
+  const requestId = randomUUID();
+  let path = null;
 
-  const { env, error: envError } = loadEnv();
-  if (envError) {
-    sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
-    return;
-  }
 
-  const routeUrl = url.pathname.slice(active.prefix.length) || "/";
-  const { handler, params } = active.router.match({
-    method: request.method,
-    url: `${routeUrl}${url.search}`
-  });
-  if (!handler) {
-    sendJson(response, 404, { error: "not found" });
-    return;
+  try {
+    const url = new URL(request.url ?? "/", `http://localhost:${port}`);
+    const matchesPrefix = (prefix) =>
+      url.pathname.startsWith(`${prefix}/`) || url.pathname === prefix;
+    // Admin prefix is checked first; the two prefixes are disjoint
+    // ("/api/admin/v1..." never matches "/api/v1" and vice versa).
+    path = url.pathname;
+    const active = matchesPrefix(apiPrefix)
+      ? { prefix: apiPrefix, router }
+      : matchesPrefix(userApiPrefix)
+        ? { prefix: userApiPrefix, router: userRouter }
+        : null;
+    if (!active) {
+      serveStatic(request, response);
+      return;
+    }
+
+    const { env, error: envError } = loadEnv();
+    if (envError) {
+      sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
+      return;
+    }
+
+    const routeUrl = url.pathname.slice(active.prefix.length) || "/";
+    const matchResult = active.router.match({
+      method: request.method,
+      url: `${routeUrl}${url.search}`
+    });
+    if (!matchResult.handler) {
+      sendJson(response, 404, { error: "not found" });
+      return;
+    }
+
+    // Use the matched route template, or fall back to the pathname
+    path = matchResult.template || url.pathname;
+
+    try {
+      await matchResult.handler(request, response, { env, params: matchResult.params });
+    } catch (error) {
+      // OP-20 fire-and-forget error report. Never awaited: it must not delay
+      // (or, if it fails/times out, ever affect) the 500 response this error
+      // is about to produce via createApp's catch / the Vercel serverless
+      // catch in api/[[...path]].mjs. The error is always rethrown unchanged
+      // immediately after. Marking it here stops those outer, last-resort
+      // catches from reporting the identical error a second time, while
+      // still leaving them free to report anything that escapes from
+      // *outside* this specific try (a defense-in-depth net, not the common
+      // case -- see their own reportError calls).
+      reportError(error, {
+        dsn: env.OBSERVABILITY_DSN,
+        route: path,
+        status: 500,
+        requestId,
+        userId: request.authenticatedUserId ?? null
+      });
+      error.__observabilityReported = true;
+      throw error;
+    }
+  } finally {
+    // Always log, even if the handler threw. Never log request bodies, query
+    // strings, auth headers, or env values — only the fields below.
+    //
+    // The user id comes from authenticate(), which stashes the subject it
+    // verified on the request. Re-verifying the token here would both double
+    // the crypto work on every authenticated request and risk logging an
+    // identity the route itself rejected; unauthenticated (or rejected)
+    // requests simply log null.
+    logRequest(
+      request,
+      path || "/",
+      response.statusCode || 500,
+      startTime,
+      requestId,
+      request.authenticatedUserId ?? null
+    );
   }
-  await handler(request, response, { env, params });
 }
 
 export function createApp() {
@@ -336,6 +430,16 @@ export function createApp() {
     Promise.resolve()
       .then(() => handleRequest(request, response))
       .catch((error) => {
+        // Defense-in-depth net: handleRequest's own try/catch around the
+        // matched route handler already reports (and marks) the common case.
+        // This only reports something that escaped from outside that try
+        // (e.g. a bug in routing/env-loading itself) so it is not lost, and
+        // never double-reports the common case. No `env` is reliably
+        // available this far out, so this reads OBSERVABILITY_DSN directly
+        // off process.env rather than going through readServerEnv.
+        if (!error.__observabilityReported) {
+          reportError(error, { dsn: process.env.OBSERVABILITY_DSN, route: null, status: 500, requestId: null, userId: null });
+        }
         if (!response.headersSent) {
           sendJson(response, 500, { error: "internal server error", detail: error.message });
         } else {

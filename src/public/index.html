@@ -45,53 +45,107 @@
           <p>
             This first production slice models configurable report templates, required answers,
             immutable submitted snapshots, attachments, audit events, and outbox notifications.
+            Expand a submission's "Attachments" toggle to upload evidence (draft submissions only)
+            or download anything already on file.
           </p>
         </div>
         <div id="reports-list" class="module-list"></div>
+        <div id="report-form-area" class="report-form-area" hidden></div>
+      </section>
+      <section class="panel" aria-labelledby="report-inbox-heading">
+        <div>
+          <p class="eyebrow">Manager review</p>
+          <h2 id="report-inbox-heading">Report review inbox</h2>
+          <p>
+            Filter submissions by status, date range, department, and template. Opening a
+            submission renders its answers from the exact schema version it was filled against
+            (never the current template, even if it's since been re-published), plus its
+            attachments, any validation warnings it was submitted with, and a PDF export.
+          </p>
+        </div>
+        <div class="report-inbox">
+          <form id="report-inbox-filters" class="report-inbox-filters">
+            <label>
+              <span>Status</span>
+              <select id="report-filter-status">
+                <option value="">All</option>
+                <option value="draft">Draft</option>
+                <option value="submitted">Submitted</option>
+                <option value="locked">Locked</option>
+                <option value="revised">Revised</option>
+              </select>
+            </label>
+            <label>
+              <span>From</span>
+              <input type="date" id="report-filter-from" />
+            </label>
+            <label>
+              <span>To</span>
+              <input type="date" id="report-filter-to" />
+            </label>
+            <label>
+              <span>Department</span>
+              <select id="report-filter-department"><option value="">All departments</option></select>
+            </label>
+            <label>
+              <span>Template</span>
+              <select id="report-filter-template"><option value="">All templates</option></select>
+            </label>
+            <button type="submit" class="primary">Apply filters</button>
+          </form>
+          <div id="report-inbox-list" class="module-list"></div>
+          <div id="report-inbox-detail" class="report-form-area" hidden></div>
+        </div>
       </section>
       <section class="panel" aria-labelledby="schedule-heading">
         <div>
           <p class="eyebrow">Scheduling workflow</p>
-          <h2 id="schedule-heading">Weekly coverage readiness</h2>
+          <h2 id="schedule-heading">Weekly schedule board</h2>
           <p>
-            The scheduling slice tracks draft periods, shifts, assignments, certifications,
-            publish versions, and conflict checks before managers publish coverage.
+            Pick a week to see its shifts grouped by day, assign or unassign staff on a shift
+            card, generate shifts from templates, and validate or publish once coverage is
+            ready. Conflict and certification badges call out anything blocking publish.
           </p>
         </div>
-        <div id="schedule-list" class="schedule-list" aria-label="Schedule readiness checks"></div>
+        <div id="schedule-workspace" class="module-workspace" aria-label="Weekly schedule board"></div>
       </section>
       <section class="panel" aria-labelledby="incident-heading">
         <div>
           <p class="eyebrow">Incident workflow</p>
           <h2 id="incident-heading">Incident reports</h2>
           <p>
-            Incident capture now has a tenant-scoped data model for people involved, evidence,
-            escalations, follow-up actions, append-only audit events, and legal-safe amendments.
+            Report a new incident, then track it from draft through submission: follow-up
+            actions, escalation acknowledgement/resolution, an immutable amendment history, and
+            evidence attachments. High/critical severity requires an immediate-actions note
+            before a report can be created.
           </p>
         </div>
-        <div id="incidents-list"></div>
+        <div id="incidents-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="work-order-heading">
         <div>
           <p class="eyebrow">Maintenance workflow</p>
           <h2 id="work-order-heading">Work orders</h2>
           <p>
-            Work orders connect operational issues to assets, assignments, due dates, updates,
-            attachments, and audit-ready status history.
+            Filter by open/mine/overdue/priority, create a work order, and open one to see its
+            comment thread and change its status or assignee. Expand a work order's
+            "Attachments" toggle to upload a photo or document, or download evidence already on
+            file.
           </p>
         </div>
-        <div id="work-orders-list"></div>
+        <div id="work-orders-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="communications-heading">
         <div>
           <p class="eyebrow">Communications workflow</p>
           <h2 id="communications-heading">Messages</h2>
           <p>
-            Communications track channels, audiences, delivery receipts, acknowledgements,
-            notification jobs, and urgent messages that can bypass quiet hours.
+            Publishers can compose a message with a channel, priority, audience, and optional
+            required acknowledgement. Opening this panel marks each visible message delivered
+            and read; required-acknowledgement messages show their acknowledgement state.
           </p>
         </div>
-        <div id="messages-list"></div>
+        <div id="comms-workspace" class="module-workspace"></div>
       </section>
       <section class="panel" aria-labelledby="training-heading">
         <div>
@@ -103,6 +157,17 @@
           </p>
         </div>
         <div id="training-list"></div>
+      </section>
+      <section class="panel" aria-labelledby="certifications-heading">
+        <div>
+          <p class="eyebrow">Certification wallet</p>
+          <h2 id="certifications-heading">My certifications</h2>
+          <p>
+            Every certification on file for the current facility, with a live status derived
+            from its expiry and renewal window, plus whether evidence has been uploaded.
+          </p>
+        </div>
+        <div id="certifications-list"></div>
       </section>
       <section class="panel" aria-labelledby="admin-heading">
         <div>
