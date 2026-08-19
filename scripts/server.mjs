@@ -337,7 +337,7 @@ function serveStatic(request, response) {
 }
 
 // Core request dispatch, shared by the long-running Node server (createApp) and
-// the Vercel serverless function (api/[[...path]].mjs). Routes /api/admin/v1/*
+// the Vercel serverless function (api/[...path].mjs). Routes /api/admin/v1/*
 // to the admin router and /api/v1/* to the end-user router; anything else falls
 // through to static file serving (used only by the Node server — on Vercel the
 // platform serves dist/ and this function only ever receives /api/* requests).
@@ -389,7 +389,7 @@ export async function handleRequest(request, response) {
       // OP-20 fire-and-forget error report. Never awaited: it must not delay
       // (or, if it fails/times out, ever affect) the 500 response this error
       // is about to produce via createApp's catch / the Vercel serverless
-      // catch in api/[[...path]].mjs. The error is always rethrown unchanged
+      // catch in api/[...path].mjs. The error is always rethrown unchanged
       // immediately after. Marking it here stops those outer, last-resort
       // catches from reporting the identical error a second time, while
       // still leaving them free to report anything that escapes from
