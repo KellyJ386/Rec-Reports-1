@@ -1,4 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { reportError } from "../observability.mjs";
 import { requireAuthPermission } from "./guard.mjs";
 import {
   escalationDueAt,
@@ -108,6 +109,45 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
 
   function queryParams(request) {
     return new URL(request.url ?? "/", "http://localhost").searchParams;
+  }
+
+  // Inserts one incident_audit_events row, used at every one of this
+  // module's domain-write -> audit-write sites (escalate/acknowledge/
+  // resolve, submit, transition, amend, follow-up create/complete, PDF
+  // export). The domain write and this audit write are two separate REST
+  // calls, not one transaction, so a failure here (network blip, RLS
+  // hiccup, ...) leaves the domain write already committed with no audit
+  // record of it -- a real gap, not just a formality, since these events
+  // are the legal-defensibility trail IN-01/IN-04 depend on. The correct
+  // fix is a single transactional RPC that writes both rows atomically
+  // (tracked as Wave 3 IN-22); until that lands, every call site routes
+  // through this one helper so the failure is handled identically
+  // everywhere instead of nine slightly different ad hoc try/catches: the
+  // caller gets a clear 500 naming the incident whose audit trail is now
+  // incomplete, and the failure is reported (fire-and-forget, per
+  // observability.mjs's contract -- never awaited, never allowed to slow
+  // or fail the response) so it's visible for manual reconciliation
+  // instead of silently vanishing.
+  //
+  // Returns true on success. On failure it has already sent the response
+  // itself (matching this module's requireRead/requirePerm convention) --
+  // every call site must check the return value and bail out (`return`)
+  // without sending anything further.
+  async function writeAuditEvent(auth, response, env, event) {
+    try {
+      await pgInsert(auth.client, "incident_audit_events", [event], { returning: false });
+      return true;
+    } catch (error) {
+      reportError(error, {
+        dsn: env?.OBSERVABILITY_DSN,
+        route: `incidents.audit_write/${event.event_type}`,
+        status: 500,
+        requestId: event.incident_id,
+        userId: auth.claims?.sub ?? null
+      });
+      sendJson(response, 500, { error: "audit write failed", entity_id: event.incident_id });
+      return false;
+    }
   }
 
   // Collapses the actor's membership into the plain permission-code list
@@ -316,26 +356,25 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         });
         const createdEscalation = (rows ?? [])[0] ?? null;
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.escalated",
-              payload: {
-                actor: auth.claims.sub,
-                escalationId: createdEscalation?.id ?? null,
-                level: escalation.escalation_level,
-                targetRole: escalation.target_role,
-                reasonCode: escalation.reason_code
-              }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.escalated",
+            payload: {
+              actor: auth.claims.sub,
+              escalationId: createdEscalation?.id ?? null,
+              level: escalation.escalation_level,
+              targetRole: escalation.target_role,
+              reasonCode: escalation.reason_code
+            }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 201, createdEscalation);
       })
@@ -369,20 +408,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           { returning: true }
         );
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: escalation.facility_id,
-              incidentId: escalation.incident_id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.escalation_acknowledged",
-              payload: { actor: auth.claims.sub, escalationId: escalation.id, from: "pending", to: "acknowledged" }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: escalation.facility_id,
+            incidentId: escalation.incident_id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.escalation_acknowledged",
+            payload: { actor: auth.claims.sub, escalationId: escalation.id, from: "pending", to: "acknowledged" }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
       })
@@ -414,20 +452,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           { returning: true }
         );
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: escalation.facility_id,
-              incidentId: escalation.incident_id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.escalation_resolved",
-              payload: { actor: auth.claims.sub, escalationId: escalation.id, from: "acknowledged", to: "resolved" }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: escalation.facility_id,
+            incidentId: escalation.incident_id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.escalation_resolved",
+            payload: { actor: auth.claims.sub, escalationId: escalation.id, from: "acknowledged", to: "resolved" }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
       })
@@ -501,20 +538,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           { returning: true }
         );
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.submitted",
-              payload: { actor: auth.claims.sub, from: incident.status, to: "submitted" }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.submitted",
+            payload: { actor: auth.claims.sub, from: incident.status, to: "submitted" }
+          })
         );
+        if (!auditOk) return;
 
         const suggestedFollowUps = requiredIncidentFollowUps({
           severity: incident.severity,
@@ -575,20 +611,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           { returning: true }
         );
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.status_changed",
-              payload: { actor: auth.claims.sub, from: incident.status, to, reason: reason ?? null }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.status_changed",
+            payload: { actor: auth.claims.sub, from: incident.status, to, reason: reason ?? null }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
       })
@@ -690,26 +725,25 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           { returning: true }
         );
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.amended",
-              payload: {
-                actor: auth.claims.sub,
-                reason: built.reason,
-                fields: built.changedFields,
-                beforeHash: built.beforeHash,
-                afterHash: built.afterHash
-              }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.amended",
+            payload: {
+              actor: auth.claims.sub,
+              reason: built.reason,
+              fields: built.changedFields,
+              beforeHash: built.beforeHash,
+              afterHash: built.afterHash
+            }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 201, {
           incident: (incidentRows ?? [])[0] ?? null,
@@ -775,20 +809,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         const rows = await pgInsert(auth.client, "incident_followup_actions", [row], { returning: true });
         const created = (rows ?? [])[0] ?? null;
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.followup_created",
-              payload: { actor: auth.claims.sub, followupId: created?.id ?? null, actionType, description }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.followup_created",
+            payload: { actor: auth.claims.sub, followupId: created?.id ?? null, actionType, description }
+          })
         );
+        if (!auditOk) return;
 
         return sendJson(response, 201, created);
       })
@@ -835,20 +868,19 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         );
 
         if (isCompleting) {
-          await pgInsert(
-            auth.client,
-            "incident_audit_events",
-            [
-              buildIncidentAuditEvent({
-                facilityId: followup.facility_id,
-                incidentId: followup.incident_id,
-                actorUserId: auth.claims.sub,
-                eventType: "incident.followup_completed",
-                payload: { actor: auth.claims.sub, followupId: followup.id }
-              })
-            ],
-            { returning: false }
+          const auditOk = await writeAuditEvent(
+            auth,
+            response,
+            env,
+            buildIncidentAuditEvent({
+              facilityId: followup.facility_id,
+              incidentId: followup.incident_id,
+              actorUserId: auth.claims.sub,
+              eventType: "incident.followup_completed",
+              payload: { actor: auth.claims.sub, followupId: followup.id }
+            })
           );
+          if (!auditOk) return;
         }
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
@@ -941,26 +973,25 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           generatedBy: auth.claims.sub
         });
 
-        await pgInsert(
-          auth.client,
-          "incident_audit_events",
-          [
-            buildIncidentAuditEvent({
-              facilityId: incident.facility_id,
-              incidentId: incident.id,
-              actorUserId: auth.claims.sub,
-              eventType: "incident.exported",
-              payload: {
-                actor: auth.claims.sub,
-                format: "pdf",
-                draft: incident.status === "draft",
-                amended: (amendments ?? []).length > 0,
-                documentHash: pkg.documentHash
-              }
-            })
-          ],
-          { returning: false }
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.exported",
+            payload: {
+              actor: auth.claims.sub,
+              format: "pdf",
+              draft: incident.status === "draft",
+              amended: (amendments ?? []).length > 0,
+              documentHash: pkg.documentHash
+            }
+          })
         );
+        if (!auditOk) return;
 
         // documentHash traveled with pkg only so the audit event above could
         // carry it; it is not part of the wire envelope, which matches the

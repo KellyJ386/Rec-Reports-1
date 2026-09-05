@@ -50,3 +50,13 @@ test("router ignores query strings when matching the path", () => {
   const { handler } = router.match({ method: "GET", url: "/modules?foo=bar" });
   assert.ok(handler);
 });
+
+test("router treats malformed percent-encoding in a param segment as no match instead of throwing", () => {
+  const router = createRouter();
+  router.register("GET", "/api/v1/reports/:id", () => {});
+  assert.doesNotThrow(() => {
+    const { handler, params } = router.match({ method: "GET", url: "/api/v1/reports/%" });
+    assert.equal(handler, null);
+    assert.deepEqual(params, {});
+  });
+});
