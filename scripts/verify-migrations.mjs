@@ -102,7 +102,8 @@ for (const helper of [
   "fn_audit_chain_link",
   "fn_enforce_change_request_transition",
   "fn_storage_attachment_facility_id",
-  "fn_storage_attachment_module"
+  "fn_storage_attachment_module",
+  "fn_message_audience_ref_facility"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
