@@ -25,7 +25,7 @@ function signToken(payload, { secretOverride = secret, header = { alg: "HS256", 
 
 test("verifySupabaseJwt accepts a validly signed, unexpired token", () => {
   const futureExp = Math.floor(Date.now() / 1000) + 3600;
-  const token = signToken({ sub: "user-1", role: "authenticated", exp: futureExp });
+  const token = signToken({ sub: "user-1", role: "authenticated", exp: futureExp, iss: "supabase" });
   const claims = verifySupabaseJwt(token, secret);
   assert.equal(claims.sub, "user-1");
   assert.equal(claims.role, "authenticated");
@@ -181,7 +181,10 @@ test("createJwtVerifier accepts an ES256 token signed by a published JWKS key", 
   const { privateKey, jwk } = es256Keys();
   const { fetchImpl } = jwksFetch([jwk]);
   const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
-  const token = makeJwksToken({ sub: "user-9", role: "authenticated", exp: futureExp() }, { privateKey, kid: "key-1" });
+  const token = makeJwksToken(
+    { sub: "user-9", role: "authenticated", exp: futureExp(), iss: "supabase" },
+    { privateKey, kid: "key-1" }
+  );
   const claims = await verify(token);
   assert.equal(claims.sub, "user-9");
 });
@@ -246,7 +249,7 @@ test("createJwtVerifier fails closed when the JWKS is unreachable", async () => 
 test("createJwtVerifier still handles HS256 tokens with the shared secret", async () => {
   resetJwksCache();
   const verify = createJwtVerifier({ jwtSecret: secret, supabaseUrl: "https://proj.supabase.co" });
-  const claims = await verify(signToken({ sub: "user-1", exp: futureExp() }));
+  const claims = await verify(signToken({ sub: "user-1", exp: futureExp(), iss: "supabase" }));
   assert.equal(claims.sub, "user-1");
 });
 
@@ -338,7 +341,7 @@ test("createJwtVerifier bounds the JWKS fetch with an abort signal", async () =>
       return { ok: true, text: async () => JSON.stringify({ keys: [jwk] }) };
     }
   });
-  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp(), iss: "supabase" }, { privateKey, kid: "key-1" });
   assert.ok(await verify(token));
   assert.ok(init?.signal instanceof AbortSignal, "the JWKS fetch must carry a timeout signal");
 });
@@ -387,4 +390,123 @@ test("createJwtVerifier refuses a JWKS key whose declared alg is not the header 
   const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
   const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
   assert.equal(await verify(token), null);
+});
+
+// --- S-13: iss claim, JWKS fetch de-duplication, kid-less trial, alg pruning
+
+test("verifySupabaseJwt accepts iss \"supabase\" and rejects a missing or foreign iss", () => {
+  const token = signToken({ sub: "user-1", exp: futureExp(), iss: "supabase" });
+  assert.equal(verifySupabaseJwt(token, secret).sub, "user-1");
+
+  const noIss = signToken({ sub: "user-1", exp: futureExp() });
+  assert.equal(verifySupabaseJwt(noIss, secret), null);
+
+  const foreignIss = signToken({ sub: "user-1", exp: futureExp(), iss: "https://evil.example.com" });
+  assert.equal(verifySupabaseJwt(foreignIss, secret), null);
+});
+
+test("verifySupabaseJwt accepts iss as \"${supabaseUrl}/auth/v1\" (trailing slash trimmed) only when supabaseUrl is given, case-sensitively", () => {
+  const token = signToken({ sub: "user-1", exp: futureExp(), iss: "https://proj.supabase.co/auth/v1" });
+  assert.equal(verifySupabaseJwt(token, secret, "https://proj.supabase.co/").sub, "user-1");
+  assert.equal(verifySupabaseJwt(token, secret, "https://proj.supabase.co").sub, "user-1");
+  // Without a supabaseUrl, only the bare "supabase" issuer is accepted.
+  assert.equal(verifySupabaseJwt(token, secret), null);
+
+  const wrongCase = signToken({ sub: "user-1", exp: futureExp(), iss: "Supabase" });
+  assert.equal(verifySupabaseJwt(wrongCase, secret), null);
+});
+
+test("createJwtVerifier rejects an ES256 token with no iss claim", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const { fetchImpl } = jwksFetch([jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier de-dupes concurrent JWKS fetches for the same supabaseUrl", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const counter = { calls: 0 };
+  const { fetchImpl } = jwksFetch([jwk], counter);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp(), iss: "supabase" }, { privateKey, kid: "key-1" });
+  const results = await Promise.all([verify(token), verify(token), verify(token), verify(token), verify(token)]);
+  for (const claims of results) assert.equal(claims.sub, "user-9");
+  assert.equal(counter.calls, 1, "5 concurrent verifications on a cache miss must share one JWKS fetch");
+});
+
+test("createJwtVerifier tries every JWK matching the header alg when the token carries no kid", async () => {
+  resetJwksCache();
+  const first = es256Keys("key-1");
+  const second = es256Keys("key-2");
+  const { fetchImpl } = jwksFetch([first.jwk, second.jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  // Signed by the *second* published key, with no kid in the header: the
+  // verifier must fall through to it instead of only trying the first.
+  const token = makeJwksToken(
+    { sub: "user-9", exp: futureExp(), iss: "supabase" },
+    { privateKey: second.privateKey, kid: undefined }
+  );
+  const claims = await verify(token);
+  assert.equal(claims.sub, "user-9");
+});
+
+test("createJwtVerifier fails closed when no kid is given and no published key verifies", async () => {
+  resetJwksCache();
+  const published = es256Keys("key-1");
+  const attacker = es256Keys("key-2");
+  const { fetchImpl } = jwksFetch([published.jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken(
+    { sub: "user-9", exp: futureExp(), iss: "supabase" },
+    { privateKey: attacker.privateKey, kid: undefined }
+  );
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier never falls back to HS256 when a kid is missing from an asymmetric token", async () => {
+  resetJwksCache();
+  const { jwk } = es256Keys("key-1");
+  const { fetchImpl } = jwksFetch([jwk]);
+  const verify = createJwtVerifier({ jwtSecret: secret, supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  // HS256-sign a kid-less, ES256-labelled header with the shared secret: it
+  // must not be accepted by quietly falling back to the HS256 verifier.
+  const payload = { sub: "user-9", exp: futureExp(), iss: "supabase" };
+  const headerB64 = base64Url(JSON.stringify({ alg: "ES256", typ: "JWT" }));
+  const payloadB64 = base64Url(JSON.stringify(payload));
+  const hsSignature = createHmac("sha256", secret).update(`${headerB64}.${payloadB64}`).digest();
+  const token = `${headerB64}.${payloadB64}.${base64Url(hsSignature)}`;
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier rejects an ES512 token (removed from the algorithm allow-list)", async () => {
+  resetJwksCache();
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-521" });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "key-1", alg: "ES512", use: "sig" };
+  const counter = { calls: 0 };
+  const { fetchImpl } = jwksFetch([jwk], counter);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken(
+    { sub: "user-9", exp: futureExp(), iss: "supabase" },
+    { privateKey, kid: "key-1", alg: "ES512" }
+  );
+  assert.equal(await verify(token), null);
+  assert.equal(counter.calls, 0, "an unlisted alg (ES512) must be rejected before any JWKS fetch");
+});
+
+test("createJwtVerifier rejects an RS512 token (removed from the algorithm allow-list)", async () => {
+  resetJwksCache();
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "key-1", alg: "RS512", use: "sig" };
+  const counter = { calls: 0 };
+  const { fetchImpl } = jwksFetch([jwk], counter);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const headerB64 = base64Url(JSON.stringify({ alg: "RS512", typ: "JWT", kid: "key-1" }));
+  const payloadB64 = base64Url(JSON.stringify({ sub: "user-9", exp: futureExp(), iss: "supabase" }));
+  const signature = sign("sha512", Buffer.from(`${headerB64}.${payloadB64}`), privateKey);
+  const token = `${headerB64}.${payloadB64}.${base64Url(signature)}`;
+  assert.equal(await verify(token), null);
+  assert.equal(counter.calls, 0, "an unlisted alg (RS512) must be rejected before any JWKS fetch");
 });

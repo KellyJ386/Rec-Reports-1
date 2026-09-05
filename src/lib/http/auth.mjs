@@ -25,7 +25,22 @@ const CLOCK_SKEW_SECONDS = 30;
 // pinning it to "authenticated" would reject legitimate deployments. The
 // `sub`/`role` checks below cover the case that actually matters -- a
 // non-session token being replayed as one.
-function validateClaims(payload) {
+
+// The `iss` values a token from this deployment may carry. Supabase mints
+// `iss: "supabase"` on some projects and the full issuer URL
+// (`${supabaseUrl}/auth/v1`) on others, so both are accepted -- but nothing
+// else is: an unset or foreign `iss` is how a token minted for a *different*
+// Supabase project (or a different service entirely) would otherwise slip
+// past a signature check that only verifies "signed by a key this verifier
+// trusts", not "issued for this deployment". The comparison is exact and
+// case-sensitive; only a trailing slash on supabaseUrl is normalized away.
+function allowedIssuers(supabaseUrl) {
+  const issuers = new Set(["supabase"]);
+  if (supabaseUrl) issuers.add(`${String(supabaseUrl).replace(/\/+$/, "")}/auth/v1`);
+  return issuers;
+}
+
+function validateClaims(payload, supabaseUrl) {
   if (!payload || typeof payload !== "object") return null;
   const now = Math.floor(Date.now() / 1000);
 
@@ -46,10 +61,13 @@ function validateClaims(payload) {
   if (typeof payload.sub !== "string" || payload.sub.length === 0) return null;
   if (payload.role === "anon" || payload.role === "service_role") return null;
 
+  // `iss` is REQUIRED and must name this deployment. See allowedIssuers above.
+  if (typeof payload.iss !== "string" || !allowedIssuers(supabaseUrl).has(payload.iss)) return null;
+
   return payload;
 }
 
-export function verifySupabaseJwt(token, jwtSecret) {
+export function verifySupabaseJwt(token, jwtSecret, supabaseUrl) {
   if (typeof token !== "string" || !jwtSecret) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
@@ -73,7 +91,7 @@ export function verifySupabaseJwt(token, jwtSecret) {
   if (expectedBuffer.length !== providedBuffer.length) return null;
   if (!timingSafeEqual(expectedBuffer, providedBuffer)) return null;
 
-  return validateClaims(payload);
+  return validateClaims(payload, supabaseUrl);
 }
 
 // --- Asymmetric (JWKS) verification ---------------------------------------
@@ -91,13 +109,15 @@ export function verifySupabaseJwt(token, jwtSecret) {
 // otherwise stops a P-521 key (or an RSA key) from being used to check an
 // "ES256" signature. Membership is tested with Object.hasOwn, never a bare
 // property read -- `alg: "constructor"` reads truthy off Object.prototype.
+// ES512/RS512 are deliberately not listed: Supabase projects issue ES256 or
+// RS256, and every unlisted algorithm is rejected before a JWKS is even
+// fetched (see the Object.hasOwn check below), so trimming the allow-list to
+// what is actually issued shrinks the attack surface for free.
 const JWS_ALGORITHMS = {
   // JWS ES256 signatures are the raw r||s pair, not the DER encoding
   // node:crypto verifies by default.
   ES256: { hash: "sha256", kty: "EC", crv: "P-256", options: { dsaEncoding: "ieee-p1363" } },
-  ES512: { hash: "sha512", kty: "EC", crv: "P-521", options: { dsaEncoding: "ieee-p1363" } },
-  RS256: { hash: "sha256", kty: "RSA", crv: null, options: {} },
-  RS512: { hash: "sha512", kty: "RSA", crv: null, options: {} }
+  RS256: { hash: "sha256", kty: "RSA", crv: null, options: {} }
 };
 
 const JWKS_TTL_MS = 10 * 60 * 1000;
@@ -113,6 +133,13 @@ const JWKS_FETCH_TIMEOUT_MS = 3000;
 // unknown `kid` (key rotation) but at most once per TTL window, so a bogus kid
 // cannot be used to hammer the auth server.
 const jwksCache = new Map();
+
+// In-flight JWKS fetches, keyed by supabaseUrl. A burst of requests that all
+// miss the cache at once (a cold start, or a TTL expiry under load) must not
+// turn into a fetch per request -- they share the one outstanding promise and
+// the entry is cleared as soon as it settles, so the next genuine cache miss
+// fetches again normally.
+const jwksPending = new Map();
 
 function jwksUrl(supabaseUrl) {
   return `${String(supabaseUrl).replace(/\/+$/, "")}/auth/v1/.well-known/jwks.json`;
@@ -136,36 +163,71 @@ async function fetchJwks(supabaseUrl, fetchImpl) {
   }
 }
 
-async function resolveJwk(supabaseUrl, kid, fetchImpl) {
+function fetchJwksDeduped(supabaseUrl, fetchImpl) {
+  const pending = jwksPending.get(supabaseUrl);
+  if (pending) return pending;
+  const promise = fetchJwks(supabaseUrl, fetchImpl).finally(() => {
+    jwksPending.delete(supabaseUrl);
+  });
+  jwksPending.set(supabaseUrl, promise);
+  return promise;
+}
+
+// kid known: at most one candidate (the key with that kid, or none). kid
+// missing: every published key is a candidate -- the caller tries each one
+// whose kty/crv/alg fit the header alg (see resolveJwkCandidates below).
+function findCandidates(keys, kid) {
+  if (!keys) return [];
+  if (kid) {
+    const key = keys.find((candidate) => candidate.kid === kid);
+    return key ? [key] : [];
+  }
+  return keys;
+}
+
+async function resolveJwkCandidates(supabaseUrl, kid, fetchImpl) {
   const now = Date.now();
   const cached = jwksCache.get(supabaseUrl);
-  const findKey = (keys) =>
-    keys?.find((key) => (kid ? key.kid === kid : true)) ?? (kid ? null : (keys?.[0] ?? null));
 
   if (cached) {
-    const hit = findKey(cached.keys);
-    if (hit) return hit;
-    // Unknown kid: only pay for a refetch once the TTL has elapsed.
-    if (now - cached.fetchedAt < (cached.failed ? JWKS_ERROR_TTL_MS : JWKS_TTL_MS)) return null;
+    const hits = findCandidates(cached.keys, kid);
+    if (hits.length > 0) return hits;
+    // Unknown kid (or, with no kid, nothing cached yet): only pay for a
+    // refetch once the TTL has elapsed.
+    if (now - cached.fetchedAt < (cached.failed ? JWKS_ERROR_TTL_MS : JWKS_TTL_MS)) return [];
   }
 
-  const keys = await fetchJwks(supabaseUrl, fetchImpl);
+  const keys = await fetchJwksDeduped(supabaseUrl, fetchImpl);
   if (!keys) {
     // Negative cache. Any previously fetched keys are kept (a transient outage
     // must not sign every user out); only the retry clock is reset, so a JWKS
     // the server cannot reach is retried at most once per JWKS_ERROR_TTL_MS
     // rather than once per request.
     jwksCache.set(supabaseUrl, { keys: cached?.keys ?? [], fetchedAt: now, failed: true });
-    return null;
+    return [];
   }
   jwksCache.set(supabaseUrl, { keys, fetchedAt: now, failed: false });
-  return findKey(keys);
+  return findCandidates(keys, kid);
+}
+
+// The header names an algorithm but the *key* comes from the JWKS, and
+// nothing otherwise stops a P-521 key (or an RSA key) from being used to check
+// an "ES256" signature -- so a candidate only counts if its kty/crv agree with
+// the header alg, it is not published for encryption, and (when the key
+// itself declares an alg) that alg matches the header too.
+function jwkMatchesAlg(jwk, algorithm, headerAlg) {
+  if (jwk.kty !== algorithm.kty) return false;
+  if (algorithm.crv && jwk.crv !== algorithm.crv) return false;
+  if (jwk.use && jwk.use !== "sig") return false;
+  if (jwk.alg && jwk.alg !== headerAlg) return false;
+  return true;
 }
 
 // Exported for tests: drops the cached JWKS so a test can control what the next
 // verification fetches.
 export function resetJwksCache() {
   jwksCache.clear();
+  jwksPending.clear();
 }
 
 // Builds the verifier the request pipeline uses. Returns an async function that
@@ -186,43 +248,21 @@ export function createJwtVerifier({ jwtSecret, supabaseUrl, fetchImpl = globalTh
     }
 
     // Legacy shared-secret projects.
-    if (header.alg === "HS256") return verifySupabaseJwt(token, jwtSecret);
+    if (header.alg === "HS256") return verifySupabaseJwt(token, jwtSecret, supabaseUrl);
 
     if (typeof header.alg !== "string" || !Object.hasOwn(JWS_ALGORITHMS, header.alg)) return null;
     const algorithm = JWS_ALGORITHMS[header.alg];
     if (!supabaseUrl) return null;
 
-    const jwk = await resolveJwk(supabaseUrl, header.kid, fetchImpl);
-    if (!jwk) return null;
-
-    // The header picks the algorithm but the JWKS supplies the key, so the two
-    // have to agree before a signature check means anything: a key of the wrong
-    // family or curve, or one the issuer published for encryption rather than
-    // signing, is not a key for this token.
-    if (jwk.kty !== algorithm.kty) return null;
-    if (algorithm.crv && jwk.crv !== algorithm.crv) return null;
-    if (jwk.use && jwk.use !== "sig") return null;
-    if (jwk.alg && jwk.alg !== header.alg) return null;
-
-    let key;
-    try {
-      key = createPublicKey({ key: jwk, format: "jwk" });
-    } catch {
-      return null;
-    }
-
-    let signatureValid;
-    try {
-      signatureValid = verifySignature(
-        algorithm.hash,
-        Buffer.from(`${headerB64}.${payloadB64}`),
-        { key, ...algorithm.options },
-        base64UrlDecode(signatureB64)
-      );
-    } catch {
-      return null;
-    }
-    if (!signatureValid) return null;
+    // Candidates: the single JWK with the token's `kid`, or -- when the token
+    // carries no `kid` at all -- every published key whose kty/crv/alg fit the
+    // header alg. Each candidate is tried in turn; a HS256-signed token can
+    // never reach here (the branch above already returned), so there is no
+    // path from "no matching JWK" back to the shared-secret check.
+    const candidates = (await resolveJwkCandidates(supabaseUrl, header.kid, fetchImpl)).filter((jwk) =>
+      jwkMatchesAlg(jwk, algorithm, header.alg)
+    );
+    if (candidates.length === 0) return null;
 
     let payload;
     try {
@@ -231,7 +271,26 @@ export function createJwtVerifier({ jwtSecret, supabaseUrl, fetchImpl = globalTh
       return null;
     }
 
-    return validateClaims(payload);
+    const signedInput = Buffer.from(`${headerB64}.${payloadB64}`);
+    const signature = base64UrlDecode(signatureB64);
+    for (const jwk of candidates) {
+      let key;
+      try {
+        key = createPublicKey({ key: jwk, format: "jwk" });
+      } catch {
+        continue;
+      }
+      let signatureValid;
+      try {
+        signatureValid = verifySignature(algorithm.hash, signedInput, { key, ...algorithm.options }, signature);
+      } catch {
+        continue;
+      }
+      if (signatureValid) return validateClaims(payload, supabaseUrl);
+    }
+
+    // Fail closed: none of the candidate keys verified this signature.
+    return null;
   };
 }
 
