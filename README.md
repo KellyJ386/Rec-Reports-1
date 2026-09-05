@@ -9,6 +9,24 @@ Rec Reports is a recreation operations SaaS platform for multi-facility recreati
 - Node built-in test runner for unit tests; SQL test suites under `supabase/tests/`
 - Repository-local format, lint (JS-parse), permission-vocabulary, settings-registry, build, migration, and seed verification gates
 
+## Signing in
+
+`/signin` is the single entry point for both the end-user app at `/` and the Admin Control
+Center at `/admin/`. It posts email and password to `POST /api/v1/auth/sign-in`, a
+same-origin proxy to Supabase Auth — the browser never calls GoTrue directly, because the
+`default-src 'self'` CSP forbids the cross-origin request and the app ships no bundler.
+
+- The returned session is stored under `rr_admin_token` / `rr_refresh_token`.
+- Both apps redirect to `/signin?next=…` when signed out and return you to the page you
+  asked for. Only same-origin, path-only `next` values are honoured.
+- An expired access token is refreshed silently once (single-flight, so concurrent 401s
+  don't race for the single-use refresh token) and the request is replayed; only if that
+  fails does the user get bounced to sign in again.
+- `POST /api/v1/auth/sign-out` revokes the refresh token upstream. It always answers 200 —
+  the browser drops its copy either way, so signing out cannot fail.
+- The admin top bar shows the signed-in email from `/me` and picks the organization from
+  the facilities that call returns, so no one pastes a token or an organization UUID.
+
 ## Admin Control Center
 
 The admin area at `/admin/` governs the whole platform. All ten sections are live:

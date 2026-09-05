@@ -89,25 +89,95 @@ function clearAuthAndRedirect() {
   window.location.assign("/signin/");
 }
 
-// Helper: Fetch with bearer token and JSON handling
-async function apiFetch(path, options = {}) {
-  const token = getToken();
-  const headers = { "Accept": "application/json", ...options.headers };
+// Helper: Exchange the stored refresh token for a new session. Single-flight,
+// because several calls can 401 at once when the access token expires and the
+// refresh token is single-use. Resolves true when a fresh token was stored.
+let refreshInFlight = null;
 
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+async function exchangeRefreshToken() {
+  let refreshToken = "";
+  try {
+    refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY) || "";
+  } catch {
+    return false;
   }
-
-  if (options.body && typeof options.body === "object") {
-    headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify(options.body);
-  }
+  if (!refreshToken) return false;
 
   let response;
   try {
-    response = await fetch(`${API_BASE}${path}`, { ...options, headers });
-  } catch (error) {
-    throw new Error(`Network error: ${error.message}`);
+    response = await fetch(`${API_BASE}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken })
+    });
+  } catch {
+    return false;
+  }
+  if (!response.ok) return false;
+
+  let session;
+  try {
+    session = await response.json();
+  } catch {
+    return false;
+  }
+  if (!session || !session.access_token) return false;
+
+  try {
+    localStorage.setItem(TOKEN_KEY, session.access_token);
+    if (session.refresh_token) {
+      localStorage.setItem(REFRESH_TOKEN_KEY, session.refresh_token);
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function refreshSession() {
+  if (!refreshInFlight) {
+    refreshInFlight = exchangeRefreshToken().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+// Helper: Fetch with bearer token and JSON handling
+async function apiFetch(path, options = {}) {
+  // Serialize the body once, outside the send helper, so a retry after a token
+  // refresh doesn't stringify an already-stringified body.
+  const requestOptions = { ...options };
+  const baseHeaders = { "Accept": "application/json", ...options.headers };
+  if (requestOptions.body && typeof requestOptions.body === "object") {
+    baseHeaders["Content-Type"] = "application/json";
+    requestOptions.body = JSON.stringify(requestOptions.body);
+  }
+
+  async function send() {
+    const token = getToken();
+    const headers = { ...baseHeaders };
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    try {
+      return await fetch(`${API_BASE}${path}`, { ...requestOptions, headers });
+    } catch (error) {
+      throw new Error(`Network error: ${error.message}`);
+    }
+  }
+
+  let response = await send();
+
+  // An expired access token gets one silent refresh and one replay before the
+  // user is bounced to the sign-in page.
+  if (response.status === 401 && (await refreshSession())) {
+    response = await send();
+  }
+
+  if (response.status === 401) {
+    clearAuthAndRedirect();
+    return null;
   }
 
   const text = await response.text();
@@ -118,11 +188,6 @@ async function apiFetch(path, options = {}) {
     } catch {
       data = null;
     }
-  }
-
-  if (response.status === 401) {
-    clearAuthAndRedirect();
-    return null;
   }
 
   if (!response.ok) {
@@ -3082,14 +3147,27 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (m) => map[m]);
 }
 
-// Sign out handler
+// Sign out handler. Revokes the refresh token upstream first so the session
+// cannot be resumed elsewhere, then clears local storage and redirects. The
+// local clear runs even if revocation fails, so signing out always works.
 function setupSignOut() {
   const signOutBtn = document.getElementById("sign-out-btn");
-  if (signOutBtn) {
-    signOutBtn.addEventListener("click", () => {
-      clearAuthAndRedirect();
-    });
-  }
+  if (!signOutBtn) return;
+  signOutBtn.addEventListener("click", async () => {
+    signOutBtn.disabled = true;
+    const token = getToken();
+    if (token) {
+      try {
+        await fetch(`${API_BASE}/auth/sign-out`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+        });
+      } catch {
+        // Ignore: the local clear below is what signs this browser out.
+      }
+    }
+    clearAuthAndRedirect();
+  });
 }
 
 // Start app on load

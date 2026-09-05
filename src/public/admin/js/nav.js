@@ -115,7 +115,7 @@ export function initRouter() {
     renderRoute();
   });
   // Re-render the current page whenever shared state changes (org/facility
-  // context switch, session token save, /me resolving) so pages don't need
+  // context switch, sign-in/sign-out, /me resolving) so pages don't need
   // their own change-detection wiring.
   subscribe(() => {
     renderRoute();

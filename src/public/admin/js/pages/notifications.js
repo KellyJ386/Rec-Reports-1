@@ -228,16 +228,9 @@ export async function renderNotifications(container) {
 }
 
 async function deleteMember(facilityId, listId, memberId) {
-  // api.js has no delete helper; issue the DELETE through fetch with the same
-  // token handling the wrapper uses by delegating to a small inline request.
-  const token = localStorage.getItem("rr_admin_token") || "";
-  const response = await fetch(
-    `/api/admin/v1/facilities/${encodeURIComponent(facilityId)}/distribution-lists/${encodeURIComponent(listId)}/members/${encodeURIComponent(memberId)}`,
-    { method: "DELETE", headers: token ? { Authorization: `Bearer ${token}` } : {} }
+  await api.del(
+    `/facilities/${encodeURIComponent(facilityId)}/distribution-lists/${encodeURIComponent(listId)}/members/${encodeURIComponent(memberId)}`
   );
-  if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}`);
-  }
 }
 
 function buildCreateListForm({ facilityId, statusRegion, onCreated }) {

@@ -23,14 +23,14 @@ export function registerMeRoute(router, { authenticate, sendJson }) {
       let facilities;
       if (auth.platformAdmin === true) {
         facilities = await pgSelect(auth.client, "facilities", {
-          select: "id,name,organization_id",
+          select: "id,name,organization_id,organizations(name)",
           order: "name.asc"
         });
       } else {
         const ids = [...new Set((auth.memberships ?? []).map((m) => m.facilityId))];
         facilities = ids.length
           ? await pgSelect(auth.client, "facilities", {
-              select: "id,name,organization_id",
+              select: "id,name,organization_id,organizations(name)",
               order: "name.asc",
               extra: { id: `in.(${ids.join(",")})` }
             })
@@ -44,6 +44,10 @@ export function registerMeRoute(router, { authenticate, sendJson }) {
           id: f.id,
           name: f.name,
           organizationId: f.organization_id,
+          // Embedded from organizations so the admin top bar can label the
+          // organization picker without a second round trip (and without the
+          // user pasting an organization UUID by hand).
+          organizationName: f.organizations?.name ?? null,
           permissions: permsByFacility[f.id] ?? []
         }))
       });
