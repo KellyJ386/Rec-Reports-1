@@ -19,7 +19,7 @@
 ///      postWithTimeout's headers/URL parsing for Sentry's `key@host/project`
 //       DSN form) is the entire migration.
 //     - reportError(error, context) is the stable public entry point every
-//       caller (scripts/server.mjs, api/[[...path]].mjs,
+//       caller (scripts/server.mjs, api/[...path].mjs,
 //       src/lib/notifications/worker.mjs) already uses; it never needs to
 //       change shape once the owner picks a provider.
 //   Until that decision lands, every report is just:
