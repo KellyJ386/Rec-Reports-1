@@ -30,6 +30,7 @@ import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
+import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -106,7 +107,16 @@ async function handleDrain(request, response, { env }, sendJson) {
   // reportError treats as a silent no-op -- identical to every other call
   // site in this codebase.
   const summary = await drainAll({ client, now: new Date(), limit, config: { dsn: env.OBSERVABILITY_DSN } });
-  sendJson(response, 200, summary);
+
+  // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
+  // cadence as the drain -- the durable throttle store's equivalent of the
+  // in-memory limiter's own periodic sweep (rate-limit.mjs), so a table
+  // written from every sign-in/refresh attempt across every instance stays
+  // bounded. Fails open (never throws -- see durable-rate-limit.mjs), so a
+  // sweep failure can never turn a healthy drain into a 500.
+  const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
+
+  sendJson(response, 200, { ...summary, authThrottleSwept: authThrottleSwept.deleted });
 }
 
 // GET /internal/audit/verify-all's chain fetch for one facility. Fetches

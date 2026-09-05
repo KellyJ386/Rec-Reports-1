@@ -18,6 +18,18 @@ export const permissions = Object.freeze([
   // incidents.manage: a supervisor may review/escalate/create tasks without
   // holding full incidents.manage, and legal_hold/export.pdf/audit.view are
   // restricted to facility/ops admin roles even where incidents.manage is held.
+  // RLS wiring (0043/0044, Slice 1C S-4/S-5): incidents.escalate gates
+  // incident_escalations INSERT (OR incidents.manage), incidents.tasks.create
+  // gates incident_followup_actions INSERT (OR incidents.manage),
+  // incidents.legal_hold.manage gates incident_reports.legal_hold changes
+  // (fn_incident_report_transition_guard, 0043) and PATCH
+  // /incidents/:id/legal-hold, incidents.audit.view gates incident_audit_events
+  // SELECT (OR incidents.manage/incidents.review). incidents.export.pdf is
+  // BFF-only by design (scripts/typecheck.mjs's bffOnlyPermissionCodes): the
+  // GET /incidents/:id/export.pdf route gates on it, but the only DB write it
+  // triggers is an incident_audit_events insert already covered by that
+  // table's (incidents.manage or incidents.review) INSERT policy, so there is
+  // no separate RLS predicate for this code to appear in.
   "incidents.review",
   "incidents.escalate",
   "incidents.tasks.create",
@@ -31,6 +43,12 @@ export const permissions = Object.freeze([
   // Reports governance codes (DR-05). reports.template.manage alone can author
   // a template but cannot publish it, manage its workflow automation, or
   // manage its distribution lists -- each is its own governance surface.
+  // reports.publish is wired into RLS (0044, Slice 1C S-5): it gates the
+  // report_template_versions UPDATE policy's is_published=true transition
+  // (OR reports.template.manage for every other field). reports.workflow.manage
+  // and reports.distribution.manage are BFF-only by design, reserved for
+  // DR-18/DR-21 (scripts/typecheck.mjs's bffOnlyPermissionCodes) -- no route
+  // or RLS predicate exists for either yet.
   "reports.publish",
   "reports.workflow.manage",
   "reports.distribution.manage",

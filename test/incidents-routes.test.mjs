@@ -25,6 +25,9 @@ const TASK_CREATOR = [
 const EXPORTER = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.export.pdf"] }
 ];
+const ESCALATOR = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.escalate"] }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -323,6 +326,19 @@ test("POST escalate loads incident and denies non-manager with 403", async (t) =
   assert.equal(result.status, 403);
 });
 
+test("POST escalate allows an incidents.escalate holder without incidents.manage (S-5)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-3" }];
+    return [];
+  });
+  const { call } = mount({ memberships: ESCALATOR });
+  const result = await call("POST", "/incidents/inc-1/escalate");
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_escalations" && c.method === "POST");
+  assert.ok(insert, "expected an incident_escalations insert");
+});
+
 test("POST escalate happy path inserts an escalation row", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [INCIDENT];
@@ -531,6 +547,50 @@ test("POST status 404s when the incident is missing", async (t) => {
   const { call } = mount({ memberships: REVIEWER });
   const result = await call("POST", "/incidents/nope/status", { to: "under_review" });
   assert.equal(result.status, 404);
+});
+
+// --- PATCH /incidents/:id/legal-hold (S-5) ----------------------------------
+
+test("PATCH legal-hold validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: "yes" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH legal-hold 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/nope/legal-hold", { legalHold: true });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH legal-hold denies a manager without incidents.legal_hold.manage", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: true });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH legal-hold happy path flips legal_hold and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, legal_hold: true }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: true });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.legal_hold, true);
+
+  const update = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
+  assert.equal(update.body.legal_hold, true);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  assert.equal(auditInsert.body[0].event_type, "incident.legal_hold_changed");
 });
 
 // --- POST /incidents/:id/submit: suggestedFollowUps (IN-05) -----------------

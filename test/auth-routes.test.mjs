@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { createRateLimiter } from "../src/lib/http/rate-limit.mjs";
@@ -25,14 +26,15 @@ function stubFetch(t, respond) {
 
 // `now` and `signInRateLimit` are forwarded straight to registerAuthRoutes so
 // throttle tests can inject a fake, manually-advanced clock and tiny
-// windows/limits instead of relying on real elapsed time.
-function mount({ env = ENV, now, signInRateLimit } = {}) {
+// windows/limits instead of relying on real elapsed time. `durableLimiter`
+// is forwarded the same way for the S-7 durable-backstop tests below.
+function mount({ env = ENV, now, signInRateLimit, durableLimiter } = {}) {
   const router = createRouter();
   const sent = [];
   const sendJson = (response, status, payload) =>
     sent.push({ status, payload, headers: { ...(response.__headers ?? {}) } });
   const readBody = async (request) => request.__body ?? "{}";
-  registerAuthRoutes(router, { sendJson, readBody, now, signInRateLimit });
+  registerAuthRoutes(router, { sendJson, readBody, now, signInRateLimit, durableLimiter });
   async function call(method, path, body, { headers = {} } = {}) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
@@ -51,6 +53,27 @@ function mount({ env = ENV, now, signInRateLimit } = {}) {
     return sent[sent.length - 1];
   }
   return { call };
+}
+
+// A stub durable limiter that records every check/recordFailure/reset call
+// (key + call order) and answers according to `blockedKeys` (a Set of keys
+// that should report as blocked). Mirrors createDurableRateLimiter's async
+// {check, recordFailure, reset} shape without touching PostgREST.
+function stubDurableLimiter({ blockedKeys = new Set() } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async check(key) {
+      calls.push({ method: "check", key });
+      return blockedKeys.has(key) ? { blocked: true, retryAfterMs: 42000 } : { blocked: false, retryAfterMs: 0 };
+    },
+    async recordFailure(key) {
+      calls.push({ method: "recordFailure", key });
+    },
+    async reset(key) {
+      calls.push({ method: "reset", key });
+    }
+  };
 }
 
 // A manually-advanced fake clock: `clock.now` is the injectable `now`
@@ -443,6 +466,136 @@ test("rate limiter: reset() clears a key outright", () => {
   limiter.reset("a@b.com");
   assert.equal(limiter.check("a@b.com").blocked, false);
   assert.equal(limiter.size(), 0);
+});
+
+// ---------------------------------------------------------------------------
+// S-7: durable (cross-instance) throttle backstop, layered behind the
+// in-memory limiter tested above.
+// ---------------------------------------------------------------------------
+
+test("sign-in: the durable limiter is checked (email/ip keys) and recorded on failure", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const clock = fakeClock();
+  const { call } = mount({ now: clock.now, durableLimiter: durable });
+
+  const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });
+  assert.equal(result.status, 401);
+
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.deepEqual(checked.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+  const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
+  assert.deepEqual(recorded.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+});
+
+test("sign-in: a successful sign-in resets the durable email key", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-ok", refresh_token: "r-ok", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+  const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "correct" });
+  assert.equal(result.status, 200);
+  assert.deepEqual(
+    durable.calls.filter((c) => c.method === "reset"),
+    [{ method: "reset", key: "email:a@b.com" }]
+  );
+});
+
+test("sign-in: a durable-only block (in-memory clear) still returns 429 with Retry-After, before calling GoTrue", async (t) => {
+  const captured = stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter({ blockedKeys: new Set(["email:victim@example.com"]) });
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });
+  assert.equal(result.status, 429);
+  assert.equal(result.payload.error, "too many attempts, try again later");
+  assert.equal(result.headers["Retry-After"], "42");
+  assert.equal(captured.length, 0, "GoTrue must not be called once the durable limiter blocks");
+});
+
+test("refresh: throttled by the in-memory refresh limiter after enough failures (429, Retry-After)", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const clock = fakeClock();
+  const { call } = mount({
+    now: clock.now,
+    signInRateLimit: { refreshMax: 2, refreshWindowMs: 15 * 60 * 1000, refreshIpMax: 1000 }
+  });
+  const body = { refresh_token: "stale-refresh-token" };
+
+  assert.equal((await call("POST", "/auth/refresh", body)).status, 401);
+  assert.equal((await call("POST", "/auth/refresh", body)).status, 401);
+  const blocked = await call("POST", "/auth/refresh", body);
+  assert.equal(blocked.status, 429);
+  const retryAfter = Number(blocked.headers["Retry-After"]);
+  assert.ok(Number.isFinite(retryAfter) && retryAfter > 0);
+});
+
+test("refresh: the durable limiter is checked/recorded keyed on sha256(refresh_token) and client IP", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "stale-refresh-token" },
+    { headers: { "x-forwarded-for": "203.0.113.9" } }
+  );
+  assert.equal(result.status, 401);
+
+  const expectedTokenHash = createHash("sha256").update("stale-refresh-token").digest("hex");
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.deepEqual(checked.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+  const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
+  assert.deepEqual(recorded.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+});
+
+test("refresh: prefers the rr_refresh cookie over body.refresh_token for the durable throttle key", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+
+  await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "body-token" },
+    { headers: { cookie: "rr_refresh=cookie-token; other=1" } }
+  );
+
+  const expectedTokenHash = createHash("sha256").update("cookie-token").digest("hex");
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.ok(checked.includes(`refresh:${expectedTokenHash}`));
+});
+
+test("refresh: a durable-only block returns 429 before calling GoTrue", async (t) => {
+  const expectedTokenHash = createHash("sha256").update("stale-refresh-token").digest("hex");
+  const captured = stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter({ blockedKeys: new Set([`refresh:${expectedTokenHash}`]) });
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call("POST", "/auth/refresh", { refresh_token: "stale-refresh-token" });
+  assert.equal(result.status, 429);
+  assert.equal(result.headers["Retry-After"], "42");
+  assert.equal(captured.length, 0, "GoTrue must not be called once the durable limiter blocks");
+});
+
+test("refresh: a successful refresh resets the in-memory and durable token counters", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+  const result = await call("POST", "/auth/refresh", { refresh_token: "good-refresh-token" });
+  assert.equal(result.status, 200);
+
+  const expectedTokenHash = createHash("sha256").update("good-refresh-token").digest("hex");
+  assert.deepEqual(
+    durable.calls.filter((c) => c.method === "reset"),
+    [{ method: "reset", key: `refresh:${expectedTokenHash}` }]
+  );
 });
 
 test("sign-out revokes the caller's token upstream", async (t) => {

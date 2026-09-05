@@ -81,7 +81,8 @@ const requiredRlsTables = [
   "employee_notification_preferences",
   "subscription_plans",
   "tenant_subscriptions",
-  "usage_counters"
+  "usage_counters",
+  "auth_throttle"
 ];
 
 for (const table of requiredRlsTables) {
@@ -102,7 +103,10 @@ for (const helper of [
   "fn_audit_chain_link",
   "fn_enforce_change_request_transition",
   "fn_storage_attachment_facility_id",
-  "fn_storage_attachment_module"
+  "fn_storage_attachment_module",
+  "fn_message_audience_ref_facility",
+  "fn_incident_report_audit",
+  "fn_incident_report_transition_guard"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

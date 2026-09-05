@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
-import { requireAuthPermission, requireAuthOrgAdmin } from "./guard.mjs";
+import { requireAuthPermission, requireAuthOrgAdminRow } from "./guard.mjs";
 import {
   validateModuleTogglePayload,
   validateMembershipInput,
@@ -34,14 +34,6 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       return { ok: false };
     }
     return { ok: true, payload };
-  }
-
-  async function orgFacilityIds(client, organizationId) {
-    const rows = await pgSelect(client, "facilities", {
-      filters: { organization_id: organizationId },
-      select: "id"
-    });
-    return (rows ?? []).map((row) => row.id);
   }
 
   async function withAuth(request, response, env, handler) {
@@ -138,8 +130,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   // --- Org facilities ------------------------------------------------------
   router.register("GET", "/org/:orgId/facilities", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      const facilityIds = await orgFacilityIds(auth.client, params.orgId);
-      const guard = requireAuthOrgAdmin(auth, facilityIds);
+      const guard = await requireAuthOrgAdminRow(auth, params.orgId);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const rows = await pgSelect(auth.client, "facilities", {
         filters: { organization_id: params.orgId },
@@ -155,8 +146,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
       const { valid, errors } = validateFacilityInput(body.payload);
       if (!valid) return sendJson(response, 400, { errors });
-      const facilityIds = await orgFacilityIds(auth.client, params.orgId);
-      const guard = requireAuthOrgAdmin(auth, facilityIds);
+      const guard = await requireAuthOrgAdminRow(auth, params.orgId);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const row = { organization_id: params.orgId, name: body.payload.name };
       if (body.payload.timezone) row.timezone = body.payload.timezone;
@@ -182,8 +172,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
       });
       const facility = (found ?? [])[0];
       if (!facility) return sendJson(response, 404, { error: "facility not found" });
-      const facilityIds = await orgFacilityIds(auth.client, facility.organization_id);
-      const guard = requireAuthOrgAdmin(auth, facilityIds);
+      const guard = await requireAuthOrgAdminRow(auth, facility.organization_id);
       if (!guard.allowed) return sendJson(response, 403, { error: guard.reason });
       const patch = {};
       if (body.payload.name !== undefined) patch.name = body.payload.name;
