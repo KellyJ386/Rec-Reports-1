@@ -62,6 +62,53 @@ if (unknownMigrationCodes.length > 0) {
   );
 }
 
+// Slice 1C, S-5 (plans/WAVES_1_4_IMPLEMENTATION_PLAN.md): every permission
+// code in the catalog must be wired into at least one has_permission(...)
+// literal somewhere in supabase/migrations/*.sql -- i.e. actually enforced by
+// RLS, not merely gated at the HTTP layer -- EXCEPT the codes below, which
+// are BFF-only by design (documented in src/lib/permissions.mjs's own
+// comments): incidents.export.pdf has no DB write beyond an audit event
+// already covered by another code's policy; reports.workflow.manage and
+// reports.distribution.manage are reserved for DR-18/DR-21 with no route or
+// policy yet. Any other code that stops appearing in a migration (or a new
+// code that's added without one) is a real regression of the kind S-5 itself
+// fixed for incidents.escalate/tasks.create/legal_hold.manage/audit.view and
+// reports.publish.
+const bffOnlyPermissionCodes = new Set([
+  "incidents.export.pdf",
+  "reports.workflow.manage",
+  "reports.distribution.manage"
+]);
+
+// Broader than hasPermissionPattern above (which only matches the 3-arg
+// has_permission(auth.uid(), X, 'code') shape): this also matches the 4-arg
+// has_permission(auth.uid(), facility_id, department_id, 'code') overload
+// (0023) and internal.has_permission(...) (0042) alike, since the permission
+// code is always the literal, quoted, LAST argument immediately before the
+// closing paren in every call site in this codebase.
+const anyHasPermissionPattern = /has_permission\(\s*auth\.uid\(\)\s*,\s*[^']*'([^']+)'\s*\)/g;
+const anyMigrationCodes = new Set();
+let anyMatch;
+while ((anyMatch = anyHasPermissionPattern.exec(combinedMigrationSql)) !== null) {
+  anyMigrationCodes.add(anyMatch[1]);
+}
+
+const uncoveredCodes = libCodes.filter(
+  (code) => !bffOnlyPermissionCodes.has(code) && !anyMigrationCodes.has(code)
+);
+if (uncoveredCodes.length > 0) {
+  failures.push(
+    `Permission codes with no has_permission(...) literal in any migration and not in bffOnlyPermissionCodes: ${uncoveredCodes.join(", ")}`
+  );
+}
+
+const unknownBffOnlyCodes = [...bffOnlyPermissionCodes].filter((code) => !libCodeSet.has(code));
+if (unknownBffOnlyCodes.length > 0) {
+  failures.push(
+    `scripts/typecheck.mjs's bffOnlyPermissionCodes lists codes outside the permission vocabulary: ${unknownBffOnlyCodes.join(", ")}`
+  );
+}
+
 if (failures.length) throw new Error(failures.join("\n"));
 console.log(
   `Type contract checks passed: ${libCodeSet.size} permission code(s) consistent across permissions.mjs, seed.sql, and migrations.`
