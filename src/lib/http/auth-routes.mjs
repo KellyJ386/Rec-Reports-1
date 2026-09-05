@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createRateLimiter } from "./rate-limit.mjs";
 
 // Server-side authentication proxy for the email + password sign-in flow.
@@ -26,9 +27,19 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // tests can inject a fake, steppable clock and tiny windows instead of
 // sleeping in real time; production callers (scripts/server.mjs) get the
 // defaults below by omitting them.
+//
+// Durable throttle (S-7)
+// -----------------------------------------------------------------------
+// `durableLimiter` is an optional second-line backstop behind every
+// in-memory limiter below -- same {check, recordFailure, reset} shape,
+// backed by the auth_throttle table (src/lib/http/durable-rate-limit.mjs,
+// supabase/migrations/0046_auth_throttle.sql) instead of a per-process Map,
+// so a lockout survives across serverless instances. `null` (the default)
+// keeps this module exactly as before -- in-memory only, e.g. in tests and
+// anywhere SUPABASE_SERVICE_ROLE_KEY isn't configured.
 export function registerAuthRoutes(
   router,
-  { sendJson, readBody, now = Date.now, signInRateLimit = {} }
+  { sendJson, readBody, now = Date.now, signInRateLimit = {}, durableLimiter = null }
 ) {
   const emailLimiter = createRateLimiter({
     windowMs: signInRateLimit.emailWindowMs ?? 15 * 60 * 1000,
@@ -45,6 +56,38 @@ export function registerAuthRoutes(
     now,
     sweepEvery: signInRateLimit.sweepEvery ?? 500
   });
+  // POST /auth/refresh throttle (S-7): same two-bucket shape as sign-in
+  // above (a token bucket and an IP bucket), sized looser than sign-in's
+  // since a legitimate client refreshes far more often than it signs in.
+  const refreshLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+  const refreshIpLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshIpWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshIpMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+
+  // Awaits the durable check for both buckets only when a durableLimiter is
+  // configured (see the file header); the in-memory pair passed in has
+  // already been checked synchronously by the caller. Small shared helper so
+  // the sign-in and refresh handlers below don't repeat this Promise.all
+  // shape.
+  async function checkDurable(keyA, keyB) {
+    if (!durableLimiter) return { blocked: false, retryAfterMs: 0 };
+    const [a, b] = await Promise.all([durableLimiter.check(keyA), durableLimiter.check(keyB)]);
+    if (!a.blocked && !b.blocked) return { blocked: false, retryAfterMs: 0 };
+    return { blocked: true, retryAfterMs: Math.max(a.retryAfterMs, b.retryAfterMs) };
+  }
+
+  async function recordDurableFailure(keyA, keyB) {
+    if (!durableLimiter) return;
+    await Promise.all([durableLimiter.recordFailure(keyA), durableLimiter.recordFailure(keyB)]);
+  }
 
   async function parseJsonBody(request) {
     try {
@@ -187,6 +230,8 @@ export function registerAuthRoutes(
 
       const ip = clientIp(request);
       const emailKey = normalizeEmail(email);
+      const durableIpKey = `ip:${ip}`;
+      const durableEmailKey = `email:${emailKey}`;
 
       const ipCheck = ipLimiter.check(ip);
       const emailCheck = emailLimiter.check(emailKey);
@@ -194,17 +239,42 @@ export function registerAuthRoutes(
         const retryAfterMs = Math.max(ipCheck.retryAfterMs, emailCheck.retryAfterMs);
         return sendThrottled(response, retryAfterMs);
       }
+      const durableCheck = await checkDurable(durableIpKey, durableEmailKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
 
       const result = await callGotrue(env, "token?grant_type=password", { email, password });
       if (!result.ok) {
         ipLimiter.recordFailure(ip);
         emailLimiter.recordFailure(emailKey);
+        await recordDurableFailure(durableIpKey, durableEmailKey);
         return sendJson(response, 401, { error: "invalid email or password" });
       }
       emailLimiter.reset(emailKey);
+      if (durableLimiter) await durableLimiter.reset(durableEmailKey);
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
+
+  // Throttle key material for POST /auth/refresh (S-7): the raw refresh
+  // token itself must never become a throttle-store key or land in a
+  // reported error, so this hashes it (sha256) instead. Reads the
+  // `rr_refresh` HttpOnly cookie first, falling back to body.refresh_token --
+  // matching the cookie-first precedence the route's own token lookup uses,
+  // so the throttle bucket lines up with whichever token the request is
+  // actually trying to redeem regardless of which source it came from.
+  function refreshTokenForThrottle(request, body) {
+    const cookieHeader = request.headers?.cookie;
+    if (cookieHeader) {
+      const match = /(?:^|;\s*)rr_refresh=([^;]+)/.exec(String(cookieHeader));
+      if (match) return decodeURIComponent(match[1]);
+    }
+    return body?.payload?.refresh_token;
+  }
+
+  function refreshThrottleKeys(request, body) {
+    const tokenHash = createHash("sha256").update(String(refreshTokenForThrottle(request, body) ?? "")).digest("hex");
+    return { tokenKey: `refresh:${tokenHash}`, ipKey: `refresh-ip:${clientIp(request)}` };
+  }
 
   // POST /auth/refresh { refresh_token } -> session
   router.register("POST", "/auth/refresh", (request, response, { env }) =>
@@ -212,6 +282,16 @@ export function registerAuthRoutes(
       if (!requireConfigured(env, response)) return;
       const body = await parseJsonBody(request);
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+      const { tokenKey, ipKey } = refreshThrottleKeys(request, body);
+      const tokenCheck = refreshLimiter.check(tokenKey);
+      const ipCheck = refreshIpLimiter.check(ipKey);
+      if (tokenCheck.blocked || ipCheck.blocked) {
+        return sendThrottled(response, Math.max(tokenCheck.retryAfterMs, ipCheck.retryAfterMs));
+      }
+      const durableCheck = await checkDurable(tokenKey, ipKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
+
       const refreshToken = body.payload.refresh_token;
       if (!refreshToken) {
         return sendJson(response, 400, { errors: ["refresh_token is required"] });
@@ -220,8 +300,13 @@ export function registerAuthRoutes(
         refresh_token: refreshToken
       });
       if (!result.ok) {
+        refreshLimiter.recordFailure(tokenKey);
+        refreshIpLimiter.recordFailure(ipKey);
+        await recordDurableFailure(tokenKey, ipKey);
         return sendJson(response, 401, { error: "could not refresh session" });
       }
+      refreshLimiter.reset(tokenKey);
+      if (durableLimiter) await durableLimiter.reset(tokenKey);
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
