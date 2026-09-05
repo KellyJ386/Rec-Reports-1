@@ -43,6 +43,12 @@ on conflict (id) do nothing;
 
 insert into role_permissions (role_id, permission_code) values
   ('28c00000-0000-0000-0000-0000000000c1', 'reports.template.manage'),
+  -- reports.publish (Slice 1C, S-5, 0044): since that migration, flipping
+  -- is_published to true additionally requires this code -- template.manage
+  -- alone still covers every other field edit (asserted in step 2 above via
+  -- the version insert, and implicitly by every non-publish write in this
+  -- file).
+  ('28c00000-0000-0000-0000-0000000000c1', 'reports.publish'),
   ('28c00000-0000-0000-0000-0000000000c1', 'reports.read'),
   ('28c00000-0000-0000-0000-0000000000c2', 'reports.read')
 on conflict do nothing;

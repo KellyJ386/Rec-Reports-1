@@ -114,6 +114,7 @@ const MODULES = [
   {
     name: "reports",
     urlSegment: "reports",
+    storageModule: "reports",
     parentTable: "report_submissions",
     parentLabel: "report",
     readPerm: "reports.read",
@@ -126,6 +127,7 @@ const MODULES = [
   {
     name: "incidents",
     urlSegment: "incidents",
+    storageModule: "incidents",
     parentTable: "incident_reports",
     parentLabel: "incident",
     readPerm: "incidents.read",
@@ -138,6 +140,7 @@ const MODULES = [
   {
     name: "work-orders",
     urlSegment: "work-orders",
+    storageModule: "work_orders",
     parentTable: "work_orders",
     parentLabel: "work order",
     readPerm: "work_orders.read",
@@ -267,7 +270,7 @@ for (const mod of MODULES) {
   test(`${mod.name}: signed-url route 404s (not 403) for a caller who cannot read the attachment's facility`, async (t) => {
     stubFetch(t, (table, method) =>
       table === mod.attachmentTable && method === "GET"
-        ? [{ id: "att-1", facility_id: FAC_1, storage_path: `facilities/${FAC_1}/x/y/z-file.png` }]
+        ? [{ id: "att-1", facility_id: FAC_1, storage_path: `facilities/${FAC_1}/${mod.storageModule}/y/z-file.png` }]
         : []
     );
     const storage = stubStorageClient(t);
@@ -281,7 +284,7 @@ for (const mod of MODULES) {
   test(`${mod.name}: signed-url route returns a short-TTL url for an authorized reader`, async (t) => {
     stubFetch(t, (table, method) =>
       table === mod.attachmentTable && method === "GET"
-        ? [{ id: "att-1", facility_id: FAC_1, storage_path: `facilities/${FAC_1}/x/y/z-file.png` }]
+        ? [{ id: "att-1", facility_id: FAC_1, storage_path: `facilities/${FAC_1}/${mod.storageModule}/y/z-file.png` }]
         : []
     );
     const storage = stubStorageClient(t);
@@ -297,6 +300,21 @@ for (const mod of MODULES) {
     assert.ok(sign, "should have requested a signed url from storage");
     const signBody = JSON.parse(sign.body);
     assert.equal(signBody.expiresIn, 300);
+  });
+
+  test(`${mod.name}: signed-url route 404s (not the storage client) when the row's storage_path names another facility`, async (t) => {
+    stubFetch(t, (table, method) =>
+      table === mod.attachmentTable && method === "GET"
+        ? [{ id: "att-1", facility_id: FAC_1, storage_path: `facilities/${FAC_2}/${mod.storageModule}/y/z-file.png` }]
+        : []
+    );
+    const storage = stubStorageClient(t);
+    const { call } = mount({ memberships: READER, createStorageClient: () => storage.client });
+
+    const result = await call("GET", `/${mod.urlSegment}/attachments/att-1/url`);
+    assert.equal(result.status, 404);
+    assert.equal(result.payload.error, "attachment not found");
+    assert.equal(storage.calls.length, 0, "should never mint a signed url for a path outside the row's own facility");
   });
 
   test(`${mod.name}: signed-url route 404s when the attachment does not exist`, async (t) => {

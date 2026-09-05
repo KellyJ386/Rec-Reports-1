@@ -5,8 +5,36 @@ import {
   requireOrgAdmin,
   requireAuthPermission,
   authCanAccessFacility,
-  requireAuthOrgAdmin
+  requireAuthOrgAdmin,
+  requireAuthOrgAdminRow
 } from "../src/lib/http/guard.mjs";
+import { createClient } from "../src/lib/supabase-rest.mjs";
+
+// requireAuthOrgAdminRow queries organization_admins over PostgREST via
+// auth.client; stub global.fetch the same way the route tests do, keyed by
+// table + method so a test can hand back a row (allowed) or none (denied).
+function stubOrgAdminsFetch(t, respond) {
+  const captured = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    captured.push({ table, method: init.method, url: parsed });
+    const data = respond(table, init.method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  return captured;
+}
+
+function fakeAuth(userId) {
+  return {
+    claims: { sub: userId },
+    client: createClient({ url: "https://example.supabase.co", key: "service-key" })
+  };
+}
 
 const activeAdmin = [
   { facilityId: "facility-a", status: "active", permissions: ["admin.manage", "reports.read"] }
@@ -92,4 +120,45 @@ test("requireAuthOrgAdmin honors the bypass even with no facilities", () => {
   assert.equal(requireAuthOrgAdmin({ memberships: [], platformAdmin: true }, []).allowed, true);
   assert.equal(requireAuthOrgAdmin({ memberships: activeAdmin }, ["facility-a"]).allowed, true);
   assert.equal(requireAuthOrgAdmin({ memberships: activeAdmin }, ["facility-b"]).allowed, false);
+});
+
+// --- requireAuthOrgAdminRow (S-6, matches the actual SQL rule: 0019 requires
+// an explicit organization_admins row, not admin.manage on any org facility) -
+
+test("requireAuthOrgAdminRow honors the platform super-admin bypass without querying the DB", async (t) => {
+  const captured = stubOrgAdminsFetch(t, () => {
+    throw new Error("must not query organization_admins for a platform admin");
+  });
+  const auth = { ...fakeAuth("user-1"), platformAdmin: true };
+  const result = await requireAuthOrgAdminRow(auth, "org-1");
+  assert.deepEqual(result, { allowed: true, reason: null });
+  assert.equal(captured.length, 0);
+});
+
+test("requireAuthOrgAdminRow denies when organization id is missing", async (t) => {
+  stubOrgAdminsFetch(t, () => []);
+  const result = await requireAuthOrgAdminRow(fakeAuth("user-1"), null);
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /organization id/);
+});
+
+test("requireAuthOrgAdminRow allows a caller with an organization_admins row", async (t) => {
+  const captured = stubOrgAdminsFetch(t, (table, method, url) => {
+    if (table === "organization_admins" && method === "GET") {
+      assert.equal(url.searchParams.get("organization_id"), "eq.org-1");
+      assert.equal(url.searchParams.get("user_id"), "eq.user-1");
+      return [{ id: "oa-1" }];
+    }
+    return [];
+  });
+  const result = await requireAuthOrgAdminRow(fakeAuth("user-1"), "org-1");
+  assert.deepEqual(result, { allowed: true, reason: null });
+  assert.equal(captured.length, 1);
+});
+
+test("requireAuthOrgAdminRow denies a member with admin.manage but no organization_admins row", async (t) => {
+  stubOrgAdminsFetch(t, () => []);
+  const result = await requireAuthOrgAdminRow(fakeAuth("user-1"), "org-1");
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /organization_admins/);
 });

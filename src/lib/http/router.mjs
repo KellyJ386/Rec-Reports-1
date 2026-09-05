@@ -25,9 +25,14 @@ export function createRouter() {
       const result = route.regex.exec(url.pathname);
       if (!result) continue;
       const params = {};
-      route.paramNames.forEach((name, index) => {
-        params[name] = decodeURIComponent(result[index + 1]);
-      });
+      try {
+        route.paramNames.forEach((name, index) => {
+          params[name] = decodeURIComponent(result[index + 1]);
+        });
+      } catch (err) {
+        if (err instanceof URIError) continue;
+        throw err;
+      }
       return { handler: route.handler, params, template: route.pattern };
     }
     return { handler: null, params: {}, template: null };

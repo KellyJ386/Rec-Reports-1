@@ -1,7 +1,6 @@
 import { chooseDestination, isSafeNextPath } from "./destination.js";
 
 const TOKEN_KEY = "rr_admin_token";
-const REFRESH_TOKEN_KEY = "rr_refresh_token";
 
 const form = document.getElementById("signin-form");
 const emailInput = document.getElementById("email-input");
@@ -9,12 +8,12 @@ const passwordInput = document.getElementById("password-input");
 const signinButton = document.getElementById("signin-button");
 const errorMessage = document.getElementById("error-message");
 
+// S-11: the refresh token no longer travels in the response body -- the
+// server sets it as an HttpOnly `rr_refresh` cookie instead, so only the
+// access token is ever stored here (client JS cannot read it either way).
 function storeSession(session) {
   try {
     localStorage.setItem(TOKEN_KEY, session.access_token);
-    if (session.refresh_token) {
-      localStorage.setItem(REFRESH_TOKEN_KEY, session.refresh_token);
-    }
   } catch {
     // Storage may be unavailable (private browsing, blocked cookies). The
     // redirect below will bounce straight back here, and the message shown
@@ -67,6 +66,7 @@ async function handleSignIn(event) {
   try {
     const response = await fetch("/api/v1/auth/sign-in", {
       method: "POST",
+      credentials: "same-origin",
       headers: {
         "Content-Type": "application/json"
       },

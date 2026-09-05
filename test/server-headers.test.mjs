@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
 
-const port = 41000 + (process.pid % 4000);
+// Port ranges are disjoint per test file (server-logging uses 41000-42999) and the
+// second server below sits 2000 above this one, so parallel test files can
+// never collide on a port -- a collision made this file's 503 test hit the
+// other file's fully configured server and read a 401.
+const port = 43000 + (process.pid % 2000);
 const base = `http://localhost:${port}`;
 
 function waitForServer(url, attempts = 50) {
@@ -114,7 +118,7 @@ test("hardened server: security headers, 404s, JSON API 404, and stream resilien
 });
 
 test("server returns 503 JSON on API routes when required server env is missing", async (t) => {
-  const badPort = port + 1;
+  const badPort = port + 2000;
   const child = spawn(process.execPath, ["scripts/server.mjs"], {
     env: {
       ...process.env,

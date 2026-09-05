@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { createRateLimiter } from "../src/lib/http/rate-limit.mjs";
@@ -25,14 +26,15 @@ function stubFetch(t, respond) {
 
 // `now` and `signInRateLimit` are forwarded straight to registerAuthRoutes so
 // throttle tests can inject a fake, manually-advanced clock and tiny
-// windows/limits instead of relying on real elapsed time.
-function mount({ env = ENV, now, signInRateLimit } = {}) {
+// windows/limits instead of relying on real elapsed time. `durableLimiter`
+// is forwarded the same way for the S-7 durable-backstop tests below.
+function mount({ env = ENV, now, signInRateLimit, durableLimiter } = {}) {
   const router = createRouter();
   const sent = [];
   const sendJson = (response, status, payload) =>
     sent.push({ status, payload, headers: { ...(response.__headers ?? {}) } });
   const readBody = async (request) => request.__body ?? "{}";
-  registerAuthRoutes(router, { sendJson, readBody, now, signInRateLimit });
+  registerAuthRoutes(router, { sendJson, readBody, now, signInRateLimit, durableLimiter });
   async function call(method, path, body, { headers = {} } = {}) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
@@ -51,6 +53,27 @@ function mount({ env = ENV, now, signInRateLimit } = {}) {
     return sent[sent.length - 1];
   }
   return { call };
+}
+
+// A stub durable limiter that records every check/recordFailure/reset call
+// (key + call order) and answers according to `blockedKeys` (a Set of keys
+// that should report as blocked). Mirrors createDurableRateLimiter's async
+// {check, recordFailure, reset} shape without touching PostgREST.
+function stubDurableLimiter({ blockedKeys = new Set() } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async check(key) {
+      calls.push({ method: "check", key });
+      return blockedKeys.has(key) ? { blocked: true, retryAfterMs: 42000 } : { blocked: false, retryAfterMs: 0 };
+    },
+    async recordFailure(key) {
+      calls.push({ method: "recordFailure", key });
+    },
+    async reset(key) {
+      calls.push({ method: "reset", key });
+    }
+  };
 }
 
 // A manually-advanced fake clock: `clock.now` is the injectable `now`
@@ -83,12 +106,69 @@ test("sign-in forwards to GoTrue password grant and returns the session", async 
   const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "secret" });
   assert.equal(result.status, 200);
   assert.equal(result.payload.access_token, "jwt-123");
-  assert.equal(result.payload.refresh_token, "refresh-123");
+  assert.equal("refresh_token" in result.payload, false, "refresh_token must never appear in the body (S-11)");
   assert.deepEqual(result.payload.user, { id: "user-1", email: "a@b.com" });
   const gotrueCall = captured[0];
   assert.match(gotrueCall.url.href, /\/auth\/v1\/token\?grant_type=password$/);
   assert.equal(gotrueCall.init.headers.apikey, "anon-key");
   assert.deepEqual(gotrueCall.body, { email: "a@b.com", password: "secret" });
+});
+
+test("sign-in sets an HttpOnly refresh cookie with the expected attributes", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: {
+      access_token: "jwt-123",
+      refresh_token: "refresh-123",
+      expires_in: 3600,
+      token_type: "bearer",
+      user: { id: "user-1", email: "a@b.com" }
+    }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "secret" });
+  assert.equal(result.status, 200);
+  const cookie = result.headers["Set-Cookie"];
+  assert.ok(cookie, "Set-Cookie header must be present");
+  assert.match(cookie, /^rr_refresh=refresh-123;/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /Secure/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api\/v1\/auth/);
+  assert.match(cookie, /Max-Age=2592000/);
+});
+
+test("sign-in omits Secure on the refresh cookie for plain-http localhost", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-123", refresh_token: "refresh-123", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/sign-in",
+    { email: "a@b.com", password: "secret" },
+    { headers: { host: "localhost:4411" } }
+  );
+  const cookie = result.headers["Set-Cookie"];
+  assert.ok(cookie);
+  assert.doesNotMatch(cookie, /Secure/);
+});
+
+test("sign-in keeps Secure on the refresh cookie for a non-localhost host with no proxy header", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-123", refresh_token: "refresh-123", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/sign-in",
+    { email: "a@b.com", password: "secret" },
+    { headers: { host: "app.example.com" } }
+  );
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /Secure/);
 });
 
 test("sign-in maps a GoTrue rejection to 401", async (t) => {
@@ -106,7 +186,7 @@ test("sign-in returns 503 when Supabase is not configured", async (t) => {
   assert.equal(captured.length, 0);
 });
 
-test("refresh requires a refresh_token (400)", async (t) => {
+test("refresh requires a refresh_token (400) when neither cookie nor body carries one", async (t) => {
   const captured = stubFetch(t, () => ({}));
   const { call } = mount();
   const result = await call("POST", "/auth/refresh", {});
@@ -114,18 +194,98 @@ test("refresh requires a refresh_token (400)", async (t) => {
   assert.equal(captured.length, 0);
 });
 
-test("refresh forwards to GoTrue refresh grant and returns the session", async (t) => {
+test("refresh reads the token from the rr_refresh cookie, not the body", async (t) => {
   const captured = stubFetch(t, () => ({
     ok: true,
     data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
   }));
   const { call } = mount();
-  const result = await call("POST", "/auth/refresh", { refresh_token: "refresh-123" });
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=refresh-123" } });
   assert.equal(result.status, 200);
   assert.equal(result.payload.access_token, "jwt-new");
+  assert.equal("refresh_token" in result.payload, false);
   const gotrueCall = captured[0];
   assert.match(gotrueCall.url.href, /\/auth\/v1\/token\?grant_type=refresh_token$/);
   assert.deepEqual(gotrueCall.body, { refresh_token: "refresh-123" });
+});
+
+test("refresh rotates the cookie on success (new token, same attributes)", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=refresh-123" } });
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=refresh-new;/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api\/v1\/auth/);
+});
+
+// One-release compat: a body refresh_token still works when there is no
+// cookie yet (a session that signed in before S-11 shipped).
+test("refresh falls back to a body refresh_token when there is no cookie", async (t) => {
+  const captured = stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", { refresh_token: "legacy-refresh" });
+  assert.equal(result.status, 200);
+  const gotrueCall = captured[0];
+  assert.deepEqual(gotrueCall.body, { refresh_token: "legacy-refresh" });
+});
+
+test("refresh prefers the cookie over a body refresh_token when both are present", async (t) => {
+  const captured = stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new" }
+  }));
+  const { call } = mount();
+  await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "body-token" },
+    { headers: { cookie: "rr_refresh=cookie-token" } }
+  );
+  const gotrueCall = captured[0];
+  assert.deepEqual(gotrueCall.body, { refresh_token: "cookie-token" });
+});
+
+test("refresh rejects a cross-site request (sec-fetch-site: cross-site) without calling GoTrue", async (t) => {
+  const captured = stubFetch(t, () => ({}));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/refresh",
+    {},
+    { headers: { cookie: "rr_refresh=refresh-123", "sec-fetch-site": "cross-site" } }
+  );
+  assert.equal(result.status, 403);
+  assert.deepEqual(result.payload, { error: "cross-site request" });
+  assert.equal(captured.length, 0, "GoTrue must not be called for a cross-site refresh attempt");
+});
+
+test("refresh allows sec-fetch-site: same-origin and none, and a missing header", async (t) => {
+  stubFetch(t, () => ({ ok: true, data: { access_token: "jwt-new", refresh_token: "refresh-new" } }));
+  const { call } = mount();
+  for (const secFetchSite of ["same-origin", "none", undefined]) {
+    const headers = { cookie: "rr_refresh=refresh-123" };
+    if (secFetchSite) headers["sec-fetch-site"] = secFetchSite;
+    const result = await call("POST", "/auth/refresh", {}, { headers });
+    assert.equal(result.status, 200, `sec-fetch-site=${secFetchSite} should be allowed`);
+  }
+});
+
+test("refresh clears the cookie when GoTrue rejects the token (401)", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 401, data: { error: "invalid_grant" } }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=stale-token" } });
+  assert.equal(result.status, 401);
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=;/);
+  assert.match(cookie, /Max-Age=0/);
 });
 
 // ---------------------------------------------------------------------------
@@ -308,6 +468,136 @@ test("rate limiter: reset() clears a key outright", () => {
   assert.equal(limiter.size(), 0);
 });
 
+// ---------------------------------------------------------------------------
+// S-7: durable (cross-instance) throttle backstop, layered behind the
+// in-memory limiter tested above.
+// ---------------------------------------------------------------------------
+
+test("sign-in: the durable limiter is checked (email/ip keys) and recorded on failure", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const clock = fakeClock();
+  const { call } = mount({ now: clock.now, durableLimiter: durable });
+
+  const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });
+  assert.equal(result.status, 401);
+
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.deepEqual(checked.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+  const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
+  assert.deepEqual(recorded.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+});
+
+test("sign-in: a successful sign-in resets the durable email key", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-ok", refresh_token: "r-ok", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+  const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "correct" });
+  assert.equal(result.status, 200);
+  assert.deepEqual(
+    durable.calls.filter((c) => c.method === "reset"),
+    [{ method: "reset", key: "email:a@b.com" }]
+  );
+});
+
+test("sign-in: a durable-only block (in-memory clear) still returns 429 with Retry-After, before calling GoTrue", async (t) => {
+  const captured = stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter({ blockedKeys: new Set(["email:victim@example.com"]) });
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });
+  assert.equal(result.status, 429);
+  assert.equal(result.payload.error, "too many attempts, try again later");
+  assert.equal(result.headers["Retry-After"], "42");
+  assert.equal(captured.length, 0, "GoTrue must not be called once the durable limiter blocks");
+});
+
+test("refresh: throttled by the in-memory refresh limiter after enough failures (429, Retry-After)", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const clock = fakeClock();
+  const { call } = mount({
+    now: clock.now,
+    signInRateLimit: { refreshMax: 2, refreshWindowMs: 15 * 60 * 1000, refreshIpMax: 1000 }
+  });
+  const body = { refresh_token: "stale-refresh-token" };
+
+  assert.equal((await call("POST", "/auth/refresh", body)).status, 401);
+  assert.equal((await call("POST", "/auth/refresh", body)).status, 401);
+  const blocked = await call("POST", "/auth/refresh", body);
+  assert.equal(blocked.status, 429);
+  const retryAfter = Number(blocked.headers["Retry-After"]);
+  assert.ok(Number.isFinite(retryAfter) && retryAfter > 0);
+});
+
+test("refresh: the durable limiter is checked/recorded keyed on sha256(refresh_token) and client IP", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "stale-refresh-token" },
+    { headers: { "x-forwarded-for": "203.0.113.9" } }
+  );
+  assert.equal(result.status, 401);
+
+  const expectedTokenHash = createHash("sha256").update("stale-refresh-token").digest("hex");
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.deepEqual(checked.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+  const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
+  assert.deepEqual(recorded.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+});
+
+test("refresh: prefers the rr_refresh cookie over body.refresh_token for the durable throttle key", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+
+  await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "body-token" },
+    { headers: { cookie: "rr_refresh=cookie-token; other=1" } }
+  );
+
+  const expectedTokenHash = createHash("sha256").update("cookie-token").digest("hex");
+  const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
+  assert.ok(checked.includes(`refresh:${expectedTokenHash}`));
+});
+
+test("refresh: a durable-only block returns 429 before calling GoTrue", async (t) => {
+  const expectedTokenHash = createHash("sha256").update("stale-refresh-token").digest("hex");
+  const captured = stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter({ blockedKeys: new Set([`refresh:${expectedTokenHash}`]) });
+  const { call } = mount({ durableLimiter: durable });
+
+  const result = await call("POST", "/auth/refresh", { refresh_token: "stale-refresh-token" });
+  assert.equal(result.status, 429);
+  assert.equal(result.headers["Retry-After"], "42");
+  assert.equal(captured.length, 0, "GoTrue must not be called once the durable limiter blocks");
+});
+
+test("refresh: a successful refresh resets the in-memory and durable token counters", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+  const result = await call("POST", "/auth/refresh", { refresh_token: "good-refresh-token" });
+  assert.equal(result.status, 200);
+
+  const expectedTokenHash = createHash("sha256").update("good-refresh-token").digest("hex");
+  assert.deepEqual(
+    durable.calls.filter((c) => c.method === "reset"),
+    [{ method: "reset", key: `refresh:${expectedTokenHash}` }]
+  );
+});
+
 test("sign-out revokes the caller's token upstream", async (t) => {
   const captured = stubFetch(t, () => ({ ok: true, data: {} }));
   const { call } = mount();
@@ -322,6 +612,9 @@ test("sign-out revokes the caller's token upstream", async (t) => {
   // forwarded rather than the anon key.
   assert.equal(gotrueCall.init.headers.Authorization, "Bearer jwt-123");
   assert.equal(gotrueCall.init.headers.apikey, "anon-key");
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=;/);
+  assert.match(cookie, /Max-Age=0/);
 });
 
 test("sign-out without a token succeeds without calling GoTrue", async (t) => {
@@ -330,6 +623,7 @@ test("sign-out without a token succeeds without calling GoTrue", async (t) => {
   const result = await call("POST", "/auth/sign-out");
   assert.equal(result.status, 200);
   assert.equal(captured.length, 0);
+  assert.match(result.headers["Set-Cookie"], /^rr_refresh=;.*Max-Age=0/s);
 });
 
 test("sign-out still succeeds when GoTrue rejects the token", async (t) => {

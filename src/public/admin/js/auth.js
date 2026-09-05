@@ -4,9 +4,15 @@
 // in src/lib/http/auth-routes.mjs and stores the resulting Supabase session
 // here. This module owns those storage keys, the silent refresh, and the
 // redirects, so api.js and app.js never touch localStorage directly.
+//
+// S-11: the refresh token lives only in the HttpOnly `rr_refresh` cookie the
+// server sets -- this module never reads or writes it. The one exception is
+// `migrateLegacyRefreshToken`, a one-release compat path for a session that
+// signed in before this change and still has a refresh token sitting in
+// localStorage from the old flow.
 
 const TOKEN_KEY = "rr_admin_token";
-const REFRESH_TOKEN_KEY = "rr_refresh_token";
+const LEGACY_REFRESH_TOKEN_KEY = "rr_refresh_token";
 const AUTH_BASE = "/api/v1/auth";
 const SIGN_IN_PATH = "/signin/";
 
@@ -33,22 +39,16 @@ export function getToken() {
   return readStorage(TOKEN_KEY);
 }
 
-export function getRefreshToken() {
-  return readStorage(REFRESH_TOKEN_KEY);
-}
-
 export function hasToken() {
   return getToken().length > 0;
 }
 
 export function setSession(session) {
   writeStorage(TOKEN_KEY, session?.access_token ?? "");
-  if (session?.refresh_token) writeStorage(REFRESH_TOKEN_KEY, session.refresh_token);
 }
 
 export function clearSession() {
   writeStorage(TOKEN_KEY, "");
-  writeStorage(REFRESH_TOKEN_KEY, "");
 }
 
 // Sends the browser to the sign-in page, remembering where it was so sign-in
@@ -58,20 +58,52 @@ export function redirectToSignIn() {
   window.location.assign(`${SIGN_IN_PATH}?next=${encodeURIComponent(here)}`);
 }
 
-// Single-flight refresh: several API calls can 401 at once when an access token
-// expires, and they must not each burn the (single-use) refresh token. The first
-// caller performs the exchange; the rest await the same promise.
+// One-release compat (S-11): a session that signed in before the refresh
+// token moved into the `rr_refresh` cookie may still have one sitting in
+// localStorage. On load, exchange it through /auth/refresh's body fallback
+// exactly once so the browser picks up the cookie, then delete the key --
+// every later refresh goes through the cookie like any other session. A
+// missing/empty key is the common case and a silent no-op.
+export async function migrateLegacyRefreshToken() {
+  const legacyToken = readStorage(LEGACY_REFRESH_TOKEN_KEY);
+  if (!legacyToken) return;
+  writeStorage(LEGACY_REFRESH_TOKEN_KEY, "");
+  try {
+    const response = await fetch(`${AUTH_BASE}/refresh`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ refresh_token: legacyToken })
+    });
+    if (!response.ok) return;
+    const session = await response.json();
+    if (session?.access_token) setSession(session);
+  } catch {
+    // Network failure: the legacy key is already gone -- the user simply
+    // re-authenticates like anyone else whose session has fully expired.
+  }
+}
+
+// Single-flight refresh: several API calls can 401 at once when an access
+// token expires, and they must not each race the single-use refresh cookie.
+// The first caller performs the exchange; the rest await the same promise.
+//
+// Two-tab race: this only serializes refreshes *within one tab*. Two tabs
+// refreshing at nearly the same moment each send the same (single-use, at
+// the time they read it) rr_refresh cookie; GoTrue's refresh-token reuse
+// detection/reuse-interval is what keeps the loser from being treated as
+// token theft, not anything in this file -- see S-11 in the implementation
+// plan for the risk note.
 let refreshInFlight = null;
 
 async function exchangeRefreshToken() {
-  const refreshToken = getRefreshToken();
-  if (!refreshToken) return false;
   let response;
   try {
     response = await fetch(`${AUTH_BASE}/refresh`, {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken })
+      body: "{}"
     });
   } catch {
     // Network failure: keep the stored session so a later call can retry
@@ -79,7 +111,7 @@ async function exchangeRefreshToken() {
     return false;
   }
   if (!response.ok) {
-    // The refresh token itself is rejected — the session is genuinely over.
+    // The refresh cookie itself is rejected — the session is genuinely over.
     clearSession();
     return false;
   }
@@ -105,18 +137,18 @@ export function refreshSession() {
 
 // Best-effort revocation of the refresh token upstream, then a local clear and
 // a bounce to the sign-in page. The local clear runs even if revocation fails,
-// so "Sign out" always signs the browser out.
+// so "Sign out" always signs the browser out. Always called -- even with no
+// access token -- so the server clears the rr_refresh cookie either way.
 export async function signOut() {
   const token = getToken();
-  if (token) {
-    try {
-      await fetch(`${AUTH_BASE}/sign-out`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
-      });
-    } catch {
-      // Ignore: revocation is a courtesy, the local clear below is what matters.
-    }
+  try {
+    await fetch(`${AUTH_BASE}/sign-out`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" }
+    });
+  } catch {
+    // Ignore: revocation is a courtesy, the local clear below is what matters.
   }
   clearSession();
   window.location.assign(SIGN_IN_PATH);

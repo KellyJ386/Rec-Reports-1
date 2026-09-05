@@ -84,6 +84,24 @@ test("GET /facilities/:facilityId/messages returns 200 for a reader", async (t) 
   assert.ok(Array.isArray(result.payload));
 });
 
+test("GET /facilities/:facilityId/messages?status=published filters published_at with a PostgREST is-null operator, not eq.not-null", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/messages?status=published");
+  assert.equal(result.status, 200);
+  const messagesCall = captured.find((c) => c.table === "messages");
+  assert.equal(messagesCall.url.searchParams.get("published_at"), "not.is.null");
+});
+
+test("GET /facilities/:facilityId/messages?status=draft filters published_at with is.null", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [DRAFT_MESSAGE] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/messages?status=draft");
+  assert.equal(result.status, 200);
+  const messagesCall = captured.find((c) => c.table === "messages");
+  assert.equal(messagesCall.url.searchParams.get("published_at"), "is.null");
+});
+
 test("POST /facilities/:facilityId/messages validates shape before guard (400, no fetch)", async (t) => {
   const captured = stubFetch(t, () => []);
   const { call } = mount({ memberships: READER });
@@ -105,10 +123,11 @@ test("POST /facilities/:facilityId/messages denies a reader without communicatio
 
 test("POST /facilities/:facilityId/messages happy path inserts a shaped row", async (t) => {
   const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
     if (table === "messages" && method === "POST") return [{ id: "msg-2" }];
     return [];
   });
-  const { call } = mount({ userId: "emp-99" });
+  const { call } = mount({ userId: "user-42" });
   const result = await call("POST", "/facilities/fac-1/messages", {
     channelId: "ch-1",
     subject: "Alert",
@@ -116,13 +135,37 @@ test("POST /facilities/:facilityId/messages happy path inserts a shaped row", as
     priority: "urgent"
   });
   assert.equal(result.status, 201);
+
+  const employeeLookup = captured.find((c) => c.table === "employees" && c.method === "GET");
+  assert.ok(employeeLookup, "expected a lookup of the caller's employee row");
+  assert.equal(employeeLookup.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(employeeLookup.url.searchParams.get("user_id"), "eq.user-42");
+
   const insert = captured.find((c) => c.table === "messages" && c.method === "POST");
   assert.equal(insert.body[0].facility_id, "fac-1");
   assert.equal(insert.body[0].channel_id, "ch-1");
   assert.equal(insert.body[0].subject, "Alert");
   assert.equal(insert.body[0].body_text, "Staff meeting");
   assert.equal(insert.body[0].priority, "urgent");
-  assert.equal(insert.body[0].author_employee_id, "emp-99");
+  // author_employee_id must be the resolved employees.id (RLS WITH CHECK
+  // validates it via fn_assert_same_facility against the employees table),
+  // NEVER the caller's raw auth user id.
+  assert.equal(insert.body[0].author_employee_id, "emp-own-row");
+});
+
+test("POST /facilities/:facilityId/messages returns 404 when the caller has no employee row in the facility", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ userId: "user-ghost" });
+  const result = await call("POST", "/facilities/fac-1/messages", {
+    channelId: "ch-1",
+    subject: "Alert",
+    bodyText: "Staff meeting"
+  });
+  assert.equal(result.status, 404);
+  assert.ok(!captured.some((c) => c.table === "messages" && c.method === "POST"));
 });
 
 test("POST /messages/:id/acknowledge resolves the caller's own employee row and inserts an acknowledgement row", async (t) => {
@@ -242,6 +285,8 @@ test("POST /messages/:id/audiences denies non-publisher with 403", async (t) => 
 test("POST /messages/:id/audiences happy path inserts shaped rows", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "messages") return [MESSAGE];
+    if (table === "roles") return [{ id: "role-1", facility_id: "fac-1" }];
+    if (table === "departments") return [{ id: "dept-1", facility_id: "fac-1" }];
     if (table === "message_audiences" && method === "POST") return [{ id: "aud-1" }, { id: "aud-2" }];
     return [];
   });
@@ -261,6 +306,33 @@ test("POST /messages/:id/audiences happy path inserts shaped rows", async (t) =>
   assert.equal(insert.body[0].audience_type, "role");
   assert.equal(insert.body[0].audience_ref_id, "role-1");
   assert.equal(insert.body[1].audience_type, "department");
+});
+
+test("POST /messages/:id/audiences rejects a cross-facility ref with 400 (S-8)", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "messages") return [MESSAGE];
+    // role-1 belongs to a different facility than the message (fac-1).
+    if (table === "roles") return [{ id: "role-1", facility_id: "fac-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [
+    { audienceType: "role", audienceRefId: "role-1" }
+  ]);
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /does not belong to this facility/);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"), "must not insert on a cross-facility ref");
+});
+
+test("POST /messages/:id/audiences rejects a nonexistent ref with 400 (S-8)", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [
+    { audienceType: "employee", audienceRefId: "emp-missing" }
+  ]);
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /not found/);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"));
 });
 
 test("POST /messages/:id/audiences denies non-publisher from different facility", async (t) => {
@@ -347,32 +419,52 @@ test("POST /facilities/:facilityId/channels happy path creates channel", async (
   assert.equal(insert.body[0].emergency_enabled, false);
 });
 
-test("POST /facilities/:facilityId/channels maps 409 duplicate name error", async (t) => {
-  stubFetch(t, (table, method) => {
-    if (table === "communication_channels" && method === "POST") {
-      const err = new Error("duplicate");
-      err.status = 409;
-      throw err;
+test("POST /facilities/:facilityId/channels maps a real PostgrestError 409 to a friendly conflict response", async (t) => {
+  // Exercises the actual pgInsert -> PostgrestError path (a non-ok PostgREST
+  // response, as a real unique-constraint violation on (facility_id, name)
+  // would produce), not a hand-thrown plain Error -- the route must catch
+  // via `instanceof PostgrestError`, not by pattern-matching error.message.
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const table = new URL(url).pathname.replace("/rest/v1/", "");
+    if (table === "communication_channels") {
+      return {
+        ok: false,
+        status: 409,
+        text: async () => JSON.stringify({ message: "duplicate key value violates unique constraint" })
+      };
     }
-    return [];
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
   });
   const { call } = mount({ memberships: CREATOR });
-  // Override fetch to throw a PostgreSQL unique constraint error
-  const error = new Error("duplicate key value");
-  error.status = 409;
-  globalThis.fetch = async () => {
-    throw error;
+  const result = await call("POST", "/facilities/fac-1/channels", {
+    name: "Duplicate",
+    type: "facility"
+  });
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.error, "channel with this name already exists in this facility");
+});
+
+test("POST /facilities/:facilityId/channels rethrows a non-409 PostgrestError instead of masking it as a conflict", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const table = new URL(url).pathname.replace("/rest/v1/", "");
+    if (table === "communication_channels") {
+      return { ok: false, status: 500, text: async () => JSON.stringify({ message: "internal error" }) };
+    }
+    return { ok: true, status: 200, text: async () => "[]" };
   };
-  try {
-    const result = await call("POST", "/facilities/fac-1/channels", {
-      name: "Duplicate",
-      type: "facility"
-    });
-    // Due to the way stubFetch is set up, this may not catch the error perfectly,
-    // so we check if this works in integration testing
-  } finally {
-    globalThis.fetch = fetch;
-  }
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ memberships: CREATOR });
+  await assert.rejects(
+    () => call("POST", "/facilities/fac-1/channels", { name: "Whatever", type: "facility" }),
+    /PostgREST POST communication_channels failed with status 500/
+  );
 });
 
 // --- Message receipts (CM-05) ------------------------------------------------
@@ -606,6 +698,7 @@ test("POST .../messages/:id/publish 404s when the message belongs to a different
 
 test("POST /facilities/:facilityId/messages defaults to a draft (published_at null)", async (t) => {
   const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
     if (table === "messages" && method === "POST") return [{ id: "msg-new" }];
     return [];
   });
@@ -834,6 +927,7 @@ test("PUT /me/notification-preferences denies a caller who is not a member of th
 
 test("POST /facilities/:facilityId/messages publishes immediately with legacy publishNow:true", async (t) => {
   const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [{ id: "emp-own-row" }];
     if (table === "messages" && method === "POST") return [{ id: "msg-new" }];
     return [];
   });

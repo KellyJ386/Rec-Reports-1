@@ -14,6 +14,7 @@ import {
   buildAttachmentPath,
   assertMimeAllowed,
   assertWithinSizeCap,
+  assertPathInFacility,
   uploadObject,
   createSignedUrl,
   DEFAULT_MAX_UPLOAD_BYTES,
@@ -974,6 +975,20 @@ export function registerTrainingRoutes(
 
         if (!cert.evidence_path) {
           return sendJson(response, 404, { error: "no evidence uploaded for this certification" });
+        }
+
+        // Defense-in-depth twin of 0041_attachment_path_guard.sql's write-side
+        // trigger: never mint a signed URL for a row whose stored path
+        // disagrees with its own facility_id/module -- same not-found shape as
+        // "no evidence uploaded", and never touch the storage client on
+        // mismatch.
+        try {
+          assertPathInFacility(cert.evidence_path, cert.facility_id, EVIDENCE_STORAGE_MODULE);
+        } catch (error) {
+          if (error instanceof StorageValidationError) {
+            return sendJson(response, 404, { error: "no evidence uploaded for this certification" });
+          }
+          throw error;
         }
 
         const storageClient = createStorageClient(env);

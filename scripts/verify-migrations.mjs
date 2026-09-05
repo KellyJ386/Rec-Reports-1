@@ -81,7 +81,8 @@ const requiredRlsTables = [
   "employee_notification_preferences",
   "subscription_plans",
   "tenant_subscriptions",
-  "usage_counters"
+  "usage_counters",
+  "auth_throttle"
 ];
 
 for (const table of requiredRlsTables) {
@@ -100,10 +101,52 @@ for (const helper of [
   "fn_audit_admin_change",
   "fn_protect_system_role",
   "fn_audit_chain_link",
-  "fn_enforce_change_request_transition"
+  "fn_enforce_change_request_transition",
+  "fn_storage_attachment_facility_id",
+  "fn_storage_attachment_module",
+  "fn_message_audience_ref_facility",
+  "fn_incident_report_audit",
+  "fn_incident_report_transition_guard"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+// 0042 moved the five internal scope/permission helper names (has_permission
+// covers both its overloads) into the `internal` schema and locked them down
+// so PostgREST can never expose them as /rest/v1/rpc/<name>. Any later
+// migration that redefines one of them must keep it there -- a bare or
+// `public.`-qualified `create [or replace] function <name>(...)` from 0043
+// onward would silently recreate the old public-schema, PUBLIC-executable
+// version (CREATE FUNCTION defaults to a new object in the search_path's
+// first schema and grants EXECUTE to PUBLIC), re-opening OP-05.
+const internalHelperNames = new Set([
+  "current_facility_ids",
+  "has_permission",
+  "fn_assert_same_facility",
+  "is_organization_admin",
+  "is_platform_admin"
+]);
+const createFunctionPattern = /create\s+(?:or\s+replace\s+)?function\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\(/gi;
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 43) {
+    continue;
+  }
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  createFunctionPattern.lastIndex = 0;
+  let helperMatch;
+  while ((helperMatch = createFunctionPattern.exec(fileSql)) !== null) {
+    const qualifiedName = helperMatch[1];
+    const parts = qualifiedName.split(".");
+    const bareName = parts[parts.length - 1];
+    const schema = parts.length > 1 ? parts[0] : null;
+    if (internalHelperNames.has(bareName) && schema !== "internal") {
+      throw new Error(
+        `${file}: "create function ${qualifiedName}(...)" redefines an internal helper outside the internal schema; use internal.${bareName}(...).`
+      );
+    }
   }
 }
 

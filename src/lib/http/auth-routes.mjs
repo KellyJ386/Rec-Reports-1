@@ -1,4 +1,11 @@
+import { createHash } from "node:crypto";
 import { createRateLimiter } from "./rate-limit.mjs";
+import {
+  REFRESH_COOKIE_NAME,
+  buildRefreshCookie,
+  clearRefreshCookie,
+  parseCookies
+} from "./cookies.mjs";
 
 // Server-side authentication proxy for the email + password sign-in flow.
 //
@@ -9,6 +16,13 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // anon key and return the resulting session. The access token is then stored
 // client-side under the existing `rr_admin_token` key and sent as a bearer
 // token to /api/admin/v1/* and /api/v1/*, where auth.mjs verifies it.
+//
+// Refresh token (S-11): the response body never carries `refresh_token` --
+// it travels only in an HttpOnly `rr_refresh` cookie (see ./cookies.mjs), so
+// XSS that steals the access token from localStorage cannot also mint a new
+// indefinite session. /auth/refresh reads the cookie, not the body; a
+// `refresh_token` in the body is accepted for one release as a migration
+// path for sessions that signed in before this change (removed in Wave 2).
 //
 // Injected primitives match the other route modules:
 //   sendJson(response, status, payload)
@@ -26,9 +40,19 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // tests can inject a fake, steppable clock and tiny windows instead of
 // sleeping in real time; production callers (scripts/server.mjs) get the
 // defaults below by omitting them.
+//
+// Durable throttle (S-7)
+// -----------------------------------------------------------------------
+// `durableLimiter` is an optional second-line backstop behind every
+// in-memory limiter below -- same {check, recordFailure, reset} shape,
+// backed by the auth_throttle table (src/lib/http/durable-rate-limit.mjs,
+// supabase/migrations/0046_auth_throttle.sql) instead of a per-process Map,
+// so a lockout survives across serverless instances. `null` (the default)
+// keeps this module exactly as before -- in-memory only, e.g. in tests and
+// anywhere SUPABASE_SERVICE_ROLE_KEY isn't configured.
 export function registerAuthRoutes(
   router,
-  { sendJson, readBody, now = Date.now, signInRateLimit = {} }
+  { sendJson, readBody, now = Date.now, signInRateLimit = {}, durableLimiter = null }
 ) {
   const emailLimiter = createRateLimiter({
     windowMs: signInRateLimit.emailWindowMs ?? 15 * 60 * 1000,
@@ -45,6 +69,38 @@ export function registerAuthRoutes(
     now,
     sweepEvery: signInRateLimit.sweepEvery ?? 500
   });
+  // POST /auth/refresh throttle (S-7): same two-bucket shape as sign-in
+  // above (a token bucket and an IP bucket), sized looser than sign-in's
+  // since a legitimate client refreshes far more often than it signs in.
+  const refreshLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+  const refreshIpLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshIpWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshIpMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+
+  // Awaits the durable check for both buckets only when a durableLimiter is
+  // configured (see the file header); the in-memory pair passed in has
+  // already been checked synchronously by the caller. Small shared helper so
+  // the sign-in and refresh handlers below don't repeat this Promise.all
+  // shape.
+  async function checkDurable(keyA, keyB) {
+    if (!durableLimiter) return { blocked: false, retryAfterMs: 0 };
+    const [a, b] = await Promise.all([durableLimiter.check(keyA), durableLimiter.check(keyB)]);
+    if (!a.blocked && !b.blocked) return { blocked: false, retryAfterMs: 0 };
+    return { blocked: true, retryAfterMs: Math.max(a.retryAfterMs, b.retryAfterMs) };
+  }
+
+  async function recordDurableFailure(keyA, keyB) {
+    if (!durableLimiter) return;
+    await Promise.all([durableLimiter.recordFailure(keyA), durableLimiter.recordFailure(keyB)]);
+  }
 
   async function parseJsonBody(request) {
     try {
@@ -75,6 +131,47 @@ export function registerAuthRoutes(
     return String(email).trim().toLowerCase();
   }
 
+  // Whether the refresh cookie should carry `Secure`. Real deployments (Vercel
+  // and anything behind a TLS-terminating proxy) set `x-forwarded-proto`, so
+  // that wins first; a direct TLS listener with no proxy in front falls back
+  // to the raw socket's `encrypted` flag; failing both (no proxy header, plain
+  // HTTP socket) the only case allowed to omit `Secure` is local dev over
+  // `http://localhost` -- every other host defaults to secure so a
+  // misconfigured/absent proxy header never silently downgrades a cookie sent
+  // to a real domain.
+  function isSecureRequest(request) {
+    const forwardedProto = request.headers?.["x-forwarded-proto"];
+    if (forwardedProto) {
+      return (
+        String(forwardedProto)
+          .split(",")[0]
+          .trim()
+          .toLowerCase() === "https"
+      );
+    }
+    if (request.socket?.encrypted !== undefined) {
+      return !!request.socket.encrypted;
+    }
+    const host = String(request.headers?.host || "")
+      .split(":")[0]
+      .toLowerCase();
+    return host !== "localhost" && host !== "127.0.0.1";
+  }
+
+  // CSRF check for /auth/refresh: `SameSite=Strict` already stops the cookie
+  // from riding along on a cross-site navigation or fetch in any modern
+  // browser, but `Strict` cookies are still attached to same-site requests
+  // and (in older/non-compliant clients) `sec-fetch-site` may be the only
+  // signal available -- so this is defense in depth, not the only guard.
+  // Missing header (older browsers, some non-browser clients) fails open on
+  // purpose: it is the same trust boundary SameSite=Strict already draws.
+  function isSameSiteRequest(request) {
+    const secFetchSite = request.headers?.["sec-fetch-site"];
+    if (!secFetchSite) return true;
+    const value = String(secFetchSite).trim().toLowerCase();
+    return value === "same-origin" || value === "none";
+  }
+
   function retryAfterSeconds(retryAfterMs) {
     return Math.max(1, Math.ceil(retryAfterMs / 1000));
   }
@@ -101,10 +198,11 @@ export function registerAuthRoutes(
 
   // Shapes the session GoTrue returns into the minimal payload the client
   // needs. access_token is what the app's JWT verifier consumes.
+  // `refresh_token` never appears here (S-11) -- it only ever travels as the
+  // HttpOnly `rr_refresh` cookie set alongside this body.
   function sessionPayload(data) {
     return {
       access_token: data.access_token,
-      refresh_token: data.refresh_token,
       token_type: data.token_type ?? "bearer",
       expires_in: data.expires_in ?? null,
       expires_at: data.expires_at ?? null,
@@ -187,6 +285,8 @@ export function registerAuthRoutes(
 
       const ip = clientIp(request);
       const emailKey = normalizeEmail(email);
+      const durableIpKey = `ip:${ip}`;
+      const durableEmailKey = `email:${emailKey}`;
 
       const ipCheck = ipLimiter.check(ip);
       const emailCheck = emailLimiter.check(emailKey);
@@ -194,34 +294,94 @@ export function registerAuthRoutes(
         const retryAfterMs = Math.max(ipCheck.retryAfterMs, emailCheck.retryAfterMs);
         return sendThrottled(response, retryAfterMs);
       }
+      const durableCheck = await checkDurable(durableIpKey, durableEmailKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
 
       const result = await callGotrue(env, "token?grant_type=password", { email, password });
       if (!result.ok) {
         ipLimiter.recordFailure(ip);
         emailLimiter.recordFailure(emailKey);
+        await recordDurableFailure(durableIpKey, durableEmailKey);
         return sendJson(response, 401, { error: "invalid email or password" });
       }
       emailLimiter.reset(emailKey);
+      if (durableLimiter) await durableLimiter.reset(durableEmailKey);
+      response.setHeader?.(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure: isSecureRequest(request) })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
 
-  // POST /auth/refresh { refresh_token } -> session
+  // Throttle key material for POST /auth/refresh (S-7): the raw refresh
+  // token itself must never become a throttle-store key or land in a
+  // reported error, so this hashes it (sha256) instead. Reads the
+  // `rr_refresh` HttpOnly cookie first, falling back to body.refresh_token --
+  // the same precedence the route's own token lookup uses, so the throttle
+  // bucket lines up with whichever token the request is actually redeeming.
+  function refreshTokenForThrottle(request, body) {
+    const cookies = parseCookies(request.headers?.cookie);
+    return cookies[REFRESH_COOKIE_NAME] || body?.payload?.refresh_token;
+  }
+
+  function refreshThrottleKeys(request, body) {
+    const tokenHash = createHash("sha256")
+      .update(String(refreshTokenForThrottle(request, body) ?? ""))
+      .digest("hex");
+    return { tokenKey: `refresh:${tokenHash}`, ipKey: `refresh-ip:${clientIp(request)}` };
+  }
+
+  // POST /auth/refresh {} -> session
+  //
+  // The refresh token itself comes from the HttpOnly `rr_refresh` cookie, not
+  // the body -- the body fallback below exists only so sessions started
+  // before this change (refresh token still in the client's localStorage)
+  // keep working for one release; remove the fallback in Wave 2 once every
+  // live session has rotated through the cookie at least once.
   router.register("POST", "/auth/refresh", (request, response, { env }) =>
     (async () => {
       if (!requireConfigured(env, response)) return;
+      if (!isSameSiteRequest(request)) {
+        return sendJson(response, 403, { error: "cross-site request" });
+      }
       const body = await parseJsonBody(request);
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-      const refreshToken = body.payload.refresh_token;
+
+      const { tokenKey, ipKey } = refreshThrottleKeys(request, body);
+      const tokenCheck = refreshLimiter.check(tokenKey);
+      const ipCheck = refreshIpLimiter.check(ipKey);
+      if (tokenCheck.blocked || ipCheck.blocked) {
+        return sendThrottled(response, Math.max(tokenCheck.retryAfterMs, ipCheck.retryAfterMs));
+      }
+      const durableCheck = await checkDurable(tokenKey, ipKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
+
+      const cookies = parseCookies(request.headers?.cookie);
+      const refreshToken = cookies[REFRESH_COOKIE_NAME] || body.payload.refresh_token;
       if (!refreshToken) {
         return sendJson(response, 400, { errors: ["refresh_token is required"] });
       }
+      const secure = isSecureRequest(request);
       const result = await callGotrue(env, "token?grant_type=refresh_token", {
         refresh_token: refreshToken
       });
       if (!result.ok) {
+        refreshLimiter.recordFailure(tokenKey);
+        refreshIpLimiter.recordFailure(ipKey);
+        await recordDurableFailure(tokenKey, ipKey);
+        // The refresh token was rejected (expired/revoked/reused) -- drop the
+        // cookie so the browser stops offering a token GoTrue will never
+        // accept again.
+        response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure }));
         return sendJson(response, 401, { error: "could not refresh session" });
       }
+      refreshLimiter.reset(tokenKey);
+      if (durableLimiter) await durableLimiter.reset(tokenKey);
+      response.setHeader?.(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
@@ -238,6 +398,7 @@ export function registerAuthRoutes(
       if (authorization) {
         await callGotrue(env, "logout", {}, { authorization });
       }
+      response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure: isSecureRequest(request) }));
       return sendJson(response, 200, { signed_out: true });
     })()
   );
