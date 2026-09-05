@@ -126,6 +126,9 @@ test("POST facilities rejects a missing name with 400 (no DB call)", async (t) =
 
 test("POST facilities happy path inserts into facilities for an org admin", async (t) => {
   const captured = stubFetch(t, (table, method) => {
+    // requireAuthOrgAdminRow (S-6) checks organization_admins, not
+    // admin.manage on any facility of the org -- the caller must hold both.
+    if (table === "organization_admins" && method === "GET") return [{ id: "oa-1" }];
     if (table === "facilities" && method === "GET") return [{ id: "fac-1" }];
     if (table === "facilities" && method === "POST") return [{ id: "fac-new", name: "New Rink" }];
     return [];
