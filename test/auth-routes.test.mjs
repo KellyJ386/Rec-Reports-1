@@ -83,12 +83,69 @@ test("sign-in forwards to GoTrue password grant and returns the session", async 
   const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "secret" });
   assert.equal(result.status, 200);
   assert.equal(result.payload.access_token, "jwt-123");
-  assert.equal(result.payload.refresh_token, "refresh-123");
+  assert.equal("refresh_token" in result.payload, false, "refresh_token must never appear in the body (S-11)");
   assert.deepEqual(result.payload.user, { id: "user-1", email: "a@b.com" });
   const gotrueCall = captured[0];
   assert.match(gotrueCall.url.href, /\/auth\/v1\/token\?grant_type=password$/);
   assert.equal(gotrueCall.init.headers.apikey, "anon-key");
   assert.deepEqual(gotrueCall.body, { email: "a@b.com", password: "secret" });
+});
+
+test("sign-in sets an HttpOnly refresh cookie with the expected attributes", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: {
+      access_token: "jwt-123",
+      refresh_token: "refresh-123",
+      expires_in: 3600,
+      token_type: "bearer",
+      user: { id: "user-1", email: "a@b.com" }
+    }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/sign-in", { email: "a@b.com", password: "secret" });
+  assert.equal(result.status, 200);
+  const cookie = result.headers["Set-Cookie"];
+  assert.ok(cookie, "Set-Cookie header must be present");
+  assert.match(cookie, /^rr_refresh=refresh-123;/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /Secure/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api\/v1\/auth/);
+  assert.match(cookie, /Max-Age=2592000/);
+});
+
+test("sign-in omits Secure on the refresh cookie for plain-http localhost", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-123", refresh_token: "refresh-123", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/sign-in",
+    { email: "a@b.com", password: "secret" },
+    { headers: { host: "localhost:4411" } }
+  );
+  const cookie = result.headers["Set-Cookie"];
+  assert.ok(cookie);
+  assert.doesNotMatch(cookie, /Secure/);
+});
+
+test("sign-in keeps Secure on the refresh cookie for a non-localhost host with no proxy header", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-123", refresh_token: "refresh-123", user: { id: "u1", email: "a@b.com" } }
+  }));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/sign-in",
+    { email: "a@b.com", password: "secret" },
+    { headers: { host: "app.example.com" } }
+  );
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /Secure/);
 });
 
 test("sign-in maps a GoTrue rejection to 401", async (t) => {
@@ -106,7 +163,7 @@ test("sign-in returns 503 when Supabase is not configured", async (t) => {
   assert.equal(captured.length, 0);
 });
 
-test("refresh requires a refresh_token (400)", async (t) => {
+test("refresh requires a refresh_token (400) when neither cookie nor body carries one", async (t) => {
   const captured = stubFetch(t, () => ({}));
   const { call } = mount();
   const result = await call("POST", "/auth/refresh", {});
@@ -114,18 +171,98 @@ test("refresh requires a refresh_token (400)", async (t) => {
   assert.equal(captured.length, 0);
 });
 
-test("refresh forwards to GoTrue refresh grant and returns the session", async (t) => {
+test("refresh reads the token from the rr_refresh cookie, not the body", async (t) => {
   const captured = stubFetch(t, () => ({
     ok: true,
     data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
   }));
   const { call } = mount();
-  const result = await call("POST", "/auth/refresh", { refresh_token: "refresh-123" });
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=refresh-123" } });
   assert.equal(result.status, 200);
   assert.equal(result.payload.access_token, "jwt-new");
+  assert.equal("refresh_token" in result.payload, false);
   const gotrueCall = captured[0];
   assert.match(gotrueCall.url.href, /\/auth\/v1\/token\?grant_type=refresh_token$/);
   assert.deepEqual(gotrueCall.body, { refresh_token: "refresh-123" });
+});
+
+test("refresh rotates the cookie on success (new token, same attributes)", async (t) => {
+  stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=refresh-123" } });
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=refresh-new;/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api\/v1\/auth/);
+});
+
+// One-release compat: a body refresh_token still works when there is no
+// cookie yet (a session that signed in before S-11 shipped).
+test("refresh falls back to a body refresh_token when there is no cookie", async (t) => {
+  const captured = stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new", expires_in: 3600 }
+  }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", { refresh_token: "legacy-refresh" });
+  assert.equal(result.status, 200);
+  const gotrueCall = captured[0];
+  assert.deepEqual(gotrueCall.body, { refresh_token: "legacy-refresh" });
+});
+
+test("refresh prefers the cookie over a body refresh_token when both are present", async (t) => {
+  const captured = stubFetch(t, () => ({
+    ok: true,
+    data: { access_token: "jwt-new", refresh_token: "refresh-new" }
+  }));
+  const { call } = mount();
+  await call(
+    "POST",
+    "/auth/refresh",
+    { refresh_token: "body-token" },
+    { headers: { cookie: "rr_refresh=cookie-token" } }
+  );
+  const gotrueCall = captured[0];
+  assert.deepEqual(gotrueCall.body, { refresh_token: "cookie-token" });
+});
+
+test("refresh rejects a cross-site request (sec-fetch-site: cross-site) without calling GoTrue", async (t) => {
+  const captured = stubFetch(t, () => ({}));
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/auth/refresh",
+    {},
+    { headers: { cookie: "rr_refresh=refresh-123", "sec-fetch-site": "cross-site" } }
+  );
+  assert.equal(result.status, 403);
+  assert.deepEqual(result.payload, { error: "cross-site request" });
+  assert.equal(captured.length, 0, "GoTrue must not be called for a cross-site refresh attempt");
+});
+
+test("refresh allows sec-fetch-site: same-origin and none, and a missing header", async (t) => {
+  stubFetch(t, () => ({ ok: true, data: { access_token: "jwt-new", refresh_token: "refresh-new" } }));
+  const { call } = mount();
+  for (const secFetchSite of ["same-origin", "none", undefined]) {
+    const headers = { cookie: "rr_refresh=refresh-123" };
+    if (secFetchSite) headers["sec-fetch-site"] = secFetchSite;
+    const result = await call("POST", "/auth/refresh", {}, { headers });
+    assert.equal(result.status, 200, `sec-fetch-site=${secFetchSite} should be allowed`);
+  }
+});
+
+test("refresh clears the cookie when GoTrue rejects the token (401)", async (t) => {
+  stubFetch(t, () => ({ ok: false, status: 401, data: { error: "invalid_grant" } }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/refresh", {}, { headers: { cookie: "rr_refresh=stale-token" } });
+  assert.equal(result.status, 401);
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=;/);
+  assert.match(cookie, /Max-Age=0/);
 });
 
 // ---------------------------------------------------------------------------
@@ -322,6 +459,9 @@ test("sign-out revokes the caller's token upstream", async (t) => {
   // forwarded rather than the anon key.
   assert.equal(gotrueCall.init.headers.Authorization, "Bearer jwt-123");
   assert.equal(gotrueCall.init.headers.apikey, "anon-key");
+  const cookie = result.headers["Set-Cookie"];
+  assert.match(cookie, /^rr_refresh=;/);
+  assert.match(cookie, /Max-Age=0/);
 });
 
 test("sign-out without a token succeeds without calling GoTrue", async (t) => {
@@ -330,6 +470,7 @@ test("sign-out without a token succeeds without calling GoTrue", async (t) => {
   const result = await call("POST", "/auth/sign-out");
   assert.equal(result.status, 200);
   assert.equal(captured.length, 0);
+  assert.match(result.headers["Set-Cookie"], /^rr_refresh=;.*Max-Age=0/s);
 });
 
 test("sign-out still succeeds when GoTrue rejects the token", async (t) => {

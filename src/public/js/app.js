@@ -34,7 +34,11 @@ import {
 import { resolveInitialFacility } from "./facility-context.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
-const REFRESH_TOKEN_KEY = "rr_refresh_token";
+// S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
+// cookie the server sets -- this key is read (once, then deleted) only as a
+// one-release migration path for a session that signed in before that
+// change and still has a token sitting in localStorage from the old flow.
+const LEGACY_REFRESH_TOKEN_KEY = "rr_refresh_token";
 const FACILITY_KEY = "rr_facility_id";
 const API_BASE = "/api/v1";
 
@@ -101,37 +105,75 @@ function setStoredFacilityId(facilityId) {
   }
 }
 
-// Helper: Clear tokens and redirect to signin
+// Helper: Clear the stored access token and redirect to signin. The refresh
+// token is a cookie the server owns (S-11) -- clearing it is the sign-out
+// route's job (see setupSignOut), not something this client-side helper can
+// or should do on its own.
 function clearAuthAndRedirect() {
   try {
     localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_TOKEN_KEY);
   } catch {
     // Storage may be unavailable
   }
   window.location.assign("/signin/");
 }
 
-// Helper: Exchange the stored refresh token for a new session. Single-flight,
-// because several calls can 401 at once when the access token expires and the
-// refresh token is single-use. Resolves true when a fresh token was stored.
+// One-release compat (S-11): a session that signed in before the refresh
+// token moved into the `rr_refresh` cookie may still have one sitting in
+// localStorage. On load, exchange it through /auth/refresh's body fallback
+// exactly once so the browser picks up the cookie, then delete the key --
+// every later refresh goes through the cookie like any other session. A
+// missing/empty key is the common case and a silent no-op.
+async function migrateLegacyRefreshToken() {
+  let legacyToken = "";
+  try {
+    legacyToken = localStorage.getItem(LEGACY_REFRESH_TOKEN_KEY) || "";
+  } catch {
+    return;
+  }
+  if (!legacyToken) return;
+  try {
+    localStorage.removeItem(LEGACY_REFRESH_TOKEN_KEY);
+  } catch {
+    // Nothing more to do if storage is unavailable.
+  }
+  try {
+    const response = await fetch(`${API_BASE}/auth/refresh`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ refresh_token: legacyToken })
+    });
+    if (!response.ok) return;
+    const session = await response.json();
+    if (session?.access_token) localStorage.setItem(TOKEN_KEY, session.access_token);
+  } catch {
+    // Network failure: the legacy key is already gone -- the user simply
+    // re-authenticates like anyone else whose session has fully expired.
+  }
+}
+
+// Helper: Exchange the rr_refresh cookie for a new session. Single-flight,
+// because several calls can 401 at once when the access token expires and
+// the refresh cookie is single-use. Resolves true when a fresh access token
+// was stored.
+//
+// Two-tab race: this only serializes refreshes *within one tab*. Two tabs
+// refreshing at nearly the same moment each send the same (single-use, at
+// the time they read it) rr_refresh cookie; GoTrue's refresh-token reuse
+// detection/reuse-interval is what keeps the loser from being treated as
+// token theft, not anything in this file -- see S-11 in the implementation
+// plan for the risk note.
 let refreshInFlight = null;
 
 async function exchangeRefreshToken() {
-  let refreshToken = "";
-  try {
-    refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY) || "";
-  } catch {
-    return false;
-  }
-  if (!refreshToken) return false;
-
   let response;
   try {
     response = await fetch(`${API_BASE}/auth/refresh`, {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken })
+      body: "{}"
     });
   } catch {
     return false;
@@ -148,9 +190,6 @@ async function exchangeRefreshToken() {
 
   try {
     localStorage.setItem(TOKEN_KEY, session.access_token);
-    if (session.refresh_token) {
-      localStorage.setItem(REFRESH_TOKEN_KEY, session.refresh_token);
-    }
   } catch {
     return false;
   }
@@ -3174,24 +3213,25 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (m) => map[m]);
 }
 
-// Sign out handler. Revokes the refresh token upstream first so the session
-// cannot be resumed elsewhere, then clears local storage and redirects. The
-// local clear runs even if revocation fails, so signing out always works.
+// Sign out handler. Revokes the refresh token upstream first (which also
+// clears the rr_refresh cookie server-side) so the session cannot be resumed
+// elsewhere, then clears local storage and redirects. The local clear runs
+// even if revocation fails, so signing out always works. Called unconditionally
+// -- even with no access token -- so the cookie is cleared either way.
 function setupSignOut() {
   const signOutBtn = document.getElementById("sign-out-btn");
   if (!signOutBtn) return;
   signOutBtn.addEventListener("click", async () => {
     signOutBtn.disabled = true;
     const token = getToken();
-    if (token) {
-      try {
-        await fetch(`${API_BASE}/auth/sign-out`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
-        });
-      } catch {
-        // Ignore: the local clear below is what signs this browser out.
-      }
+    try {
+      await fetch(`${API_BASE}/auth/sign-out`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), Accept: "application/json" }
+      });
+    } catch {
+      // Ignore: the local clear below is what signs this browser out.
     }
     clearAuthAndRedirect();
   });
@@ -3200,5 +3240,5 @@ function setupSignOut() {
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
-  initialize();
+  migrateLegacyRefreshToken().finally(initialize);
 });

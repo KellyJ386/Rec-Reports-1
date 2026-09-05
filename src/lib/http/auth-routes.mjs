@@ -1,4 +1,10 @@
 import { createRateLimiter } from "./rate-limit.mjs";
+import {
+  REFRESH_COOKIE_NAME,
+  buildRefreshCookie,
+  clearRefreshCookie,
+  parseCookies
+} from "./cookies.mjs";
 
 // Server-side authentication proxy for the email + password sign-in flow.
 //
@@ -9,6 +15,13 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // anon key and return the resulting session. The access token is then stored
 // client-side under the existing `rr_admin_token` key and sent as a bearer
 // token to /api/admin/v1/* and /api/v1/*, where auth.mjs verifies it.
+//
+// Refresh token (S-11): the response body never carries `refresh_token` --
+// it travels only in an HttpOnly `rr_refresh` cookie (see ./cookies.mjs), so
+// XSS that steals the access token from localStorage cannot also mint a new
+// indefinite session. /auth/refresh reads the cookie, not the body; a
+// `refresh_token` in the body is accepted for one release as a migration
+// path for sessions that signed in before this change (removed in Wave 2).
 //
 // Injected primitives match the other route modules:
 //   sendJson(response, status, payload)
@@ -75,6 +88,47 @@ export function registerAuthRoutes(
     return String(email).trim().toLowerCase();
   }
 
+  // Whether the refresh cookie should carry `Secure`. Real deployments (Vercel
+  // and anything behind a TLS-terminating proxy) set `x-forwarded-proto`, so
+  // that wins first; a direct TLS listener with no proxy in front falls back
+  // to the raw socket's `encrypted` flag; failing both (no proxy header, plain
+  // HTTP socket) the only case allowed to omit `Secure` is local dev over
+  // `http://localhost` -- every other host defaults to secure so a
+  // misconfigured/absent proxy header never silently downgrades a cookie sent
+  // to a real domain.
+  function isSecureRequest(request) {
+    const forwardedProto = request.headers?.["x-forwarded-proto"];
+    if (forwardedProto) {
+      return (
+        String(forwardedProto)
+          .split(",")[0]
+          .trim()
+          .toLowerCase() === "https"
+      );
+    }
+    if (request.socket?.encrypted !== undefined) {
+      return !!request.socket.encrypted;
+    }
+    const host = String(request.headers?.host || "")
+      .split(":")[0]
+      .toLowerCase();
+    return host !== "localhost" && host !== "127.0.0.1";
+  }
+
+  // CSRF check for /auth/refresh: `SameSite=Strict` already stops the cookie
+  // from riding along on a cross-site navigation or fetch in any modern
+  // browser, but `Strict` cookies are still attached to same-site requests
+  // and (in older/non-compliant clients) `sec-fetch-site` may be the only
+  // signal available -- so this is defense in depth, not the only guard.
+  // Missing header (older browsers, some non-browser clients) fails open on
+  // purpose: it is the same trust boundary SameSite=Strict already draws.
+  function isSameSiteRequest(request) {
+    const secFetchSite = request.headers?.["sec-fetch-site"];
+    if (!secFetchSite) return true;
+    const value = String(secFetchSite).trim().toLowerCase();
+    return value === "same-origin" || value === "none";
+  }
+
   function retryAfterSeconds(retryAfterMs) {
     return Math.max(1, Math.ceil(retryAfterMs / 1000));
   }
@@ -101,10 +155,11 @@ export function registerAuthRoutes(
 
   // Shapes the session GoTrue returns into the minimal payload the client
   // needs. access_token is what the app's JWT verifier consumes.
+  // `refresh_token` never appears here (S-11) -- it only ever travels as the
+  // HttpOnly `rr_refresh` cookie set alongside this body.
   function sessionPayload(data) {
     return {
       access_token: data.access_token,
-      refresh_token: data.refresh_token,
       token_type: data.token_type ?? "bearer",
       expires_in: data.expires_in ?? null,
       expires_at: data.expires_at ?? null,
@@ -202,26 +257,49 @@ export function registerAuthRoutes(
         return sendJson(response, 401, { error: "invalid email or password" });
       }
       emailLimiter.reset(emailKey);
+      response.setHeader?.(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure: isSecureRequest(request) })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
 
-  // POST /auth/refresh { refresh_token } -> session
+  // POST /auth/refresh {} -> session
+  //
+  // The refresh token itself comes from the HttpOnly `rr_refresh` cookie, not
+  // the body -- the body fallback below exists only so sessions started
+  // before this change (refresh token still in the client's localStorage)
+  // keep working for one release; remove the fallback in Wave 2 once every
+  // live session has rotated through the cookie at least once.
   router.register("POST", "/auth/refresh", (request, response, { env }) =>
     (async () => {
       if (!requireConfigured(env, response)) return;
+      if (!isSameSiteRequest(request)) {
+        return sendJson(response, 403, { error: "cross-site request" });
+      }
       const body = await parseJsonBody(request);
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-      const refreshToken = body.payload.refresh_token;
+      const cookies = parseCookies(request.headers?.cookie);
+      const refreshToken = cookies[REFRESH_COOKIE_NAME] || body.payload.refresh_token;
       if (!refreshToken) {
         return sendJson(response, 400, { errors: ["refresh_token is required"] });
       }
+      const secure = isSecureRequest(request);
       const result = await callGotrue(env, "token?grant_type=refresh_token", {
         refresh_token: refreshToken
       });
       if (!result.ok) {
+        // The refresh token was rejected (expired/revoked/reused) -- drop the
+        // cookie so the browser stops offering a token GoTrue will never
+        // accept again.
+        response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure }));
         return sendJson(response, 401, { error: "could not refresh session" });
       }
+      response.setHeader?.(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
@@ -238,6 +316,7 @@ export function registerAuthRoutes(
       if (authorization) {
         await callGotrue(env, "logout", {}, { authorization });
       }
+      response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure: isSecureRequest(request) }));
       return sendJson(response, 200, { signed_out: true });
     })()
   );

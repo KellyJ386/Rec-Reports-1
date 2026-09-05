@@ -1,5 +1,5 @@
 import { api } from "./api.js";
-import { hasToken, redirectToSignIn, signOut } from "./auth.js";
+import { hasToken, migrateLegacyRefreshToken, redirectToSignIn, signOut } from "./auth.js";
 import { getContext, getMe, setContext, setFacilities, subscribe } from "./state.js";
 import { clearChildren, el } from "./ui.js";
 import { loadMe } from "./session.js";
@@ -185,6 +185,12 @@ async function requireSession() {
 async function bootstrap() {
   wireSidebarToggle();
   wireSessionControl();
+
+  // S-11 migration: exchange a leftover pre-cookie refresh token (if any)
+  // for the new HttpOnly cookie before deciding whether there is a session
+  // at all -- a browser that still has one of these but no live access
+  // token would otherwise be bounced to /signin unnecessarily.
+  await migrateLegacyRefreshToken();
 
   const me = await requireSession();
   if (!me) return;
