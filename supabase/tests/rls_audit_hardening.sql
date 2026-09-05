@@ -347,7 +347,7 @@ begin
     raise exception 'RLS AUDIT FAIL: a cross-facility-role membership was persisted despite the rejected INSERT';
   end if;
 
-  select has_permission('38000000-0000-0000-0000-000000000a02', '38000000-0000-0000-0000-0000000000c0', 'incidents.export.pdf') into escalated;
+  select internal.has_permission('38000000-0000-0000-0000-000000000a02', '38000000-0000-0000-0000-0000000000c0', 'incidents.export.pdf') into escalated;
   if escalated then
     raise exception 'RLS AUDIT FAIL: victim gained a Facility B role''s permission inside Facility A';
   end if;

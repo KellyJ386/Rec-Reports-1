@@ -30,13 +30,13 @@ on conflict (id) do nothing;
 
 do $$
 begin
-  if not has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'reports.create') then
+  if not internal.has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'reports.create') then
     raise exception 'SCOPE FAIL: member with reports.create was denied reports.create';
   end if;
-  if has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
+  if internal.has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
     raise exception 'SCOPE FAIL: member without admin.manage was granted admin.manage (parameter shadowing regressed)';
   end if;
-  if has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'training.manage') then
+  if internal.has_permission('a0000000-0000-0000-0000-0000000000aa', 'a0000000-0000-0000-0000-0000000000c0', 'training.manage') then
     raise exception 'SCOPE FAIL: member without training.manage was granted training.manage';
   end if;
 end;
