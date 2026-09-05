@@ -11,6 +11,44 @@ function base64UrlEncode(buffer) {
   return buffer.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+// Leeway for the time-based claims. Servers and the auth issuer do not share a
+// clock; without it a few seconds of drift rejects freshly-minted tokens.
+const CLOCK_SKEW_SECONDS = 30;
+
+// The reserved-claim gate both signing modes go through. A valid signature only
+// proves who minted the token -- it says nothing about whether the token is
+// still live, or whether it is a *user session* at all -- so this is where the
+// verifier decides to trust the payload.
+//
+// `aud` is deliberately not enforced: Supabase projects can be configured with
+// a custom audience (and GoTrue emits `aud` as either a string or an array), so
+// pinning it to "authenticated" would reject legitimate deployments. The
+// `sub`/`role` checks below cover the case that actually matters -- a
+// non-session token being replayed as one.
+function validateClaims(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const now = Math.floor(Date.now() / 1000);
+
+  // `exp` is REQUIRED. Treating a missing (or non-numeric) exp as "no expiry"
+  // would make any leaked token valid forever and defeat session expiry.
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) return null;
+  if (payload.exp <= now - CLOCK_SKEW_SECONDS) return null;
+
+  // Not-yet-valid tokens are not valid tokens.
+  if (typeof payload.nbf === "number" && payload.nbf > now + CLOCK_SKEW_SECONDS) return null;
+
+  // `sub` is REQUIRED, and the two non-user roles are refused outright.
+  // Supabase's legacy `anon` and `service_role` API keys are themselves HS256
+  // JWTs signed with this very SUPABASE_JWT_SECRET, and the anon key is public
+  // -- it ships in the browser bundle. They carry no `sub`, so requiring one
+  // here (rather than relying on every caller to re-check) stops a published
+  // API key from authenticating as a user.
+  if (typeof payload.sub !== "string" || payload.sub.length === 0) return null;
+  if (payload.role === "anon" || payload.role === "service_role") return null;
+
+  return payload;
+}
+
 export function verifySupabaseJwt(token, jwtSecret) {
   if (typeof token !== "string" || !jwtSecret) return null;
   const parts = token.split(".");
@@ -35,9 +73,7 @@ export function verifySupabaseJwt(token, jwtSecret) {
   if (expectedBuffer.length !== providedBuffer.length) return null;
   if (!timingSafeEqual(expectedBuffer, providedBuffer)) return null;
 
-  if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) return null;
-
-  return payload;
+  return validateClaims(payload);
 }
 
 // --- Asymmetric (JWKS) verification ---------------------------------------
@@ -50,16 +86,28 @@ export function verifySupabaseJwt(token, jwtSecret) {
 // this, a project on asymmetric signing would let users sign in successfully
 // and then reject every subsequent API call with 401.
 
+// The algorithm allow-list. `kty`/`crv` are part of the entry, not decoration:
+// the header names an algorithm but the *key* comes from the JWKS, and nothing
+// otherwise stops a P-521 key (or an RSA key) from being used to check an
+// "ES256" signature. Membership is tested with Object.hasOwn, never a bare
+// property read -- `alg: "constructor"` reads truthy off Object.prototype.
 const JWS_ALGORITHMS = {
   // JWS ES256 signatures are the raw r||s pair, not the DER encoding
   // node:crypto verifies by default.
-  ES256: { hash: "sha256", options: { dsaEncoding: "ieee-p1363" } },
-  ES512: { hash: "sha512", options: { dsaEncoding: "ieee-p1363" } },
-  RS256: { hash: "sha256", options: {} },
-  RS512: { hash: "sha512", options: {} }
+  ES256: { hash: "sha256", kty: "EC", crv: "P-256", options: { dsaEncoding: "ieee-p1363" } },
+  ES512: { hash: "sha512", kty: "EC", crv: "P-521", options: { dsaEncoding: "ieee-p1363" } },
+  RS256: { hash: "sha256", kty: "RSA", crv: null, options: {} },
+  RS512: { hash: "sha512", kty: "RSA", crv: null, options: {} }
 };
 
 const JWKS_TTL_MS = 10 * 60 * 1000;
+// A failed fetch is cached too, briefly: without it a JWKS outage (or a flood
+// of tokens carrying bogus kids) turns every single request into an outbound
+// call to the auth server.
+const JWKS_ERROR_TTL_MS = 30 * 1000;
+// The JWKS fetch sits in the request path of every authenticated call, so it
+// must not be able to hang one. Fail closed and fast instead.
+const JWKS_FETCH_TIMEOUT_MS = 3000;
 
 // Cache of parsed JWKS per project URL. Refetched when a token presents an
 // unknown `kid` (key rotation) but at most once per TTL window, so a bogus kid
@@ -73,7 +121,9 @@ function jwksUrl(supabaseUrl) {
 async function fetchJwks(supabaseUrl, fetchImpl) {
   let response;
   try {
-    response = await fetchImpl(jwksUrl(supabaseUrl));
+    response = await fetchImpl(jwksUrl(supabaseUrl), {
+      signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS)
+    });
   } catch {
     return null;
   }
@@ -96,12 +146,19 @@ async function resolveJwk(supabaseUrl, kid, fetchImpl) {
     const hit = findKey(cached.keys);
     if (hit) return hit;
     // Unknown kid: only pay for a refetch once the TTL has elapsed.
-    if (now - cached.fetchedAt < JWKS_TTL_MS) return null;
+    if (now - cached.fetchedAt < (cached.failed ? JWKS_ERROR_TTL_MS : JWKS_TTL_MS)) return null;
   }
 
   const keys = await fetchJwks(supabaseUrl, fetchImpl);
-  if (!keys) return null;
-  jwksCache.set(supabaseUrl, { keys, fetchedAt: now });
+  if (!keys) {
+    // Negative cache. Any previously fetched keys are kept (a transient outage
+    // must not sign every user out); only the retry clock is reset, so a JWKS
+    // the server cannot reach is retried at most once per JWKS_ERROR_TTL_MS
+    // rather than once per request.
+    jwksCache.set(supabaseUrl, { keys: cached?.keys ?? [], fetchedAt: now, failed: true });
+    return null;
+  }
+  jwksCache.set(supabaseUrl, { keys, fetchedAt: now, failed: false });
   return findKey(keys);
 }
 
@@ -131,11 +188,21 @@ export function createJwtVerifier({ jwtSecret, supabaseUrl, fetchImpl = globalTh
     // Legacy shared-secret projects.
     if (header.alg === "HS256") return verifySupabaseJwt(token, jwtSecret);
 
+    if (typeof header.alg !== "string" || !Object.hasOwn(JWS_ALGORITHMS, header.alg)) return null;
     const algorithm = JWS_ALGORITHMS[header.alg];
-    if (!algorithm || !supabaseUrl) return null;
+    if (!supabaseUrl) return null;
 
     const jwk = await resolveJwk(supabaseUrl, header.kid, fetchImpl);
     if (!jwk) return null;
+
+    // The header picks the algorithm but the JWKS supplies the key, so the two
+    // have to agree before a signature check means anything: a key of the wrong
+    // family or curve, or one the issuer published for encryption rather than
+    // signing, is not a key for this token.
+    if (jwk.kty !== algorithm.kty) return null;
+    if (algorithm.crv && jwk.crv !== algorithm.crv) return null;
+    if (jwk.use && jwk.use !== "sig") return null;
+    if (jwk.alg && jwk.alg !== header.alg) return null;
 
     let key;
     try {
@@ -163,9 +230,8 @@ export function createJwtVerifier({ jwtSecret, supabaseUrl, fetchImpl = globalTh
     } catch {
       return null;
     }
-    if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) return null;
 
-    return payload;
+    return validateClaims(payload);
   };
 }
 

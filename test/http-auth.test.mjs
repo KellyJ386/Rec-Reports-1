@@ -262,3 +262,129 @@ test("createJwtVerifier rejects alg:none regardless of signing mode", async () =
   const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1", alg: "ES384" });
   assert.equal(await verify(token), null);
 });
+
+// --- W0-4 security review: claim and algorithm hardening -------------------
+// A signature check alone is not authentication: these cover the reserved
+// claims the verifier must positively assert, and the algorithm/key-selection
+// paths that decide *which* key a signature is checked against.
+
+test("verifySupabaseJwt rejects a token with no exp claim", () => {
+  const token = signToken({ sub: "user-1", role: "authenticated" });
+  assert.equal(verifySupabaseJwt(token, secret), null);
+});
+
+test("verifySupabaseJwt rejects a non-numeric exp claim", () => {
+  const token = signToken({ sub: "user-1", exp: String(futureExp()) });
+  assert.equal(verifySupabaseJwt(token, secret), null);
+});
+
+test("verifySupabaseJwt rejects a token with no sub (the public anon API key shape)", () => {
+  // Supabase's legacy anon key is itself an HS256 JWT signed with this very
+  // secret, and it ships in the browser bundle. It carries no `sub`.
+  const token = signToken({ iss: "supabase", ref: "proj", role: "anon", exp: futureExp() });
+  assert.equal(verifySupabaseJwt(token, secret), null);
+});
+
+test("verifySupabaseJwt rejects a service_role token", () => {
+  const token = signToken({ sub: "user-1", role: "service_role", exp: futureExp() });
+  assert.equal(verifySupabaseJwt(token, secret), null);
+});
+
+test("verifySupabaseJwt rejects a token that is not valid yet (nbf in the future)", () => {
+  const token = signToken({ sub: "user-1", exp: futureExp(), nbf: Math.floor(Date.now() / 1000) + 600 });
+  assert.equal(verifySupabaseJwt(token, secret), null);
+});
+
+test("createJwtVerifier rejects an ES256 token with no exp claim", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const { fetchImpl } = jwksFetch([jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", role: "authenticated" }, { privateKey, kid: "key-1" });
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier rejects an ES256 token with no sub claim", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const { fetchImpl } = jwksFetch([jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ role: "authenticated", exp: futureExp() }, { privateKey, kid: "key-1" });
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier rejects an alg inherited from Object.prototype", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const counter = { calls: 0 };
+  const { fetchImpl } = jwksFetch([jwk], counter);
+  const verify = createJwtVerifier({ jwtSecret: secret, supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken(
+    { sub: "user-9", exp: futureExp() },
+    { privateKey, kid: "key-1", alg: "constructor" }
+  );
+  assert.equal(await verify(token), null);
+  assert.equal(counter.calls, 0, "an unlisted alg must be rejected before any JWKS fetch");
+});
+
+test("createJwtVerifier bounds the JWKS fetch with an abort signal", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  let init;
+  const verify = createJwtVerifier({
+    supabaseUrl: "https://proj.supabase.co",
+    fetchImpl: async (url, options) => {
+      init = options;
+      return { ok: true, text: async () => JSON.stringify({ keys: [jwk] }) };
+    }
+  });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
+  assert.ok(await verify(token));
+  assert.ok(init?.signal instanceof AbortSignal, "the JWKS fetch must carry a timeout signal");
+});
+
+test("createJwtVerifier negative-caches a JWKS outage instead of refetching per request", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  let calls = 0;
+  const verify = createJwtVerifier({
+    supabaseUrl: "https://proj.supabase.co",
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("network down");
+    }
+  });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: jwk.kid });
+  assert.equal(await verify(token), null);
+  assert.equal(await verify(token), null);
+  assert.equal(await verify(token), null);
+  assert.equal(calls, 1, "a JWKS outage must not turn every request into an outbound fetch");
+});
+
+test("createJwtVerifier refuses a JWKS key published for encryption", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const { fetchImpl } = jwksFetch([{ ...jwk, use: "enc" }]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier refuses an EC key on the wrong curve for the header alg", async () => {
+  resetJwksCache();
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-521" });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "key-1", use: "sig" };
+  const { fetchImpl } = jwksFetch([jwk]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1", alg: "ES256" });
+  assert.equal(await verify(token), null);
+});
+
+test("createJwtVerifier refuses a JWKS key whose declared alg is not the header alg", async () => {
+  resetJwksCache();
+  const { privateKey, jwk } = es256Keys();
+  const { fetchImpl } = jwksFetch([{ ...jwk, alg: "ES512" }]);
+  const verify = createJwtVerifier({ supabaseUrl: "https://proj.supabase.co", fetchImpl });
+  const token = makeJwksToken({ sub: "user-9", exp: futureExp() }, { privateKey, kid: "key-1" });
+  assert.equal(await verify(token), null);
+});

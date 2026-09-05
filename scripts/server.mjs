@@ -105,11 +105,11 @@ async function authenticate(request, env) {
   // Either signing mode is enough to verify a token: the legacy shared secret
   // (HS256) or the project's published JWKS (ES256/RS256, needs only the
   // project URL). Refuse only when neither is available.
-  if (!env.SUPABASE_JWT_SECRET && !env.NEXT_PUBLIC_SUPABASE_URL) {
+  if (!env.SUPABASE_JWT_SECRET && !env.SUPABASE_URL) {
     return {
       error: {
         status: 503,
-        body: { error: "SUPABASE_JWT_SECRET or NEXT_PUBLIC_SUPABASE_URL is not configured" }
+        body: { error: "SUPABASE_JWT_SECRET or SUPABASE_URL is not configured" }
       }
     };
   }
@@ -117,7 +117,7 @@ async function authenticate(request, env) {
   if (!token) return { error: { status: 401, body: { error: "missing bearer token" } } };
   const verify = createJwtVerifier({
     jwtSecret: env.SUPABASE_JWT_SECRET,
-    supabaseUrl: env.NEXT_PUBLIC_SUPABASE_URL
+    supabaseUrl: env.SUPABASE_URL
   });
   const claims = await verify(token);
   if (!claims || !claims.sub) {
