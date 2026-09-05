@@ -169,6 +169,25 @@ a {
   min-width: 200px;
 }
 
+/* Signed-in identity + sign-out, sitting at the end of the top bar. */
+.session-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.session-user {
+  color: var(--rr-text-muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+#session-email {
+  color: var(--rr-text);
+  font-weight: 700;
+}
+
 input,
 select,
 textarea,
@@ -213,6 +232,20 @@ button:disabled {
 
 .ghost-button {
   background: transparent;
+}
+
+/* .ghost-button on an <a> (e.g. the "Operations app" top-bar link) needs its
+   own box/typography rules -- the base button styles above are scoped to the
+   `button` element and don't apply to anchors. */
+a.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  padding: 9px 14px;
+  font-weight: 700;
+  text-decoration: none;
+  color: inherit;
 }
 
 .icon-button {
@@ -618,49 +651,6 @@ button:disabled {
   display: none;
 }
 
-.token-drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  height: 100vh;
-  width: min(360px, 100%);
-  background: var(--rr-surface);
-  border-left: 1px solid var(--rr-border);
-  box-shadow: var(--rr-shadow);
-  padding: 20px;
-  overflow-y: auto;
-  z-index: 40;
-}
-
-.drawer-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.drawer-field {
-  display: grid;
-  gap: 6px;
-  font-weight: 700;
-  margin: 16px 0;
-}
-
-.drawer-field textarea {
-  resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.drawer-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.drawer-status {
-  color: var(--rr-text-muted);
-  min-height: 1.2em;
-}
-
 .toast {
   position: fixed;
   left: 50%;
@@ -712,6 +702,10 @@ button:disabled {
   .context-field input,
   .context-field select {
     min-width: 140px;
+  }
+
+  .session-control {
+    margin-left: 0;
   }
 }
 

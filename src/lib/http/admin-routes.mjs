@@ -86,20 +86,12 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
   }
 
   // --- Identity ------------------------------------------------------------
-  router.register("GET", "/me", (request, response, { env }) =>
-    withAuth(request, response, env, (auth) =>
-      sendJson(response, 200, {
-        userId: auth.claims.sub,
-        platformAdmin: auth.platformAdmin === true,
-        memberships: (auth.memberships ?? []).map((m) => ({
-          facilityId: m.facilityId,
-          departmentId: m.departmentId ?? null,
-          status: m.status,
-          permissions: m.permissions ?? []
-        }))
-      })
-    )
-  );
+  // GET /me is deliberately not registered here. It lives in me-route.mjs and
+  // is mounted on both API prefixes by scripts/server.mjs, so the admin app and
+  // the end-user app read one shape from one handler. This module previously
+  // carried a second, membership-shaped /me that shadowed it on the admin
+  // prefix (first match wins), which is exactly the divergence that caused the
+  // admin session lookup to disagree with the end-user one.
 
   // --- Facility module overrides ------------------------------------------
   router.register("GET", "/facilities/:facilityId/module-overrides", (request, response, { env, params }) =>

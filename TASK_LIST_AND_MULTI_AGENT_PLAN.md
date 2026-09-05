@@ -1,3 +1,5 @@
+**Superseded (2026-09-03).** Kept for history. Current status and the active plan live in [`REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md`](REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md).
+
 # Rec Reports — Task List & Multi-Agent Execution Plan
 
 Date: 2026-07-18
@@ -107,10 +109,10 @@ Checkboxes so this doubles as a tracking sheet. Each task shows its **owner** = 
 
 ### Workstream D — Real authentication  *(owner: Sonnet logic + Haiku UI; Opus security review)*
 - [ ] **D1.** *(only if C1 = JWKS)* Extend `src/lib/http/auth.mjs` to fetch JWKS and verify ES256 (currently HS256-only, hardcoded). **Opus reviews.**
-- [ ] **D2.** Build a `/signin` page using Supabase Auth JS (anon key) — email/password or magic link. Plain ES modules, no bundler. *(Sonnet auth logic, Haiku markup/CSS)*
-- [ ] **D3.** Update `src/public/admin/js/api.js` to populate the token (localStorage `rr_admin_token`) from the Supabase session; keep the paste-drawer as a hidden debug tool.
-- [ ] **D4.** Token refresh, sign-out, and show the active user in the top bar. *(Sonnet)*
-- [ ] **D5.** Create the first real admin user and map to seeded org/facility memberships. *(Supabase MCP)*
+- [x] **D2.** Build a `/signin` page — email/password. **Done** — plain ES modules posting to the same-origin auth proxy (`src/lib/http/auth-routes.mjs`) rather than Supabase Auth JS, since `default-src 'self'` forbids the cross-origin call.
+- [x] **D3.** Update `src/public/admin/js/api.js` to populate the token (localStorage `rr_admin_token`) from the Supabase session. **Done** — `src/public/admin/js/auth.js` owns the session; the paste-drawer is removed entirely rather than kept as a debug tool (a raw-token field is a standing credential-handling hazard, and `/signin` covers the same need).
+- [x] **D4.** Token refresh, sign-out, and show the active user in the top bar. **Done** — silent single-flight refresh on 401 in both apps, `POST /api/v1/auth/sign-out` revokes upstream, top bar shows the `/me` email plus a Sign out button.
+- [x] **D5.** Create the first real admin user and map to seeded org/facility memberships. **Done** — `kgjohn02@gmail.com` is a platform admin and Tenant Owner of North Arena in the live project.
 
 ### Workstream E — End-user modules (the big one)  *(owner: Haiku build + Sonnet review)*
 Reference pattern to copy: `src/lib/http/forms-routes.mjs` — `register*Routes(router, {authenticate, sendJson, readBody})`, `withAuth` → `requireAuthPermission(auth, facilityId, "code")` → validate → `pgSelect/pgInsert/pgUpdate`. Register end-user routes under a new **`/api/v1`** prefix in `scripts/server.mjs`. Each module already has a tested domain lib and DB tables; only the route + UI layers are missing.

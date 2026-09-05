@@ -1,3 +1,5 @@
+**Superseded (2026-09-03).** Kept for history. Current status and the active plan live in [`REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md`](REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md).
+
 # Rec Reports — Status Report and Fix Plan
 
 Date: 2026-07-17
@@ -92,13 +94,16 @@ configuration in the repo (no `vercel.json`, Dockerfile, or Procfile). Note that
 `scripts/server.mjs` is a long-running Node HTTP server, which fits a Node host
 (Render/Fly/Railway) more naturally than Vercel's serverless model.
 
-### Finding C (critical): no login flow
+### Finding C (critical): no login flow — RESOLVED
 
-- The admin SPA reads a bearer token from `localStorage`, populated by **manually pasting
-  a Supabase access token** into the "Session token" drawer (`src/public/admin/index.html`,
-  `src/public/admin/js/api.js`).
-- There is no sign-in page, no Supabase Auth JS integration, and no other way to mint a
-  token. Real users cannot get in.
+- ~~The admin SPA reads a bearer token from `localStorage`, populated by manually pasting
+  a Supabase access token into the "Session token" drawer.~~ The drawer is gone. `/signin`
+  posts credentials to the same-origin auth proxy (`src/lib/http/auth-routes.mjs`), and
+  `src/public/admin/js/auth.js` owns the resulting session, its silent refresh, and
+  sign-out. `/admin/` redirects to `/signin?next=…` when signed out.
+- One related bug is fixed with it: `/me` was registered only on the end-user router, so
+  the admin app's session lookup (pinned to `/api/admin/v1`) 404'd and reported every
+  signed-in admin as signed out. It is now mounted on both prefixes.
 - `src/lib/http/auth.mjs` verifies **HS256 only**. New Supabase projects default to
   asymmetric JWT signing (ES256 with JWKS); the legacy shared JWT secret must be enabled
   on the project, or the verifier needs JWKS/ES256 support. This must be decided in
@@ -162,13 +167,13 @@ real; phases 4–5 finish the product.
 5. Store `SUPABASE_URL`, anon key, service-role key, and JWT secret as deployment
    secrets (never in the repo).
 
-### Phase 2 — Real authentication (1–2 days)
-1. Build a sign-in page using Supabase Auth (email/password or magic link via the anon
-   key) for both `/` and `/admin/`.
-2. Replace the paste-a-token drawer as the primary flow (keep it as a hidden debug tool).
-3. Handle token refresh and sign-out; surface the active user in the top bar.
-4. Create the first real admin user and map them to the seeded organization/facility
-   memberships.
+### Phase 2 — Real authentication — DONE
+1. ~~Build a sign-in page~~ — `/signin` serves both `/` and `/admin/`, posting to the
+   same-origin auth proxy (the strict CSP forbids calling Supabase Auth cross-origin).
+2. ~~Replace the paste-a-token drawer~~ — removed outright, not kept as a debug tool.
+3. ~~Handle token refresh and sign-out; surface the active user in the top bar.~~
+4. ~~Create the first real admin user and map them to the seeded organization/facility
+   memberships.~~ — `kgjohn02@gmail.com`, platform admin + Tenant Owner of North Arena.
 
 ### Phase 3 — Deploy (1 day)
 1. Host the Node server (serves `dist/` + `/api/admin/v1/*`) on a long-running Node

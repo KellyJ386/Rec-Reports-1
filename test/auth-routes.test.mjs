@@ -307,3 +307,49 @@ test("rate limiter: reset() clears a key outright", () => {
   assert.equal(limiter.check("a@b.com").blocked, false);
   assert.equal(limiter.size(), 0);
 });
+
+test("sign-out revokes the caller's token upstream", async (t) => {
+  const captured = stubFetch(t, () => ({ ok: true, data: {} }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/sign-out", undefined, {
+    headers: { authorization: "Bearer jwt-123" }
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { signed_out: true });
+  const gotrueCall = captured[0];
+  assert.match(gotrueCall.url.href, /\/auth\/v1\/logout$/);
+  // GoTrue scopes logout to the caller, so the user's own token must be
+  // forwarded rather than the anon key.
+  assert.equal(gotrueCall.init.headers.Authorization, "Bearer jwt-123");
+  assert.equal(gotrueCall.init.headers.apikey, "anon-key");
+});
+
+test("sign-out without a token succeeds without calling GoTrue", async (t) => {
+  const captured = stubFetch(t, () => ({ ok: true, data: {} }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/sign-out");
+  assert.equal(result.status, 200);
+  assert.equal(captured.length, 0);
+});
+
+test("sign-out still succeeds when GoTrue rejects the token", async (t) => {
+  // An already-expired or already-revoked token is not an error the user can
+  // act on: the browser drops its copy either way.
+  stubFetch(t, () => ({ ok: false, status: 401, data: { error: "invalid token" } }));
+  const { call } = mount();
+  const result = await call("POST", "/auth/sign-out", undefined, {
+    headers: { authorization: "Bearer stale" }
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { signed_out: true });
+});
+
+test("sign-out returns 503 when Supabase is not configured", async (t) => {
+  const captured = stubFetch(t, () => ({}));
+  const { call } = mount({ env: {} });
+  const result = await call("POST", "/auth/sign-out", undefined, {
+    headers: { authorization: "Bearer jwt-123" }
+  });
+  assert.equal(result.status, 503);
+  assert.equal(captured.length, 0);
+});
