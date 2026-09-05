@@ -17,6 +17,46 @@ const DEVICE_TOKEN_COLUMNS = "id,facility_id,employee_id,platform,token,last_see
 const NOTIFICATION_PREFERENCE_COLUMNS =
   "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end,created_at,updated_at";
 
+// S-8: audience_ref_id is polymorphic (0006_communications.sql:32-41) --
+// which table it points into depends on the sibling audience_type. Mirrors
+// work-orders-routes.mjs's resolveFacilityRef(s): pre-resolving here turns a
+// cross-facility or nonexistent ref into a clean 400 instead of letting the
+// DB reject the insert as an uncaught PostgrestError (0047's policy/trigger
+// still enforce this independently -- this is belt-and-suspenders for a
+// clean client error, not the sole guard).
+const AUDIENCE_REF_TABLES = {
+  employee: "employees",
+  department: "departments",
+  shift: "schedule_shifts",
+  role: "roles"
+};
+
+async function resolveAudienceRef(client, audienceType, refId, facilityId) {
+  if (refId === undefined || refId === null) return { ok: true };
+  const table = AUDIENCE_REF_TABLES[audienceType];
+  const rows = await pgSelect(client, table, {
+    filters: { id: refId },
+    select: "id,facility_id",
+    limit: 1
+  });
+  const row = (rows ?? [])[0];
+  if (!row) return { ok: false, error: `audienceRefId not found for audienceType ${audienceType}: ${refId}` };
+  if (row.facility_id !== facilityId) {
+    return { ok: false, error: `audienceRefId does not belong to this facility for audienceType ${audienceType}: ${refId}` };
+  }
+  return { ok: true };
+}
+
+// Resolves every item's ref in turn, short-circuiting (and issuing no
+// further fetches) on the first invalid one.
+async function resolveAudienceRefs(client, facilityId, items) {
+  for (const item of items) {
+    const result = await resolveAudienceRef(client, item.audienceType, item.audienceRefId, facilityId);
+    if (!result.ok) return result;
+  }
+  return { ok: true };
+}
+
 // Registers the end-user Communications API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
 //   authenticate(request, env) -> { claims, client, memberships, error }
@@ -381,6 +421,9 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           }
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
+
+        const refCheck = await resolveAudienceRefs(auth.client, message.facility_id, body.payload);
+        if (!refCheck.ok) return sendJson(response, 400, { error: refCheck.error });
 
         const rows = body.payload.map((item) => ({
           facility_id: message.facility_id,

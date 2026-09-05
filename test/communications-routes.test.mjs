@@ -242,6 +242,8 @@ test("POST /messages/:id/audiences denies non-publisher with 403", async (t) => 
 test("POST /messages/:id/audiences happy path inserts shaped rows", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "messages") return [MESSAGE];
+    if (table === "roles") return [{ id: "role-1", facility_id: "fac-1" }];
+    if (table === "departments") return [{ id: "dept-1", facility_id: "fac-1" }];
     if (table === "message_audiences" && method === "POST") return [{ id: "aud-1" }, { id: "aud-2" }];
     return [];
   });
@@ -261,6 +263,33 @@ test("POST /messages/:id/audiences happy path inserts shaped rows", async (t) =>
   assert.equal(insert.body[0].audience_type, "role");
   assert.equal(insert.body[0].audience_ref_id, "role-1");
   assert.equal(insert.body[1].audience_type, "department");
+});
+
+test("POST /messages/:id/audiences rejects a cross-facility ref with 400 (S-8)", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "messages") return [MESSAGE];
+    // role-1 belongs to a different facility than the message (fac-1).
+    if (table === "roles") return [{ id: "role-1", facility_id: "fac-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [
+    { audienceType: "role", audienceRefId: "role-1" }
+  ]);
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /does not belong to this facility/);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"), "must not insert on a cross-facility ref");
+});
+
+test("POST /messages/:id/audiences rejects a nonexistent ref with 400 (S-8)", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [
+    { audienceType: "employee", audienceRefId: "emp-missing" }
+  ]);
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /not found/);
+  assert.ok(!captured.some((c) => c.table === "message_audiences"));
 });
 
 test("POST /messages/:id/audiences denies non-publisher from different facility", async (t) => {
