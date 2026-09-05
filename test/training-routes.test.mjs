@@ -1201,11 +1201,25 @@ test("GET evidence-url denies a caller who is neither training.read nor the cert
   assert.equal(result.status, 403);
 });
 
+// assertPathInFacility (src/lib/storage.mjs) requires a real UUID
+// facilityId, unlike the plain "fac-1"/"cert-1" ids used elsewhere in this
+// file (those never reach it) -- so the two success-path evidence-url tests
+// below use a real UUID facility and a matching evidence_path, distinct
+// from EXISTING_CERT's default "fac-1".
+const EVIDENCE_URL_FACILITY_ID = "44444444-4444-4444-4444-444444444444";
+
 test("GET evidence-url grants a training.read manager access without needing to be the cert owner", async (t) => {
-  const withEvidence = { ...EXISTING_CERT, evidence_path: "facilities/fac-1/certifications/cert-1/uuid-evidence.pdf" };
+  const withEvidence = {
+    ...EXISTING_CERT,
+    facility_id: EVIDENCE_URL_FACILITY_ID,
+    evidence_path: `facilities/${EVIDENCE_URL_FACILITY_ID}/certifications/cert-1/uuid-evidence.pdf`
+  };
   stubFetch(t, (table) => (table === "employee_certifications" ? [withEvidence] : []));
   const { client, calls } = stubStorageClient(() => ({ status: 200, body: { signedURL: "/object/sign/attachments/p?token=abc" } }));
-  const { call } = mount({ memberships: READER, createStorageClient: () => client });
+  const { call } = mount({
+    memberships: [{ facilityId: EVIDENCE_URL_FACILITY_ID, status: "active", permissions: ["training.read"] }],
+    createStorageClient: () => client
+  });
   const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
   assert.equal(result.status, 200);
   assert.ok(result.payload.url.includes("token=abc"));
@@ -1213,7 +1227,11 @@ test("GET evidence-url grants a training.read manager access without needing to 
 });
 
 test("GET evidence-url grants the cert's own employee access without training.read (self-scoping)", async (t) => {
-  const withEvidence = { ...EXISTING_CERT, evidence_path: "facilities/fac-1/certifications/cert-1/uuid-evidence.pdf" };
+  const withEvidence = {
+    ...EXISTING_CERT,
+    facility_id: EVIDENCE_URL_FACILITY_ID,
+    evidence_path: `facilities/${EVIDENCE_URL_FACILITY_ID}/certifications/cert-1/uuid-evidence.pdf`
+  };
   stubFetch(t, (table) => {
     if (table === "employee_certifications") return [withEvidence];
     if (table === "employees") return [{ id: "emp-1" }]; // caller's own employee row == cert.employee_id
@@ -1221,7 +1239,7 @@ test("GET evidence-url grants the cert's own employee access without training.re
   });
   const { client, calls } = stubStorageClient(() => ({ status: 200, body: { signedURL: "/object/sign/attachments/p?token=self" } }));
   const { call } = mount({
-    memberships: [{ facilityId: "fac-1", status: "active", permissions: [] }],
+    memberships: [{ facilityId: EVIDENCE_URL_FACILITY_ID, status: "active", permissions: [] }],
     userId: "user-1",
     createStorageClient: () => client
   });
@@ -1229,6 +1247,24 @@ test("GET evidence-url grants the cert's own employee access without training.re
   assert.equal(result.status, 200);
   assert.ok(result.payload.url.includes("token=self"));
   assert.equal(calls.length, 1);
+});
+
+test("GET evidence-url 404s (not the storage client) when the cert's evidence_path names another facility", async (t) => {
+  const withEvidence = {
+    ...EXISTING_CERT,
+    facility_id: EVIDENCE_URL_FACILITY_ID,
+    evidence_path: "facilities/55555555-5555-5555-5555-555555555555/certifications/cert-1/uuid-evidence.pdf"
+  };
+  stubFetch(t, (table) => (table === "employee_certifications" ? [withEvidence] : []));
+  const { client, calls } = stubStorageClient(() => ({ status: 200, body: { signedURL: "/object/sign/attachments/p?token=abc" } }));
+  const { call } = mount({
+    memberships: [{ facilityId: EVIDENCE_URL_FACILITY_ID, status: "active", permissions: ["training.read"] }],
+    createStorageClient: () => client
+  });
+  const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
+  assert.equal(result.status, 404);
+  assert.equal(result.payload.error, "no evidence uploaded for this certification");
+  assert.equal(calls.length, 0, "should never call the storage client for a path outside the cert's own facility");
 });
 
 test("GET evidence-url 404s when no evidence has been uploaded yet", async (t) => {

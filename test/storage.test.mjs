@@ -4,6 +4,7 @@ import {
   createStorageClient,
   createStorageClientFromEnv,
   buildAttachmentPath,
+  assertPathInFacility,
   sanitizeFilename,
   assertMimeAllowed,
   assertWithinSizeCap,
@@ -118,6 +119,54 @@ test("buildAttachmentPath rejects a module or recordId containing path separator
   assert.throws(() => buildAttachmentPath(FACILITY_ID, "../etc", RECORD_ID, "photo.jpg"), StorageValidationError);
   assert.throws(() => buildAttachmentPath(FACILITY_ID, "incidents", "../../secrets", "photo.jpg"), StorageValidationError);
   assert.throws(() => buildAttachmentPath(FACILITY_ID, "incidents/nested", RECORD_ID, "photo.jpg"), StorageValidationError);
+});
+
+// --- assertPathInFacility -----------------------------------------------
+
+test("assertPathInFacility accepts a path under the given facility and module, and returns it", () => {
+  const path = `facilities/${FACILITY_ID}/incidents/${RECORD_ID}/uuid-photo.jpg`;
+  assert.equal(assertPathInFacility(path, FACILITY_ID, "incidents"), path);
+});
+
+test("assertPathInFacility rejects a path naming a different facility (path_outside_facility)", () => {
+  const otherFacilityId = "99999999-9999-9999-9999-999999999999";
+  const path = `facilities/${otherFacilityId}/incidents/${RECORD_ID}/uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_outside_facility"
+  );
+});
+
+test("assertPathInFacility rejects a path under the right facility but a different module", () => {
+  const path = `facilities/${FACILITY_ID}/reports/${RECORD_ID}/uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_outside_facility"
+  );
+});
+
+test("assertPathInFacility rejects a facility-id-as-prefix path that isn't actually scoped to it (no false positive on string prefix)", () => {
+  // "11111111-1111-1111-1111-111111111111X" starts with FACILITY_ID as a raw
+  // string but is not the same facility segment -- assertPathInFacility must
+  // require the "/" boundary, not just String.startsWith on the facilityId
+  // alone.
+  const path = `facilities/${FACILITY_ID}X/incidents/${RECORD_ID}/uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_outside_facility"
+  );
+});
+
+test("assertPathInFacility rejects a non-uuid facilityId before even looking at the path", () => {
+  assert.throws(
+    () => assertPathInFacility(`facilities/not-a-uuid/incidents/${RECORD_ID}/uuid-photo.jpg`, "not-a-uuid", "incidents"),
+    StorageValidationError
+  );
+});
+
+test("assertPathInFacility rejects a null/undefined/non-string path", () => {
+  assert.throws(() => assertPathInFacility(null, FACILITY_ID, "incidents"), StorageValidationError);
+  assert.throws(() => assertPathInFacility(undefined, FACILITY_ID, "incidents"), StorageValidationError);
 });
 
 test("sanitizeFilename rejects traversal attempts outright rather than cleaning them", () => {

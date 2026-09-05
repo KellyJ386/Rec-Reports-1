@@ -18,3 +18,15 @@
 grant usage on schema public to authenticated;
 grant all on all tables in schema public to authenticated;
 grant all on all sequences in schema public to authenticated;
+
+-- Same baseline for the CI-only `storage` schema shim (rls-bootstrap-pre.sql):
+-- a real Supabase project grants `authenticated` table-level privileges on
+-- storage.objects/storage.buckets out of the box, with RLS (0030/0040) as
+-- the actual gate on what a given caller can see or write. Without this,
+-- every `select ... from storage.objects` under `set local role
+-- authenticated` in supabase/tests/*.sql fails at the role/schema level
+-- before RLS is even evaluated ("permission denied for schema storage"),
+-- rather than being filtered down to zero/some rows by the policy.
+grant usage on schema storage to authenticated;
+grant select, insert, update, delete on storage.objects to authenticated;
+grant select on storage.buckets to authenticated;

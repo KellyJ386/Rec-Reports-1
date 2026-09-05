@@ -101,9 +101,12 @@ insert into work_order_updates (id, facility_id, work_order_id, update_type, bod
   ('f5000000-0000-0000-0000-0000000000a1', 'f0000000-0000-0000-0000-0000000000c0', 'f4000000-0000-0000-0000-0000000000a1', 'comment', 'Ordered a replacement seal.'),
   ('f5000000-0000-0000-0000-0000000000b1', 'f0000000-0000-0000-0000-0000000000c1', 'f4000000-0000-0000-0000-0000000000b1', 'comment', 'Facility B comment.')
 on conflict (id) do nothing;
+-- storage_path is prefixed with the row's OWN facility_id (0041's
+-- fn_attachment_path_facility trigger requires it) rather than the "fac-a"/
+-- "fac-b" placeholders used elsewhere in this file.
 insert into work_order_attachments (id, facility_id, work_order_id, storage_path, mime_type) values
-  ('f6000000-0000-0000-0000-0000000000a1', 'f0000000-0000-0000-0000-0000000000c0', 'f4000000-0000-0000-0000-0000000000a1', 'facilities/fac-a/work-orders/a1/leak.jpg', 'image/jpeg'),
-  ('f6000000-0000-0000-0000-0000000000b1', 'f0000000-0000-0000-0000-0000000000c1', 'f4000000-0000-0000-0000-0000000000b1', 'facilities/fac-b/work-orders/b1/leak.jpg', 'image/jpeg')
+  ('f6000000-0000-0000-0000-0000000000a1', 'f0000000-0000-0000-0000-0000000000c0', 'f4000000-0000-0000-0000-0000000000a1', 'facilities/f0000000-0000-0000-0000-0000000000c0/work_orders/a1/leak.jpg', 'image/jpeg'),
+  ('f6000000-0000-0000-0000-0000000000b1', 'f0000000-0000-0000-0000-0000000000c1', 'f4000000-0000-0000-0000-0000000000b1', 'facilities/f0000000-0000-0000-0000-0000000000c1/work_orders/b1/leak.jpg', 'image/jpeg')
 on conflict (id) do nothing;
 
 -- A Facility A incident, for the WO-08 cross-module read check (point 8):

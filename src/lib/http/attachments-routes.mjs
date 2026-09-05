@@ -6,8 +6,10 @@ import {
   buildAttachmentPath,
   assertMimeAllowed,
   assertWithinSizeCap,
+  assertPathInFacility,
   uploadObject,
   createSignedUrl,
+  StorageValidationError,
   DEFAULT_MAX_UPLOAD_BYTES
 } from "../storage.mjs";
 
@@ -369,6 +371,18 @@ export function registerAttachmentRoutes(router, deps) {
           if (!attachment) return sendJson(response, 404, { error: "attachment not found" });
           if (!requirePerm(auth, attachment.facility_id, config.readPermission, response, { notFoundOnDeny: true })) {
             return;
+          }
+          // Defense-in-depth twin of 0041_attachment_path_guard.sql's write-side
+          // trigger: never mint a signed URL for a row whose stored path
+          // disagrees with its own facility_id/module -- 404, same shape as an
+          // unreadable row, and never touch the storage client on mismatch.
+          try {
+            assertPathInFacility(attachment.storage_path, attachment.facility_id, config.storageModule);
+          } catch (error) {
+            if (error instanceof StorageValidationError) {
+              return sendJson(response, 404, { error: "attachment not found" });
+            }
+            throw error;
           }
           const storageClient = createStorageClient(env);
           try {
