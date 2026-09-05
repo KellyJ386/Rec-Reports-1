@@ -1,3 +1,5 @@
+**Superseded (2026-09-03).** Kept for history. Current status and the active plan live in [`REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md`](REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md).
+
 # Rec Reports — Task List & Multi-Agent Execution Plan
 
 Date: 2026-07-18

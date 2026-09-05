@@ -21,6 +21,8 @@ This document is the synthesis and execution strategy. The full per-module detai
 
 ## 1. Where the product stands
 
+**Status snapshot superseded (2026-09-03).** The table below describes the 2026-08-13 baseline before Waves 0–3 shipped. Current per-task status is in `plans/eval-2026-09-03/PLAN_RECONCILIATION.md`; the active plan is `REC_REPORTS_360_EVALUATION_AND_FINISH_PLAN.md`. The task catalogs in `plans/*.md` remain authoritative for task definitions.
+
 Every module now has DB schema + RLS, a tested pure domain library, basic `/api/v1` routes, and a minimally wired end-user panel. The admin control center is complete. What remains is **depth**: lifecycle state machines, the write paths that don't exist yet, the two platform primitives every module is waiting on (file storage and a notification delivery worker), and the go-live steps only the owner can perform.
 
 | Module | Schema | Domain lib | Routes | UI | Biggest gaps |
