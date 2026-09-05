@@ -33,7 +33,7 @@ const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
 const apiPrefix = "/api/admin/v1";
 const userApiPrefix = "/api/v1";
-const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript" };
+const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript" };
 
 const securityHeaders = Object.freeze({
   "Content-Security-Policy": "default-src 'self'",

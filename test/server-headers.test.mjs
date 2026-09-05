@@ -97,6 +97,20 @@ test("hardened server: security headers, 404s, JSON API 404, and stream resilien
     const response = await fetch(`${base}/`);
     assert.equal(response.status, 200);
   });
+
+  await t.test("GET /js/report-form.mjs returns 200 with text/javascript content-type", async () => {
+    const response = await fetch(`${base}/js/report-form.mjs`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/javascript/);
+    assertSecurityHeaders(response);
+  });
+
+  await t.test("GET /js/app.js returns 200 with text/javascript content-type", async () => {
+    const response = await fetch(`${base}/js/app.js`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/javascript");
+    assertSecurityHeaders(response);
+  });
 });
 
 test("server returns 503 JSON on API routes when required server env is missing", async (t) => {

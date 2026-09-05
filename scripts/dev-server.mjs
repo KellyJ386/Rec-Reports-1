@@ -4,7 +4,7 @@ import { extname, join, normalize } from "node:path";
 
 const root = process.argv[2] ?? "src/public";
 const port = Number(process.env.PORT ?? 3000);
-const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript" };
+const contentTypes = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript" };
 
 // Serves nested directories (e.g. src/public/admin/js/api.js) directly via
 // path.join, and resolves a directory request (e.g. /admin or /admin/) to
