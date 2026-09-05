@@ -31,9 +31,11 @@ import {
   buildAudiencePayload,
   deriveAckState
 } from "./comms-compose.mjs";
+import { resolveInitialFacility } from "./facility-context.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 const REFRESH_TOKEN_KEY = "rr_refresh_token";
+const FACILITY_KEY = "rr_facility_id";
 const API_BASE = "/api/v1";
 
 // State
@@ -75,6 +77,27 @@ function getToken() {
     return localStorage.getItem(TOKEN_KEY) || "";
   } catch {
     return "";
+  }
+}
+
+// Helper: Get/set the last-selected facility id, mirroring the
+// rr_admin_context pattern in src/public/admin/js/state.js -- persisted so a
+// reload (or a return visit) keeps the operator on the facility they were
+// last working in instead of always resetting to the first one.
+function getStoredFacilityId() {
+  try {
+    return localStorage.getItem(FACILITY_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function setStoredFacilityId(facilityId) {
+  try {
+    if (facilityId) localStorage.setItem(FACILITY_KEY, facilityId);
+    else localStorage.removeItem(FACILITY_KEY);
+  } catch {
+    // Storage may be unavailable; the switcher still works for this session.
   }
 }
 
@@ -240,16 +263,20 @@ async function initialize() {
         facilitySelect.appendChild(option);
       }
 
-      // Set first facility as default
-      if (facilities.length > 0) {
-        currentFacility = facilities[0].id;
+      // Restore the last-selected facility if it's still in this user's
+      // list, else fall back to the first one (resolveInitialFacility
+      // returns null only when `facilities` itself is empty).
+      currentFacility = resolveInitialFacility(getStoredFacilityId(), facilities);
+      if (currentFacility) {
         facilitySelect.value = currentFacility;
+        setStoredFacilityId(currentFacility);
         await loadAllModules();
       }
 
       // Listen for facility changes
       facilitySelect.addEventListener("change", async (e) => {
         currentFacility = e.target.value;
+        setStoredFacilityId(currentFacility);
         await loadAllModules();
       });
     }

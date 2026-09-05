@@ -234,6 +234,20 @@ button:disabled {
   background: transparent;
 }
 
+/* .ghost-button on an <a> (e.g. the "Operations app" top-bar link) needs its
+   own box/typography rules -- the base button styles above are scoped to the
+   `button` element and don't apply to anchors. */
+a.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--rr-border);
+  border-radius: var(--rr-radius-sm);
+  padding: 9px 14px;
+  font-weight: 700;
+  text-decoration: none;
+  color: inherit;
+}
+
 .icon-button {
   background: transparent;
   border-color: transparent;
