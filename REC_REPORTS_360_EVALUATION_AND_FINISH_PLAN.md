@@ -317,6 +317,7 @@ smoke passes, security headers present on `/`.
 | S-9 | L1–L8 batch (JWT `exp` required, drop `detail` in production errors, `URIError` → 404 in router, `published_at` filter, date-range validation, the never-passing WITH CHECK, audit partial-write) | — | Sonnet |
 | S-10 | Performance advisors: generated migration wrapping `auth.uid()` as `(select auth.uid())` in all 125 flagged policies; covering indexes for the 78 FKs; drop or justify the 71 unused indexes; consolidate duplicate permissive policies where semantics are identical | 0048–0049 | Haiku generates, Sonnet verifies with full RLS suite |
 | S-11 | Refresh token to `HttpOnly` cookie set by the auth proxy (access token stays in memory/localStorage); CSRF consideration documented | — | Sonnet + Opus |
+| S-13 | JWT verifier follow-ups deferred by the W0-4 review: validate `iss` accepting both the legacy `supabase` value and the project URL form; de-duplicate concurrent JWKS fetches; tolerate a missing `kid` by trying each published key of the header's algorithm; drop ES512/RS512 from the allow-list unless Supabase documents issuing them | — | Sonnet + Opus |
 | S-12 | Security sign-off artifact `plans/SECURITY_REVIEW_2026-09.md` closing OP-24 / WO-27 / DR-34 / IN-24 | — | Opus |
 
 Exit gate: Supabase security advisor shows zero WARN; RLS suites 21+N pass locally and against the live
