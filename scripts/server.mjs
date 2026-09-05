@@ -28,6 +28,7 @@ import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs
 import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 import { reportError } from "../src/lib/observability.mjs";
+import { createDurableRateLimiter } from "../src/lib/http/durable-rate-limit.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
@@ -267,7 +268,25 @@ userRouter.register("GET", "/public-config", (request, response, { env }) =>
 
 // Email + password sign-in / refresh, proxied server-side to Supabase Auth so
 // the client stays same-origin under the strict CSP. Logic in auth-routes.mjs.
-registerAuthRoutes(userRouter, { sendJson, readBody });
+//
+// S-7: layer the durable, cross-instance throttle backstop (src/lib/http/
+// durable-rate-limit.mjs, auth_throttle table) behind auth-routes.mjs's own
+// in-memory limiter whenever a service-role key is configured. Read directly
+// from process.env (like the OBSERVABILITY_DSN read below) rather than
+// readServerEnv(), since this client is built once at module load -- before
+// any request's per-call loadEnv() -- and local/dev without
+// SUPABASE_SERVICE_ROLE_KEY must keep working exactly as before (in-memory
+// only).
+const durableLimiter =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createDurableRateLimiter({
+        client: createClient({ url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_ROLE_KEY }),
+        windowMs: 15 * 60 * 1000,
+        max: 30,
+        dsn: process.env.OBSERVABILITY_DSN
+      })
+    : null;
+registerAuthRoutes(userRouter, { sendJson, readBody, durableLimiter });
 
 // GET /me — the signed-in user plus the facilities they can act in. Logic in
 // me-route.mjs; used by the end-user app to populate its facility switcher.

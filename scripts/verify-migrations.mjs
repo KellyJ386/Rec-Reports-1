@@ -81,7 +81,8 @@ const requiredRlsTables = [
   "employee_notification_preferences",
   "subscription_plans",
   "tenant_subscriptions",
-  "usage_counters"
+  "usage_counters",
+  "auth_throttle"
 ];
 
 for (const table of requiredRlsTables) {
