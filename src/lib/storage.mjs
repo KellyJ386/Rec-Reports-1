@@ -197,6 +197,33 @@ export function buildAttachmentPath(facilityId, module, recordId, filename) {
   return `facilities/${safeFacilityId}/${safeModule}/${safeRecordId}/${uniqueId}-${safeName}`;
 }
 
+// Asserts that a stored attachment path (e.g. a row's storage_path /
+// evidence_path column) actually lives under the facility and module its
+// own row claims, i.e. starts with "facilities/{facilityId}/{module}/".
+//
+// This is the read-side twin of 0041_attachment_path_guard.sql's
+// fn_attachment_path_facility trigger (which enforces the facility half of
+// this same invariant at write time, for every writing role including
+// service-role callers that bypass RLS): defense-in-depth so a signed-URL
+// route never mints a URL for a path that disagrees with the row's own
+// facility_id/module, whether that disagreement comes from a bug, a stale
+// row written before 0041 existed, or a row some future write path forgot
+// to run through buildAttachmentPath. Throws StorageValidationError with
+// code "path_outside_facility" on mismatch; callers should catch this and
+// respond 404 (matching the existing notFoundOnDeny posture), never call
+// the storage client on failure, and never 403 (a 403 would confirm to an
+// unauthorized caller that *some* attachment exists at that id).
+export function assertPathInFacility(path, facilityId, module) {
+  const safeFacilityId = assertUuid(facilityId, "facilityId");
+  if (typeof path !== "string" || !path.startsWith(`facilities/${safeFacilityId}/${module}/`)) {
+    throw new StorageValidationError(
+      `path does not belong to facility ${facilityId} / module ${module}: ${JSON.stringify(path)}`,
+      "path_outside_facility"
+    );
+  }
+  return path;
+}
+
 // --- Mime allow-list + size cap ---------------------------------------------
 
 export const DEFAULT_ALLOWED_MIME_TYPES = Object.freeze([

@@ -80,8 +80,10 @@ do $$
 declare
   v_submission_id uuid := current_setting('report_audit_test.submission_id')::uuid;
 begin
+  -- storage_path is prefixed with the row's own facility_id (0041's
+  -- fn_attachment_path_facility trigger requires it).
   insert into report_submission_attachments (facility_id, submission_id, field_key, storage_path, mime_type)
-  values ('9a000000-0000-0000-0000-00000000009c', v_submission_id, 'photo', 'facilities/x/reports/y/z.jpg', 'image/jpeg');
+  values ('9a000000-0000-0000-0000-00000000009c', v_submission_id, 'photo', 'facilities/9a000000-0000-0000-0000-00000000009c/reports/y/z.jpg', 'image/jpeg');
 end;
 $$;
 
