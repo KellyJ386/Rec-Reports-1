@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
-const port = 41000 + (process.pid % 4000);
+// Disjoint from test/server-headers.test.mjs (43000-46999) so parallel test
+// files never share a port.
+const port = 41000 + (process.pid % 2000);
 const base = `http://localhost:${port}`;
 
 function waitForServer(url, attempts = 50) {
