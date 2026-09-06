@@ -472,6 +472,14 @@ begin
   )
   returning * into v_amendment;
 
+  -- Disarm the transition-guard bypass as soon as the audited write is done.
+  -- set_config(..., true) is transaction-local, so this would die with the
+  -- transaction anyway -- but PostgREST-issued statements are not the only
+  -- callers (SQL tests, psql sessions, future batch jobs), and leaving the
+  -- flag armed would let any later UPDATE in the same transaction rewrite
+  -- amendable fields on ANY incident without an amendment row.
+  perform set_config('rec.amendment_in_progress', 'false', true);
+
   return jsonb_build_object('incident', to_jsonb(v_incident), 'amendment', to_jsonb(v_amendment));
 end;
 $$;
@@ -486,6 +494,41 @@ begin
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function internal.apply_incident_amendment(uuid, jsonb, text) to service_role;
+  end if;
+end
+$$;
+
+-- PostgREST only serves functions in its exposed schemas (`public` here);
+-- `internal` exists precisely so that PostgREST never serves it (0042). The
+-- BFF route posts to /rest/v1/rpc/apply_incident_amendment, so it needs this
+-- thin, SECURITY INVOKER wrapper in `public`. It carries no logic of its own:
+-- every check (auth.uid(), permission, draft status, amendable-field
+-- allow-list) still runs inside the internal definer function, and the
+-- wrapper is only executable by the same roles that may call that function.
+-- `internal` itself stays unexposed.
+create or replace function public.apply_incident_amendment(
+  incident_id uuid,
+  changes jsonb,
+  reason text
+)
+returns jsonb
+language sql
+security invoker
+set search_path = public
+as $$
+  select internal.apply_incident_amendment(incident_id, changes, reason);
+$$;
+
+revoke execute on function public.apply_incident_amendment(uuid, jsonb, text) from public;
+grant execute on function public.apply_incident_amendment(uuid, jsonb, text) to authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function public.apply_incident_amendment(uuid, jsonb, text) from anon;
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.apply_incident_amendment(uuid, jsonb, text) to service_role;
   end if;
 end
 $$;

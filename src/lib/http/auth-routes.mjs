@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { createRateLimiter } from "./rate-limit.mjs";
 import {
   REFRESH_COOKIE_NAME,
@@ -110,21 +111,46 @@ export function registerAuthRoutes(
     }
   }
 
-  // Behind Vercel, x-forwarded-for's leftmost entry is the client IP Vercel's
-  // edge network observed. It is still just a request header: nothing stops
-  // a caller from sending their own x-forwarded-for to a deployment that
-  // isn't behind Vercel, and even on Vercel the value is attacker-supplied
-  // in the sense that it's never cryptographically verified. Treat it as a
-  // throttle *bucket*, never as an identity or an audit fact -- worst case
-  // a spoofed value just gives an attacker their own private bucket, which
-  // is no worse than having no per-IP throttle at all for that request.
+  // Which address a request "comes from", for throttle bucketing only. It is
+  // derived from request headers, so it is never an identity or an audit
+  // fact: whoever can reach a deployment that is not behind a proxy can
+  // send any header they like, and the worst case is that a spoofer gets a
+  // private bucket -- no worse than having no per-IP throttle at all for
+  // that request. What this DOES guard against is the cheap evasion of a
+  // proxy-fronted deployment: behind a proxy that APPENDS to
+  // x-forwarded-for (nginx, most load balancers), the leftmost hop is the
+  // attacker's own free-text and only the rightmost hop is what the proxy
+  // itself observed, so this reads the rightmost. Vercel sets x-real-ip
+  // (and a single-hop x-forwarded-for) to the address its edge saw, which
+  // is why x-real-ip wins when present. Anything that is not a syntactically
+  // valid IPv4/IPv6 address collapses into one shared "invalid" bucket
+  // rather than a per-request bucket an attacker could mint at will.
   function clientIp(request) {
-    const header = request.headers?.["x-forwarded-for"];
-    if (header) {
-      const first = String(header).split(",")[0]?.trim();
-      if (first) return first;
+    const headers = request.headers ?? {};
+    const candidates = [];
+    if (headers["x-real-ip"]) candidates.push(String(headers["x-real-ip"]).trim());
+    if (headers["x-forwarded-for"]) {
+      const hops = String(headers["x-forwarded-for"])
+        .split(",")
+        .map((hop) => hop.trim())
+        .filter(Boolean);
+      if (hops.length > 0) candidates.push(hops[hops.length - 1]);
     }
+    for (const candidate of candidates) {
+      if (isIP(candidate)) return candidate;
+    }
+    if (candidates.length > 0) return "invalid";
     return request.socket?.remoteAddress || "unknown";
+  }
+
+  // M5: the durable store's IP key is hashed like the email key below --
+  // clientIp() already bounds the value to a real address or a fixed
+  // sentinel, but hashing keeps every auth_throttle key the same fixed-width
+  // hex shape regardless of source, so nothing derived from a request header
+  // ever reaches the table, the sweep's `in.(...)` filter, or a reported
+  // error verbatim.
+  function ipThrottleKey(prefix, ip) {
+    return `${prefix}:${createHash("sha256").update(String(ip)).digest("hex")}`;
   }
 
   function normalizeEmail(email) {
@@ -301,7 +327,7 @@ export function registerAuthRoutes(
 
       const ip = clientIp(request);
       const emailKey = normalizeEmail(email);
-      const durableIpKey = `ip:${ip}`;
+      const durableIpKey = ipThrottleKey("ip", ip);
       const durableEmailKey = emailThrottleKey(email);
 
       const ipCheck = ipLimiter.check(ip);
@@ -345,7 +371,7 @@ export function registerAuthRoutes(
     const tokenHash = createHash("sha256")
       .update(String(refreshTokenForThrottle(request, body) ?? ""))
       .digest("hex");
-    return { tokenKey: `refresh:${tokenHash}`, ipKey: `refresh-ip:${clientIp(request)}` };
+    return { tokenKey: `refresh:${tokenHash}`, ipKey: ipThrottleKey("refresh-ip", clientIp(request)) };
   }
 
   // POST /auth/refresh {} -> session

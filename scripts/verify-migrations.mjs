@@ -107,7 +107,8 @@ for (const helper of [
   "fn_message_audience_ref_facility",
   "fn_incident_report_audit",
   "fn_incident_report_transition_guard",
-  "internal.apply_incident_amendment"
+  "internal.apply_incident_amendment",
+  "public.apply_incident_amendment"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

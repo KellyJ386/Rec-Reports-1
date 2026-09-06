@@ -177,6 +177,63 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 4c. NEW-2 (0048 re-verification): the RPC disarms rec.amendment_in_progress
+-- before returning, so a direct amendable-field UPDATE later in the SAME
+-- transaction is still rejected -- the flag cannot be left armed by one
+-- legitimate amendment and reused for an unaudited rewrite.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if coalesce(current_setting('rec.amendment_in_progress', true), '') = 'true' then
+    raise exception 'IRG FAIL: rec.amendment_in_progress is still armed after apply_incident_amendment returned';
+  end if;
+  begin
+    update incident_reports set summary = 'Unaudited rewrite after RPC' where id = '43e00000-0000-0000-0000-000000000e03';
+    raise exception 'IRG FAIL: a direct amendable-field UPDATE succeeded after a prior RPC call in the same transaction (flag left armed)';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4d. NEW-1 (0048 re-verification): the BFF reaches the RPC through
+-- PostgREST as POST /rest/v1/rpc/apply_incident_amendment, i.e. the
+-- UNQUALIFIED public.apply_incident_amendment wrapper -- `internal` is never
+-- exposed by PostgREST. Calling the wrapper exactly as PostgREST would (as
+-- `authenticated`, by bare name) must work and must land the amendment row.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  result jsonb;
+  amendment_count integer;
+begin
+  select public.apply_incident_amendment(
+    '43e00000-0000-0000-0000-000000000e03'::uuid,
+    jsonb_build_object('location_text', 'Pool deck, north end (via public wrapper)'),
+    'IRG public wrapper test'
+  ) into result;
+  if (result -> 'incident' ->> 'location_text') <> 'Pool deck, north end (via public wrapper)' then
+    raise exception 'IRG FAIL: public.apply_incident_amendment did not apply the change (saw %)', result -> 'incident' ->> 'location_text';
+  end if;
+  select count(*) into amendment_count
+    from incident_amendments
+    where incident_id = '43e00000-0000-0000-0000-000000000e03' and amendment_reason = 'IRG public wrapper test';
+  if amendment_count <> 1 then
+    raise exception 'IRG FAIL: public.apply_incident_amendment did not insert its incident_amendments row (count %)', amendment_count;
+  end if;
+  if coalesce(current_setting('rec.amendment_in_progress', true), '') = 'true' then
+    raise exception 'IRG FAIL: rec.amendment_in_progress left armed by the public wrapper';
+  end if;
+exception
+  when insufficient_privilege then
+    raise exception 'IRG FAIL: authenticated cannot execute public.apply_incident_amendment (the PostgREST-facing wrapper)';
+  when undefined_function then
+    raise exception 'IRG FAIL: public.apply_incident_amendment does not exist -- the RPC is unreachable through PostgREST';
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 7a. Manager (no incidents.legal_hold.manage) cannot flip legal_hold.
 -- ---------------------------------------------------------------------------
 do $$
@@ -216,8 +273,12 @@ begin
     where entity_table = 'incident_reports'
       and entity_id = '43e00000-0000-0000-0000-000000000e03'
       and event_type = 'incident.updated';
-  if updated_count <> 1 then
-    raise exception 'IRG FAIL: expected exactly 1 incident.updated audit_events row for the summary edit, saw %', updated_count;
+  -- Two audited amendments landed on e03 above: the summary edit through
+  -- internal.apply_incident_amendment (#4b) and the location_text edit
+  -- through the PostgREST-facing public wrapper (#4d). The rejected direct
+  -- UPDATEs (#4a, #4c) must not have produced a row.
+  if updated_count <> 2 then
+    raise exception 'IRG FAIL: expected exactly 2 incident.updated audit_events rows (one per amendment), saw %', updated_count;
   end if;
 end;
 $$;

@@ -41,16 +41,14 @@ const TABLE = "auth_throttle";
 const ROW_SELECT = "failures,window_start";
 const DEFAULT_SWEEP_OLDER_THAN_MS = 60 * 60 * 1000; // 1 hour
 
-// M5: `key` is attacker-controlled -- POST /auth/sign-in's email key is now
-// sha256-hashed (auth-routes.mjs, fixed-length hex, well under this cap) but
-// the IP key is still the raw client-supplied string (see clientIp's own
-// header for why a spoofed x-forwarded-for is treated as "an attacker gets
-// their own bucket", not an identity fact), and nothing stops a future
-// caller of this module from building a key out of other unbounded input.
-// Refusing an oversized key here -- rather than trusting every call site to
-// have bounded its own input -- keeps a single unbounded key from becoming
-// an unbounded row in a durable, cross-instance store. Treated the same as
-// every other failure mode in this module: fail open, no throw.
+// M5: `key` is derived from attacker-influenced input. auth-routes.mjs now
+// sha256-hashes both its email and its IP keys (fixed-length hex, well under
+// this cap), but nothing stops a future caller of this module from building
+// a key out of other unbounded input. Refusing an oversized key here --
+// rather than trusting every call site to have bounded its own input --
+// keeps a single unbounded key from becoming an unbounded row in a durable,
+// cross-instance store. Treated the same as every other failure mode in
+// this module: fail open, no throw.
 const MAX_KEY_LENGTH = 128;
 
 function isOversizedKey(key) {
@@ -221,6 +219,10 @@ export async function sweepAuthThrottle(client, {
     });
     const excessKeys = (excessRows ?? []).map((row) => row.key).filter(Boolean);
     if (excessKeys.length > 0) {
+      // supabase-rest.mjs quotes any list value containing `,` `(` `)` `"`
+      // or whitespace, so a row whose key somehow carries one of those (no
+      // current writer produces such a key, but the table is shared state)
+      // cannot wedge this DELETE for every other row behind it.
       await pgDelete(client, TABLE, { key: { in: excessKeys } }, { returning: false });
       deleted += excessKeys.length;
     }

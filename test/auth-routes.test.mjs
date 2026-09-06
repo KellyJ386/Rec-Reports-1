@@ -412,6 +412,39 @@ test("sign-in: the per-IP throttle blocks a burst spread across many different e
   assert.equal(otherIp.status, 401);
 });
 
+// M5 (re-verification): which forwarded hop feeds the per-IP throttle bucket.
+async function signInIpKeyFor(t, headers) {
+  stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
+  const durable = stubDurableLimiter();
+  const { call } = mount({ durableLimiter: durable });
+  await call("POST", "/auth/sign-in", { email: "x@example.com", password: "wrong" }, { headers });
+  return durable.calls.filter((c) => c.method === "check").map((c) => c.key).find((key) => key.startsWith("ip:"));
+}
+
+test("client IP: the RIGHTMOST x-forwarded-for hop is the bucket, not the attacker-writable leftmost one", async (t) => {
+  const key = await signInIpKeyFor(t, { "x-forwarded-for": "6.6.6.6, 203.0.113.7" });
+  assert.equal(key, ipThrottleKey("ip", "203.0.113.7"));
+  assert.notEqual(key, ipThrottleKey("ip", "6.6.6.6"));
+});
+
+test("client IP: x-real-ip wins over x-forwarded-for when both are present", async (t) => {
+  const key = await signInIpKeyFor(t, { "x-real-ip": "198.51.100.9", "x-forwarded-for": "203.0.113.7" });
+  assert.equal(key, ipThrottleKey("ip", "198.51.100.9"));
+});
+
+test("client IP: a header value that is not an IP address lands in one shared 'invalid' bucket, never a per-request one", async (t) => {
+  const first = await signInIpKeyFor(t, { "x-forwarded-for": 'a"b)' });
+  const second = await signInIpKeyFor(t, { "x-forwarded-for": "not an ip, also not, ${nope}" });
+  assert.equal(first, ipThrottleKey("ip", "invalid"));
+  assert.equal(second, first);
+  assert.match(first, /^ip:[0-9a-f]{64}$/, "the durable key is fixed-width hex regardless of the header contents");
+});
+
+test("client IP: IPv6 forwarded addresses are accepted", async (t) => {
+  const key = await signInIpKeyFor(t, { "x-forwarded-for": "2001:db8::1" });
+  assert.equal(key, ipThrottleKey("ip", "2001:db8::1"));
+});
+
 test("sign-in: success path is unaffected while under the limit", async (t) => {
   stubFetch(t, () => ({
     ok: true,
@@ -484,6 +517,10 @@ function emailThrottleKey(email) {
   return `email:${hash}`;
 }
 
+function ipThrottleKey(prefix, ip) {
+  return `${prefix}:${createHash("sha256").update(ip).digest("hex")}`;
+}
+
 test("sign-in: the durable limiter is checked (hashed-email/ip keys) and recorded on failure", async (t) => {
   stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
   const durable = stubDurableLimiter();
@@ -495,10 +532,10 @@ test("sign-in: the durable limiter is checked (hashed-email/ip keys) and recorde
 
   const expectedEmailKey = emailThrottleKey("victim@example.com");
   const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
-  assert.deepEqual(checked.sort(), [expectedEmailKey, "ip:unknown"].sort());
+  assert.deepEqual(checked.sort(), [expectedEmailKey, ipThrottleKey("ip", "unknown")].sort());
   assert.doesNotMatch(expectedEmailKey, /victim@example\.com/, "the durable key must never carry the raw email");
   const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
-  assert.deepEqual(recorded.sort(), [expectedEmailKey, "ip:unknown"].sort());
+  assert.deepEqual(recorded.sort(), [expectedEmailKey, ipThrottleKey("ip", "unknown")].sort());
 });
 
 test("sign-in: a successful sign-in resets the durable (hashed) email key", async (t) => {
@@ -560,9 +597,9 @@ test("refresh: the durable limiter is checked/recorded keyed on sha256(refresh_t
 
   const expectedTokenHash = createHash("sha256").update("stale-refresh-token").digest("hex");
   const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
-  assert.deepEqual(checked.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+  assert.deepEqual(checked.sort(), [`refresh:${expectedTokenHash}`, ipThrottleKey("refresh-ip", "203.0.113.9")].sort());
   const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
-  assert.deepEqual(recorded.sort(), [`refresh:${expectedTokenHash}`, "refresh-ip:203.0.113.9"].sort());
+  assert.deepEqual(recorded.sort(), [`refresh:${expectedTokenHash}`, ipThrottleKey("refresh-ip", "203.0.113.9")].sort());
 });
 
 test("refresh: prefers the rr_refresh cookie over body.refresh_token for the durable throttle key", async (t) => {

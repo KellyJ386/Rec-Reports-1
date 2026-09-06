@@ -196,6 +196,22 @@ test("pgSelect supports in filters formatted as in.(a,b)", async (t) => {
   assert.equal(parsed.searchParams.get("status"), "in.(a,b)");
 });
 
+test("in filters double-quote (and escape) values containing PostgREST list delimiters", async (t) => {
+  let capturedUrl;
+  withFetch(t, async (url) => {
+    capturedUrl = url;
+    return { ok: true, status: 200, text: async () => "[]" };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "anon-key" });
+  await pgSelect(client, "auth_throttle", {
+    filters: { key: { in: ["plain", 'a"b)', "c,d", "e f", "back\\slash"] } }
+  });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("key"), 'in.(plain,"a\\"b)","c,d","e f","back\\\\slash")');
+});
+
 test("an unknown filter operator throws before any fetch is issued", async (t) => {
   let fetchCalled = false;
   withFetch(t, async () => {

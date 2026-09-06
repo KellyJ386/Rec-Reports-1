@@ -20,6 +20,19 @@ export function createClient({ url, key, authToken } = {}) {
 // compatibility with every existing caller.
 const FILTER_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "in"]);
 
+// PostgREST parses `in.(a,b)` as a comma-separated list where `,`, `(`, `)`,
+// `"` and whitespace are structural. A value containing any of them must be
+// double-quoted (with embedded quotes and backslashes escaped) or PostgREST rejects
+// the whole filter -- and a value the caller does not control (e.g. an
+// auth_throttle key derived from a request header) could otherwise wedge
+// every list-filtered query it lands in. Plain values are left bare so the
+// wire format every existing caller and test expects is unchanged.
+function quoteInListValue(value) {
+  const text = String(value);
+  if (!/[,()"\\\s]/.test(text)) return text;
+  return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -35,7 +48,7 @@ function appendFilters(params, filters) {
         }
         if (operator === "in") {
           const list = Array.isArray(operand) ? operand : [operand];
-          params.append(column, `in.(${list.join(",")})`);
+          params.append(column, `in.(${list.map(quoteInListValue).join(",")})`);
         } else {
           params.append(column, `${operator}.${operand}`);
         }

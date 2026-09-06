@@ -271,6 +271,22 @@ test("sweepAuthThrottle: deletes the oldest rows beyond maxRows even when none a
   assert.equal(rowCapDelete.url.searchParams.get("key"), "in.(excess-1,excess-2)");
 });
 
+test("sweepAuthThrottle: a poisoned key (list delimiters) is quoted so it cannot wedge the row-cap DELETE", async (t) => {
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "auth_throttle" && method === "DELETE") {
+      return url.searchParams.has("updated_at") ? [] : [{ key: "x" }];
+    }
+    if (table === "auth_throttle" && method === "GET") {
+      return [{ key: 'ip:a"b)' }, { key: "ip:ok" }];
+    }
+    return [];
+  });
+  const result = await sweepAuthThrottle(client, { maxRows: 1 });
+  assert.deepEqual(result, { deleted: 2 });
+  const rowCapDelete = captured.find((c) => c.method === "DELETE" && c.url.searchParams.has("key"));
+  assert.equal(rowCapDelete.url.searchParams.get("key"), 'in.("ip:a\\"b)",ip:ok)');
+});
+
 test("sweepAuthThrottle: a row-cap failure still reports the staleness sweep's own count", async (t) => {
   stubFetch(t, (table, method) => {
     if (table === "auth_throttle" && method === "DELETE") return [{ key: "a" }];

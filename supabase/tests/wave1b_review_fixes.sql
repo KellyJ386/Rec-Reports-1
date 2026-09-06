@@ -393,10 +393,66 @@ begin
   exception
     when insufficient_privilege then null; -- expected
   end;
+  -- NEW-1: the same denial holds through the PostgREST-facing public wrapper
+  -- (SECURITY INVOKER: it adds no privilege of its own).
+  begin
+    perform public.apply_incident_amendment(
+      '48e10000-0000-0000-0000-000000000e11'::uuid,
+      jsonb_build_object('summary', 'should never apply'),
+      'M1 permission test (public wrapper)'
+    );
+    raise exception 'M1 FAIL: an incidents.escalate-only actor was able to call public.apply_incident_amendment';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
 end;
 $$;
 
 reset role;
+
+-- ===========================================================================
+-- NEW-1 grant shape: the public wrapper is executable by authenticated (and
+-- service_role where it exists) and by nobody else -- a role with no explicit
+-- grant (standing in for PUBLIC / anon) cannot call it or the internal
+-- function behind it.
+-- ===========================================================================
+do $$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'probe_1b_new1') then
+    create role probe_1b_new1 nologin;
+  end if;
+end;
+$$;
+
+do $$
+begin
+  if not has_function_privilege('authenticated', 'public.apply_incident_amendment(uuid,jsonb,text)', 'execute') then
+    raise exception 'NEW-1 FAIL: authenticated cannot execute public.apply_incident_amendment';
+  end if;
+  if has_function_privilege('probe_1b_new1', 'public.apply_incident_amendment(uuid,jsonb,text)', 'execute') then
+    raise exception 'NEW-1 FAIL: a role with no grant (PUBLIC) can execute public.apply_incident_amendment';
+  end if;
+  if has_function_privilege('probe_1b_new1', 'internal.apply_incident_amendment(uuid,jsonb,text)', 'execute') then
+    raise exception 'NEW-1 FAIL: a role with no grant (PUBLIC) can execute internal.apply_incident_amendment';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'anon')
+     and has_function_privilege('anon', 'public.apply_incident_amendment(uuid,jsonb,text)', 'execute') then
+    raise exception 'NEW-1 FAIL: anon can execute public.apply_incident_amendment';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'service_role')
+     and not has_function_privilege('service_role', 'public.apply_incident_amendment(uuid,jsonb,text)', 'execute') then
+    raise exception 'NEW-1 FAIL: service_role cannot execute public.apply_incident_amendment';
+  end if;
+end;
+$$;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'probe_1b_new1') then
+    drop role probe_1b_new1;
+  end if;
+end;
+$$;
 
 -- ===========================================================================
 -- M3: message_audiences.audience_ref_id must be non-null for
