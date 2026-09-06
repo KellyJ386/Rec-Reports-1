@@ -149,7 +149,7 @@ export function registerAdminRoutes(router, { authenticate, sendJson, readBody }
     withAuth(request, response, env, async (auth) => {
       const body = await parseJsonBody(request);
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-      const { valid, errors } = validateFacilityInput(body.payload);
+      const { valid, errors } = validateFacilityInput(body.payload, { partial: true });
       if (!valid) return sendJson(response, 400, { errors });
       const found = await pgSelect(auth.client, "facilities", {
         filters: { id: params.facilityId },

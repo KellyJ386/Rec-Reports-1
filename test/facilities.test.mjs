@@ -25,6 +25,13 @@ test("validateFacilityInput requires a non-empty name", () => {
   assert.equal(validateFacilityInput("nope").valid, false);
 });
 
+test("validateFacilityInput in partial mode lets name be omitted but not blank", () => {
+  assert.equal(validateFacilityInput({ timezone: "America/New_York" }, { partial: true }).valid, true);
+  assert.equal(validateFacilityInput({}, { partial: true }).valid, true);
+  assert.equal(validateFacilityInput({ name: "   " }, { partial: true }).valid, false);
+  assert.equal(validateFacilityInput({ name: 7 }, { partial: true }).valid, false);
+});
+
 test("validateFacilityInput rejects a non-IANA timezone but keeps the name valid", () => {
   const result = validateFacilityInput({ name: "OK", timezone: "Pacific Time" });
   assert.equal(result.valid, false);

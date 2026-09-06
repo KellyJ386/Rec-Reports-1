@@ -174,16 +174,15 @@ test("GET cert-gaps denies a non-member of the facility with 403", async (t) => 
   assert.equal(result.status, 403);
 });
 
-// GET cert-gaps only guards on facility membership (requireMember), not
-// training.manage/training.read -- a reader with no training permission at
-// all can still read the report as long as they belong to the facility. This
-// documents that the report has no read-permission gate beyond membership.
-test("GET cert-gaps allows a facility member with no training permission at all", async (t) => {
+// GET cert-gaps requires training.read: the report exposes every employee's certification status,
+// so plain facility membership is not enough.
+test("GET cert-gaps denies a facility member with no training permission", async (t) => {
   const NO_TRAINING_PERMS = [{ facilityId: "fac-1", status: "active", permissions: [] }];
-  stubFetch(t, () => []);
+  const captured = stubFetch(t, () => []);
   const { call } = mount({ memberships: NO_TRAINING_PERMS });
   const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
-  assert.equal(result.status, 200);
+  assert.equal(result.status, 403);
+  assert.equal(captured.length, 0);
 });
 
 test("GET cert-gaps with no matching requirement rows reports zero requirements and no employees", async (t) => {

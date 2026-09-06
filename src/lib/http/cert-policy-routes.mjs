@@ -22,7 +22,7 @@ const CERT_COLUMNS = "id,facility_id,employee_id,certification_type_id,issued_at
 // to facility members; writes require training.manage AND the cert_policies
 // entitlement on the facility's organization (402 otherwise).
 export function registerCertPolicyRoutes(router, { authenticate, sendJson, readBody }) {
-  const { withAuth, requireMember, parseJsonBody, queryParams } = makeGuards({
+  const { withAuth, requireMember, requirePerm, parseJsonBody, queryParams } = makeGuards({
     authenticate,
     sendJson,
     readBody
@@ -187,9 +187,14 @@ export function registerCertPolicyRoutes(router, { authenticate, sendJson, readB
   // Joins the role's requirements against every employee_certification in the
   // facility (two pgSelects) and folds them through certGaps, returning one
   // entry per employee that has at least one gap.
+  // The gap report exposes every employee's certification status, so unlike
+  // the policy-configuration reads above it requires training.read (the same
+  // permission the employee_certifications RLS policy demands since 0045 --
+  // a member without it would only ever see their own rows and get a report
+  // in which everyone else looks "missing").
   router.register("GET", "/facilities/:facilityId/cert-gaps", (request, response, { env, params }) =>
     withAuth(request, response, env, async (auth) => {
-      if (!requireMember(auth, params.facilityId, response)) return;
+      if (!requirePerm(auth, params.facilityId, "training.read", response)) return;
       const roleId = queryParams(request).get("roleId");
       if (!roleId) return sendJson(response, 400, { error: "roleId query parameter is required" });
 

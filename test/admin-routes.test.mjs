@@ -199,22 +199,30 @@ test("PATCH facility happy path updates name and timezone for an org admin", asy
   assert.equal(update.url.searchParams.get("id"), "eq.fac-1");
 });
 
-// TODO(bug): PATCH /facilities/:facilityId reuses validateFacilityInput, the
-// same validator POST /org/:orgId/facilities uses to create a facility, which
-// unconditionally requires a non-empty `name`. A partial PATCH that only
-// touches timezone (leaving name out, as any sane partial-update client
-// would) is rejected with 400 "name is required" even though the handler
-// otherwise treats name/timezone as independently optional patch fields (see
-// `if (body.payload.name !== undefined) ...` / `if (body.payload.timezone
-// !== undefined) ...` below the validation call). This documents the current
-// (broken) partial-update behaviour rather than fixing the route.
-test("PATCH facility (TODO bug) rejects a timezone-only patch with 400 because name is required", async (t) => {
-  const captured = stubFetch(t, () => []);
+// PATCH is a partial update: leaving `name` out keeps it unchanged (the
+// validator runs in partial mode), while an explicitly blank name is still
+// rejected.
+test("PATCH facility accepts a timezone-only patch and leaves name untouched", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_admins") return [{ user_id: "user-1", organization_id: "org-1" }];
+    if (table === "facilities" && method === "PATCH") return [{ id: "fac-1", timezone: "America/Chicago" }];
+    return [];
+  });
   const { call } = mount({ memberships: ADMIN_ON_FAC1 });
   const result = await call("PATCH", "/facilities/fac-1", { timezone: "America/Chicago" });
+  assert.equal(result.status, 200);
+  const update = captured.find((c) => c.table === "facilities" && c.method === "PATCH");
+  assert.deepEqual(update.body, { timezone: "America/Chicago" });
+});
+
+test("PATCH facility still rejects an explicitly blank name", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", { name: "   " });
   assert.equal(result.status, 400);
   assert.deepEqual(result.payload.errors, ["name is required"]);
-  assert.equal(captured.length, 0, "the bug surfaces before any facility lookup even happens");
+  assert.equal(captured.length, 0);
 });
 
 test("PATCH department resolves the facility, guards on it, and updates by id", async (t) => {
