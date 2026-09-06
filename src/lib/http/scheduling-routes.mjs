@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { makeGuards } from "./guard.mjs";
 import {
   summarizeScheduleReadiness,
   canTransitionPeriod,
@@ -55,41 +55,9 @@ const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE)
 // Reads require schedule.read; writes require schedule.manage. All routes
 // operate within the authenticated user's facility scope.
 export function registerSchedulingRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const requireRead = guards.requireRead(READ);
 
   async function loadPeriod(client, periodId) {
     const rows = await pgSelect(client, "schedule_periods", {

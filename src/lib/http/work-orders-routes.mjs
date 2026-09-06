@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import {
   WORK_ORDER_STATUSES,
@@ -55,41 +55,9 @@ const MAX_LIMIT = 200;
 // Reads require work_orders.read on the row's facility; managing (creating,
 // updating) requires work_orders.manage.
 export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams, parseListLimitOffset } = guards;
+  const requireRead = guards.requireRead(READ);
 
   async function loadWorkOrder(client, workOrderId) {
     const rows = await pgSelect(client, "work_orders", {
@@ -201,30 +169,21 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       else order = orderParam;
     }
 
-    let limit = DEFAULT_LIMIT;
-    const limitParam = qp.get("limit");
-    if (limitParam !== null) {
-      const parsed = Number(limitParam);
-      if (!Number.isInteger(parsed) || parsed < 1) {
-        errors.push(`invalid limit: ${limitParam}`);
-      } else {
-        limit = Math.min(parsed, MAX_LIMIT);
-      }
-    }
-
-    let offset = 0;
-    const offsetParam = qp.get("offset");
-    if (offsetParam !== null) {
-      const parsed = Number(offsetParam);
-      if (!Number.isInteger(parsed) || parsed < 0) {
-        errors.push(`invalid offset: ${offsetParam}`);
-      } else {
-        offset = parsed;
-      }
-    }
-
+    // P-12: limit/offset parsing itself moved to the shared
+    // parseListLimitOffset (guard.mjs), which always returns the single-
+    // field `{ error }` shape on a bad value -- reconciled with
+    // reports-routes.mjs's shape, which this file used to disagree with
+    // (this function batched every bad query param, limit/offset included,
+    // into `{ errors: [...] }` with `invalid limit: X` wording). A bad
+    // limit/offset now short-circuits with that single-field body
+    // immediately, ahead of the batched `errors` from the checks above,
+    // rather than joining them.
     if (errors.length > 0) return { ok: false, body: { errors } };
-    return { ok: true, filters, order, limit, offset };
+
+    const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT });
+    if (!paging.ok) return { ok: false, body: { error: paging.error } };
+
+    return { ok: true, filters, order, limit: paging.limit, offset: paging.offset };
   }
 
   // --- Work Orders -----------------------------------------------------------

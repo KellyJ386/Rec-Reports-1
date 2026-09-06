@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { pgSelect, pgInsert } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { makeGuards } from "./guard.mjs";
 import {
   createStorageClientFromEnv,
   buildAttachmentPath,
@@ -198,29 +198,15 @@ const MODULES = {
 export function registerAttachmentRoutes(router, deps) {
   const { authenticate, sendJson, createStorageClient = (env) => createStorageClientFromEnv(env) } = deps;
 
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
+  const { withAuth, requirePerm } = makeGuards({ authenticate, sendJson, readBody: undefined });
 
   // notFoundOnDeny: the signed-url route isn't nested under a known parent,
   // so a caller with no access to the attachment's facility gets 404 rather
   // than 403 -- otherwise the response itself would confirm a foreign
   // attachment id exists. Every other route in this file keeps the normal
-  // 403-on-deny convention used across the rest of the codebase.
-  function requirePerm(auth, facilityId, code, response, { notFoundOnDeny = false } = {}) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(
-        response,
-        notFoundOnDeny ? 404 : 403,
-        notFoundOnDeny ? { error: "attachment not found" } : { error: guard.reason }
-      );
-      return false;
-    }
-    return true;
-  }
+  // 403-on-deny convention used across the rest of the codebase. Both are
+  // options on the shared guard.mjs requirePerm (P-12); this is the only
+  // call site in the codebase that sets them.
 
   async function loadParent(client, config, id) {
     const rows = await pgSelect(client, config.parentTable, {
@@ -369,7 +355,12 @@ export function registerAttachmentRoutes(router, deps) {
         withAuth(request, response, env, async (auth) => {
           const attachment = await loadAttachment(auth.client, config, params.attachmentId);
           if (!attachment) return sendJson(response, 404, { error: "attachment not found" });
-          if (!requirePerm(auth, attachment.facility_id, config.readPermission, response, { notFoundOnDeny: true })) {
+          if (
+            !requirePerm(auth, attachment.facility_id, config.readPermission, response, {
+              notFoundOnDeny: true,
+              notFoundMessage: "attachment not found"
+            })
+          ) {
             return;
           }
           // Defense-in-depth twin of 0041_attachment_path_guard.sql's write-side

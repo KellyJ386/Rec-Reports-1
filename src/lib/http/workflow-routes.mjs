@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import {
   createChangeRequest,
   advanceChangeRequest,
@@ -32,21 +32,7 @@ const CHANGE_REQUEST_COLUMNS =
 // happened. A generic "replay this jsonb patch onto an arbitrary table" isn't
 // implemented here (see ADMIN_CONTROL_CENTER_IMPLEMENTATION_PLAN.md Phase 6).
 export function registerWorkflowRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    let payload;
-    try {
-      payload = JSON.parse((await readBody(request)) || "{}");
-    } catch {
-      return { ok: false };
-    }
-    return { ok: true, payload };
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
+  const { withAuth, parseJsonBody, queryParams } = makeGuards({ authenticate, sendJson, readBody });
 
   function requireAdmin(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, "admin.manage");
@@ -55,10 +41,6 @@ export function registerWorkflowRoutes(router, { authenticate, sendJson, readBod
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   async function loadChangeRequest(client, id) {

@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
-import { requireAuthPermission, requireAuthOrgAdminRow } from "./guard.mjs";
+import { requireAuthPermission, requireAuthOrgAdminRow, makeGuards } from "./guard.mjs";
 import {
   validateModuleTogglePayload,
   validateMembershipInput,
@@ -26,21 +26,7 @@ import { permissions } from "../permissions.mjs";
 //   sendJson(response, status, payload)
 //   readBody(request) -> Promise<string>
 export function registerAdminRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    let payload;
-    try {
-      payload = JSON.parse((await readBody(request)) || "{}");
-    } catch {
-      return { ok: false };
-    }
-    return { ok: true, payload };
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
+  const { withAuth, parseJsonBody } = makeGuards({ authenticate, sendJson, readBody });
 
   // Read-then-append of a facility's settings_jsonb: merge the validated patch
   // onto the current (highest-version) settings, then INSERT a new row at

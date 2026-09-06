@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import {
   validateRequirementInput,
   validatePolicyInput,
@@ -22,27 +22,11 @@ const CERT_COLUMNS = "id,facility_id,employee_id,certification_type_id,issued_at
 // to facility members; writes require training.manage AND the cert_policies
 // entitlement on the facility's organization (402 otherwise).
 export function registerCertPolicyRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireMember(auth, facilityId, response) {
-    if (!authCanAccessFacility(auth, facilityId)) {
-      sendJson(response, 403, { error: "not a member of this facility" });
-      return false;
-    }
-    return true;
-  }
+  const { withAuth, requireMember, parseJsonBody, queryParams } = makeGuards({
+    authenticate,
+    sendJson,
+    readBody
+  });
 
   function requireManage(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, MANAGE);
@@ -72,10 +56,6 @@ export function registerCertPolicyRoutes(router, { authenticate, sendJson, readB
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   // --- Certification role requirements --------------------------------------
