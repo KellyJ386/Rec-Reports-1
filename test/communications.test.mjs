@@ -3,8 +3,7 @@ import assert from "node:assert/strict";
 import {
   acknowledgementState,
   resolveMessageAudience,
-  shouldBypassQuietHours,
-  channelsForPriority
+  shouldBypassQuietHours
 } from "../src/lib/communications.mjs";
 
 test("resolveMessageAudience expands department, shift, and employee targets without duplicates", () => {

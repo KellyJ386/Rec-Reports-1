@@ -34,8 +34,6 @@ const COURSE_MODULES_COLUMNS =
 const TRAINING_ASSIGNMENTS_COLUMNS =
   "id,facility_id,employee_id,course_id,assigned_by,assigned_at,due_at," +
   "reason_code,source_type,source_ref_id,created_at,updated_at";
-const TRAINING_COMPLETIONS_COLUMNS =
-  "id,facility_id,assignment_id,completed_at,final_score_pct,completion_status,created_at";
 const TRAINING_PROGRESS_COLUMNS =
   "id,facility_id,assignment_id,module_id,state,started_at,completed_at,score_pct,attempts,created_at,updated_at";
 // Matches the 0007 training_progress.state check constraint exactly.
