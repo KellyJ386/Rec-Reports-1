@@ -138,6 +138,16 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
       await pgInsert(auth.client, "incident_audit_events", [event], { returning: false });
       return true;
     } catch (error) {
+      // L-8: reportError is a silent no-op when OBSERVABILITY_DSN is unset
+      // (see observability.mjs -- `if (!dsn) return Promise.resolve();`),
+      // which is the normal local/dev state. Without a DSN, "the failure is
+      // reported ... so it's visible for manual reconciliation" (above) was
+      // not actually true -- console.error here is the local-log fallback
+      // that makes it true unconditionally, DSN configured or not.
+      console.error(
+        `incidents.audit_write/${event.event_type} failed for incident ${event.incident_id}:`,
+        error
+      );
       reportError(error, {
         dsn: env?.OBSERVABILITY_DSN,
         route: `incidents.audit_write/${event.event_type}`,

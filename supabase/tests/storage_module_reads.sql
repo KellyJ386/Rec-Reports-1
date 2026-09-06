@@ -169,6 +169,84 @@ end;
 $$;
 reset role;
 
+-- ---------------------------------------------------------------------------
+-- 3. M-1 regression: a training.manage holder (no training.read) cannot
+-- read ANOTHER employee's certification evidence just by inserting their
+-- OWN certification row with its evidence_path set to the victim's exact
+-- storage key. Before the M-1 fix, the self-scoping EXISTS subquery only
+-- checked `ec.evidence_path = name` and `e.user_id = auth.uid()` -- it
+-- never tied the object back to *that certification's own* canonical path,
+-- so employee_id and evidence_path (two independent columns with no
+-- cross-validation at write time -- 0041's trigger only checks the
+-- facility/module shape, never that the recordId segment matches the row's
+-- own id) could point at completely different certifications. Fixed by
+-- additionally requiring `name like
+-- 'facilities/{facility}/certifications/{ec.id}/%'`, binding the object to
+-- THIS certification's own id, not just the attacker's employee identity.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('40100000-0000-0000-0000-000000000005', 'smr-attacker@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('40100000-0000-0000-0000-000000000005', 'SMR Attacker', 'smr-attacker@test')
+on conflict (id) do nothing;
+insert into roles (id, facility_id, name) values
+  ('40400000-0000-0000-0000-000000000004', '40300000-0000-0000-0000-000000000001', 'SMR Training Manager Role')
+on conflict (id) do nothing;
+insert into role_permissions (role_id, permission_code) values
+  ('40400000-0000-0000-0000-000000000004', 'training.manage')
+on conflict do nothing;
+-- Deliberately NO training.read on this role -- the whole point of the
+-- attack is reading evidence WITHOUT that permission.
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('40500000-0000-0000-0000-000000000005', '40100000-0000-0000-0000-000000000005', '40300000-0000-0000-0000-000000000001', '40400000-0000-0000-0000-000000000004', 'active')
+on conflict (id) do nothing;
+insert into employees (id, facility_id, user_id, first_name, last_name, status) values
+  ('40600000-0000-0000-0000-000000000003', '40300000-0000-0000-0000-000000000001', '40100000-0000-0000-0000-000000000005', 'SMR', 'Attacker', 'active')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"40100000-0000-0000-0000-000000000005","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  visible int;
+  new_cert_id uuid;
+begin
+  select count(*) into visible from storage.objects where id = '40900000-0000-0000-0000-000000000004';
+  if visible <> 0 then
+    raise exception 'SMR FAIL: attacker (training.manage only, no cert row yet) can already see the victim''s evidence object';
+  end if;
+
+  -- The attack: insert the attacker's OWN certification row (their own
+  -- employee_id, so the self-scoping join's `e.user_id = auth.uid()` will
+  -- match), but with evidence_path set to the VICTIM's (Owner Two's) exact
+  -- evidence object key rather than a path under this new row's own id.
+  -- This INSERT is expected to SUCCEED (0031's write-side policy only
+  -- requires training.manage + same-facility employee/cert-type, and
+  -- 0041's trigger only validates the path's facility/module shape, never
+  -- that its recordId segment matches this row's own id) -- the write side
+  -- is not what M-1 fixes; the read side is.
+  insert into employee_certifications (facility_id, employee_id, certification_type_id, evidence_path, status)
+  values (
+    '40300000-0000-0000-0000-000000000001',
+    '40600000-0000-0000-0000-000000000003',
+    '40700000-0000-0000-0000-000000000001',
+    'facilities/40300000-0000-0000-0000-000000000001/certifications/40800000-0000-0000-0000-000000000002/evidence-2.pdf',
+    'active'
+  )
+  returning id into new_cert_id;
+  if new_cert_id is null then
+    raise exception 'SMR FAIL: attacker could not insert their own certification row with the victim''s evidence_path (attack setup is broken, not the fix under test)';
+  end if;
+
+  select count(*) into visible from storage.objects where id = '40900000-0000-0000-0000-000000000004';
+  if visible <> 0 then
+    raise exception 'SMR FAIL (M-1): attacker can read the victim''s certification evidence object after inserting a colliding evidence_path on their own cert row';
+  end if;
+end;
+$$;
+reset role;
+
 -- ===========================================================================
 -- S-2: fn_attachment_path_facility() (0041) rejects a mismatched
 -- storage_path/evidence_path on INSERT for each of the four tables, with

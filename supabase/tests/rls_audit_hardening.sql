@@ -170,10 +170,13 @@ do $$
 declare
   new_id uuid;
 begin
-  -- storage_path is prefixed with the row's own facility_id (0041's
-  -- fn_attachment_path_facility trigger requires it).
+  -- storage_path must match the full canonical
+  -- facilities/{facility}/{module}/{recordId}/{filename} shape (0041's
+  -- fn_attachment_path_facility trigger, tightened by the H-1/L-1 fix, now
+  -- checks the whole shape -- module included -- not just the facility
+  -- prefix).
   insert into report_submission_attachments (facility_id, submission_id, field_key, storage_path, mime_type)
-  values ('38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001700', 'attachment', 'facilities/38000000-0000-0000-0000-0000000000c0/reports/y.jpg', 'image/jpeg')
+  values ('38000000-0000-0000-0000-0000000000c0', '38000000-0000-0000-0000-000000001700', 'attachment', 'facilities/38000000-0000-0000-0000-0000000000c0/reports/38000000-0000-0000-0000-000000001700/y.jpg', 'image/jpeg')
   returning id into new_id;
   if new_id is null then
     raise exception 'RLS AUDIT FAIL: report_submission_attachments INSERT is still inert (0038 Class A fix did not apply)';

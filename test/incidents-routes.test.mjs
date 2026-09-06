@@ -1179,3 +1179,28 @@ test("A failing audit write with no OBSERVABILITY_DSN configured stays a silent 
   assert.equal(result.status, 500);
   assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
 });
+
+// L-8: with no DSN configured, reportError is a silent no-op (see
+// observability.mjs), so console.error is the ONLY local signal that the
+// audit write failed -- without it, "reported ... visible for manual
+// reconciliation" (writeAuditEvent's own doc comment) would be false
+// whenever OBSERVABILITY_DSN is unset, which is the normal local/dev state.
+test("A failing audit write with no OBSERVABILITY_DSN configured still logs locally via console.error", async (t) => {
+  stubFetchAuditFailure(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-4" }];
+    return [];
+  });
+  const originalConsoleError = console.error;
+  const calls = [];
+  console.error = (...args) => calls.push(args);
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  const { call } = mount({ memberships: CREATOR }); // default env: {} -- no OBSERVABILITY_DSN
+  const result = await call("POST", "/incidents/inc-1/escalate", {});
+  assert.equal(result.status, 500);
+  assert.equal(calls.length, 1, "expected exactly one console.error call for the failed audit write");
+  assert.match(calls[0][0], /incidents\.audit_write\/incident\.escalated/);
+  assert.match(calls[0][0], /inc-1/);
+});

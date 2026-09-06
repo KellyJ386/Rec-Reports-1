@@ -166,4 +166,86 @@ $$;
 -- ---------------------------------------------------------------------------
 alter function public.fn_report_template_version_immutable() set search_path = public;
 
+-- ---------------------------------------------------------------------------
+-- 7. L-2: 0042's revoke sweep above (step 5) covers the ten trigger
+--    functions, but missed three OTHER public-schema functions that were
+--    also added by 0040/0041 and are just as reachable as
+--    /rest/v1/rpc/<name> today: fn_storage_attachment_module(text) and
+--    fn_storage_attachment_facility_id(text) (pure invoker string parsers --
+--    no privilege exposure either way, but inconsistent with this
+--    migration's own stated goal) and fn_attachment_path_facility() (0041,
+--    SECURITY DEFINER -- the same class of exposure OP-05 exists to close,
+--    even though its body only touches trigger-local NEW and errors out
+--    with "record \"new\" is not assigned yet" if ever called directly via
+--    RPC rather than as a real BEFORE INSERT/UPDATE trigger, so this is
+--    belt-and-suspenders, not a live hole).
+--
+--    fn_storage_attachment_module/fn_storage_attachment_facility_id are
+--    deliberately left OUT of this revoke: they are invoker functions
+--    referenced directly inside the storage.objects SELECT policy (0040),
+--    and unlike a SECURITY DEFINER helper called through has_permission(),
+--    Postgres re-checks EXECUTE on an invoker function used inside a policy
+--    expression against the CALLING role every time the policy evaluates --
+--    revoking authenticated's EXECUTE here would make every attachment read
+--    fail with "permission denied for function fn_storage_attachment_*",
+--    not just close an unused RPC path. authenticated keeps EXECUTE on
+--    those two for exactly that reason; PUBLIC never had it revoked either
+--    (plain `create function` grants EXECUTE to PUBLIC by default) since
+--    doing so would revoke authenticated's inherited grant too on a role
+--    with no separate GRANT of its own -- so PUBLIC is left alone for these
+--    two specifically, and only fn_attachment_path_facility (never called
+--    from a policy expression, only from CREATE TRIGGER) is revoked below.
+-- ---------------------------------------------------------------------------
+revoke execute on function public.fn_attachment_path_facility() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function public.fn_attachment_path_facility() from anon;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8. H-2: make internal.* resolvable by BARE name for the duration of every
+--    migration-apply session, restoring replayability of 0001-0041.
+--
+--    ALTER FUNCTION ... SET SCHEMA (step 2 above) preserves each moved
+--    helper's OID, so the ~200 already-created policy expressions in
+--    0002-0041 that reference has_permission/current_facility_ids/
+--    fn_assert_same_facility/is_organization_admin/is_platform_admin
+--    UNQUALIFIED keep resolving correctly the first time those files are
+--    applied (that resolution happened once, at each file's own original
+--    CREATE POLICY time, before the helpers ever moved). But every one of
+--    those ~200 policies is written as a `drop policy if exists` /
+--    `create policy` PAIR (the 0009+ idempotency convention this repo's own
+--    scripts/verify-migrations.mjs enforces) -- and a REPLAY of any of
+--    those files against a database that has already run this migration
+--    executes the drop (which always succeeds) and then re-resolves the
+--    bare helper name at the new CREATE POLICY time, by which point the
+--    helper no longer lives in `public` and the session's default
+--    search_path (`"$user", public`) can no longer find it: the create
+--    fails, and the table is left with that policy MISSING until someone
+--    notices and re-applies by hand. Confirmed against a live database
+--    (re-applying 0031/0038/0040 post-0042 each throw "function
+--    has_permission(...) does not exist" and leave storage.objects with
+--    zero SELECT policies).
+--
+--    Fixed by putting `internal` on every NEW session's default
+--    search_path at the database level, so a bare reference in a REPLAYED
+--    0002-0041 file resolves exactly like it did the first time, with zero
+--    edits to any of those ~200 policy bodies. `alter database ... set`
+--    only takes effect for sessions started AFTER this runs -- the current
+--    session (this migration's own) is unaffected, which is fine, since
+--    nothing after this point in 0042 depends on it -- but it means any
+--    verification of this fix (including the CI idempotency probe added
+--    alongside this migration) must open a FRESH psql/connection to observe
+--    the new search_path.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  execute format('alter database %I set search_path = public, internal', current_database());
+end
+$$;
+
 notify pgrst, 'reload schema';

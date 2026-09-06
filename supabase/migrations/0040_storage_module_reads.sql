@@ -31,6 +31,24 @@
 -- resolves the function to a fixed OID at CREATE POLICY time, so that later
 -- move does not require touching this policy).
 --
+-- M-1 fix: the certifications self-scoping EXISTS subquery originally
+-- matched only on `ec.evidence_path = name` and `e.user_id = auth.uid()`.
+-- employee_certifications INSERT/UPDATE requires `training.manage`
+-- (0031_training_cert_writes.sql) but NOT `training.read`, so a
+-- training.manage-only caller could insert their OWN certification row with
+-- its evidence_path set to another employee's evidence object's exact
+-- storage key and then read that object straight back over the Storage
+-- REST API -- the query never tied the object back to *that specific
+-- certification's own path*. Fixed by also requiring the object name to
+-- live under this certification's own canonical
+-- facilities/{facility}/certifications/{certification id}/ prefix (the only
+-- shape buildAttachmentPath ever writes, per
+-- src/lib/http/training-routes.mjs's `buildAttachmentPath(cert.facility_id,
+-- EVIDENCE_STORAGE_MODULE, cert.id, filename)` call -- recordId is the
+-- certification's own id), and excluding soft-deleted certification rows
+-- (ec.deleted_at is null) so a deleted row can no longer be used to keep an
+-- otherwise-orphaned evidence object readable.
+--
 -- Idempotency: drop-if-exists precedes every create (0009+ convention,
 -- enforced by scripts/verify-migrations.mjs) -- both the OLD policy name
 -- from 0030 and the new name, since this migration renames the policy to
@@ -96,6 +114,8 @@ create policy "facility members can read module-scoped attachments"
             join employees e on e.id = ec.employee_id
             where ec.evidence_path = name
               and e.user_id = auth.uid()
+              and ec.deleted_at is null
+              and name like ('facilities/' || ec.facility_id::text || '/certifications/' || ec.id::text || '/%')
           )
         )
       )

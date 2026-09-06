@@ -48,6 +48,19 @@ test("clearRefreshCookie: secure=false omits Secure, defaults to secure=true", (
   assert.match(clearRefreshCookie({}), /Secure/);
 });
 
+// L-4: buildRefreshCookie writes with encodeURIComponent, parseCookies reads
+// back with decodeURIComponent -- a token containing a reserved cookie-value
+// character (";", ",", a literal space) must round-trip unchanged instead of
+// being corrupted/truncated by the browser's own cookie-value parsing.
+test("buildRefreshCookie + parseCookies round-trip a token containing reserved cookie characters", () => {
+  const token = "abc; def,ghi jkl%mno";
+  const cookie = buildRefreshCookie({ token });
+  const cookieValuePart = cookie.split("; ")[0];
+  assert.equal(cookieValuePart, `${REFRESH_COOKIE_NAME}=${encodeURIComponent(token)}`);
+  const parsed = parseCookies(cookieValuePart);
+  assert.equal(parsed[REFRESH_COOKIE_NAME], token);
+});
+
 test("parseCookies: parses a simple Cookie header", () => {
   assert.deepEqual(parseCookies("a=1; b=2"), { a: "1", b: "2" });
 });
