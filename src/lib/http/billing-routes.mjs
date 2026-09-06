@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, requireAuthOrgAdminRow, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission, requireAuthOrgAdminRow, authCanAccessFacility, makeGuards } from "./guard.mjs";
 import { entitlementsFor, flagState, usageStatus, loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
 const ENTITLEMENT = "advanced_flags";
@@ -10,19 +10,7 @@ const ENTITLEMENT = "advanced_flags";
 // by scope: org rows require org admin; facility rows require admin.manage on
 // the facility. Same injected-primitives shape as the other route modules.
 export function registerBillingRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
+  const { withAuth, parseJsonBody } = makeGuards({ authenticate, sendJson, readBody });
 
   async function orgFacilities(client, organizationId) {
     const rows = await pgSelect(client, "facilities", {

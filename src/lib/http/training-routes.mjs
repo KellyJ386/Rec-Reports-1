@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission, authCanAccessFacility, makeGuards } from "./guard.mjs";
 import { trainingAssignmentState, certificationStatus, assignmentReadyToComplete } from "../training.mjs";
 import {
   validateCourseInput,
@@ -62,14 +62,6 @@ export function registerTrainingRoutes(
   router,
   { authenticate, sendJson, readBody, createStorageClient = (env) => createStorageClientFromEnv(env) }
 ) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
   // Thrown by readRawBody when the request body (declared or actual)
   // exceeds the per-route cap.
   class UploadTooLargeError extends Error {
@@ -134,33 +126,9 @@ export function registerTrainingRoutes(
     return createHash("sha256").update(buffer).digest("hex");
   }
 
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const requireRead = guards.requireRead(READ);
 
   async function loadAssignment(client, assignmentId) {
     const rows = await pgSelect(client, "training_assignments", {

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { createRateLimiter } from "./rate-limit.mjs";
+import { makeGuards } from "./guard.mjs";
 import {
   REFRESH_COOKIE_NAME,
   buildRefreshCookie,
@@ -103,13 +104,10 @@ export function registerAuthRoutes(
     await Promise.all([durableLimiter.recordFailure(keyA), durableLimiter.recordFailure(keyB)]);
   }
 
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
+  // No authenticate() here -- these routes ARE the auth surface -- so only
+  // parseJsonBody is drawn from the shared factory (P-12); withAuth is never
+  // constructed.
+  const { parseJsonBody } = makeGuards({ authenticate: null, sendJson, readBody });
 
   // Which address a request "comes from", for throttle bucketing only. It is
   // derived from request headers, so it is never an identity or an audit

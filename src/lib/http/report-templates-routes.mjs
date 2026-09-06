@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import {
   validateTemplateInput,
   nextTemplateVersionNumber,
@@ -30,27 +30,11 @@ const VERSION_COLUMNS =
 // on the row's facility (matching the RLS gates added by 0028); publishing a
 // version additionally requires reports.publish.
 export function registerReportTemplatesRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireMember(auth, facilityId, response) {
-    if (!authCanAccessFacility(auth, facilityId)) {
-      sendJson(response, 403, { error: "not a member of this facility" });
-      return false;
-    }
-    return true;
-  }
+  const { withAuth, requireMember, parseJsonBody, queryParams } = makeGuards({
+    authenticate,
+    sendJson,
+    readBody
+  });
 
   function requireManage(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, TEMPLATE_MANAGE);
@@ -68,10 +52,6 @@ export function registerReportTemplatesRoutes(router, { authenticate, sendJson, 
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   async function loadTemplateById(client, id) {

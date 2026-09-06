@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { authCanAccessFacility, makeGuards } from "./guard.mjs";
 import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority } from "../communications.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
@@ -66,41 +66,9 @@ async function resolveAudienceRefs(client, facilityId, items) {
 // Reads require communications.read on the row's facility; creating or publishing
 // a message requires communications.publish. Acknowledgements require communications.read.
 export function registerCommunicationRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const requireRead = guards.requireRead(READ);
 
   async function loadMessage(client, messageId) {
     const rows = await pgSelect(client, "messages", {

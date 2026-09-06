@@ -1,6 +1,6 @@
 import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { reportError } from "../observability.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import {
   escalationDueAt,
   isEscalationOverdue,
@@ -64,37 +64,9 @@ const PEOPLE_COLUMNS =
 // Reads require incidents.read on the row's facility; creating or escalating
 // an incident requires incidents.manage.
 export function registerIncidentRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const requireRead = guards.requireRead(READ);
 
   // Allowed if the actor holds ANY of `codes` at facilityId. Used where a
   // capability is legitimately reachable by more than one role (amendments:
@@ -106,10 +78,6 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   // Inserts one incident_audit_events row, used at every one of this

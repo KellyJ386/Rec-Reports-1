@@ -7,6 +7,7 @@ import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { createJwtVerifier, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
 import { requireAuthOrgAdminRow } from "../src/lib/http/guard.mjs";
+import { translatePostgrestError, includeErrorDetail } from "../src/lib/http/errors.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
@@ -26,7 +27,7 @@ import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
 import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
 import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
-import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
+import { createClient, pgSelect, pgInsert, PostgrestError } from "../src/lib/supabase-rest.mjs";
 import { reportError } from "../src/lib/observability.mjs";
 import { createDurableRateLimiter } from "../src/lib/http/durable-rate-limit.mjs";
 
@@ -419,6 +420,26 @@ export async function handleRequest(request, response) {
     try {
       await matchResult.handler(request, response, { env, params: matchResult.params });
     } catch (error) {
+      // P-9: a PostgrestError escaping a route handler that never caught it
+      // itself (the bespoke 409 catch sites and the incidents-routes.mjs
+      // incident_no retry loop still handle their own; guard.mjs's withAuth
+      // already translates most others closer to the source -- this is the
+      // net for whatever reaches here regardless, e.g. a route registered
+      // without withAuth) is answered directly with the matching 4xx,
+      // instead of reported/rethrown as a server bug. /internal/* routes are
+      // deliberately excluded: they run on a service-role client with RLS
+      // bypassed entirely (see internal-routes.mjs's header), so a
+      // PostgrestError there is never "this caller was denied" -- it is
+      // always a bug, and must stay a reported 500 (see errors.mjs's own
+      // doc comment, and test/http-errors.test.mjs's proof of this
+      // exclusion).
+      const isInternalRoute = path.startsWith("/internal/");
+      const translated = isInternalRoute ? null : translatePostgrestError(error);
+      if (translated && translated.status < 500) {
+        sendJson(response, translated.status, translated.body);
+        return;
+      }
+
       // OP-20 fire-and-forget error report. Never awaited: it must not delay
       // (or, if it fails/times out, ever affect) the 500 response this error
       // is about to produce via createApp's catch / the Vercel serverless
@@ -436,6 +457,12 @@ export async function handleRequest(request, response) {
         userId: request.authenticatedUserId ?? null
       });
       error.__observabilityReported = true;
+      // P-9: carries this request's own id through to createApp's catch /
+      // api/[...path].mjs's catch, so the 500 response body's `requestId`
+      // (added by this task) matches the one just reported above and logged
+      // in the finally block below, instead of each outer catch minting an
+      // unrelated one of its own.
+      error.__requestId = requestId;
       throw error;
     }
   } finally {
@@ -470,11 +497,20 @@ export function createApp() {
         // never double-reports the common case. No `env` is reliably
         // available this far out, so this reads OBSERVABILITY_DSN directly
         // off process.env rather than going through readServerEnv.
+        //
+        // P-9: error.__requestId is the id handleRequest already reported
+        // and logged under, when this error passed through its own catch
+        // (the common case); a genuinely escaped error (routing/env-loading
+        // bug) never got one, so a fresh id is minted here instead -- either
+        // way the response body below carries the same id this was (or now
+        // is) reported under.
+        const requestId = error.__requestId ?? randomUUID();
         if (!error.__observabilityReported) {
-          reportError(error, { dsn: process.env.OBSERVABILITY_DSN, route: null, status: 500, requestId: null, userId: null });
+          reportError(error, { dsn: process.env.OBSERVABILITY_DSN, route: null, status: 500, requestId, userId: null });
         }
         if (!response.headersSent) {
-          sendJson(response, 500, { error: "internal server error", detail: error.message });
+          const detail = includeErrorDetail(process.env) ? { detail: error.message } : {};
+          sendJson(response, 500, { error: "internal server error", requestId, ...detail });
         } else {
           response.end();
         }

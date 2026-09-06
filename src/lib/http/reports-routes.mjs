@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { makeGuards } from "./guard.mjs";
 import { hasDepartmentPermission } from "../permissions.mjs";
 import {
   validateReportSubmission,
@@ -53,37 +53,9 @@ function unknownKeysError(schema, payload) {
 // submission leaves 'draft' it is immutable here (matching the RLS gate in 0002,
 // which only permits updates while status = 'draft').
 export function registerReportRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams, parseListLimitOffset } = guards;
+  const requireRead = guards.requireRead(READ);
 
   // --- Department-scoped guards (DR-11) ---------------------------------
   // 0033 switched report_templates SELECT and report_submissions
@@ -125,10 +97,6 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     }
     sendJson(response, 403, { error: `missing permission: ${code}` });
     return false;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   async function loadTemplate(client, facilityId, templateId) {
@@ -269,32 +237,15 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           filters.report_date = { ...(filters.report_date ?? {}), lte: to };
         }
 
-        let limit = DEFAULT_LIST_LIMIT;
-        const limitParam = qp.get("limit");
-        if (limitParam !== null) {
-          const parsed = Number(limitParam);
-          if (!Number.isInteger(parsed) || parsed <= 0) {
-            return sendJson(response, 400, { error: "limit must be a positive integer" });
-          }
-          limit = Math.min(parsed, MAX_LIST_LIMIT);
-        }
-
-        let offset;
-        const offsetParam = qp.get("offset");
-        if (offsetParam !== null) {
-          const parsed = Number(offsetParam);
-          if (!Number.isInteger(parsed) || parsed < 0) {
-            return sendJson(response, 400, { error: "offset must be a non-negative integer" });
-          }
-          offset = parsed;
-        }
+        const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIST_LIMIT, maxLimit: MAX_LIST_LIMIT });
+        if (!paging.ok) return sendJson(response, 400, { error: paging.error });
 
         const rows = await pgSelect(auth.client, "report_submissions", {
           filters,
           select: SUBMISSION_COLUMNS,
           order: "report_date.desc",
-          limit,
-          offset
+          limit: paging.limit,
+          offset: paging.offset
         });
         return sendJson(response, 200, rows ?? []);
       })
