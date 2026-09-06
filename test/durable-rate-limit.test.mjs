@@ -197,22 +197,136 @@ test("a failure reports via reportError when a dsn is configured", async (t) => 
 // sweepAuthThrottle (called from internal-routes.mjs's handleDrain)
 // ---------------------------------------------------------------------------
 
-test("sweepAuthThrottle: DELETE request shape (lt filter on updated_at) and returns the deleted count", async (t) => {
+test("sweepAuthThrottle: DELETE request shape (lt filter on updated_at), then a row-cap check that finds nothing over the cap", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "auth_throttle" && method === "DELETE") return [{ key: "a" }, { key: "b" }];
+    if (table === "auth_throttle" && method === "GET") return []; // M5: no rows past maxRows
     return [];
   });
   const now = 10_000_000;
   const result = await sweepAuthThrottle(client, { now: () => now, olderThanMs: 60 * 60 * 1000 });
   assert.deepEqual(result, { deleted: 2 });
-  assert.equal(captured.length, 1);
-  const req = captured[0];
-  assert.equal(req.method, "DELETE");
-  assert.equal(req.url.searchParams.get("updated_at"), `lt.${new Date(now - 60 * 60 * 1000).toISOString()}`);
+  assert.equal(captured.length, 2, "expected the staleness DELETE plus the row-cap GET");
+  const deleteReq = captured[0];
+  assert.equal(deleteReq.method, "DELETE");
+  assert.equal(deleteReq.url.searchParams.get("updated_at"), `lt.${new Date(now - 60 * 60 * 1000).toISOString()}`);
+  const rowCapReq = captured[1];
+  assert.equal(rowCapReq.method, "GET");
+  assert.equal(rowCapReq.url.searchParams.get("order"), "updated_at.desc");
 });
 
 test("sweepAuthThrottle: fails open (deleted: 0) on a network error", async (t) => {
   stubFetchThrows(t);
   const result = await sweepAuthThrottle(client, {});
   assert.deepEqual(result, { deleted: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// M5: bounded keys and a bounded total row count.
+// ---------------------------------------------------------------------------
+
+test("check()/recordFailure()/reset(): a key over 128 chars is refused before any fetch, fail-open shape", async (t) => {
+  const captured = stubFetch(t, () => {
+    throw new Error("must not be called for an oversized key");
+  });
+  const limiter = createDurableRateLimiter({ client, windowMs: 900000, max: 5 });
+  const hugeKey = `ip:${"1".repeat(200)}`;
+  assert.ok(hugeKey.length > 128);
+
+  assert.deepEqual(await limiter.check(hugeKey), { blocked: false, retryAfterMs: 0 });
+  await assert.doesNotReject(limiter.recordFailure(hugeKey));
+  await assert.doesNotReject(limiter.reset(hugeKey));
+  assert.equal(captured.length, 0, "an oversized key must never reach PostgREST");
+});
+
+test("check(): a key at exactly 128 chars is still allowed through to PostgREST", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const limiter = createDurableRateLimiter({ client, windowMs: 900000, max: 5 });
+  const exactKey = `e${"1".repeat(127)}`;
+  assert.equal(exactKey.length, 128);
+  await limiter.check(exactKey);
+  assert.equal(captured.length, 1);
+});
+
+test("sweepAuthThrottle: deletes the oldest rows beyond maxRows even when none are individually stale", async (t) => {
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "auth_throttle" && method === "DELETE") {
+      // Two distinct DELETE calls happen: the staleness pass (lt filter,
+      // matches nothing here) and the row-cap pass (key in.(...)).
+      if (url.searchParams.has("updated_at")) return [];
+      return [{ key: "excess-1" }, { key: "excess-2" }];
+    }
+    if (table === "auth_throttle" && method === "GET") {
+      return [{ key: "excess-1" }, { key: "excess-2" }];
+    }
+    return [];
+  });
+  const result = await sweepAuthThrottle(client, { maxRows: 3 });
+  assert.deepEqual(result, { deleted: 2 });
+
+  const rowCapGet = captured.find((c) => c.method === "GET");
+  assert.equal(rowCapGet.url.searchParams.get("offset"), "3");
+
+  const rowCapDelete = captured.find((c) => c.method === "DELETE" && c.url.searchParams.has("key"));
+  assert.equal(rowCapDelete.url.searchParams.get("key"), "in.(excess-1,excess-2)");
+});
+
+test("sweepAuthThrottle: a row-cap failure still reports the staleness sweep's own count", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "auth_throttle" && method === "DELETE") return [{ key: "a" }];
+    if (table === "auth_throttle" && method === "GET") throw new Error("row-cap query failed");
+    return [];
+  });
+  const result = await sweepAuthThrottle(client, {});
+  assert.deepEqual(result, { deleted: 1 });
+});
+
+// ---------------------------------------------------------------------------
+// L5: a request timeout, so a hanging PostgREST cannot hang sign-in/refresh.
+// ---------------------------------------------------------------------------
+
+test("check()/recordFailure()/reset(): every fetch carries an AbortSignal", async (t) => {
+  const signals = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    signals.push(init.signal);
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const limiter = createDurableRateLimiter({ client, windowMs: 900000, max: 5 });
+  await limiter.check("email:abc"); // 1 fetch (GET)
+  await limiter.recordFailure("email:abc"); // 2 fetches (GET then POST upsert)
+  await limiter.reset("email:abc"); // 1 fetch (DELETE)
+
+  assert.equal(signals.length, 4);
+  for (const signal of signals) {
+    assert.ok(signal instanceof AbortSignal, "expected every durable-limiter fetch to carry an AbortSignal");
+  }
+});
+
+test("check(): an aborted (timed-out) PostgREST request fails open, same as any other error", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) =>
+    new Promise((resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+    });
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  // AbortSignal.timeout()'s internal timer is deliberately unref'd (per spec
+  // it must never by itself keep a process alive) -- a real server always
+  // has other ref'd activity (its own HTTP listener) so this is a non-issue
+  // in production, but this standalone test needs its own ref'd keep-alive
+  // or the runner can decide there is nothing left to wait for before the
+  // timeout ever fires.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
+
+  const limiter = createDurableRateLimiter({ client, windowMs: 900000, max: 5, requestTimeoutMs: 5 });
+  const result = await limiter.check("email:abc");
+  assert.deepEqual(result, { blocked: false, retryAfterMs: 0 });
 });

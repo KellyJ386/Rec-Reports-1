@@ -22,8 +22,18 @@ function audienceRefId(audience) {
   // department/role/shift audiences and the audience row itself for
   // employee ones. `id` is only the ref in the pure { type, id } shape the
   // domain tests use, which has no audience_ref_id key at all.
-  if (audience?.audience_ref_id !== undefined && audience.audience_ref_id !== null) {
-    return audience.audience_ref_id;
+  //
+  // M3 fix: the prior version fell back to `audience.id` whenever
+  // `audience_ref_id` was undefined OR null -- for a LIVE row, a null
+  // audience_ref_id is a real, meaningful value (0047's policy/trigger
+  // allow it for department/shift/role), not "this key is missing", and
+  // falling back silently resolved the audience row's own id as the target
+  // instead. The presence of the `audience_ref_id` key at all is what
+  // distinguishes a live row from the pure { type, id } test shape, so that
+  // is what gates the fallback now -- a live row's own null is returned as
+  // null, never `audience.id`.
+  if (audience && Object.prototype.hasOwnProperty.call(audience, "audience_ref_id")) {
+    return audience.audience_ref_id ?? null;
   }
   return audience?.id ?? null;
 }
@@ -69,7 +79,11 @@ export function resolveMessageAudience(message, context = {}) {
   for (const audience of message.audiences ?? []) {
     const type = audienceType(audience);
     const refId = audienceRefId(audience);
-    if (type === "employee") recipients.add(refId);
+    // M3: a null refId for an employee audience must resolve to zero
+    // recipients (the DB now rejects audience_type='employee' with a null
+    // audience_ref_id outright, 0048, but this stays defensive against any
+    // row written before that guard existed).
+    if (type === "employee" && refId != null) recipients.add(refId);
     if (type === "department") {
       for (const employee of employees.filter((item) => employeeDepartmentId(item) === refId)) {
         recipients.add(employee.id);

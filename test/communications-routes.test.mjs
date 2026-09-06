@@ -273,6 +273,33 @@ test("POST /messages/:id/audiences rejects invalid audienceType with 400", async
   assert.equal(captured.length, 1, "should only fetch messages");
 });
 
+// M3 (0048): audienceRefId is required for audienceType employee -- a null/
+// missing ref there resolves nobody (see communications.mjs's
+// resolveMessageAudience), unlike department/shift/role, where it is a
+// legitimate, if inert, row.
+test("POST /messages/:id/audiences rejects audienceType employee with a missing audienceRefId (400, no writes)", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [{ audienceType: "employee" }]);
+  assert.equal(result.status, 400);
+  assert.ok(result.payload.errors.some((e) => /audienceRefId/.test(e)));
+  assert.equal(captured.length, 1, "should only fetch messages, no ref lookups or writes");
+});
+
+test("POST /messages/:id/audiences rejects audienceType employee with audienceRefId: null (400)", async (t) => {
+  stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [{ audienceType: "employee", audienceRefId: null }]);
+  assert.equal(result.status, 400);
+});
+
+test("POST /messages/:id/audiences still allows a null audienceRefId for department/shift/role", async (t) => {
+  stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : table === "message_audiences" ? [{ id: "aud-1" }] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/messages/msg-1/audiences", [{ audienceType: "department", audienceRefId: null }]);
+  assert.equal(result.status, 201);
+});
+
 test("POST /messages/:id/audiences denies non-publisher with 403", async (t) => {
   stubFetch(t, (table) => (table === "messages" ? [MESSAGE] : []));
   const { call } = mount({ memberships: READER });

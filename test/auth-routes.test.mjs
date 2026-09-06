@@ -473,7 +473,18 @@ test("rate limiter: reset() clears a key outright", () => {
 // in-memory limiter tested above.
 // ---------------------------------------------------------------------------
 
-test("sign-in: the durable limiter is checked (email/ip keys) and recorded on failure", async (t) => {
+// M5/L1: the durable sign-in email key is sha256(normalized email), never
+// the plaintext address (see auth-routes.mjs's emailThrottleKey) -- both to
+// bound the key that lands in the durable auth_throttle table and because a
+// PostgREST failure forwards the key as `requestId` to OBSERVABILITY_DSN.
+function emailThrottleKey(email) {
+  const hash = createHash("sha256")
+    .update(String(email).trim().toLowerCase())
+    .digest("hex");
+  return `email:${hash}`;
+}
+
+test("sign-in: the durable limiter is checked (hashed-email/ip keys) and recorded on failure", async (t) => {
   stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
   const durable = stubDurableLimiter();
   const clock = fakeClock();
@@ -482,13 +493,15 @@ test("sign-in: the durable limiter is checked (email/ip keys) and recorded on fa
   const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });
   assert.equal(result.status, 401);
 
+  const expectedEmailKey = emailThrottleKey("victim@example.com");
   const checked = durable.calls.filter((c) => c.method === "check").map((c) => c.key);
-  assert.deepEqual(checked.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+  assert.deepEqual(checked.sort(), [expectedEmailKey, "ip:unknown"].sort());
+  assert.doesNotMatch(expectedEmailKey, /victim@example\.com/, "the durable key must never carry the raw email");
   const recorded = durable.calls.filter((c) => c.method === "recordFailure").map((c) => c.key);
-  assert.deepEqual(recorded.sort(), ["email:victim@example.com", "ip:unknown"].sort());
+  assert.deepEqual(recorded.sort(), [expectedEmailKey, "ip:unknown"].sort());
 });
 
-test("sign-in: a successful sign-in resets the durable email key", async (t) => {
+test("sign-in: a successful sign-in resets the durable (hashed) email key", async (t) => {
   stubFetch(t, () => ({
     ok: true,
     data: { access_token: "jwt-ok", refresh_token: "r-ok", user: { id: "u1", email: "a@b.com" } }
@@ -499,13 +512,13 @@ test("sign-in: a successful sign-in resets the durable email key", async (t) => 
   assert.equal(result.status, 200);
   assert.deepEqual(
     durable.calls.filter((c) => c.method === "reset"),
-    [{ method: "reset", key: "email:a@b.com" }]
+    [{ method: "reset", key: emailThrottleKey("a@b.com") }]
   );
 });
 
 test("sign-in: a durable-only block (in-memory clear) still returns 429 with Retry-After, before calling GoTrue", async (t) => {
   const captured = stubFetch(t, () => ({ ok: false, status: 400, data: { error: "invalid_grant" } }));
-  const durable = stubDurableLimiter({ blockedKeys: new Set(["email:victim@example.com"]) });
+  const durable = stubDurableLimiter({ blockedKeys: new Set([emailThrottleKey("victim@example.com")]) });
   const { call } = mount({ durableLimiter: durable });
 
   const result = await call("POST", "/auth/sign-in", { email: "victim@example.com", password: "wrong" });

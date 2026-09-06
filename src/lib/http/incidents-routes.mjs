@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { reportError } from "../observability.mjs";
 import { requireAuthPermission } from "./guard.mjs";
 import {
@@ -253,6 +253,12 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
 
+        // M2 (0048): legalHold is deliberately NOT read from the client body
+        // -- creating an incident already on legal hold is a distinct,
+        // narrower-gated action (incidents.legal_hold.manage), matching the
+        // DB-layer INSERT guard added in 0048. Every draft starts
+        // legal_hold=false; PATCH /incidents/:id/legal-hold is the only way
+        // to set it, and only for an actor who holds that code.
         const row = {
           facility_id: params.facilityId,
           department_id: body.payload.departmentId ?? null,
@@ -264,7 +270,7 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           summary,
           immediate_actions: body.payload.immediateActions ?? null,
           requires_osha_review: body.payload.requiresOshaReview ?? false,
-          legal_hold: body.payload.legalHold ?? false,
+          legal_hold: false,
           status: "draft"
         };
 
@@ -756,29 +762,37 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         });
         if (built.error) return sendJson(response, 400, { error: built.error });
 
-        const incidentRows = await pgUpdate(
-          auth.client,
-          "incident_reports",
-          { id: incident.id },
-          built.patch,
-          { returning: true }
-        );
-
-        const amendmentRows = await pgInsert(
-          auth.client,
-          "incident_amendments",
-          [
-            {
-              facility_id: incident.facility_id,
-              incident_id: incident.id,
-              amendment_reason: built.reason,
-              before_snapshot: built.beforeSnapshot,
-              after_snapshot: built.afterSnapshot,
-              amended_by: auth.claims.sub
-            }
-          ],
-          { returning: true }
-        );
+        // M1 (0048): the incident_reports UPDATE and the incident_amendments
+        // INSERT now happen atomically inside internal.apply_incident_amendment
+        // -- a SECURITY DEFINER RPC that sets the session-local
+        // rec.amendment_in_progress flag fn_incident_report_transition_guard's
+        // amendable-column check requires, re-checks incidents.manage/review
+        // itself (it runs with elevated, RLS-bypassing rights), and computes
+        // its own before/after snapshot from the authoritative row rather
+        // than trusting a client-supplied one. buildAmendment above still
+        // owns validation (empty patch, disallowed fields, blank reason) and
+        // the beforeHash/afterHash carried in the incident.amended audit
+        // event below, so those stay unchanged; only the actual DB write
+        // moved into the RPC. A plain pgUpdate straight to incident_reports
+        // for an amendable field on a non-draft incident (the prior two-call
+        // shape this replaced) is now rejected by the transition guard.
+        let rpcResult;
+        try {
+          rpcResult = await pgRpc(auth.client, "apply_incident_amendment", {
+            incident_id: incident.id,
+            changes: built.patch,
+            reason: built.reason
+          });
+        } catch (error) {
+          if (error instanceof PostgrestError && (error.status === 403 || error.status === 409 || error.status === 400)) {
+            return sendJson(response, error.status, {
+              error: error.body?.message ?? "amendment rejected"
+            });
+          }
+          throw error;
+        }
+        const incidentRows = [rpcResult?.incident ?? null];
+        const amendmentRows = [rpcResult?.amendment ?? null];
 
         const auditOk = await writeAuditEvent(
           auth,

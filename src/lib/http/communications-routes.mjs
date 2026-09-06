@@ -435,6 +435,17 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             errors.push(`invalid audienceType: ${item.audienceType}`);
             break; // Early exit on first invalid type
           }
+          // M3: audience_ref_id is genuinely optional for department/shift/
+          // role (0047 -- it degrades to zero recipients, which is a valid,
+          // if inert, row), but NOT for employee: resolveMessageAudience's
+          // employee branch has no other way to resolve a target, so a null
+          // ref there is never inert, only wrong. 0048's DB-layer policy and
+          // trigger reject this independently; this is the clean-400
+          // belt-and-suspenders layer, same rationale as resolveAudienceRef
+          // above.
+          if (item.audienceType === "employee" && (item.audienceRefId === undefined || item.audienceRefId === null)) {
+            errors.push("audienceRefId is required when audienceType is employee");
+          }
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
 

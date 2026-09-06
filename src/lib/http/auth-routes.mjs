@@ -131,6 +131,22 @@ export function registerAuthRoutes(
     return String(email).trim().toLowerCase();
   }
 
+  // M5/L1: the durable throttle key for sign-in must not be the plaintext
+  // email -- unlike the in-memory `emailLimiter` above (a per-process Map
+  // that never leaves this instance and is never reported anywhere), this
+  // key is written to the auth_throttle table (durable-rate-limit.mjs) and,
+  // on a PostgREST failure, forwarded to reportError -> OBSERVABILITY_DSN as
+  // requestId (L1). Hashing it here -- the same sha256(...).digest("hex")
+  // shape refreshThrottleKeys already uses for the refresh token -- means
+  // neither the durable store nor the DSN ever carries a real address, and
+  // the fixed 64-hex-char output is always far under durable-rate-limit.mjs's
+  // own MAX_KEY_LENGTH cap regardless of how long an attacker-supplied email
+  // string is.
+  function emailThrottleKey(email) {
+    const hash = createHash("sha256").update(normalizeEmail(email)).digest("hex");
+    return `email:${hash}`;
+  }
+
   // Whether the refresh cookie should carry `Secure`. Real deployments (Vercel
   // and anything behind a TLS-terminating proxy) set `x-forwarded-proto`, so
   // that wins first; a direct TLS listener with no proxy in front falls back
@@ -286,7 +302,7 @@ export function registerAuthRoutes(
       const ip = clientIp(request);
       const emailKey = normalizeEmail(email);
       const durableIpKey = `ip:${ip}`;
-      const durableEmailKey = `email:${emailKey}`;
+      const durableEmailKey = emailThrottleKey(email);
 
       const ipCheck = ipLimiter.check(ip);
       const emailCheck = emailLimiter.check(emailKey);

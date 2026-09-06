@@ -8,9 +8,10 @@
 --   3. Once an incident has left draft, editing a locked column
 --      (occurred_at, not on the amendment allow-list) raises check_violation,
 --      even for an incidents.manage holder.
---   4. An amendable field (summary) CAN still change on a non-draft incident
---      -- the locked-column guard does not lock everything, only the
---      documented allow-list.
+--   4. M1 (0048, wave 1B review fix): a DIRECT UPDATE to an amendable field
+--      (summary) on a non-draft incident is now REJECTED -- amendable
+--      fields may only change via internal.apply_incident_amendment, which
+--      is exercised here too, succeeding for the same actor/incident.
 --   5. A reviewer (incidents.review, no incidents.manage) can transition a
 --      submitted incident to under_review (0043's widened incident_reports
 --      UPDATE policy) AND the resulting write lands an incident.status_changed
@@ -133,16 +134,45 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 4. Manager: an amendable field (summary) can still change on the same
--- non-draft incident -- the locked-column guard only locks the undocumented
--- columns, not everything.
+-- 4a. M1 (0048): a DIRECT UPDATE to an amendable field (summary) on the same
+-- non-draft incident is now rejected -- the prior wide-open behavior this
+-- migration closes.
 -- ---------------------------------------------------------------------------
 do $$
 begin
-  update incident_reports set summary = 'Corrected summary' where id = '43e00000-0000-0000-0000-000000000e03';
+  begin
+    update incident_reports set summary = 'Corrected summary (direct)' where id = '43e00000-0000-0000-0000-000000000e03';
+    raise exception 'IRG FAIL: a direct UPDATE to an amendable field (summary) succeeded on a non-draft incident (M1 not closed)';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4b. M1 (0048): the SAME field change succeeds through
+-- internal.apply_incident_amendment, which sets the session flag the guard
+-- above honors, and writes an incident_amendments row atomically with the
+-- incident_reports UPDATE.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  result jsonb;
+begin
+  select internal.apply_incident_amendment(
+    '43e00000-0000-0000-0000-000000000e03'::uuid,
+    jsonb_build_object('summary', 'Corrected summary (via RPC)'),
+    'IRG amendment test'
+  ) into result;
+  if (result -> 'incident' ->> 'summary') <> 'Corrected summary (via RPC)' then
+    raise exception 'IRG FAIL: apply_incident_amendment did not actually change summary (saw %)', result -> 'incident' ->> 'summary';
+  end if;
+  if (result -> 'amendment' ->> 'amendment_reason') <> 'IRG amendment test' then
+    raise exception 'IRG FAIL: apply_incident_amendment did not insert the expected incident_amendments row';
+  end if;
 exception
-  when check_violation then
-    raise exception 'IRG FAIL: an amendable field (summary) was rejected on a non-draft incident';
+  when insufficient_privilege then
+    raise exception 'IRG FAIL: an incidents.manage holder was denied by apply_incident_amendment';
 end;
 $$;
 

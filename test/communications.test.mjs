@@ -82,3 +82,19 @@ test("resolveMessageAudience resolves live rows by audience_ref_id, never the ro
     ["emp-1", "emp-3", "emp-4", "emp-5"]
   );
 });
+
+// M3: a live row with audience_type='employee' and a NULL audience_ref_id
+// must resolve to zero recipients, never the audience row's own `id` --
+// the bug the 0047 migration header claimed was already inert (it wasn't;
+// see the fixed audienceRefId() above).
+test("resolveMessageAudience: a null audience_ref_id on an employee row resolves to zero recipients, never the row's own id", () => {
+  assert.deepEqual(
+    resolveMessageAudience({
+      audiences: [
+        { id: "AUDROW-1", audience_type: "employee", audience_ref_id: null },
+        { id: "AUDROW-2", audience_type: "department", audience_ref_id: null }
+      ]
+    }),
+    []
+  );
+});

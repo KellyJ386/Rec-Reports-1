@@ -41,6 +41,34 @@ const TABLE = "auth_throttle";
 const ROW_SELECT = "failures,window_start";
 const DEFAULT_SWEEP_OLDER_THAN_MS = 60 * 60 * 1000; // 1 hour
 
+// M5: `key` is attacker-controlled -- POST /auth/sign-in's email key is now
+// sha256-hashed (auth-routes.mjs, fixed-length hex, well under this cap) but
+// the IP key is still the raw client-supplied string (see clientIp's own
+// header for why a spoofed x-forwarded-for is treated as "an attacker gets
+// their own bucket", not an identity fact), and nothing stops a future
+// caller of this module from building a key out of other unbounded input.
+// Refusing an oversized key here -- rather than trusting every call site to
+// have bounded its own input -- keeps a single unbounded key from becoming
+// an unbounded row in a durable, cross-instance store. Treated the same as
+// every other failure mode in this module: fail open, no throw.
+const MAX_KEY_LENGTH = 128;
+
+function isOversizedKey(key) {
+  return typeof key !== "string" || key.length > MAX_KEY_LENGTH;
+}
+
+// M5: hard ceiling on total row count, enforced by the sweep below
+// independent of the staleness (updated_at) sweep -- an attacker minting a
+// fresh key on every single request (before MAX_KEY_LENGTH existed, or via
+// any key material this module doesn't itself bound, e.g. a legitimately
+// short but endlessly varying IP) would otherwise keep every row "fresh"
+// forever and never age out of the updated_at sweep at all.
+const DEFAULT_MAX_ROWS = 10000;
+// Deleted per sweep call when over MAX_ROWS -- bounded so one sweep can
+// never issue an unbounded SELECT/DELETE; a sustained overage is worked
+// down over consecutive drain-cadence sweeps instead.
+const EXCESS_SWEEP_BATCH = 1000;
+
 function reportFailure(error, { dsn, fetchImpl, route, key }) {
   // Fire-and-forget by design (see observability.mjs) -- callers below never
   // await this, and it never rejects.
@@ -58,16 +86,31 @@ export function createDurableRateLimiter({
   max,
   now = Date.now,
   dsn,
-  fetchImpl
+  fetchImpl,
+  requestTimeoutMs = 1500
 }) {
   if (!(windowMs > 0)) throw new Error("createDurableRateLimiter: windowMs must be > 0");
   if (!(max > 0)) throw new Error("createDurableRateLimiter: max must be > 0");
+
+  // L5: bounds every PostgREST round trip this limiter makes. Fail-open
+  // above already covers a down/erroring PostgREST (an immediate rejected
+  // fetch or a non-2xx response); it did nothing for a *hanging* one, since
+  // nothing in supabase-rest.mjs ever carried a timeout/AbortSignal before
+  // pgRpc/signal support was added (0048-adjacent change) -- an unbounded
+  // await here turned a slow database into a slow sign-in/refresh even
+  // though this module's whole job is to never do that. AbortSignal.timeout
+  // rejects with a DOMException the `catch` blocks below already handle
+  // exactly like any other failure.
+  function requestSignal() {
+    return requestTimeoutMs > 0 ? AbortSignal.timeout(requestTimeoutMs) : undefined;
+  }
 
   async function fetchRow(key) {
     const rows = await pgSelect(client, TABLE, {
       filters: { key },
       select: ROW_SELECT,
-      limit: 1
+      limit: 1,
+      signal: requestSignal()
     });
     return rows?.[0] ?? null;
   }
@@ -79,6 +122,7 @@ export function createDurableRateLimiter({
   return {
     // Read-only: is `key` currently over the limit? Never writes.
     async check(key) {
+      if (isOversizedKey(key)) return { blocked: false, retryAfterMs: 0 }; // M5: refuse before any fetch
       try {
         const current = now();
         const row = await fetchRow(key);
@@ -95,6 +139,7 @@ export function createDurableRateLimiter({
     // Record one failed attempt for `key`. Read-then-upsert -- see the file
     // header for the small race this accepts and why.
     async recordFailure(key) {
+      if (isOversizedKey(key)) return; // M5: never write an unbounded key
       try {
         const current = now();
         const nowIso = new Date(current).toISOString();
@@ -109,7 +154,8 @@ export function createDurableRateLimiter({
         await pgInsert(client, TABLE, [nextRow], {
           onConflict: "key",
           merge: true,
-          returning: false
+          returning: false,
+          signal: requestSignal()
         });
       } catch (error) {
         reportFailure(error, { dsn, fetchImpl, route: "durable-rate-limit.recordFailure", key });
@@ -120,8 +166,9 @@ export function createDurableRateLimiter({
 
     // Clear all recorded failures for `key` (e.g. a successful sign-in).
     async reset(key) {
+      if (isOversizedKey(key)) return;
       try {
-        await pgDelete(client, TABLE, { key });
+        await pgDelete(client, TABLE, { key }, { signal: requestSignal() });
       } catch (error) {
         reportFailure(error, { dsn, fetchImpl, route: "durable-rate-limit.reset", key });
         // fail open: a reset that silently didn't happen is never worse than
@@ -141,13 +188,47 @@ export function createDurableRateLimiter({
 // Fail-open like every method above: a failing sweep must never fail the
 // cron response it rides along with, so this always resolves with
 // `{ deleted: 0 }` on error (after reporting it) rather than rejecting.
-export async function sweepAuthThrottle(client, { olderThanMs = DEFAULT_SWEEP_OLDER_THAN_MS, now = Date.now, dsn, fetchImpl } = {}) {
+export async function sweepAuthThrottle(client, {
+  olderThanMs = DEFAULT_SWEEP_OLDER_THAN_MS,
+  maxRows = DEFAULT_MAX_ROWS,
+  now = Date.now,
+  dsn,
+  fetchImpl
+} = {}) {
+  let deleted = 0;
   try {
     const cutoffIso = new Date(now() - olderThanMs).toISOString();
     const deletedRows = await pgDelete(client, TABLE, { updated_at: { lt: cutoffIso } }, { returning: true });
-    return { deleted: Array.isArray(deletedRows) ? deletedRows.length : 0 };
+    deleted += Array.isArray(deletedRows) ? deletedRows.length : 0;
   } catch (error) {
     reportFailure(error, { dsn, fetchImpl, route: "durable-rate-limit.sweep", key: null });
     return { deleted: 0 };
   }
+
+  // M5: cap total row count even when every remaining row is individually
+  // within the staleness window -- keep only the maxRows most recently
+  // updated rows, deleting the oldest excess (bounded to EXCESS_SWEEP_BATCH
+  // per call; a sustained overage is worked down over consecutive sweeps
+  // rather than one unbounded query). A separate try/catch from the sweep
+  // above: a failure here must not undo or misreport the staleness sweep
+  // that already succeeded.
+  try {
+    const excessRows = await pgSelect(client, TABLE, {
+      select: "key",
+      order: "updated_at.desc",
+      offset: maxRows,
+      limit: EXCESS_SWEEP_BATCH
+    });
+    const excessKeys = (excessRows ?? []).map((row) => row.key).filter(Boolean);
+    if (excessKeys.length > 0) {
+      await pgDelete(client, TABLE, { key: { in: excessKeys } }, { returning: false });
+      deleted += excessKeys.length;
+    }
+  } catch (error) {
+    reportFailure(error, { dsn, fetchImpl, route: "durable-rate-limit.sweep.rowcap", key: null });
+    // fail open: the staleness sweep above already ran and its count is
+    // still reported; only the row-cap pass is skipped this cycle.
+  }
+
+  return { deleted };
 }
