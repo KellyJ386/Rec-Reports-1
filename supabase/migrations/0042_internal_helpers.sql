@@ -245,6 +245,14 @@ $$;
 do $$
 begin
   execute format('alter database %I set search_path = public, internal', current_database());
+exception
+  when insufficient_privilege then
+    -- A runner that does not own the database (some CI/self-hosted setups)
+    -- cannot change its defaults. Supabase's `postgres` role owns the
+    -- database, so production takes the happy path; elsewhere the operator
+    -- must set search_path = public, internal on the database or role
+    -- before replaying migrations numbered below 0042.
+    raise notice '0042: could not set the database search_path (insufficient privilege); set "search_path = public, internal" on the database or migration role manually before re-applying older migrations';
 end
 $$;
 
