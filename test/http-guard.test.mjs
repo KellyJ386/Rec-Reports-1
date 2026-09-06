@@ -6,7 +6,9 @@ import {
   requireAuthPermission,
   authCanAccessFacility,
   requireAuthOrgAdmin,
-  requireAuthOrgAdminRow
+  requireAuthOrgAdminRow,
+  makeGuards,
+  parseListLimitOffset
 } from "../src/lib/http/guard.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
 
@@ -161,4 +163,235 @@ test("requireAuthOrgAdminRow denies a member with admin.manage but no organizati
   const result = await requireAuthOrgAdminRow(fakeAuth("user-1"), "org-1");
   assert.equal(result.allowed, false);
   assert.match(result.reason, /organization_admins/);
+});
+
+// --- makeGuards (P-12) -------------------------------------------------
+// Every route module used to hand-roll withAuth/requirePerm/requireRead/
+// requireMember/parseJsonBody/queryParams over the same three injected
+// primitives; these exercise the shared factory directly rather than
+// through any one route module.
+
+function sinkSendJson() {
+  const sent = [];
+  const sendJson = (response, status, payload) => {
+    sent.push({ status, payload });
+    return sent[sent.length - 1];
+  };
+  return { sent, sendJson };
+}
+
+test("makeGuards().withAuth sends the auth error and never calls the handler on a 401", async () => {
+  const { sent, sendJson } = sinkSendJson();
+  const authenticate = async () => ({ error: { status: 401, body: { error: "invalid or expired token" } } });
+  const { withAuth } = makeGuards({ authenticate, sendJson, readBody: async () => "{}" });
+  let handlerCalled = false;
+  await withAuth({}, {}, {}, async () => {
+    handlerCalled = true;
+  });
+  assert.equal(handlerCalled, false);
+  assert.deepEqual(sent, [{ status: 401, payload: { error: "invalid or expired token" } }]);
+});
+
+test("makeGuards().withAuth calls the handler with the resolved auth on success", async () => {
+  const { sendJson } = sinkSendJson();
+  const auth = { claims: { sub: "user-1" }, memberships: [], error: null };
+  const authenticate = async () => auth;
+  const { withAuth } = makeGuards({ authenticate, sendJson, readBody: async () => "{}" });
+  let received;
+  const result = await withAuth({}, {}, {}, async (a) => {
+    received = a;
+    return "handler-result";
+  });
+  assert.equal(received, auth);
+  assert.equal(result, "handler-result");
+});
+
+test("makeGuards().requirePerm denies with 403 {error: reason} when the permission is missing", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requirePerm } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const auth = { memberships: [{ facilityId: "fac-1", status: "active", permissions: [] }] };
+  const allowed = requirePerm(auth, "fac-1", "reports.read", {});
+  assert.equal(allowed, false);
+  assert.equal(sent[0].status, 403);
+  assert.match(sent[0].payload.error, /reports\.read/);
+});
+
+test("makeGuards().requirePerm allows and sends nothing when the permission is held", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requirePerm } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const auth = { memberships: [{ facilityId: "fac-1", status: "active", permissions: ["reports.read"] }] };
+  const allowed = requirePerm(auth, "fac-1", "reports.read", {});
+  assert.equal(allowed, true);
+  assert.equal(sent.length, 0);
+});
+
+test("makeGuards().requirePerm honors notFoundOnDeny/notFoundMessage (attachments-routes.mjs's option)", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requirePerm } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const auth = { memberships: [] };
+  const allowed = requirePerm(auth, "fac-1", "attachments.read", {}, {
+    notFoundOnDeny: true,
+    notFoundMessage: "attachment not found"
+  });
+  assert.equal(allowed, false);
+  assert.deepEqual(sent, [{ status: 404, payload: { error: "attachment not found" } }]);
+});
+
+test("makeGuards().requirePerm defaults notFoundMessage to 'not found' when notFoundOnDeny is set without one", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requirePerm } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const allowed = requirePerm({ memberships: [] }, "fac-1", "x.read", {}, { notFoundOnDeny: true });
+  assert.equal(allowed, false);
+  assert.deepEqual(sent, [{ status: 404, payload: { error: "not found" } }]);
+});
+
+test("makeGuards().requireRead(code) bakes the permission code into a requirePerm-shaped guard", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requireRead } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const communicationsRead = requireRead("communications.read");
+  const denied = { memberships: [] };
+  const allowed = { memberships: [{ facilityId: "fac-1", status: "active", permissions: ["communications.read"] }] };
+  assert.equal(communicationsRead(denied, "fac-1", {}), false);
+  assert.equal(sent[0].status, 403);
+  assert.match(sent[0].payload.error, /communications\.read/);
+  assert.equal(communicationsRead(allowed, "fac-1", {}), true);
+});
+
+test("makeGuards().requireMember denies with 403 for a non-member of the facility", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requireMember } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const auth = { memberships: [{ facilityId: "fac-2", status: "active", permissions: [] }] };
+  assert.equal(requireMember(auth, "fac-1", {}), false);
+  assert.deepEqual(sent, [{ status: 403, payload: { error: "not a member of this facility" } }]);
+});
+
+test("makeGuards().requireMember allows a member of the facility", () => {
+  const { sent, sendJson } = sinkSendJson();
+  const { requireMember } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const auth = { memberships: [{ facilityId: "fac-1", status: "active", permissions: [] }] };
+  assert.equal(requireMember(auth, "fac-1", {}), true);
+  assert.equal(sent.length, 0);
+});
+
+test("makeGuards().parseJsonBody returns 400-shaped {ok:false} on invalid JSON", async () => {
+  const { sendJson } = sinkSendJson();
+  const { parseJsonBody } = makeGuards({ authenticate: null, sendJson, readBody: async () => "not json" });
+  const result = await parseJsonBody({});
+  assert.deepEqual(result, { ok: false });
+});
+
+test("makeGuards().parseJsonBody parses a valid JSON body", async () => {
+  const { sendJson } = sinkSendJson();
+  const { parseJsonBody } = makeGuards({
+    authenticate: null,
+    sendJson,
+    readBody: async () => JSON.stringify({ name: "x" })
+  });
+  const result = await parseJsonBody({});
+  assert.deepEqual(result, { ok: true, payload: { name: "x" } });
+});
+
+test("makeGuards().parseJsonBody defaults an empty body to {}", async () => {
+  const { sendJson } = sinkSendJson();
+  const { parseJsonBody } = makeGuards({ authenticate: null, sendJson, readBody: async () => "" });
+  const result = await parseJsonBody({});
+  assert.deepEqual(result, { ok: true, payload: {} });
+});
+
+test("makeGuards().queryParams parses the request URL's search params", () => {
+  const { sendJson } = sinkSendJson();
+  const { queryParams } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const qp = queryParams({ url: "/facilities/fac-1/reports?status=submitted&limit=10" });
+  assert.equal(qp.get("status"), "submitted");
+  assert.equal(qp.get("limit"), "10");
+});
+
+test("makeGuards().queryParams falls back to '/' when the request has no url", () => {
+  const { sendJson } = sinkSendJson();
+  const { queryParams } = makeGuards({ authenticate: null, sendJson, readBody: null });
+  const qp = queryParams({});
+  assert.equal(qp.toString(), "");
+});
+
+// --- parseListLimitOffset (P-12) ----------------------------------------
+
+test("parseListLimitOffset defaults limit and offset when neither is given", () => {
+  const qp = new URLSearchParams("");
+  assert.deepEqual(parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 }), {
+    ok: true,
+    limit: 50,
+    offset: 0
+  });
+});
+
+test("parseListLimitOffset passes a limit under the cap through unchanged", () => {
+  const qp = new URLSearchParams("limit=10");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: true, limit: 10, offset: 0 });
+});
+
+test("parseListLimitOffset clamps a limit above the cap down to maxLimit", () => {
+  const qp = new URLSearchParams("limit=9000");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: true, limit: 200, offset: 0 });
+});
+
+test("parseListLimitOffset accepts a limit exactly at the cap", () => {
+  const qp = new URLSearchParams("limit=200");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.equal(result.ok, true);
+  assert.equal(result.limit, 200);
+});
+
+test("parseListLimitOffset rejects limit=0 with the reconciled single-field error shape", () => {
+  const qp = new URLSearchParams("limit=0");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: false, error: "limit must be a positive integer" });
+});
+
+test("parseListLimitOffset rejects a negative limit", () => {
+  const qp = new URLSearchParams("limit=-5");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "limit must be a positive integer");
+});
+
+test("parseListLimitOffset rejects a non-integer limit", () => {
+  const qp = new URLSearchParams("limit=abc");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "limit must be a positive integer");
+});
+
+test("parseListLimitOffset accepts offset=0 explicitly", () => {
+  const qp = new URLSearchParams("offset=0");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: true, limit: 50, offset: 0 });
+});
+
+test("parseListLimitOffset passes a positive offset through", () => {
+  const qp = new URLSearchParams("offset=40");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: true, limit: 50, offset: 40 });
+});
+
+test("parseListLimitOffset rejects a negative offset", () => {
+  const qp = new URLSearchParams("offset=-1");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.deepEqual(result, { ok: false, error: "offset must be a non-negative integer" });
+});
+
+test("parseListLimitOffset rejects a non-integer offset", () => {
+  const qp = new URLSearchParams("offset=abc");
+  const result = parseListLimitOffset(qp, { defaultLimit: 50, maxLimit: 200 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "offset must be a non-negative integer");
+});
+
+test("parseListLimitOffset uses the caller-supplied defaultLimit/maxLimit", () => {
+  const qp = new URLSearchParams("limit=500");
+  const result = parseListLimitOffset(qp, { defaultLimit: 20, maxLimit: 100 });
+  assert.deepEqual(result, { ok: true, limit: 100, offset: 0 });
+  const unspecified = parseListLimitOffset(new URLSearchParams(""), { defaultLimit: 20, maxLimit: 100 });
+  assert.equal(unspecified.limit, 20);
 });

@@ -5,7 +5,8 @@ const optionalServerFields = [
   "SUPABASE_JWT_SECRET",
   "DATABASE_URL",
   "OBSERVABILITY_DSN",
-  "CRON_SECRET"
+  "CRON_SECRET",
+  "DEBUG_ERRORS"
 ];
 
 // CRON_SECRET (OP-13, src/lib/http/internal-routes.mjs) gates the internal
@@ -14,6 +15,14 @@ const optionalServerFields = [
 // 503 -- disabled, never open -- when it is unset. Vercel injects it
 // automatically as the cron request's Authorization header once the env var
 // of this exact name is configured on the project (see vercel.json).
+//
+// DEBUG_ERRORS (P-9, scripts/server.mjs + api/[...path].mjs) overrides the
+// production detail-leak guard on the generic 500 response: Vercel sets
+// VERCEL_ENV=production automatically on a production deployment, and both
+// last-resort error handlers hide `error.message` there unless DEBUG_ERRORS
+// is also set (any non-empty value other than "false"/"0"). Every other
+// environment (VERCEL_ENV unset -- local/dev, or "preview") shows the detail
+// unconditionally, matching this app's behavior before DEBUG_ERRORS existed.
 //
 // SUPABASE_STORAGE_BUCKET (OP-16, src/lib/storage.mjs) is optional like the
 // fields above, but unlike them it always ends up set on the returned env --

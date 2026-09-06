@@ -1,5 +1,6 @@
 import { hasPermission, canAccessFacility } from "../permissions.mjs";
 import { pgSelect } from "../supabase-rest.mjs";
+import { translatePostgrestError } from "./errors.mjs";
 
 export function requirePermission(memberships, facilityId, code) {
   if (!code) return { allowed: false, reason: "permission code is required" };
@@ -73,4 +74,139 @@ export async function requireAuthOrgAdminRow(auth, organizationId) {
   });
   if ((rows ?? []).length > 0) return { allowed: true, reason: null };
   return { allowed: false, reason: "missing organization_admins row" };
+}
+
+// --- P-12: shared request-guard factory -------------------------------------
+// Every route module used to hand-roll its own withAuth/requirePerm/
+// requireRead/requireMember/parseJsonBody/queryParams closures over the same
+// three injected primitives (authenticate, sendJson, readBody). All copies
+// were behaviourally identical (verified line-by-line across all 15
+// withAuth, 7 requirePerm, 6 requireRead, 4 requireMember, 14 parseJsonBody
+// and 12 queryParams copies) with exactly one deliberate exception:
+// attachments-routes.mjs's requirePerm accepts a `notFoundOnDeny` option (a
+// denied attachments.read reads as a plain 404 "attachment not found"
+// instead of a 403, so a caller can't distinguish "wrong facility" from
+// "no permission" by probing another module's attachment ids). That option
+// -- and its message -- is preserved here as opt-in parameters so every
+// other call site is unaffected.
+export function makeGuards({ authenticate, sendJson, readBody }) {
+  // P-9 step 2: every route's own client is scoped to the calling user's
+  // bearer token (see translatePostgrestError's doc comment for why that
+  // makes this safe), so a PostgrestError any handler lets escape --
+  // instead of catching it itself, the way the nine bespoke 409 sites and
+  // the incidents-routes.mjs incident_no retry loop already do -- is
+  // translated here and answered directly. This is what lets a route's own
+  // unit tests (which call the registered handler directly, never through
+  // scripts/server.mjs) see the clean 4xx without any server.mjs
+  // involvement. A translation landing at 500 (or no translation at all,
+  // e.g. a plain Error) rethrows unchanged, exactly as before this existed,
+  // so it still reaches scripts/server.mjs's own catch to be reported.
+  async function withAuth(request, response, env, handler) {
+    const auth = await authenticate(request, env);
+    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
+    try {
+      return await handler(auth);
+    } catch (error) {
+      const translated = translatePostgrestError(error);
+      if (translated && translated.status < 500) {
+        return sendJson(response, translated.status, translated.body);
+      }
+      throw error;
+    }
+  }
+
+  function requirePerm(
+    auth,
+    facilityId,
+    code,
+    response,
+    { notFoundOnDeny = false, notFoundMessage = "not found" } = {}
+  ) {
+    const guard = requireAuthPermission(auth, facilityId, code);
+    if (!guard.allowed) {
+      sendJson(
+        response,
+        notFoundOnDeny ? 404 : 403,
+        notFoundOnDeny ? { error: notFoundMessage } : { error: guard.reason }
+      );
+      return false;
+    }
+    return true;
+  }
+
+  // requireRead(code) bakes a module's read-permission constant into a
+  // requirePerm-shaped guard, matching every existing call site's
+  // `requireRead(auth, facilityId, response)` shape.
+  function requireRead(code) {
+    return function requireReadGuard(auth, facilityId, response) {
+      return requirePerm(auth, facilityId, code, response);
+    };
+  }
+
+  function requireMember(auth, facilityId, response) {
+    if (!authCanAccessFacility(auth, facilityId)) {
+      sendJson(response, 403, { error: "not a member of this facility" });
+      return false;
+    }
+    return true;
+  }
+
+  async function parseJsonBody(request) {
+    try {
+      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  function queryParams(request) {
+    return new URL(request.url ?? "/", "http://localhost").searchParams;
+  }
+
+  return {
+    withAuth,
+    requirePerm,
+    requireRead,
+    requireMember,
+    parseJsonBody,
+    queryParams,
+    parseListLimitOffset
+  };
+}
+
+// P-12: shared ?limit=/?offset= parsing, replacing the two inline copies in
+// reports-routes.mjs and work-orders-routes.mjs. The two copies used to
+// disagree on error shape (reports-routes returned a single
+// `{ error: "..." }` per bad field; work-orders-routes batched every bad
+// query param, limit/offset included, into `{ errors: [...] }`) and on the
+// unset-offset default (reports-routes left it `undefined`, which
+// buildQuery in supabase-rest.mjs omits from the query string the same way
+// PostgREST treats an absent `offset` as 0 -- so defaulting to the literal
+// `0` here is behaviourally a no-op, it just now appears on the wire).
+// Reconciled to always: default offset 0, and on a bad limit/offset return
+// the single-field `{ error }` shape immediately (independent of whatever
+// other query-param errors a caller like work-orders-routes.mjs is also
+// batching) -- see that file's parseListQuery for how the two are combined.
+export function parseListLimitOffset(qp, { defaultLimit = 50, maxLimit = 200 } = {}) {
+  let limit = defaultLimit;
+  const limitParam = qp.get("limit");
+  if (limitParam !== null) {
+    const parsed = Number(limitParam);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      return { ok: false, error: "limit must be a positive integer" };
+    }
+    limit = Math.min(parsed, maxLimit);
+  }
+
+  let offset = 0;
+  const offsetParam = qp.get("offset");
+  if (offsetParam !== null) {
+    const parsed = Number(offsetParam);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      return { ok: false, error: "offset must be a non-negative integer" };
+    }
+    offset = parsed;
+  }
+
+  return { ok: true, limit, offset };
 }

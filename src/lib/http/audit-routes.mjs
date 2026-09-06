@@ -1,5 +1,5 @@
 import { pgSelect } from "../supabase-rest.mjs";
-import { requireAuthPermission } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { queryAuditTimeline, buildExportPackage } from "../admin/audit-export.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 import { verifyDbChain } from "../audit.mjs";
@@ -16,13 +16,7 @@ const EXPORT_ENTITLEMENT = "audit_export";
 //     read; kept in the signature so this registration function is a drop-in
 //     alongside registerAdminRoutes in scripts/server.mjs)
 export function registerAuditRoutes(router, { authenticate, sendJson, readBody }) {
-  void readBody;
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
+  const { withAuth, queryParams } = makeGuards({ authenticate, sendJson, readBody });
 
   function requireAuditAccess(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, "admin.manage");
@@ -31,10 +25,6 @@ export function registerAuditRoutes(router, { authenticate, sendJson, readBody }
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   async function facilityOrgId(client, facilityId) {
