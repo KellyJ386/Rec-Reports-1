@@ -173,7 +173,12 @@ for (const file of files) {
   if (Number.isNaN(fileNumber) || fileNumber < 43) {
     continue;
   }
-  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  // Match against code only: `--` line comments and `/* */` blocks routinely
+  // mention the helpers by name when explaining a policy, and a mention is
+  // not a call.
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/--[^\n]*/g, "");
   helperCallPattern.lastIndex = 0;
   let callMatch;
   while ((callMatch = helperCallPattern.exec(fileSql)) !== null) {
