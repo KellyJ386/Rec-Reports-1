@@ -36,6 +36,47 @@ jobs:
       - run: npm run typecheck
       - run: npm run test
       - run: npm run build
+      - name: Start server for smoke tests
+        run: |
+          SUPABASE_URL=https://example.invalid SUPABASE_ANON_KEY=x PORT=8000 \
+            node scripts/server.mjs dist > server-smoke.log 2>&1 &
+          echo $! > server-smoke.pid
+      # public-config needs only SUPABASE_URL/SUPABASE_ANON_KEY to be set (any
+      # value -- see src/lib/env.mjs) and never talks to Supabase itself, so
+      # this loop only ever waits on process startup, not on real credentials.
+      - name: Wait for smoke server to become ready
+        run: |
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://localhost:8000/api/v1/public-config; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "Smoke server did not become ready within 30s. Server log:"
+            cat server-smoke.log
+            exit 1
+          fi
+      # SMOKE_EMAIL/SMOKE_PASSWORD are deliberately unset here: scripts/smoke.mjs
+      # SKIPs the sign-in-and-beyond steps cleanly (exit 0) without real
+      # credentials, so this only ever proves the deployed server answers its
+      # unauthenticated health route.
+      - name: Run smoke tests
+        env:
+          SMOKE_BASE_URL: http://localhost:8000
+        run: npm run smoke
+      - name: Stop smoke test server
+        if: always()
+        run: |
+          if [ -f server-smoke.pid ]; then
+            kill "$(cat server-smoke.pid)" 2>/dev/null || true
+          fi
+          if [ -f server-smoke.log ]; then
+            echo "---- smoke server log ----"
+            cat server-smoke.log
+          fi
       - run: npm run db:verify
       # db:verify:seed does two things: (1) the textual checks it always did,
       # and (2) since DATABASE_URL is set (job-level env above) and the
