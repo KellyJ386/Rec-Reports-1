@@ -50,6 +50,43 @@ test("verify-migrations accepts an internal.-qualified helper redefinition at >=
   }
 });
 
+// M-3: 0042's header promises the guard catches every bare/`public.`-
+// qualified *reference* to an internal helper from >=0043, not just a bad
+// redefinition. Prove the reference-call guard by dropping a >=0043
+// migration that calls has_permission(...) bare inside a policy predicate.
+test("verify-migrations rejects a >=0043 migration that calls an internal helper bare (not just redefines it)", () => {
+  const badFile = new URL("../supabase/migrations/9999_bad_internal_helper_call.sql", import.meta.url);
+  writeFileSync(
+    badFile,
+    'drop policy if exists "x" on facilities;\ncreate policy "x" on facilities for select using (has_permission(auth.uid(), id, \'reports.read\'));\n'
+  );
+  try {
+    const result = spawnSync(process.execPath, ["scripts/verify-migrations.mjs"], {
+      encoding: "utf8"
+    });
+    assert.notEqual(result.status, 0, "expected verify-migrations to fail on a bare helper call");
+    assert.match(result.stderr, /bare reference to internal helper "has_permission\(\.\.\.\)"/);
+  } finally {
+    unlinkSync(badFile);
+  }
+});
+
+test("verify-migrations accepts a >=0043 migration that calls an internal helper internal.-qualified", () => {
+  const goodFile = new URL("../supabase/migrations/9999_ok_internal_helper_call.sql", import.meta.url);
+  writeFileSync(
+    goodFile,
+    'drop policy if exists "x" on facilities;\ncreate policy "x" on facilities for select using (internal.has_permission(auth.uid(), id, \'reports.read\'));\n'
+  );
+  try {
+    const result = spawnSync(process.execPath, ["scripts/verify-migrations.mjs"], {
+      encoding: "utf8"
+    });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    unlinkSync(goodFile);
+  }
+});
+
 test("requiredRlsTables has no duplicate entries", () => {
   const source = readFileSync(new URL("../scripts/verify-migrations.mjs", import.meta.url), "utf8");
   const arrayMatch = source.match(/const requiredRlsTables = \[([\s\S]*?)\];/);

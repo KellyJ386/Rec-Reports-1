@@ -169,6 +169,44 @@ test("assertPathInFacility rejects a null/undefined/non-string path", () => {
   assert.throws(() => assertPathInFacility(undefined, FACILITY_ID, "incidents"), StorageValidationError);
 });
 
+// H-1: a prefix-only check accepts "own-facility/../../other-facility/...",
+// which fetch()'s WHATWG URL parsing later resolves into a request for the
+// OTHER facility's object -- signed with the service-role key, bypassing
+// RLS. assertPathInFacility must reject any ".", "..", or empty segment
+// outright, even when the string still starts with the right prefix.
+test("assertPathInFacility rejects a '..' segment even though the string still starts with the right facility/module prefix (path_traversal)", () => {
+  const path = `facilities/${FACILITY_ID}/incidents/${RECORD_ID}/../../other/incidents/x/secret.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_traversal"
+  );
+});
+
+test("assertPathInFacility rejects a bare '.' segment (path_traversal)", () => {
+  const path = `facilities/${FACILITY_ID}/incidents/./uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_traversal"
+  );
+});
+
+test("assertPathInFacility rejects an empty segment from a doubled slash (path_traversal)", () => {
+  const path = `facilities/${FACILITY_ID}/incidents//uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents"),
+    (error) => error instanceof StorageValidationError && error.code === "path_traversal"
+  );
+});
+
+test("assertPathInFacility rejects the exact cross-facility traversal string from the Wave 1A security review", () => {
+  const otherFacilityId = "99999999-9999-9999-9999-999999999999";
+  const path = `facilities/${FACILITY_ID}/work_orders/../../${otherFacilityId}/work_orders/x/secret.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "work_orders"),
+    (error) => error instanceof StorageValidationError && error.code === "path_traversal"
+  );
+});
+
 test("sanitizeFilename rejects traversal attempts outright rather than cleaning them", () => {
   assert.throws(() => sanitizeFilename("../../etc/passwd"), StorageValidationError);
   assert.throws(() => sanitizeFilename("a/../b.png"), StorageValidationError);

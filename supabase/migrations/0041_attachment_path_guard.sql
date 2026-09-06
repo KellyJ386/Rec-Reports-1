@@ -34,6 +34,25 @@
 -- resolves employee_certifications/etc. correctly regardless of which role
 -- fires it, matching fn_work_order_child_facility's shape in 0035.
 --
+-- H-1 fix: the original check was `attachment_path not like
+-- ('facilities/' || new.facility_id::text || '/%')` -- a PREFIX test only.
+-- A path like "facilities/<own>/work_orders/../../<other>/work_orders/x/y"
+-- passes that prefix test (it does start with "facilities/<own>/") but
+-- WHATWG URL parsing later collapses the ".."/".." segments, landing any
+-- signed-URL request on a DIFFERENT facility entirely (src/lib/storage.mjs's
+-- assertPathInFacility has the identical blind spot, fixed alongside this).
+-- Replaced with a POSITIVE regex anchored on the one canonical shape every
+-- legitimate row can ever have (src/lib/storage.mjs's buildAttachmentPath
+-- output): `facilities/<uuid>/<module>/<recordId>/<filename>`, where the
+-- module is one of the four literal module names this schema knows about
+-- (reports, incidents, work_orders, certifications -- also closes L-1: the
+-- old check never constrained the module segment at all, so a row could
+-- legally claim a module it doesn't belong to) and every segment is
+-- required to be non-empty and not "."/"..". Anything else -- a dot
+-- segment, an empty segment (a leading/trailing/doubled "/"), a foreign
+-- facility, an unknown module, or a path with more or fewer than five
+-- segments -- fails the match and is rejected.
+--
 -- Idempotent (0009+/0035 convention): create-or-replace the function,
 -- drop-if-exists then create each trigger.
 -- ===========================================================================
@@ -54,9 +73,12 @@ begin
   end if;
 
   if attachment_path is not null
-    and attachment_path not like ('facilities/' || new.facility_id::text || '/%')
+    and attachment_path !~ (
+      '^facilities/' || new.facility_id::text ||
+      '/(reports|incidents|work_orders|certifications)/(?!\.\.?/)[^/]+/(?!\.\.?$)[^/]+$'
+    )
   then
-    raise exception 'attachment path % does not start with facilities/%/', attachment_path, new.facility_id
+    raise exception 'attachment path % does not match facilities/%/<module>/<recordId>/<filename>', attachment_path, new.facility_id
       using errcode = 'check_violation';
   end if;
 

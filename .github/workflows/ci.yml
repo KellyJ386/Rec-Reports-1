@@ -72,4 +72,64 @@ jobs:
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/ci/rls-bootstrap-post.sql
       - name: Load seed data
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/seed.sql
+      # H-2 idempotency probe: 0042_internal_helpers.sql moves five scope/
+      # permission helpers into `internal`, and every one of ~200 existing
+      # policies across 0002-0041 references them UNQUALIFIED inside a
+      # `drop policy if exists` / `create policy` pair (the 0009+
+      # convention). Before 0042's `alter database ... set search_path =
+      # public, internal` fix, replaying any of those files against a
+      # post-0042 database dropped the old policy (which always succeeds)
+      # and then failed to recreate it (bare helper name no longer resolves
+      # once the create runs in a session whose search_path never picked up
+      # `internal`), silently leaving the table with that policy MISSING.
+      # Re-apply three representative files here -- 0031 (training/cert
+      # writes), 0038 (the RLS audit-hardening pass with the largest count
+      # of touched policies), and 0040 (storage.objects itself, S-1) -- and
+      # assert neither the storage.objects SELECT policy nor the named
+      # training policy went missing. `alter database ... set` only affects
+      # NEW sessions, so each `psql -f` below opens its own fresh
+      # connection already, and the two assertions after them do too.
       - run: npm run db:test:rls
+      # The H-2 replay probe below MUST stay the last DB step: re-applying an
+      # older file re-creates policies a later migration superseded (e.g. 0038's
+      # training_completions INSERT policy that 0039 replaced), which is fine for
+      # proving replayability but would make db:test:rls fail if it ran afterwards.
+      - name: Re-apply representative migrations to prove post-0042 replayability (H-2)
+        run: |
+          set -e
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0031_training_cert_writes.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0038_rls_audit_hardening.sql
+          # 0038 (re-)creates "training readers can insert completions" -- an
+          # ownership-free training_completions INSERT policy that
+          # 0039_training_completion_ownership.sql permanently retired in
+          # favor of a self-service-or-training.manage rule. Postgres ORs
+          # multiple permissive policies for the same command together, so
+          # replaying 0038 alone (this migration's own numbered position)
+          # WITHOUT also replaying 0039 right behind it would silently
+          # resurrect the exact ownership gap 0039 closed -- a real
+          # regression discovered while proving this fix, not a pre-existing
+          # one (see supabase/tests/training_completions.sql, which fails if
+          # you skip this step). Replaying 0039 immediately after restores
+          # the final, currently-intended policy set on training_completions
+          # before the assertions below and before db:test:rls runs.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0039_training_completion_ownership.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0040_storage_module_reads.sql
+      - name: Assert re-applied migrations did not drop RLS policies (H-2)
+        run: |
+          set -e
+          storage_policy_count="$(psql "$DATABASE_URL" -Atc "select count(*) from pg_policies where tablename='objects' and schemaname='storage';")"
+          if [ "$storage_policy_count" -lt 1 ]; then
+            echo "FAIL: storage.objects has $storage_policy_count SELECT polic(ies) after replaying 0040, expected >= 1"
+            exit 1
+          fi
+          training_policy_exists="$(psql "$DATABASE_URL" -Atc "select exists(select 1 from pg_policies where policyname='training managers can insert employee certifications');")"
+          if [ "$training_policy_exists" != "t" ]; then
+            echo "FAIL: \"training managers can insert employee certifications\" policy is missing after replaying 0031"
+            exit 1
+          fi
+          stale_policy_exists="$(psql "$DATABASE_URL" -Atc "select exists(select 1 from pg_policies where policyname='training readers can insert completions');")"
+          if [ "$stale_policy_exists" != "f" ]; then
+            echo "FAIL: 0038's superseded \"training readers can insert completions\" policy is still present after replaying 0039 -- the ownership gap it introduced is back"
+            exit 1
+          fi
+          echo "OK: storage.objects has $storage_policy_count SELECT polic(ies); training policy present; superseded policy absent"

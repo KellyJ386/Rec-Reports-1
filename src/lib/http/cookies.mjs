@@ -15,8 +15,18 @@ export const REFRESH_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;
 // origin gets `Secure`. `maxAge` is seconds, matching the `Max-Age` cookie
 // attribute's own unit.
 export function buildRefreshCookie({ token, secure = true, maxAge = REFRESH_COOKIE_MAX_AGE }) {
+  // L-4: parseCookies below decodeURIComponent's the value it reads back, so
+  // the value written here must be its encodeURIComponent'd counterpart or
+  // the two are asymmetric. GoTrue refresh tokens are base64url today (no
+  // "%" or other percent-encodable characters), so this is currently a
+  // no-op in practice -- but encoding on write is what makes that an
+  // invariant instead of an accident, and protects a future token shape
+  // that does contain a reserved cookie-value character (";", ",", raw
+  // whitespace) from being corrupted or truncated by the browser's own
+  // cookie-value parsing before parseCookies ever sees it.
+  const encodedToken = encodeURIComponent(token);
   const attributes = [
-    `${REFRESH_COOKIE_NAME}=${token}`,
+    `${REFRESH_COOKIE_NAME}=${encodedToken}`,
     "HttpOnly",
     ...(secure ? ["Secure"] : []),
     "SameSite=Strict",

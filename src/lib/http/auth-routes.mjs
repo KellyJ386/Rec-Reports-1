@@ -183,7 +183,7 @@ export function registerAuthRoutes(
   // account-existence note above the sign-in handler for the matching
   // point about the 401 body.
   function sendThrottled(response, retryAfterMs) {
-    response.setHeader?.("Retry-After", String(retryAfterSeconds(retryAfterMs)));
+    response.setHeader("Retry-After", String(retryAfterSeconds(retryAfterMs)));
     return sendJson(response, 429, { error: "too many attempts, try again later" });
   }
 
@@ -306,7 +306,7 @@ export function registerAuthRoutes(
       }
       emailLimiter.reset(emailKey);
       if (durableLimiter) await durableLimiter.reset(durableEmailKey);
-      response.setHeader?.(
+      response.setHeader(
         "Set-Cookie",
         buildRefreshCookie({ token: result.data.refresh_token, secure: isSecureRequest(request) })
       );
@@ -373,12 +373,12 @@ export function registerAuthRoutes(
         // The refresh token was rejected (expired/revoked/reused) -- drop the
         // cookie so the browser stops offering a token GoTrue will never
         // accept again.
-        response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure }));
+        response.setHeader("Set-Cookie", clearRefreshCookie({ secure }));
         return sendJson(response, 401, { error: "could not refresh session" });
       }
       refreshLimiter.reset(tokenKey);
       if (durableLimiter) await durableLimiter.reset(tokenKey);
-      response.setHeader?.(
+      response.setHeader(
         "Set-Cookie",
         buildRefreshCookie({ token: result.data.refresh_token, secure })
       );
@@ -391,6 +391,28 @@ export function registerAuthRoutes(
   // Always answers 200: the browser clears its own copy of the session either
   // way, so a token GoTrue has already forgotten (expired, revoked, missing
   // header) is not an error the user can act on. Signing out must never fail.
+  //
+  // L-9: revocation only happens when an `Authorization` bearer is present.
+  // GoTrue's `/auth/v1/logout` identifies WHICH session/refresh-token family
+  // to revoke from the access token's own claims in the Authorization
+  // header it is called with -- it has no endpoint that accepts a bare
+  // refresh token and revokes by that alone (the token-exchange endpoint,
+  // `token?grant_type=refresh_token`, MINTS a new session rather than
+  // killing the old one, which is the opposite of what sign-out needs).
+  // So when the caller's access token has already expired (the common case
+  // for a tab left open past its ~1 hour lifetime) but the `rr_refresh`
+  // cookie is still live, there is no GoTrue call this route can make to
+  // revoke that refresh token server-side -- only the browser's own copy of
+  // it can be, and is, discarded (clearRefreshCookie below). The token
+  // itself stays valid upstream for the rest of its ~30-day lifetime,
+  // exactly as noted in the review this fixes: pre-existing shape, unchanged
+  // risk, since the token is HttpOnly and never leaves the browser as
+  // anything an XSS payload could read. A future fix would need either a
+  // GoTrue admin-API call (service-role, out of scope for a user-initiated
+  // sign-out) or refreshing first purely to get a fresh access token to log
+  // out with -- the latter defeats the purpose (it would mint a session
+  // just to kill it, racing any other tab's own refresh) so this is left as
+  // documented, accepted residual risk rather than "fixed."
   router.register("POST", "/auth/sign-out", (request, response, { env }) =>
     (async () => {
       if (!requireConfigured(env, response)) return;
@@ -398,7 +420,7 @@ export function registerAuthRoutes(
       if (authorization) {
         await callGotrue(env, "logout", {}, { authorization });
       }
-      response.setHeader?.("Set-Cookie", clearRefreshCookie({ secure: isSecureRequest(request) }));
+      response.setHeader("Set-Cookie", clearRefreshCookie({ secure: isSecureRequest(request) }));
       return sendJson(response, 200, { signed_out: true });
     })()
   );

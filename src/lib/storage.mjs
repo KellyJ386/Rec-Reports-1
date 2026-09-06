@@ -221,6 +221,21 @@ export function assertPathInFacility(path, facilityId, module) {
       "path_outside_facility"
     );
   }
+  // H-1: the startsWith check above is a prefix test only -- it happily
+  // accepts "facilities/<own>/<module>/../../<other>/<module>/x/secret.jpg",
+  // whose ".."/".." segments WHATWG's URL parser (used inside `fetch()`
+  // when this path is later interpolated into the signed-URL request)
+  // resolves away, landing the request on a DIFFERENT facility's object --
+  // which createSignedUrl then signs with the service-role key, bypassing
+  // RLS entirely. Reject any dot or empty segment outright so a traversal
+  // string can never reach the prefix check's blind spot, regardless of
+  // which facility/module prefix it starts with.
+  if (path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new StorageValidationError(
+      `path contains an empty or "."/".." segment: ${JSON.stringify(path)}`,
+      "path_traversal"
+    );
+  }
   return path;
 }
 

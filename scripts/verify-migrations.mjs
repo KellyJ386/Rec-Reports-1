@@ -150,6 +150,47 @@ for (const file of files) {
   }
 }
 
+// M-3: the guard above only caught a bad *definition* -- a >=0043
+// migration that CALLS one of the five internal helpers bare (or
+// `public.`-qualified), e.g. inside a new policy predicate, was never
+// checked at all, even though 0042's own header promises
+// "scripts/verify-migrations.mjs enforces this for every migration
+// numbered >= 0043" for exactly that shape of reference. Such a call is
+// self-detecting today (H-2's `alter database ... set search_path =
+// public, internal` makes a bare reference resolve and WORK correctly, so
+// it is no longer even self-detecting the way it was before that fix --
+// it would just silently succeed), so this is the only thing left
+// enforcing the "always write internal.<helper>(...)" convention the
+// header documents. `has_permission` covers both its overloads; a call is
+// any occurrence of the bare name immediately followed by `(`, not already
+// qualified with `internal.` right before it.
+const helperCallPattern = new RegExp(
+  `(?<!internal\\.)\\b(${[...internalHelperNames].sort((a, b) => b.length - a.length).join("|")})\\s*\\(`,
+  "g"
+);
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 43) {
+    continue;
+  }
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  helperCallPattern.lastIndex = 0;
+  let callMatch;
+  while ((callMatch = helperCallPattern.exec(fileSql)) !== null) {
+    // Definitions ("create [or replace] function <name>(") are already
+    // reported by the more specific error above -- skip them here so a bad
+    // definition doesn't also get flagged as a bad call, muddying the
+    // error message.
+    const precedingText = fileSql.slice(0, callMatch.index);
+    if (/create\s+(?:or\s+replace\s+)?function\s+$/i.test(precedingText)) {
+      continue;
+    }
+    throw new Error(
+      `${file}: bare reference to internal helper "${callMatch[1]}(...)" outside the internal schema; call it as internal.${callMatch[1]}(...).`
+    );
+  }
+}
+
 // Audit backbone: both audit tables must carry an append-only guard, i.e. a
 // BEFORE UPDATE OR DELETE trigger, so audit rows can never be mutated in place.
 const lowerSql = combinedSql.toLowerCase();
