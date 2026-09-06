@@ -323,6 +323,14 @@ smoke passes, security headers present on `/`.
 Exit gate: Supabase security advisor shows zero WARN; RLS suites 21+N pass locally and against the live
 project; Opus sign-off written.
 
+**Status 2026-09-06:** every row above is built, reviewed and signed off on PR #18
+(`claude/wave1-review-fixes`, migrations 0040–0049; note the renumbering: 0048 carries the part B review
+fixes and the performance migration became 0049). Two adversarial reviews and two re-verification rounds
+are recorded in `plans/SECURITY_REVIEW_2026-09.md` (S-12). Gate on the signed-off head: 1478 unit tests,
+29 RLS suites, 49-migration replay, seed twice, re-apply probe, CI green. Still open from the exit gate:
+applying 0040–0049 to the live project and the live advisor re-run, both waiting on the owner's go
+(one-way change), and the in-browser cookie-refresh check against production afterwards.
+
 ### 5.4 Wave 2 — Pilot-ready product (≈2 weeks, parallel tracks in worktrees)
 
 | # | Task | IDs | Agent |

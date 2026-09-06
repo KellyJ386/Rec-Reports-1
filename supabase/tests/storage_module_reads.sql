@@ -334,6 +334,51 @@ begin
 end;
 $$;
 
+-- H-1 (review A): the trigger's canonical-shape regex rejects every
+-- non-canonical path even when the facility prefix is correct -- traversal
+-- segments, empty segments, an unknown module, and a missing filename. Each
+-- must fail with 23514; a canonical path on the same fixture must succeed.
+do $$
+declare
+  bad_path text;
+  bad_paths text[] := array[
+    'facilities/40300000-0000-0000-0000-000000000001/reports/../x/y.jpg',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/./x/y.jpg',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x/..',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x/.',
+    'facilities/40300000-0000-0000-0000-000000000001/reports//y.jpg',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x/',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x',
+    'facilities/40300000-0000-0000-0000-000000000001/other/x/y.jpg',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x/y/z.jpg',
+    'Facilities/40300000-0000-0000-0000-000000000001/reports/x/y.jpg',
+    'facilities/40300000-0000-0000-0000-000000000001/reports/x/y.jpg/'
+  ];
+  new_id uuid;
+begin
+  foreach bad_path in array bad_paths loop
+    begin
+      insert into report_submission_attachments (facility_id, submission_id, field_key, storage_path, mime_type)
+      values ('40300000-0000-0000-0000-000000000001', '40a00000-0000-0000-0000-000000000003', 'photo', bad_path, 'image/jpeg');
+      raise exception 'SMR FAIL: report_submission_attachments accepted non-canonical storage_path %', bad_path;
+    exception
+      when others then
+        if sqlstate <> '23514' then
+          raise exception 'SMR FAIL: non-canonical storage_path % failed with unexpected sqlstate % (%), expected 23514', bad_path, sqlstate, sqlerrm;
+        end if;
+    end;
+  end loop;
+
+  insert into report_submission_attachments (facility_id, submission_id, field_key, storage_path, mime_type)
+  values ('40300000-0000-0000-0000-000000000001', '40a00000-0000-0000-0000-000000000003', 'photo',
+          'facilities/40300000-0000-0000-0000-000000000001/reports/40a00000-0000-0000-0000-000000000003/photo.jpg', 'image/jpeg')
+  returning id into new_id;
+  if new_id is null then
+    raise exception 'SMR FAIL: a canonical storage_path was rejected by fn_attachment_path_facility';
+  end if;
+end;
+$$;
+
 -- Sanity: employee_certifications with evidence_path left NULL still inserts
 -- fine (the guard skips a null path rather than rejecting every insert).
 do $$

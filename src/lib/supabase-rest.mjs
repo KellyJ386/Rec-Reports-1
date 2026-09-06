@@ -29,7 +29,7 @@ const FILTER_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "in"]);
 // wire format every existing caller and test expects is unchanged.
 function quoteInListValue(value) {
   const text = String(value);
-  if (!/[,()"\\\s]/.test(text)) return text;
+  if (text !== "" && !/[,()"\\\s]/.test(text)) return text;
   return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 

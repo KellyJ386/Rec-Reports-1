@@ -177,7 +177,7 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
 - Retention/legal hold: DR-31, IN-25, OP-22 runbook.
 - Packaging: WO-25 entitlement gating ("Ops Plus"), DR-27 settings keys, SC-22 admin settings surface.
 - Frontend: split `src/public/js/app.js` (3204 lines) along the four IIFE seams (`schedulePanel` 1392, `incidentsPanel` 1771, `workOrdersPanel` 2379, `commsPanel` 2790) into `src/public/js/panels/*.mjs`, each with the DOM-free parts tested; remove the remaining 10 `innerHTML` writes (`:258, 457, 462, 494, 3078, 3093, 3130, 3146, 3155, 3161`) in favour of `el()`. SC-23 mobile day view, DR-32 builder polish.
-- Hardening: SC-24, CM-18, TR-16 audit coverage; DR-34/IN-24/WO-27 already closed by S-12.
+- Hardening: SC-24, CM-18, TR-16 audit coverage; IN-24's feature half (429 on incident submit/export, justification-capturing break-glass reads — its review half is closed by S-12); DR-34/WO-27 closed by S-12.
 
 ---
 
@@ -208,3 +208,26 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
 | 2 | 2A–2D | ~2 weeks | 0049–0050 |
 | 3 | 3A–3G | 4–6 weeks | 0051–0061 |
 | 4 | — | 3–4 weeks | 0062+ |
+
+## Execution status (2026-09-06) — Wave 1 complete, pending merge and live apply
+
+- **Landed:** all of Wave 1 (S-1 … S-13) on PR #18 `claude/wave1-review-fixes` against `main`. Migration
+  numbering shifted during execution: 0040 storage reads, 0041 path guard, 0042 internal helpers, 0043
+  incident guards, 0044 permission alignment, 0045 read/audit policies, 0046 auth throttle, 0047 audience
+  refs, **0048 part B review fixes** (incl. `internal.apply_incident_amendment` + its public wrapper), **0049
+  policy performance**. Wave 2's migrations therefore start at **0050** (P-6 people/statements → 0050,
+  P-8 search indexes → 0051) and later waves shift by two.
+- **Reviews:** two adversarial reviews (parts A and B) and two re-verification rounds; every finding
+  closed or accepted with rationale in `plans/SECURITY_REVIEW_2026-09.md` (S-12). The re-verification
+  caught one High introduced by the first fix round (the amendment RPC was unreachable through
+  PostgREST) — a reminder that unit tests with a stubbed fetch cannot prove API reachability.
+- **Gate on the signed-off head:** 1478 unit tests, 29 RLS suites, 49-migration replay, seed applied twice,
+  0031/0038/0040 re-apply probe after the RLS run, CI green.
+- **Owner actions now due:** merge PR #18; give the explicit go to apply 0040–0049 to the live project
+  (then the advisor re-run and the post-deploy checklist in the sign-off); enable leaked-password
+  protection.
+- **Lessons folded into later waves:** the Agent tool's worktree isolation cuts from `main` — create
+  worktrees manually from the slice base; set `core.fileMode false` in them; the H-2 re-apply probe must
+  run after the RLS suite; Haiku factual claims are re-verified before use.
+- **Next:** Wave 2, Slice 2A first (guard factory, error translation, lint, missing tests, smoke in CI,
+  changelog and runbook), branched from `main` once PR #18 merges.

@@ -427,8 +427,13 @@ test("client IP: the RIGHTMOST x-forwarded-for hop is the bucket, not the attack
   assert.notEqual(key, ipThrottleKey("ip", "6.6.6.6"));
 });
 
-test("client IP: x-real-ip wins over x-forwarded-for when both are present", async (t) => {
+test("client IP: the rightmost x-forwarded-for hop outranks a (possibly pass-through) x-real-ip", async (t) => {
   const key = await signInIpKeyFor(t, { "x-real-ip": "198.51.100.9", "x-forwarded-for": "203.0.113.7" });
+  assert.equal(key, ipThrottleKey("ip", "203.0.113.7"));
+});
+
+test("client IP: x-real-ip is used when no x-forwarded-for is present", async (t) => {
+  const key = await signInIpKeyFor(t, { "x-real-ip": "198.51.100.9" });
   assert.equal(key, ipThrottleKey("ip", "198.51.100.9"));
 });
 

@@ -120,15 +120,17 @@ export function registerAuthRoutes(
   // proxy-fronted deployment: behind a proxy that APPENDS to
   // x-forwarded-for (nginx, most load balancers), the leftmost hop is the
   // attacker's own free-text and only the rightmost hop is what the proxy
-  // itself observed, so this reads the rightmost. Vercel sets x-real-ip
-  // (and a single-hop x-forwarded-for) to the address its edge saw, which
-  // is why x-real-ip wins when present. Anything that is not a syntactically
-  // valid IPv4/IPv6 address collapses into one shared "invalid" bucket
-  // rather than a per-request bucket an attacker could mint at will.
+  // itself observed, so this reads the rightmost. It is consulted before
+  // x-real-ip on purpose: every proxy that sets x-real-ip also writes the
+  // matching x-forwarded-for hop (Vercel overwrites both with the address
+  // its edge saw), whereas a proxy that only appends to x-forwarded-for
+  // may pass a client-supplied x-real-ip through untouched. Anything that
+  // is not a syntactically valid IPv4/IPv6 address collapses into one
+  // shared "invalid" bucket rather than a per-request bucket an attacker
+  // could mint at will.
   function clientIp(request) {
     const headers = request.headers ?? {};
     const candidates = [];
-    if (headers["x-real-ip"]) candidates.push(String(headers["x-real-ip"]).trim());
     if (headers["x-forwarded-for"]) {
       const hops = String(headers["x-forwarded-for"])
         .split(",")
@@ -136,6 +138,7 @@ export function registerAuthRoutes(
         .filter(Boolean);
       if (hops.length > 0) candidates.push(hops[hops.length - 1]);
     }
+    if (headers["x-real-ip"]) candidates.push(String(headers["x-real-ip"]).trim());
     for (const candidate of candidates) {
       if (isIP(candidate)) return candidate;
     }
