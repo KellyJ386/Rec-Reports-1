@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { createJwtVerifier, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
-import { requireAuthOrgAdmin } from "../src/lib/http/guard.mjs";
+import { requireAuthOrgAdminRow } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
@@ -135,14 +135,6 @@ async function authenticate(request, env) {
   return { claims, client, memberships, platformAdmin, error: null };
 }
 
-async function orgFacilityIds(client, organizationId) {
-  const rows = await pgSelect(client, "facilities", {
-    filters: { organization_id: organizationId },
-    select: "id"
-  });
-  return (rows ?? []).map((row) => row.id);
-}
-
 export const router = createRouter();
 
 router.register("GET", "/modules", async (request, response, { env }) => {
@@ -158,8 +150,12 @@ router.register("GET", "/modules", async (request, response, { env }) => {
 router.register("GET", "/org/:id/module-settings", async (request, response, { env, params }) => {
   const auth = await authenticate(request, env);
   if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-  const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
+  // M4 (S-6/0048): matches the actual SQL rule (0019 -- admin.manage on any
+  // one org facility no longer implies org-wide authority; an explicit
+  // organization_admins row is required), same as admin-routes.mjs and
+  // billing-routes.mjs. The deprecated requireAuthOrgAdmin/orgFacilityIds
+  // pair this replaced enforced the older, looser pre-0019 rule.
+  const guardResult = await requireAuthOrgAdminRow(auth, params.id);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
   const rows = await pgSelect(auth.client, "organization_module_settings", {
     filters: { organization_id: params.id },
@@ -182,8 +178,7 @@ router.register("PUT", "/org/:id/module-settings/:moduleId", async (request, res
   const { valid, errors } = validateModuleTogglePayload(payload);
   if (!valid) return sendJson(response, 422, { errors });
 
-  const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
+  const guardResult = await requireAuthOrgAdminRow(auth, params.id);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
 
   const rows = await pgInsert(

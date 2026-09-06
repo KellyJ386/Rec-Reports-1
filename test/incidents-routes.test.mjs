@@ -208,6 +208,30 @@ test("POST incidents happy path inserts a draft with a server-generated incident
   assert.equal(insert.body[0].summary, "Test incident");
 });
 
+// M2 (0048): a client-supplied legalHold:true must never reach the insert --
+// creating an incident already on legal hold is gated on
+// incidents.legal_hold.manage, a permission this route's MANAGE-only guard
+// does not itself check. Matches the new BEFORE INSERT guard in 0048.
+test("POST incidents ignores a client-supplied legalHold:true; every draft is created with legal_hold=false", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [];
+    if (table === "incident_reports" && method === "POST") return [{ id: "inc-2" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("POST", "/facilities/fac-1/incidents", {
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident",
+    legalHold: true
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_reports" && c.method === "POST");
+  assert.equal(insert.body[0].legal_hold, false);
+});
+
 test("POST incidents ignores a client-supplied incidentNo and generates its own", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [];
@@ -635,6 +659,7 @@ test("POST amendments on a draft incident is rejected with 409 and no writes", a
   assert.ok(!captured.some((c) => c.table === "incident_amendments"));
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
   assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "rpc/apply_incident_amendment"));
 });
 
 test("POST amendments denies an actor without incidents.manage or incidents.review", async (t) => {
@@ -669,16 +694,23 @@ test("POST amendments rejects an empty patch, non-amendable fields, and a blank 
 
   assert.ok(!captured.some((c) => c.table === "incident_amendments"));
   assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "rpc/apply_incident_amendment"));
 });
 
-test("POST amendments on a submitted incident writes BOTH the incident_reports UPDATE and the incident_amendments row, plus an audit event", async (t) => {
+test("POST amendments on a submitted incident calls internal.apply_incident_amendment (RPC) and writes an audit event", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
-    if (table === "incident_reports" && method === "PATCH") {
-      return [{ ...SUBMITTED_INCIDENT, summary: "Updated after investigation" }];
-    }
-    if (table === "incident_amendments" && method === "POST") {
-      return [{ id: "amend-1", incident_id: "inc-1" }];
+    if (table === "rpc/apply_incident_amendment" && method === "POST") {
+      return {
+        incident: { ...SUBMITTED_INCIDENT, summary: "Updated after investigation" },
+        amendment: {
+          id: "amend-1",
+          facility_id: "fac-1",
+          incident_id: "inc-1",
+          amendment_reason: "Investigation revealed more detail",
+          amended_by: "user-9"
+        }
+      };
     }
     if (table === "incident_audit_events" && method === "POST") return [];
     return [];
@@ -692,20 +724,18 @@ test("POST amendments on a submitted incident writes BOTH the incident_reports U
   assert.equal(result.payload.incident.summary, "Updated after investigation");
   assert.equal(result.payload.amendment.id, "amend-1");
 
-  const incidentPatch = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
-  assert.ok(incidentPatch, "expected incident_reports to be updated");
-  assert.equal(incidentPatch.body.summary, "Updated after investigation");
-  assert.equal(Object.keys(incidentPatch.body).length, 1); // only the amended field, nothing else
+  // M1 (0048): the incident_reports UPDATE and the incident_amendments
+  // INSERT no longer happen as two separate REST calls from this route --
+  // both are applied atomically inside the RPC, so this route now issues
+  // exactly one write call for them combined.
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "incident_amendments" && c.method === "POST"));
 
-  const amendmentInsert = captured.find((c) => c.table === "incident_amendments" && c.method === "POST");
-  assert.ok(amendmentInsert, "expected an incident_amendments insert");
-  const amendment = amendmentInsert.body[0];
-  assert.equal(amendment.facility_id, "fac-1");
-  assert.equal(amendment.incident_id, "inc-1");
-  assert.equal(amendment.amendment_reason, "Investigation revealed more detail");
-  assert.equal(amendment.amended_by, "user-9");
-  assert.equal(amendment.before_snapshot.summary, "Test incident");
-  assert.equal(amendment.after_snapshot.summary, "Updated after investigation");
+  const rpcCall = captured.find((c) => c.table === "rpc/apply_incident_amendment" && c.method === "POST");
+  assert.ok(rpcCall, "expected a call to internal.apply_incident_amendment via RPC");
+  assert.equal(rpcCall.body.incident_id, "inc-1");
+  assert.deepEqual(rpcCall.body.changes, { summary: "Updated after investigation" });
+  assert.equal(rpcCall.body.reason, "Investigation revealed more detail");
 
   const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
   assert.ok(auditInsert, "expected an incident_audit_events insert");
@@ -719,8 +749,12 @@ test("POST amendments on a submitted incident writes BOTH the incident_reports U
 test("POST amendments succeeds for an incidents.review holder (no incidents.manage)", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
-    if (table === "incident_reports" && method === "PATCH") return [{ ...SUBMITTED_INCIDENT, severity: "high" }];
-    if (table === "incident_amendments" && method === "POST") return [{ id: "amend-2" }];
+    if (table === "rpc/apply_incident_amendment" && method === "POST") {
+      return {
+        incident: { ...SUBMITTED_INCIDENT, severity: "high" },
+        amendment: { id: "amend-2" }
+      };
+    }
     return [];
   });
   const { call } = mount({ memberships: REVIEWER });
@@ -729,7 +763,36 @@ test("POST amendments succeeds for an incidents.review holder (no incidents.mana
     patch: { severity: "high" }
   });
   assert.equal(result.status, 201);
-  assert.ok(captured.some((c) => c.table === "incident_amendments" && c.method === "POST"));
+  assert.ok(captured.some((c) => c.table === "rpc/apply_incident_amendment" && c.method === "POST"));
+});
+
+test("POST amendments propagates a DB-level rejection (e.g. RPC's own permission/status guard) as the same status", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_reports" && init.method === "GET") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([SUBMITTED_INCIDENT]) };
+    }
+    if (table === "rpc/apply_incident_amendment") {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => JSON.stringify({ message: "missing permission: incidents.manage or incidents.review" })
+      };
+    }
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "why",
+    patch: { summary: "x" }
+  });
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /incidents\.manage/);
 });
 
 test("GET amendments 404s when the incident is missing and denies a non-reader", async (t) => {

@@ -73,12 +73,13 @@ function buildHeaders(client, { returning, prefer, count } = {}) {
   return headers;
 }
 
-async function request(client, method, table, { query, body, headers } = {}) {
+async function request(client, method, table, { query, body, headers, signal } = {}) {
   const search = query ? `?${query}` : "";
   const response = await fetch(`${client.url}/rest/v1/${table}${search}`, {
     method,
     headers,
-    body: body === undefined ? undefined : JSON.stringify(body)
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
@@ -91,33 +92,54 @@ async function request(client, method, table, { query, body, headers } = {}) {
   return data;
 }
 
+// L5: every function below accepts an optional `signal` (an AbortSignal,
+// e.g. AbortSignal.timeout(ms)) so a caller that cannot tolerate an
+// indefinite hang -- src/lib/http/durable-rate-limit.mjs's fail-open
+// contract explicitly promises to catch a down/erroring PostgREST, but a
+// *hanging* one previously had no timeout to catch at all -- can bound the
+// request. Omitted (the default everywhere else in this codebase), `fetch`
+// gets `signal: undefined`, i.e. no behavior change from before this was
+// added.
 export async function pgSelect(client, table, options = {}) {
-  const { count } = options;
+  const { count, signal } = options;
   const query = buildQuery(options);
   const headers = buildHeaders(client, { count });
-  return request(client, "GET", table, { query, headers });
+  return request(client, "GET", table, { query, headers, signal });
 }
 
 export async function pgInsert(client, table, rows, options = {}) {
-  const { returning = true, onConflict, merge = false } = options;
+  const { returning = true, onConflict, merge = false, signal } = options;
   const query = onConflict ? buildQuery({ extra: { on_conflict: onConflict } }) : "";
   const headers = buildHeaders(client, {
     returning,
     prefer: merge ? "resolution=merge-duplicates" : undefined
   });
-  return request(client, "POST", table, { query, body: rows, headers });
+  return request(client, "POST", table, { query, body: rows, headers, signal });
 }
 
 export async function pgUpdate(client, table, filters, patch, options = {}) {
-  const { returning = true } = options;
+  const { returning = true, signal } = options;
   const query = buildQuery({ filters });
   const headers = buildHeaders(client, { returning });
-  return request(client, "PATCH", table, { query, body: patch, headers });
+  return request(client, "PATCH", table, { query, body: patch, headers, signal });
 }
 
 export async function pgDelete(client, table, filters, options = {}) {
-  const { returning = false } = options;
+  const { returning = false, signal } = options;
   const query = buildQuery({ filters });
   const headers = buildHeaders(client, { returning });
-  return request(client, "DELETE", table, { query, headers });
+  return request(client, "DELETE", table, { query, headers, signal });
+}
+
+// PostgREST RPC: POST /rest/v1/rpc/<name>, body = the function's named
+// arguments as a plain JSON object (PostgREST maps each key to the matching
+// SQL parameter name). Used by incidents-routes.mjs's amendment route to
+// call internal.apply_incident_amendment (0048, M1) -- the response body is
+// the function's own return value (here, a jsonb object), not a row array,
+// so this intentionally does not go through pgInsert's `returning`/onConflict
+// shape.
+export async function pgRpc(client, name, args = {}, options = {}) {
+  const { signal } = options;
+  const headers = buildHeaders(client, {});
+  return request(client, "POST", `rpc/${name}`, { body: args, headers, signal });
 }
