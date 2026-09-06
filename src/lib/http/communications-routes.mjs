@@ -9,11 +9,7 @@ const PUBLISH = "communications.publish";
 const MESSAGE_COLUMNS =
   "id,facility_id,channel_id,author_employee_id,message_type,subject,body_text,priority,is_required_ack,ack_due_at,published_at,created_at,updated_at";
 const MESSAGE_AUDIENCES_COLUMNS = "id,facility_id,message_id,audience_type,audience_ref_id,rule_jsonb,created_at";
-const MESSAGE_ACKNOWLEDGEMENTS_COLUMNS =
-  "id,facility_id,message_id,employee_id,ack_state,acknowledged_at,ack_method,signature_path,created_at,updated_at";
 const CHANNEL_COLUMNS = "id,facility_id,name,channel_type,department_id,shift_scoped,emergency_enabled,created_at,updated_at";
-const MESSAGE_RECEIPTS_COLUMNS = "id,facility_id,message_id,employee_id,delivered_at,read_at,created_at";
-const DEVICE_TOKEN_COLUMNS = "id,facility_id,employee_id,platform,token,last_seen_at,revoked_at,created_at";
 const NOTIFICATION_PREFERENCE_COLUMNS =
   "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end,created_at,updated_at";
 

@@ -25,9 +25,6 @@ const ESCALATE = "incidents.escalate";
 // constraints on incident_followup_actions (0004_incidents.sql:74-75).
 const FOLLOWUP_ACTION_TYPES = ["corrective_action", "investigation", "documentation", "equipment_fix", "training"];
 const FOLLOWUP_STATUSES = ["open", "in_progress", "completed", "waived"];
-// Escalation status vocabulary, verbatim from incident_escalations'
-// check constraint (0004_incidents.sql:61).
-const ESCALATION_STATUSES = ["pending", "acknowledged", "resolved", "expired"];
 
 // Permission codes the transition machine (canTransitionIncident) consults.
 // Gathered once per request into a plain string[] via requireAuthPermission
