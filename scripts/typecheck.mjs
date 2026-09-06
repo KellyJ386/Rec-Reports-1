@@ -109,6 +109,168 @@ if (unknownBffOnlyCodes.length > 0) {
   );
 }
 
+// P-11 (plans/WAVES_1_4_IMPLEMENTATION_PLAN.md, Slice 2A): every permission
+// code the HTTP layer actually checks a caller against must be a code that
+// exists in the permissions.mjs catalog -- catches a typo'd or
+// since-renamed code in a guard call silently always denying (or, worse,
+// silently always allowing were the typo to collide with something else).
+//
+// This is a regex scan, not an AST: for each of the guard-call names below,
+// every call site's third argument (0-based index 2 -- the "code" position
+// in requireAuthPermission(auth, facilityId, code) /
+// hasPermission(memberships, facilityId, code), and in every local
+// requirePerm(auth, facilityId, code, ...) wrapper these route files define
+// with the same argument order) is checked when it is either:
+//   - a string literal ("training.read"), checked directly, or
+//   - a bare identifier (READ, MANAGE, PUBLISH, ...) resolved against that
+//     same file's own top-level `const NAME = "literal";` assignments.
+// Anything else at that position -- a function parameter threaded through a
+// wrapper (requirePerm's own `code` parameter), a member expression
+// (attachments-routes.mjs's config.writePermission/readPermission), or a
+// call result (workflow-routes.mjs's permissionForTable(...) return value)
+// -- cannot be resolved by a regex pass and is skipped rather than guessed
+// at. Known, accepted blind spots as of this check's introduction:
+//   - attachments-routes.mjs: config.writePermission / config.readPermission
+//     are themselves object-literal permission strings a few lines up in
+//     the same file (already valid catalog codes) -- just not
+//     const-resolvable by this pass.
+//   - workflow-routes.mjs: requiredCode comes from admin/export.mjs's
+//     permissionForTable(...), outside the two directories this check reads.
+// A call whose arguments span multiple lines is also out of scope (every
+// call site in this codebase today is single-line).
+const GUARD_CALL_NAMES = ["requireAuthPermission", "requirePerm", "requireRead", "hasPermission", "has_permission"];
+const TOP_LEVEL_STRING_CONST_RE = /^const\s+([A-Za-z_$][\w$]*)\s*=\s*(["'])((?:(?!\2)[^\\]|\\.)*)\2\s*;?\s*$/gm;
+const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/;
+const STRING_LITERAL_RE = /^(["'])((?:(?!\1)[^\\]|\\.)*)\1$/;
+
+function topLevelStringConsts(text) {
+  const consts = new Map();
+  TOP_LEVEL_STRING_CONST_RE.lastIndex = 0;
+  let m;
+  while ((m = TOP_LEVEL_STRING_CONST_RE.exec(text))) {
+    consts.set(m[1], m[3]);
+  }
+  return consts;
+}
+
+// Finds every call to `name(` in text and returns each call's raw argument
+// list text plus the 1-based line it starts on. Scans char-by-char with
+// paren/string-aware balancing (rather than a single regex) so a call whose
+// arguments themselves contain parens, brackets, or quoted strings -- e.g.
+// `hasPermission(memberships ?? [], facilityId, "admin.manage")` -- is not
+// truncated at the first inner `)`.
+function findCallArgLists(text, name) {
+  const calls = [];
+  const nameRe = new RegExp(`\\b${name}\\s*\\(`, "g");
+  let m;
+  while ((m = nameRe.exec(text))) {
+    const argStart = nameRe.lastIndex;
+    let i = argStart;
+    let depth = 1;
+    let inStr = null;
+    while (i < text.length && depth > 0) {
+      const ch = text[i];
+      if (inStr) {
+        if (ch === "\\") {
+          i += 2;
+          continue;
+        }
+        if (ch === inStr) inStr = null;
+        i++;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") {
+        inStr = ch;
+        i++;
+        continue;
+      }
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      i++;
+    }
+    calls.push({ argsText: text.slice(argStart, i - 1), line: text.slice(0, m.index).split("\n").length });
+  }
+  return calls;
+}
+
+// Splits a call's argument-list text on top-level commas, respecting
+// nested (), [], {}, and quoted strings.
+function splitTopLevelArgs(argsText) {
+  const args = [];
+  let depth = 0;
+  let current = "";
+  let inStr = null;
+  for (let i = 0; i < argsText.length; i++) {
+    const ch = argsText[i];
+    if (inStr) {
+      current += ch;
+      if (ch === "\\") {
+        current += argsText[++i] ?? "";
+        continue;
+      }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inStr = ch;
+      current += ch;
+      continue;
+    }
+    if ("([{".includes(ch)) depth++;
+    if (")]}".includes(ch)) depth--;
+    if (ch === "," && depth === 0) {
+      args.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim().length > 0) args.push(current);
+  return args.map((s) => s.trim());
+}
+
+function permissionLiteralFindings(text, filePath) {
+  const findings = [];
+  const localConsts = topLevelStringConsts(text);
+  for (const name of GUARD_CALL_NAMES) {
+    for (const call of findCallArgLists(text, name)) {
+      const args = splitTopLevelArgs(call.argsText);
+      const codeArg = args[2];
+      if (!codeArg) continue;
+      let code = null;
+      const literalMatch = codeArg.match(STRING_LITERAL_RE);
+      if (literalMatch) {
+        code = literalMatch[2];
+      } else if (IDENTIFIER_RE.test(codeArg) && localConsts.has(codeArg)) {
+        code = localConsts.get(codeArg);
+      } else {
+        continue; // not resolvable by this regex pass -- documented blind spot above
+      }
+      if (!libCodeSet.has(code)) {
+        findings.push(`${filePath}:${call.line}: unknown permission code '${code}' passed to ${name}(...)`);
+      }
+    }
+  }
+  return findings;
+}
+
+const permissionCallDirs = ["src/lib/http"];
+const permissionCallFiles = [];
+for (const dir of permissionCallDirs) {
+  const dirUrl = new URL(`../${dir}/`, import.meta.url);
+  for (const entry of readdirSync(dirUrl)) {
+    if (entry.endsWith(".mjs")) permissionCallFiles.push(`${dir}/${entry}`);
+  }
+}
+for (const entry of readdirSync(new URL("../src/lib/", import.meta.url), { withFileTypes: true })) {
+  if (entry.isFile() && entry.name.endsWith(".mjs")) permissionCallFiles.push(`src/lib/${entry.name}`);
+}
+
+for (const filePath of permissionCallFiles) {
+  const text = readFileSync(new URL(`../${filePath}`, import.meta.url), "utf8");
+  failures.push(...permissionLiteralFindings(text, filePath));
+}
+
 if (failures.length) throw new Error(failures.join("\n"));
 console.log(
   `Type contract checks passed: ${libCodeSet.size} permission code(s) consistent across permissions.mjs, seed.sql, and migrations.`
