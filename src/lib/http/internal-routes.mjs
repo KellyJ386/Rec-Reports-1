@@ -28,6 +28,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
+import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -106,7 +107,15 @@ async function handleDrain(request, response, { env }, sendJson) {
   // call site. Unset (dev default) flows through as `undefined`, which
   // reportError treats as a silent no-op -- identical to every other call
   // site in this codebase.
-  const summary = await drainAll({ client, now: new Date(), limit, config: { dsn: env.OBSERVABILITY_DSN } });
+  const now = new Date();
+  const summary = await drainAll({ client, now, limit, config: { dsn: env.OBSERVABILITY_DSN } });
+
+  // DR-20: the report workflow ledger's own drain pass, on the same
+  // CRON_SECRET-guarded service-role client and the same cadence as the
+  // notifications drain above. Never throws (see
+  // report-workflow-executor.mjs's own per-event try/catch) -- a broken
+  // workflow event can dead-letter itself, but can never fail this route.
+  const reportWorkflow = await executeReportWorkflowEvents(client, { now, limit });
 
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
   // cadence as the drain -- the durable throttle store's equivalent of the
@@ -116,7 +125,7 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
-  sendJson(response, 200, { ...summary, authThrottleSwept: authThrottleSwept.deleted });
+  sendJson(response, 200, { ...summary, reportWorkflow, authThrottleSwept: authThrottleSwept.deleted });
 }
 
 // GET /internal/audit/verify-all's chain fetch for one facility. Fetches

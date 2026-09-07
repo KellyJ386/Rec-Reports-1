@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc } from "../supabase-rest.mjs";
 import { makeGuards } from "./guard.mjs";
 import { hasDepartmentPermission } from "../permissions.mjs";
 import {
@@ -10,6 +10,7 @@ import { computeCompliance, dateRange } from "../reports-compliance.mjs";
 import { buildReportPdfPackage } from "../admin/report-pdf.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import { flagState } from "../admin/entitlements.mjs";
+import { evaluateWorkflow } from "../report-workflow.mjs";
 
 const READ = "reports.read";
 const CREATE = "reports.create";
@@ -142,6 +143,58 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
+  }
+
+  // --- Workflow (DR-18/DR-19) -------------------------------------------
+  // Loads the facility's effective config across every module the
+  // workflow's incidents.mjs/work-orders.mjs helpers read from (daily_
+  // reports for the engine's own future keys, incidents for severity
+  // auto-escalation, work_orders for SLA hours), merged into one flat map --
+  // module.config_jsonb key strings are already globally unique (e.g.
+  // "incidents.escalationSlaHours"), so a plain Object.assign cannot
+  // collide. Never throws (loadModuleConfig itself degrades to {} on any
+  // lookup failure); each layer independently defaults to {} so a facility
+  // that has configured nothing behaves exactly like configValue's shipped
+  // defaults.
+  async function loadWorkflowConfig(client, facilityId) {
+    const [dailyReports, incidents, workOrders] = await Promise.all([
+      loadModuleConfig({ client, facilityId, moduleCode: "daily_reports" }),
+      loadModuleConfig({ client, facilityId, moduleCode: "incidents" }),
+      loadModuleConfig({ client, facilityId, moduleCode: "work_orders" })
+    ]);
+    return { ...dailyReports, ...incidents, ...workOrders };
+  }
+
+  // Evaluates the submission's pinned version's workflow_json and persists
+  // the result through the submitting user's own session (never
+  // service-role -- internal.enqueue_report_workflow, 0053, re-checks
+  // reports.submit itself). Swallows every error: a workflow failure must
+  // never block or fail a submit that has already landed.
+  async function enqueueWorkflow(client, { submission, version, payload }) {
+    try {
+      const config = await loadWorkflowConfig(client, submission.facility_id);
+      const { actions } = evaluateWorkflow({
+        template: { id: submission.template_id },
+        version,
+        submission,
+        payload,
+        now: new Date(),
+        config
+      });
+      await pgRpc(client, "enqueue_report_workflow", {
+        p_submission_id: submission.id,
+        p_actions: actions
+      });
+    } catch {
+      // Intentionally swallowed -- see this function's own doc comment.
+      // report_workflow_events has no authenticated-writable path for this
+      // route to fall back to (0053: no insert policy for authenticated),
+      // so there is nothing further to record here beyond what the RPC
+      // itself already persists on a partial success; a total failure
+      // (e.g. the RPC call never reaching PostgREST) leaves no workflow
+      // events for this submission, which the drain's absence of activity
+      // already makes visible operationally.
+    }
   }
 
   // --- Templates -------------------------------------------------------------
@@ -462,7 +515,19 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       const rows = await pgUpdate(auth.client, "report_submissions", { id: params.id }, patch, {
         returning: true
       });
-      return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      const submitted = (rows ?? [])[0] ?? null;
+
+      // DR-18/DR-19: evaluate this version's on_submit workflow and persist
+      // the resulting actions (+ the report.submitted outbox event) through
+      // internal.enqueue_report_workflow (0053) -- ALWAYS attempted on a
+      // successful submit, action list empty or not, so the outbox event
+      // fires uniformly. Wrapped end-to-end: a broken workflow rule, an RPC
+      // rejection, or a network failure must NEVER turn a successful submit
+      // into an error response -- the submission is already durably
+      // 'submitted' by the pgUpdate above.
+      await enqueueWorkflow(auth.client, { submission, version, payload });
+
+      return sendJson(response, 200, submitted);
     })
   );
 
