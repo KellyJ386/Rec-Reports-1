@@ -140,9 +140,16 @@ export async function pgInsert(client, table, rows, options = {}) {
   return request(client, "POST", table, { query, body: rows, headers, signal });
 }
 
+// WO-16: `extra` mirrors pgSelect's own raw-passthrough (e.g.
+// { sla_breached_at: "is.null" }) so a conditional/CAS-style UPDATE -- "only
+// claim this row if some other column is still null" -- can be expressed the
+// same way claimDueJobs/claimDueOutboxEvents already express "only claim
+// while status='pending'" via `filters`. Purely additive: every existing
+// caller omits `extra` and sees byte-identical behavior to before this was
+// added.
 export async function pgUpdate(client, table, filters, patch, options = {}) {
-  const { returning = true, signal } = options;
-  const query = buildQuery({ filters });
+  const { returning = true, extra, signal } = options;
+  const query = buildQuery({ filters, extra });
   const headers = buildHeaders(client, { returning });
   return request(client, "PATCH", table, { query, body: patch, headers, signal });
 }

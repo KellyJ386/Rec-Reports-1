@@ -33,6 +33,7 @@
 import { shouldEscalateIncident, classifyOshaReview } from "./incidents.mjs";
 import { slaHoursForPriority, WORK_ORDER_PRIORITIES } from "./work-orders.mjs";
 import { configValue } from "./settings-registry.mjs";
+import { extractDefects } from "./report-schema.mjs";
 
 const ACTION_TYPES = new Set(["create_incident", "create_work_order", "notify", "queue_pdf"]);
 const CONDITION_OPS = new Set(["eq", "neq", "in", "gt", "lt"]);
@@ -142,6 +143,44 @@ function buildWorkOrderParams(rawParams, { config, now }) {
   return { priority, slaHours, dueAt, title, description };
 }
 
+// WO-21: one create_work_order action per extracted defect (report-schema.mjs
+// extractDefects), gated on the work_orders.autoCreateFromReportDefects
+// setting (new settings-registry key, default false). Priority/SLA are
+// derived exactly like a rule-authored create_work_order action with no
+// explicit severity/priority -- the facility's configured default priority,
+// through the same slaHoursForPriority math -- since a defect field carries
+// no severity signal of its own beyond "this fired".
+//
+// `eventType` is set to `create_work_order:<fieldKey>` rather than the
+// default `<type>:<index>` composition: 0060's create-or-replace of
+// internal.enqueue_report_workflow (0053) honors an action's own eventType
+// when present (falling back to type:index otherwise), so each defect's
+// report_workflow_events ledger row is labeled by the field that produced
+// it -- and, since report_workflow_events' own uniqueness is
+// (submission_id, event_type), this is also what keeps two DIFFERENT
+// defects on the same submission from colliding into a single ledger row.
+// `params.sourceDefectKey` carries the same field key through to
+// internal.mint_workflow_work_order (0060), which is what keeps the DB-side
+// idempotency guard per-defect rather than per-submission (see that
+// migration's header for the full derivation).
+function buildDefectWorkOrderAction(defect, { config, now }) {
+  const priority = configValue(config, "workOrders.defaultPriority");
+  const slaHours = slaHoursForPriority(priority, config);
+  const dueAt = new Date(now.getTime() + slaHours * 60 * 60 * 1000).toISOString();
+  return {
+    type: "create_work_order",
+    eventType: `create_work_order:${defect.fieldKey}`,
+    params: {
+      priority,
+      slaHours,
+      dueAt,
+      title: `Defect: ${defect.label}`,
+      description: defect.summary,
+      sourceDefectKey: defect.fieldKey
+    }
+  };
+}
+
 function buildNotifyParams(rawParams) {
   const params = isPlainObject(rawParams) ? rawParams : {};
   const target = typeof params.target === "string" && params.target.trim() ? params.target.trim() : "managers";
@@ -245,16 +284,35 @@ export function evaluateWorkflow({ template, version, submission, payload, now, 
     actions.push(action);
   }
 
+  // WO-21: one create_work_order action per report-schema.mjs defect field,
+  // appended AFTER every rule-authored action (rule order above is
+  // preserved unchanged; defects are a distinct, additive source of
+  // actions, not interleaved with the template author's own on_submit
+  // list). Off by default (configValue's shipped default is false) -- a
+  // facility that has configured nothing sees byte-identical behavior to
+  // before this existed.
+  if (configValue(effectiveConfig, "workOrders.autoCreateFromReportDefects")) {
+    const defects = extractDefects({ payload: effectivePayload }, version);
+    for (const defect of defects) {
+      actions.push(buildDefectWorkOrderAction(defect, context));
+    }
+  }
+
   return { actions, warnings };
 }
 
-// Exported for DR-19/H-1's event_type generation (`${type}:${index}`) --
-// used directly by report-workflow-executor.mjs's executeEvaluate when it
-// inserts each derived action's own report_workflow_events row (H-1 moved
-// action derivation server-side into the executor; this is the single
-// source of truth for that naming scheme now, not a duplicated SQL
-// algorithm) -- and by tests.
+// Exported for DR-19/H-1's event_type generation -- used directly by
+// report-workflow-executor.mjs's executeEvaluate when it inserts each derived
+// action's own report_workflow_events row (H-1 moved action derivation
+// server-side into the executor; this is the single source of truth for the
+// naming scheme -- the RPC itself only ever inserts one 'evaluate' event) --
+// and by tests. An action carrying its own non-empty `eventType` (WO-21's
+// per-defect create_work_order actions, `create_work_order:<fieldKey>`) uses
+// it verbatim so two defects on one submission get two distinct ledger rows;
+// every other action falls back to the `${type}:${index}` composition.
 export function actionEventType(action, index) {
+  const custom = typeof action?.eventType === "string" ? action.eventType.trim() : "";
+  if (custom) return custom;
   return `${action?.type ?? "unknown"}:${index}`;
 }
 

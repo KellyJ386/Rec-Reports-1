@@ -11,7 +11,9 @@ import {
   canTransition,
   applyStatusChange,
   createWorkOrderFromIncident,
-  workOrderDueAt
+  workOrderDueAt,
+  isResolvingStatus,
+  slaState
 } from "../work-orders.mjs";
 
 const READ = "work_orders.read";
@@ -19,7 +21,34 @@ const MANAGE = "work_orders.manage";
 const INCIDENT_READ = "incidents.read";
 
 const WORK_ORDER_COLUMNS =
-  "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status,assigned_to_employee_id,due_at,completed_at,created_by,created_at,updated_at";
+  "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status," +
+  "assigned_to_employee_id,due_at,completed_at,sla_due_at,first_response_at,sla_breached_at,resolved_at," +
+  "created_by,created_at,updated_at";
+
+// WO-15: server-authoritative SLA fields -- a client can never set any of
+// these directly on create or through a PATCH. sla_due_at is always derived
+// from the facility's resolved workOrders.slaHours* config (never the
+// request body); first_response_at/resolved_at are stamped by this route
+// layer itself off other request fields (a status transition, a posted
+// comment), never taken verbatim from the body; sla_breached_at is stamped
+// ONLY by the SLA scan (src/lib/work-order-sla-scan.mjs) -- 0060's DB
+// trigger is the backstop for that one specifically, this list is the
+// route-layer rejection for all four.
+const CLIENT_IMMUTABLE_SLA_FIELDS = ["sla_due_at", "first_response_at", "sla_breached_at", "resolved_at"];
+
+function rejectedSlaFields(payload) {
+  return CLIENT_IMMUTABLE_SLA_FIELDS.filter((field) => payload[field] !== undefined);
+}
+
+// Maps one DB-shaped work_orders row (snake_case) to slaState's camelCase
+// input shape and attaches the result as `sla` on a shallow copy of the row
+// -- used by both the list and detail responses so the two never drift.
+function withSla(row, now) {
+  return {
+    ...row,
+    sla: slaState({ slaDueAt: row.sla_due_at, slaBreachedAt: row.sla_breached_at, createdAt: row.created_at }, {}, now)
+  };
+}
 
 // WO-12: the assets registry (WO-11/0059) lives in this same file, not a
 // dedicated assets-routes.mjs module. It shares this file's permission
@@ -235,6 +264,25 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       errors.push(`unknown overdue value: ${overdue}`);
     }
 
+    // WO-15: ?sla=breached|at_risk. 'breached' is a plain SQL predicate on
+    // the durable sla_breached_at stamp, applied server-side like every
+    // other filter here. 'at_risk' is NOT a stored column -- it is derived
+    // per-row from slaState -- so it cannot be expressed as a PostgREST
+    // predicate; the route handler below over-fetches open, unbreached,
+    // due-dated candidates and applies slaState/limit/offset in JS instead
+    // (see its own comment for the documented pagination caveat that
+    // implies).
+    let sla = null;
+    const slaParam = qp.get("sla");
+    if (slaParam !== null) {
+      if (slaParam !== "breached" && slaParam !== "at_risk") {
+        errors.push(`unknown sla value: ${slaParam}`);
+      } else {
+        sla = slaParam;
+        if (sla === "at_risk" && !filters.status) filters.status = { in: OPEN_STATUSES };
+      }
+    }
+
     let order = DEFAULT_ORDER;
     const orderParam = qp.get("order");
     if (orderParam) {
@@ -256,7 +304,7 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT });
     if (!paging.ok) return { ok: false, body: { error: paging.error } };
 
-    return { ok: true, filters, order, limit: paging.limit, offset: paging.offset };
+    return { ok: true, filters, order, limit: paging.limit, offset: paging.offset, sla };
   }
 
   // WO-12: parses ?status=/?category=/?q=/?limit=/?offset= for the assets
@@ -345,17 +393,45 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
         const qp = queryParams(request);
-        const query = parseListQuery(qp, params.facilityId, new Date());
+        const now = new Date();
+        const query = parseListQuery(qp, params.facilityId, now);
         if (!query.ok) return sendJson(response, 400, query.body);
         if (!requireRead(auth, params.facilityId, response)) return;
+
+        // WO-15: ?sla=at_risk has no stored column to filter/paginate on in
+        // SQL -- over-fetch every open, unbreached, due-dated candidate (up
+        // to MAX_LIMIT, not the caller's own ?limit=) and apply slaState +
+        // the caller's requested limit/offset in JS below. ?sla=breached, by
+        // contrast, is a plain predicate on the durable sla_breached_at
+        // column and keeps normal SQL-side pagination.
+        const extra = {};
+        let fetchLimit = query.limit;
+        let fetchOffset = query.offset;
+        if (query.sla === "breached") {
+          extra.sla_breached_at = "not.is.null";
+        } else if (query.sla === "at_risk") {
+          extra.sla_breached_at = "is.null";
+          extra.sla_due_at = "not.is.null";
+          fetchLimit = MAX_LIMIT;
+          fetchOffset = 0;
+        }
+
         const rows = await pgSelect(auth.client, "work_orders", {
           filters: query.filters,
           select: WORK_ORDER_COLUMNS,
           order: query.order,
-          limit: query.limit,
-          offset: query.offset
+          limit: fetchLimit,
+          offset: fetchOffset,
+          extra: Object.keys(extra).length > 0 ? extra : undefined
         });
-        return sendJson(response, 200, rows ?? []);
+
+        let shaped = (rows ?? []).map((row) => withSla(row, now));
+        if (query.sla === "at_risk") {
+          shaped = shaped
+            .filter((row) => row.sla.state === "at_risk")
+            .slice(query.offset, query.offset + query.limit);
+        }
+        return sendJson(response, 200, shaped);
       })
   );
 
@@ -391,6 +467,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         }
         if (dueAt !== undefined && (typeof dueAt !== "string" || Number.isNaN(new Date(dueAt).getTime()))) {
           shape.push("dueAt must be a valid ISO date string");
+        }
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          shape.push(`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`);
         }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
 
@@ -436,7 +516,13 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         );
 
         const now = new Date();
-        const resolvedDueAt = dueAt ?? workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+        // WO-15: sla_due_at is ALWAYS the config-derived deadline, even when
+        // the caller overrides dueAt (the human target) -- the two are
+        // independent columns from here on. due_at keeps its pre-WO-15
+        // fallback behavior (the same config-derived value) when the caller
+        // supplies no override.
+        const slaDueAt = workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+        const resolvedDueAt = dueAt ?? slaDueAt;
 
         const row = {
           facility_id: created.facilityId,
@@ -450,6 +536,7 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           status: created.status,
           assigned_to_employee_id: assignee ?? null,
           due_at: resolvedDueAt,
+          sla_due_at: slaDueAt,
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
@@ -466,7 +553,7 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         const workOrder = await loadWorkOrder(auth.client, params.id);
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requireRead(auth, workOrder.facility_id, response)) return;
-        return sendJson(response, 200, workOrder);
+        return sendJson(response, 200, withSla(workOrder, new Date()));
       })
   );
 
@@ -495,6 +582,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (sourceType !== undefined && sourceType !== null && !SOURCE_TYPE_SET.has(sourceType)) {
           shape.push(`unknown source_type: ${sourceType}`);
         }
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          shape.push(`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`);
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
 
@@ -504,6 +595,13 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           assigned_to_employee_id: body.payload.assigned_to_employee_id
         });
         if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        // WO-15: sla_due_at is always the facility's resolved
+        // workOrders.slaHours* deadline -- never the client-supplied due_at
+        // (which stays the human target, unchanged).
+        const config = await loadModuleConfig({ client: auth.client, facilityId: params.facilityId, moduleCode: "work_orders" });
+        const now = new Date();
+        const slaDueAt = workOrderDueAt({ priority }, config, now).toISOString();
 
         const row = {
           facility_id: params.facilityId,
@@ -515,6 +613,7 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           description,
           priority,
           status: "open",
+          sla_due_at: slaDueAt,
           assigned_to_employee_id: body.payload.assigned_to_employee_id ?? null,
           due_at: body.payload.due_at ?? null,
           created_by: auth.claims.sub
@@ -536,6 +635,17 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       withAuth(request, response, env, async (auth) => {
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        // WO-15: an SLA field in the body 400s before even the
+        // "nothing to update" shape check below, so the response always
+        // names the offending field(s) rather than "nothing to update" when
+        // that is the ONLY thing the caller sent.
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          return sendJson(response, 400, {
+            errors: [`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`]
+          });
+        }
 
         const { status: nextStatus, priority: nextPriority, assigned_to_employee_id: nextAssignee } = body.payload;
         if (nextStatus === undefined && nextPriority === undefined && nextAssignee === undefined) {
@@ -572,6 +682,17 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
 
         if (nextStatus !== undefined) {
           Object.assign(patch, applyStatusChange(workOrder, nextStatus, now));
+          // WO-15: resolved_at stamps once on entering resolved/closed and
+          // keeps its original timestamp through a resolved -> closed
+          // transition (isResolvingStatus is true for both); it clears on
+          // any transition OUT of that pair (e.g. a resolved -> in_progress
+          // reopen), mirroring completed_at's own reopen-clears behavior
+          // above. first_response_at stamps once, the first time a work
+          // order moves off 'open' -- never re-stamped or cleared after.
+          patch.resolved_at = isResolvingStatus(nextStatus) ? workOrder.resolved_at ?? now.toISOString() : null;
+          if (workOrder.status === "open" && !workOrder.first_response_at) {
+            patch.first_response_at = now.toISOString();
+          }
           history.push({
             update_type: "status_change",
             previous_value: workOrder.status ?? null,
@@ -617,7 +738,8 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           );
         }
 
-        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+        const updated = (rows ?? [])[0] ?? null;
+        return sendJson(response, 200, updated ? withSla(updated, now) : null);
       })
   );
 
@@ -670,6 +792,20 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_order_updates", [row], { returning: true });
+
+        // WO-15: a comment is a "first response" exactly like a status
+        // change off open is (see the PATCH route above) -- stamp it once,
+        // only when nothing has stamped it yet, never overwrite it.
+        if (!workOrder.first_response_at) {
+          await pgUpdate(
+            auth.client,
+            "work_orders",
+            { id: workOrder.id },
+            { first_response_at: new Date().toISOString() },
+            { returning: false }
+          );
+        }
+
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
       })
   );

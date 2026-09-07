@@ -343,6 +343,47 @@ function validatePhotoConstraints(field, prefix, errors) {
   }
 }
 
+// --- WO-21: the defect field convention --------------------------------
+// A field may carry `isDefect: true` to mark it as a signal that its own
+// answer represents a maintenance defect worth a work order (e.g. a
+// checklist item that failed, or a select whose answer names a specific
+// fault). Only meaningful on the two field types with a fixed, enumerable
+// answer set -- checkbox and select -- since "which answer counts as a
+// defect" needs to be an unambiguous, author-declared value, not a free-text
+// guess. `defectWhen` names that value: on a checkbox it is optional
+// (defaults to `true` -- "checked means defective"); on a select it is
+// REQUIRED (there is no single obvious "defective" option among an
+// author-defined list) and must be one of the field's own `options`.
+// extractDefects (below) reads this convention at submit time; nothing here
+// changes value validation itself -- a defect field's answer is still
+// checked against its ordinary type rules exactly like any other field.
+const DEFECT_ELIGIBLE_TYPES = new Set(["checkbox", "select"]);
+
+function validateDefectFlag(field, prefix, errors) {
+  if (field.isDefect !== undefined && typeof field.isDefect !== "boolean") {
+    errors.push(`${prefix}.isDefect must be a boolean`);
+    return;
+  }
+  const isDefect = field.isDefect === true;
+  if (field.defectWhen !== undefined && !isDefect) {
+    errors.push(`${prefix}.defectWhen is only valid when isDefect is true`);
+  }
+  if (!isDefect) return;
+  if (!DEFECT_ELIGIBLE_TYPES.has(field.type)) {
+    errors.push(`${prefix}.isDefect is only valid on checkbox or select fields`);
+    return;
+  }
+  if (field.type === "select") {
+    if (field.defectWhen === undefined) {
+      errors.push(`${prefix}.defectWhen is required when isDefect is true on a select field`);
+    } else if (Array.isArray(field.options) && field.options.length > 0 && !field.options.includes(field.defectWhen)) {
+      errors.push(`${prefix}.defectWhen must be one of the field's own options`);
+    }
+  } else if (field.type === "checkbox" && field.defectWhen !== undefined && typeof field.defectWhen !== "boolean") {
+    errors.push(`${prefix}.defectWhen must be a boolean when set on a checkbox field`);
+  }
+}
+
 const VISIBILITY_RULE_KEYS = new Set(["field", "op", "value"]);
 
 // Validates one field's `visibility_rules` array at authoring time: shape,
@@ -512,6 +553,7 @@ export function validateReportTemplateSchema(schema) {
       validateHelpText(field, prefix, errors);
       validatePhotoConstraints(field, prefix, errors);
       validateDefaultValue(field, prefix, errors);
+      validateDefectFlag(field, prefix, errors);
 
       const deps = validateFieldVisibilityRules(field, prefix, errors);
       if (field.key) visibilityDeps.set(field.key, deps);
@@ -890,4 +932,60 @@ export function findFieldByKey(schema, key) {
     }
   }
   return null;
+}
+
+// WO-21: extractDefects(submission, templateVersion) ->
+// [{ fieldKey, label, value, summary }, ...], in schema field order. Pure --
+// no I/O, exactly like every other function in this module -- so
+// src/lib/report-workflow.mjs's evaluateWorkflow can call it directly at
+// submit-evaluation time without threading any extra dependency through.
+//
+// `submission` reads `.payload` (the submitted answers -- report-workflow.mjs
+// passes `{ payload: effectivePayload }`, the same object it already
+// resolved for its own condition evaluation, so submission.payload_json vs.
+// a separately-tracked payload can never disagree here); `templateVersion`
+// reads `.schema_json` (falling back to `.schema` so a caller that already
+// unwrapped the version's schema, e.g. a test fixture, works unchanged).
+//
+// A field only ever fires when ALL of the following hold:
+//   - it declares `isDefect: true` (the report-schema.mjs authoring
+//     convention above);
+//   - its type is checkbox or select (extractDefects trusts
+//     validateReportTemplateSchema already rejected anything else at
+//     authoring time, but re-checks the type here too -- defense in depth
+//     against a template saved before that validation existed);
+//   - it is NOT currently hidden by its own visibility_rules (evaluateVisibility,
+//     the same function submit-time validation already uses -- a field the
+//     respondent never saw can never represent an observed defect);
+//   - its submitted value equals the field's defectWhen (checkbox: defaults
+//     to `true` when defectWhen is unset; select: defectWhen is always
+//     required by validateDefectFlag, so no default is needed there).
+// A field with no answer at all (undefined/null) never fires, regardless of
+// defectWhen -- there is nothing to report a defect FROM.
+export function extractDefects(submission, templateVersion) {
+  const schema = templateVersion?.schema_json ?? templateVersion?.schema ?? null;
+  const payload = isPlainObject(submission?.payload) ? submission.payload : {};
+  if (!schema || !Array.isArray(schema.sections)) return [];
+
+  const hidden = evaluateVisibility(schema, payload);
+  const defects = [];
+  for (const section of schema.sections) {
+    for (const field of section?.fields ?? []) {
+      if (!field?.key || !field.isDefect) continue;
+      if (!DEFECT_ELIGIBLE_TYPES.has(field.type)) continue;
+      if (hidden.has(field.key)) continue;
+      if (!Object.prototype.hasOwnProperty.call(payload, field.key)) continue;
+
+      const value = payload[field.key];
+      if (value === undefined || value === null) continue;
+
+      const defectWhen = field.type === "checkbox" ? (field.defectWhen ?? true) : field.defectWhen;
+      if (value !== defectWhen) continue;
+
+      const label = field.label ?? field.key;
+      const summary = field.type === "checkbox" ? `${label} flagged as a defect` : `${label}: ${value}`;
+      defects.push({ fieldKey: field.key, label, value, summary });
+    }
+  }
+  return defects;
 }

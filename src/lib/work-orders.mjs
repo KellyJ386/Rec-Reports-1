@@ -16,6 +16,9 @@ export const ASSET_CRITICALITY_LEVELS = ["low", "medium", "high", "critical"];
 export const WORK_ORDER_SOURCE_TYPES = ["manual", "report", "incident"];
 // Statuses that stamp completed_at when entered.
 const COMPLETING_STATUSES = new Set(["resolved", "closed", "cancelled"]);
+// WO-15: the narrower subset that also stamps resolved_at -- 'cancelled' is
+// a completion (stops the clock), but never a resolution.
+const RESOLVING_STATUSES = new Set(["resolved", "closed"]);
 
 const priorityRank = { low: 1, medium: 2, high: 3, urgent: 4 };
 const openStatuses = new Set(OPEN_STATUSES);
@@ -59,6 +62,73 @@ export function applyStatusChange(workOrder, next, now = new Date()) {
 
 export function isWorkOrderOverdue(workOrder, now = new Date()) {
   return isWorkOrderOpen(workOrder) && Boolean(workOrder.dueAt) && new Date(workOrder.dueAt) < now;
+}
+
+// WO-15: whether `next` is a status that stamps resolved_at when entered
+// (narrower than the completing-status set applyStatusChange already keys
+// off of -- see RESOLVING_STATUSES above). Exported so the route layer can
+// derive resolved_at without duplicating the status list itself.
+export function isResolvingStatus(status) {
+  return RESOLVING_STATUSES.has(status);
+}
+
+// WO-15: minimum at-risk window in hours, used regardless of how short a
+// work order's own SLA window is (see slaState below).
+const MIN_AT_RISK_HOURS = 4;
+// The fraction of a work order's own [createdAt, slaDueAt] window that
+// counts as "at risk" once entered, when that fraction exceeds
+// MIN_AT_RISK_HOURS.
+const AT_RISK_WINDOW_FRACTION = 0.2;
+
+// slaState(workOrder, config, now) -> { state, dueAt, remainingHours }.
+//
+// `workOrder` reads camelCase fields (slaDueAt, slaBreachedAt, createdAt),
+// matching every other domain helper in this module -- the route layer maps
+// the DB's snake_case columns before calling this. `config` is accepted for
+// forward compatibility (a future per-facility at-risk-threshold override)
+// but is not read today; every threshold below is a fixed module constant.
+//
+// Rules (WO-15's acceptance: "at_risk within the last 20% of the window or
+// <= 4h, whichever is larger"):
+//   - No sla_due_at at all -> 'on_track' (nothing to measure against; a work
+//     order predating WO-15 with no due_at either backfills to null, see
+//     0060's migration header).
+//   - Already stamped breached (sla_breached_at set), OR now is at/past
+//     sla_due_at (remainingHours <= 0) -> 'breached'. The scan (WO-16) is
+//     what durably STAMPS sla_breached_at, but this function reports the
+//     breached STATE as soon as the deadline has passed even if the scan
+//     hasn't run yet -- "is this overdue" should never lag a periodic job by
+//     definition, only the notification side effect does.
+//   - Otherwise: the window is [createdAt, slaDueAt] (falling back to the
+//     MIN_AT_RISK_HOURS floor alone when createdAt is unknown or the window
+//     is non-positive, e.g. malformed data). at_risk when the remaining time
+//     is at or under max(20% of that window, 4h); otherwise on_track.
+// Boundary is inclusive at both ends (remainingHours === threshold counts as
+// at_risk; remainingHours === 0 counts as breached), so the three states
+// partition the timeline with no gap.
+export function slaState(workOrder, config = {}, now = new Date()) {
+  const dueAtRaw = workOrder?.slaDueAt;
+  if (!dueAtRaw) return { state: "on_track", dueAt: null, remainingHours: null };
+
+  const dueAt = new Date(dueAtRaw);
+  const remainingHours = (dueAt.getTime() - now.getTime()) / (60 * 60 * 1000);
+
+  if (workOrder?.slaBreachedAt || remainingHours <= 0) {
+    return { state: "breached", dueAt: dueAt.toISOString(), remainingHours };
+  }
+
+  let atRiskThresholdHours = MIN_AT_RISK_HOURS;
+  const createdAtRaw = workOrder?.createdAt;
+  if (createdAtRaw) {
+    const createdAt = new Date(createdAtRaw);
+    const windowHours = (dueAt.getTime() - createdAt.getTime()) / (60 * 60 * 1000);
+    if (windowHours > 0) {
+      atRiskThresholdHours = Math.max(windowHours * AT_RISK_WINDOW_FRACTION, MIN_AT_RISK_HOURS);
+    }
+  }
+
+  const state = remainingHours <= atRiskThresholdHours ? "at_risk" : "on_track";
+  return { state, dueAt: dueAt.toISOString(), remainingHours };
 }
 
 export function sortWorkOrdersForDashboard(workOrders, now = new Date()) {

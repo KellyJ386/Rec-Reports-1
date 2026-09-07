@@ -223,6 +223,16 @@ export const settingsRegistry = Object.freeze(
       validation: { min: 1, max: 2160 },
       permission: "admin.manage"
     },
+    {
+      key: "workOrders.autoCreateFromReportDefects",
+      module: "work_orders",
+      label: "Auto-create work orders from report defect fields",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: false, // WO-21: off by default for pilots (report-schema.mjs's isDefect convention)
+      validation: {},
+      permission: "admin.manage"
+    },
 
     // --- Daily reports (module code: daily_reports) ------------------------
     {

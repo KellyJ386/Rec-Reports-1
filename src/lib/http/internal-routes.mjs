@@ -33,6 +33,7 @@ import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
 import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { processReportPdfJobs } from "../report-pdf-worker.mjs";
+import { scanWorkOrderSla } from "../work-order-sla-scan.mjs";
 import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
@@ -187,6 +188,15 @@ async function handleDrain(request, response, { env }, sendJson) {
   // rather than resolving each escalation's own facility's tenant
   // overrides, matching this drain's existing global-defaults posture.
   const incidentSla = await sweepIncidentEscalations(client, { now, limit });
+  // WO-16: same drain invocation, same service-role client (a work order's
+  // sla_breached_at can only ever be written by a service-role session --
+  // 0060's DB trigger rejects any authenticated-session write to it -- so
+  // this scan MUST run here, never off an end-user route). Never throws
+  // (every per-row failure inside scanWorkOrderSla simply isn't counted as
+  // breached/enqueued; the next pass retries it since sla_breached_at is
+  // only stamped on a successful claim), so a broken scan can't turn a
+  // healthy drain into a 500 any more than the other consumers above can.
+  const workOrderSla = await scanWorkOrderSla(client, { now, limit, config: { dsn: env.OBSERVABILITY_DSN } });
 
   sendJson(response, 200, {
     ...summary,
@@ -194,7 +204,8 @@ async function handleDrain(request, response, { env }, sendJson) {
     reportDistribution: reportDistributionSummary,
     reportPdf,
     authThrottleSwept: authThrottleSwept.deleted,
-    incidentSla
+    incidentSla,
+    workOrderSla
   });
 }
 
