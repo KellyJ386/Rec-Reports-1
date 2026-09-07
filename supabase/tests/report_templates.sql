@@ -258,6 +258,35 @@ begin
 end;
 $$;
 
+-- 6a2. M-1(a) INSERT arm: inserting a brand-new version that is ALREADY
+-- is_published = true (skipping the false -> true UPDATE the guard watched
+-- before) must be rejected the same way -- otherwise "insert pre-published,
+-- then point active_version at it" would bypass governance entirely.
+do $$
+begin
+  begin
+    insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published)
+      values ('28100000-0000-0000-0000-000000001005', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28100000-0000-0000-0000-000000001001', 3, '{"sections":[]}'::jsonb, true);
+    raise exception 'RT FAIL: inserting a pre-published version succeeded under templatePublishRequiresApproval with no change request';
+  exception
+    when insufficient_privilege then null; -- expected: fn_report_template_version_publish_guard raised on INSERT
+  end;
+end;
+$$;
+
+-- 6a3. The INSERT arm only bites when is_published is true: an unpublished
+-- draft version still inserts freely (the governed transition is publishing,
+-- not authoring).
+do $$
+begin
+  insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published)
+    values ('28100000-0000-0000-0000-000000001006', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28100000-0000-0000-0000-000000001001', 3, '{"sections":[]}'::jsonb, false);
+exception
+  when insufficient_privilege then
+    raise exception 'RT FAIL: inserting an UNPUBLISHED draft version was denied by the publish guard';
+end;
+$$;
+
 -- 6b. Stage + approve a change request for this exact version (requester
 -- 28...a01, a DIFFERENT reviewer 28...a03) -- then the identical publish
 -- UPDATE succeeds.

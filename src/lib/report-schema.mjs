@@ -54,8 +54,7 @@ export function isSupportedFieldType(type) {
 // (unsafeRegexStructureReason below), applied in this exact order by
 // unsafeRegexPatternReason:
 //   1. Must be a non-empty string, at most MAX_REGEX_PATTERN_LENGTH (200)
-//      characters -- bounds the search space of every check below and caps
-//      how much backtracking even a pathological pattern could ever attempt.
+//      characters -- bounds the search space of every check below.
 //   2. Must be anchored: starts with `^` and ends with an UNESCAPED `$`
 //      (rejects a pattern ending `\$`, since that is a literal dollar sign,
 //      not the end anchor) -- an unanchored pattern can be forced into more
@@ -72,39 +71,64 @@ export function isSupportedFieldType(type) {
 //        b. No group nested more than one level deep -- `((a))` is
 //           rejected, `(a(b)c)` is rejected, `(a)(b)` (two SIBLING
 //           depth-1 groups) is fine.
-//        c. `|` alternation is legal only at the TOP level (depth 0) --
-//           `a|b` is fine, `(a|b)` is not, closing off the alternation-
-//           inside-a-repeated-group shape (`(a|a)*`) entirely regardless of
-//           whether the group is ever quantified.
+//        c. `|` alternation is legal only INSIDE a group (depth 1) --
+//           `^(AM|PM)$` is fine, `^AM|PM$` is not: a top-level `|` binds
+//           looser than the anchors, so the second branch of `^AM|PM$` is
+//           `PM$` with no `^` -- an unanchored branch that silently changes
+//           what "matches" means and defeats rule 2. Each alternative
+//           counts toward the backtracking budget in (f), and the group
+//           carrying the alternation is still subject to (d), so the
+//           `(a|a)*` shape stays impossible.
 //        d. A GROUP may carry at most a single, non-repeated `?` (optional,
 //           greedy or lazy: `(a)?`, `(a)??`) -- any other quantifier
 //           immediately following a group's closing `)` (`*`, `+`, `{n,m}`,
-//           `{n,}`, or a second `?`) is rejected. This is the one rule that
-//           actually matters for catastrophic backtracking: a REPEATED group
-//           is what turns whatever ambiguity lives inside it (alternation,
-//           a nested quantifier, an optional sub-match) into exponential
-//           work: `(a+)+`, `(\d\d?)*`, `(a{1,2})*` are all caught here, on
-//           top of (c) already catching `(a|a)*`. Quantifiers on ordinary
-//           atoms outside a group (`\d+`, `[A-Z]{2}`, `a*`) are NOT
-//           restricted by this rule at all -- only a group's own trailing
-//           quantifier is.
+//           `{n,}`, or a second `?`) is rejected. A REPEATED group is what
+//           turns whatever ambiguity lives inside it (alternation, a nested
+//           quantifier, an optional sub-match) into exponential work:
+//           `(a+)+`, `(\d\d?)*`, `(a{1,2})*`, `(a|a)*` are all caught here.
 //        e. At most MAX_REGEX_QUANTIFIERS (8) quantifier occurrences in the
 //           whole pattern (belt-and-suspenders bound on authoring
-//           complexity, independent of (d)).
+//           complexity, independent of (d) and (f)).
+//        f. Backtracking budget. Quantifiers on ORDINARY atoms are the
+//           remaining source of super-linear matching: two or more
+//           quantified atoms that can match the same characters
+//           (`^\d+\d+\d+\d+x$`, `^\d{1,64}\d{1,64}\d{1,64}\d{1,64}x$`) make
+//           the engine try every way of splitting a failing input between
+//           them -- polynomial in the input length with the exponent equal
+//           to the number of overlapping quantifiers, and measured at
+//           ~9 seconds for four `\d+` on a 400-character value. The scanner
+//           does not try to prove which atoms overlap; it bounds the worst
+//           case instead. Every quantifier multiplies a running "ambiguity"
+//           by the number of ways it can split a MAX_REGEX_INPUT_LENGTH
+//           (512) character input -- `*`, `+`, `{n,}` by 512; `{n,m}` by
+//           (m - n + 1); `?` by 2; `{n}` by 1; a group with k alternatives
+//           by k -- and the pattern is rejected once that product exceeds
+//           MAX_REGEX_BACKTRACK_BUDGET (2^22). In practice: two unbounded
+//           quantifiers are always fine (2^18), a third is never fine
+//           (2^27), and one unbounded quantifier leaves room for bounded
+//           ranges multiplying out to 8192 (`{1,64}` twice plus a `?`).
+//           Ordinary field patterns -- `^\d+(\.\d+)?$`, `^[A-Z]{2}-\d{4}$`,
+//           `^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,10}$` -- all fit.
 //   5. Must be syntactically valid (`new RegExp(pattern)` does not throw).
 //      Constructing a RegExp only compiles it -- it never executes matching
 //      -- so this step carries no backtracking risk regardless of shape.
 // Defense in depth at match time (validateFieldValue): a value longer than
-// MAX_REGEX_INPUT_LENGTH is rejected without ever being passed to `.test()`,
-// bounding the worst case even if a future pattern shape turns out to evade
-// the static checks above.
+// MAX_REGEX_INPUT_LENGTH (512) is rejected without ever being passed to
+// `.test()`. Rule (f) is computed against that same cap, so the budget it
+// enforces is the real worst case, not an estimate for an unbounded value.
 const MAX_REGEX_PATTERN_LENGTH = 200;
-const MAX_REGEX_INPUT_LENGTH = 2000;
+const MAX_REGEX_INPUT_LENGTH = 512;
 const MAX_REGEX_QUANTIFIERS = 8;
+// Upper bound on the number of distinct ways the quantifiers in a pattern
+// can carve up a MAX_REGEX_INPUT_LENGTH-character input (see rule (f) in the
+// module doc comment). 2^22 measured at well under 100 ms of backtracking on
+// this engine for the worst shapes that still fit inside it; the shapes the
+// security review timed in seconds sit at 2^27 and above.
+const MAX_REGEX_BACKTRACK_BUDGET = 2 ** 22;
 const BACKREFERENCE_RE = /\\[1-9]/;
 const LOOKAROUND_AT_RE = /^\(\?(?:=|!|<=|<!)/;
 const GROUP_QUANTIFIER_RE = /^(?:\*|\+|\{\d*(?:,\d*)?\})/;
-const BRACE_QUANTIFIER_RE = /^\{\d*(?:,\d*)?\}/;
+const BRACE_QUANTIFIER_RE = /^\{(\d+)(?:(,)(\d*))?\}/;
 
 // Structural allow-list scan over `pattern` (already known to be a string).
 // Returns a rejection reason, or null when the pattern's STRUCTURE is safe
@@ -114,8 +138,18 @@ const BRACE_QUANTIFIER_RE = /^\{\d*(?:,\d*)?\}/;
 function unsafeRegexStructureReason(pattern) {
   let depth = 0;
   let quantifiers = 0;
+  // Rule (f): running product of "how many ways can this quantifier split
+  // the input" over every quantifier and alternation seen so far.
+  let ambiguity = 1;
+  // Number of `|`-separated alternatives inside the currently open group
+  // (1 = no alternation). Folded into `ambiguity` when the group closes.
+  let groupBranches = 1;
   let i = 0;
   const n = pattern.length;
+
+  const overBudget = () => ambiguity > MAX_REGEX_BACKTRACK_BUDGET;
+  const budgetReason =
+    "has too much backtracking potential -- use fewer unbounded quantifiers (*, +, {n,}) or narrower {n,m} ranges";
 
   while (i < n) {
     const ch = pattern[i];
@@ -152,6 +186,7 @@ function unsafeRegexStructureReason(pattern) {
       if (depth > 1) {
         return "must not nest groups more than one level deep";
       }
+      groupBranches = 1;
       i += 1;
       continue;
     }
@@ -160,28 +195,40 @@ function unsafeRegexStructureReason(pattern) {
       depth -= 1;
       if (depth < 0) return "has unbalanced parentheses";
       i += 1;
+      // Rule (c): each alternative is one more way to match the same span.
+      ambiguity *= groupBranches;
+      groupBranches = 1;
       const rest = pattern.slice(i);
       if (GROUP_QUANTIFIER_RE.test(rest)) {
         return "must not repeat a group -- only a single trailing ? is allowed after a group";
       }
       if (rest[0] === "?") {
         quantifiers += 1;
+        ambiguity *= 2;
         i += 1;
         if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") {
           return "must not repeat a group -- only a single trailing ? is allowed after a group";
         }
       }
+      if (overBudget()) return budgetReason;
       continue;
     }
 
     if (ch === "|") {
-      if (depth > 0) return "must not use alternation inside a group -- only top-level | is allowed";
+      if (depth === 0) {
+        return "must wrap alternation in a group (for example ^(AM|PM)$) -- a top-level | leaves one branch unanchored";
+      }
+      groupBranches += 1;
       i += 1;
       continue;
     }
 
     if (ch === "*" || ch === "+" || ch === "?") {
       quantifiers += 1;
+      // `*` and `+` are unbounded: the atom can take anywhere from 0/1 up to
+      // the whole (capped) input. `?` is a plain either/or.
+      ambiguity *= ch === "?" ? 2 : MAX_REGEX_INPUT_LENGTH;
+      if (overBudget()) return budgetReason;
       i += 1;
       if (pattern[i] === "?") i += 1; // lazy modifier on an ordinary atom
       continue;
@@ -191,6 +238,17 @@ function unsafeRegexStructureReason(pattern) {
       const match = BRACE_QUANTIFIER_RE.exec(pattern.slice(i));
       if (match) {
         quantifiers += 1;
+        const min = Number(match[1]);
+        if (match[2] === undefined) {
+          // {n}: exact repetition -- exactly one way to match.
+        } else if (match[3] === "") {
+          ambiguity *= MAX_REGEX_INPUT_LENGTH; // {n,}: unbounded
+        } else {
+          // {n,m}: (m - n + 1) ways, but never more than the input allows.
+          const max = Number(match[3]);
+          ambiguity *= Math.min(Math.max(max - min, 0) + 1, MAX_REGEX_INPUT_LENGTH);
+        }
+        if (overBudget()) return budgetReason;
         i += match[0].length;
         if (pattern[i] === "?") i += 1;
         continue;
