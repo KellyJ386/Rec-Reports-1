@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, pgDelete } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 import { loadEntitlements, isEntitled } from "../admin/entitlements.mjs";
 
@@ -16,27 +16,11 @@ const ROUTE_COLUMNS = "id,facility_id,event_code,priority,route_jsonb,active,cre
 // communications.publish. The global event catalog is readable by any
 // authenticated caller.
 export function registerNotificationRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireMember(auth, facilityId, response) {
-    if (!authCanAccessFacility(auth, facilityId)) {
-      sendJson(response, 403, { error: "not a member of this facility" });
-      return false;
-    }
-    return true;
-  }
+  const { withAuth, requireMember, parseJsonBody, queryParams } = makeGuards({
+    authenticate,
+    sendJson,
+    readBody
+  });
 
   function requirePublish(auth, facilityId, response) {
     const guard = requireAuthPermission(auth, facilityId, PUBLISH);
@@ -66,10 +50,6 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
       return false;
     }
     return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
   }
 
   // --- Event catalog (global, read-all) --------------------------------------

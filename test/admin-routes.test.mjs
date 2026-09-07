@@ -145,6 +145,86 @@ test("POST facilities happy path inserts into facilities for an org admin", asyn
   ]);
 });
 
+// --- P-10: PATCH /facilities/:facilityId ------------------------------------
+
+test("PATCH facility rejects an invalid IANA timezone with 400 before any guard", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", { name: "Rink One", timezone: "Nonsense" });
+  assert.equal(result.status, 400);
+  assert.ok(result.payload.errors.some((e) => /IANA time zone/.test(e)));
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH facility denies a caller without an organization_admins row with 403", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    // No organization_admins row -> requireAuthOrgAdminRow denies.
+    if (table === "organization_admins" && method === "GET") return [];
+    return [];
+  });
+  // admin.manage on fac-1 is not enough -- PATCH /facilities requires an
+  // organization_admins row (0019), same rule as POST /org/:orgId/facilities.
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", { name: "Rink One", timezone: "America/Chicago" });
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /organization_admins/);
+});
+
+test("PATCH facility 404s when the facility does not exist", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/missing", { name: "Rink One" });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH facility happy path updates name and timezone for an org admin", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_admins" && method === "GET") return [{ id: "oa-1" }];
+    if (table === "facilities" && method === "PATCH") {
+      return [{ id: "fac-1", name: "Rink One Renamed", timezone: "America/Chicago" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", {
+    name: "Rink One Renamed",
+    timezone: "America/Chicago"
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.name, "Rink One Renamed");
+  const update = captured.find((c) => c.table === "facilities" && c.method === "PATCH");
+  assert.deepEqual(update.body, { name: "Rink One Renamed", timezone: "America/Chicago" });
+  assert.equal(update.url.searchParams.get("id"), "eq.fac-1");
+});
+
+// PATCH is a partial update: leaving `name` out keeps it unchanged (the
+// validator runs in partial mode), while an explicitly blank name is still
+// rejected.
+test("PATCH facility accepts a timezone-only patch and leaves name untouched", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_admins") return [{ user_id: "user-1", organization_id: "org-1" }];
+    if (table === "facilities" && method === "PATCH") return [{ id: "fac-1", timezone: "America/Chicago" }];
+    return [];
+  });
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", { timezone: "America/Chicago" });
+  assert.equal(result.status, 200);
+  const update = captured.find((c) => c.table === "facilities" && c.method === "PATCH");
+  assert.deepEqual(update.body, { timezone: "America/Chicago" });
+});
+
+test("PATCH facility still rejects an explicitly blank name", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: ADMIN_ON_FAC1 });
+  const result = await call("PATCH", "/facilities/fac-1", { name: "   " });
+  assert.equal(result.status, 400);
+  assert.deepEqual(result.payload.errors, ["name is required"]);
+  assert.equal(captured.length, 0);
+});
+
 test("PATCH department resolves the facility, guards on it, and updates by id", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "departments" && method === "GET") return [{ id: "dep-1", facility_id: "fac-1" }];

@@ -211,3 +211,153 @@ test("POST route test denies a non-publisher with 403", async (t) => {
   const result = await call("POST", "/facilities/fac-1/notification-routes/route-1/test");
   assert.equal(result.status, 403);
 });
+
+// --- P-10: PATCH distribution list ------------------------------------------
+
+test("PATCH distribution list denies a member without communications.publish", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("PATCH", "/facilities/fac-1/distribution-lists/list-1", { name: "Renamed" });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH distribution list rejects an empty name with 400", async (t) => {
+  const captured = stubFetch(t, withEntitlement(() => []));
+  const { call } = mount();
+  const result = await call("PATCH", "/facilities/fac-1/distribution-lists/list-1", { name: "   " });
+  assert.equal(result.status, 400);
+  assert.deepEqual(result.payload.errors, ["name must be a non-empty string"]);
+  assert.ok(
+    !captured.some((c) => c.table === "distribution_lists" && c.method === "PATCH"),
+    "must not attempt the update"
+  );
+});
+
+test("PATCH distribution list rejects an empty patch with 400", async (t) => {
+  stubFetch(t, withEntitlement(() => []));
+  const { call } = mount();
+  const result = await call("PATCH", "/facilities/fac-1/distribution-lists/list-1", {});
+  assert.equal(result.status, 400);
+  assert.equal(result.payload.error, "nothing to update");
+});
+
+test("PATCH distribution list happy path updates name/description/active and stamps updated_at", async (t) => {
+  const captured = stubFetch(
+    t,
+    withEntitlement((table, method) => {
+      if (table === "distribution_lists" && method === "PATCH") return [{ id: "list-1", name: "Renamed" }];
+      return [];
+    })
+  );
+  const { call } = mount();
+  const result = await call("PATCH", "/facilities/fac-1/distribution-lists/list-1", {
+    name: "  Renamed  ",
+    description: "New description",
+    active: false
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.name, "Renamed");
+  const patch = captured.find((c) => c.table === "distribution_lists" && c.method === "PATCH");
+  assert.equal(patch.body.name, "Renamed");
+  assert.equal(patch.body.description, "New description");
+  assert.equal(patch.body.active, false);
+  assert.ok(patch.body.updated_at);
+  assert.equal(patch.url.searchParams.get("id"), "eq.list-1");
+  assert.equal(patch.url.searchParams.get("facility_id"), "eq.fac-1");
+});
+
+// --- P-10: GET distribution-list members / DELETE member --------------------
+
+test("GET distribution-list members denies a non-member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/distribution-lists/list-1/members");
+  assert.equal(result.status, 403);
+});
+
+test("GET distribution-list members returns the shaped rows for a member", async (t) => {
+  const captured = stubFetch(t, (table) =>
+    table === "distribution_list_members"
+      ? [{ id: "m-1", facility_id: "fac-1", distribution_list_id: "list-1", member_type: "role", member_ref_id: "role-a" }]
+      : []
+  );
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("GET", "/facilities/fac-1/distribution-lists/list-1/members");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  const get = captured.find((c) => c.table === "distribution_list_members" && c.method === "GET");
+  assert.equal(get.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(get.url.searchParams.get("distribution_list_id"), "eq.list-1");
+});
+
+test("DELETE distribution list member denies a member without communications.publish", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("DELETE", "/facilities/fac-1/distribution-lists/list-1/members/m-1");
+  assert.equal(result.status, 403);
+  assert.equal(captured.length, 0);
+});
+
+test("DELETE distribution list member happy path returns 200 {deleted:true} and scopes the filter", async (t) => {
+  const captured = stubFetch(t, withEntitlement(() => []));
+  const { call } = mount();
+  const result = await call("DELETE", "/facilities/fac-1/distribution-lists/list-1/members/m-1");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { deleted: true });
+  const del = captured.find((c) => c.table === "distribution_list_members" && c.method === "DELETE");
+  assert.equal(del.url.searchParams.get("id"), "eq.m-1");
+  assert.equal(del.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(del.url.searchParams.get("distribution_list_id"), "eq.list-1");
+});
+
+// The route never checks pgDelete's affected-row count -- it always returns
+// 200 {deleted:true}, even for a memberId/list/facility combination that
+// matched nothing. This matches the "deny/no-op by empty result" idempotent-
+// delete convention used elsewhere in this codebase (see durable-rate-limit.mjs),
+// so it documents intended behaviour rather than a bug: callers get no 404 for
+// an already-removed or nonexistent member.
+test("DELETE distribution list member returns 200 even when the member id does not exist", async (t) => {
+  const captured = stubFetch(t, withEntitlement(() => []));
+  const { call } = mount();
+  const result = await call("DELETE", "/facilities/fac-1/distribution-lists/list-1/members/does-not-exist");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { deleted: true });
+  assert.equal(captured.filter((c) => c.table === "distribution_list_members" && c.method === "DELETE").length, 1);
+});
+
+// --- P-10: GET notification-routes list -------------------------------------
+
+test("GET notification-routes denies a non-member of the facility", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/notification-routes");
+  assert.equal(result.status, 403);
+});
+
+test("GET notification-routes returns the facility's routes and filters by event when given", async (t) => {
+  const captured = stubFetch(t, (table) =>
+    table === "notification_routes"
+      ? [{ id: "route-1", facility_id: "fac-1", event_code: "incident.escalated", priority: 5 }]
+      : []
+  );
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("GET", "/facilities/fac-1/notification-routes?event=incident.escalated");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  const get = captured.find((c) => c.table === "notification_routes" && c.method === "GET");
+  assert.equal(get.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(get.url.searchParams.get("event_code"), "eq.incident.escalated");
+});
+
+test("GET notification-routes without an event filter omits event_code from the query", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MEMBER });
+  await call("GET", "/facilities/fac-1/notification-routes");
+  const get = captured.find((c) => c.table === "notification_routes" && c.method === "GET");
+  assert.equal(get.url.searchParams.get("event_code"), null);
+});
+
+// Note: notification-routes.mjs registers no DELETE route for a notification
+// route (GET, POST, PATCH and POST .../test only) -- there is no way to
+// delete/deactivate a route other than PATCH {active:false}. No test is added
+// for a DELETE endpoint since one does not exist; see the final report.

@@ -164,3 +164,135 @@ test("GET cert-gaps requires roleId and returns the report shape", async (t) => 
   assert.ok(!result.payload.employees.some((e) => e.employeeId === "emp-2"));
   void captured;
 });
+
+// --- P-10: additional gap-report branches -----------------------------------
+
+test("GET cert-gaps denies a non-member of the facility with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 403);
+});
+
+// GET cert-gaps requires training.read: the report exposes every employee's certification status,
+// so plain facility membership is not enough.
+test("GET cert-gaps denies a facility member with no training permission", async (t) => {
+  const NO_TRAINING_PERMS = [{ facilityId: "fac-1", status: "active", permissions: [] }];
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: NO_TRAINING_PERMS });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 403);
+  assert.equal(captured.length, 0);
+});
+
+test("GET cert-gaps with no matching requirement rows reports zero requirements and no employees", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "certification_role_requirements") return [];
+    if (table === "employee_certifications") {
+      return [{ employee_id: "emp-1", certification_type_id: "first_aid", status: "active", expires_at: "2030-01-01" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.requirementCount, 0);
+  assert.deepEqual(result.payload.employees, []);
+  void captured;
+});
+
+test("GET cert-gaps reports no employees when every held certification is compliant", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "certification_role_requirements") {
+      return [
+        { certification_type_id: "cpr", role_id: "r1", enforcement_mode: "hard-block" },
+        { certification_type_id: "first_aid", role_id: "r1", enforcement_mode: "warning" }
+      ];
+    }
+    if (table === "employee_certifications") {
+      return [
+        // Far-future expiry, well outside any renewal window -- unambiguously
+        // "active" regardless of when this test runs.
+        { employee_id: "emp-1", certification_type_id: "cpr", status: "active", expires_at: "2099-01-01" },
+        { employee_id: "emp-1", certification_type_id: "first_aid", status: "active", expires_at: "2099-01-01" }
+      ];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.requirementCount, 2);
+  assert.deepEqual(result.payload.employees, []);
+});
+
+test("GET cert-gaps flags an expired certification distinctly from a missing one", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "certification_role_requirements") {
+      return [
+        { certification_type_id: "cpr", role_id: "r1", enforcement_mode: "hard-block" },
+        { certification_type_id: "first_aid", role_id: "r1", enforcement_mode: "warning" }
+      ];
+    }
+    if (table === "employee_certifications") {
+      return [
+        // cpr expired long ago -- unambiguous regardless of when this test
+        // runs (renewal_window_days is not set, so even with a generous
+        // default window this is still expired, not "expiring").
+        { employee_id: "emp-1", certification_type_id: "cpr", status: "active", expires_at: "2000-01-01" }
+        // first_aid never issued -> "missing".
+      ];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.employees.length, 1);
+  const emp1 = result.payload.employees[0];
+  assert.equal(emp1.employeeId, "emp-1");
+  const byType = Object.fromEntries(emp1.gaps.map((g) => [g.certificationTypeId, g]));
+  assert.equal(byType.cpr.status, "expired");
+  assert.equal(byType.cpr.enforcement, "hard-block");
+  assert.equal(byType.first_aid.status, "missing");
+  assert.equal(byType.first_aid.enforcement, "warning");
+  assert.equal(emp1.gaps.length, 2);
+});
+
+test("GET cert-gaps ignores an inactive requirement row entirely", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "certification_role_requirements") {
+      return [{ certification_type_id: "cpr", role_id: "r1", enforcement_mode: "hard-block", active: false }];
+    }
+    if (table === "employee_certifications") {
+      // emp-1 holds nothing, but the only requirement is inactive.
+      return [{ employee_id: "emp-1", certification_type_id: "unrelated", status: "active", expires_at: "2099-01-01" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1");
+  assert.equal(result.status, 200);
+  // requirementsForRole does not filter on `active` -- requirementCount still
+  // counts the row -- but certGaps itself skips inactive requirements, so no
+  // employee ends up with a gap for it.
+  assert.equal(result.payload.requirementCount, 1);
+  assert.deepEqual(result.payload.employees, []);
+});
+
+// The route only recognises a `roleId` query parameter (see queryParams(request)
+// above) -- there is no departmentId or other filter branch on cert-gaps to
+// exercise; an unrelated query parameter is simply ignored.
+test("GET cert-gaps ignores unrelated query parameters such as departmentId", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "certification_role_requirements") {
+      return [{ certification_type_id: "cpr", role_id: "r1", enforcement_mode: "hard-block" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/cert-gaps?roleId=r1&departmentId=dept-1");
+  assert.equal(result.status, 200);
+  const requirementsGet = captured.find((c) => c.table === "certification_role_requirements");
+  assert.equal(requirementsGet.url.searchParams.get("department_id"), null);
+});

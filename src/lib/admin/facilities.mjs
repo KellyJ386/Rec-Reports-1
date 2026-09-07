@@ -16,12 +16,15 @@ function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function validateFacilityInput(input) {
+// `partial: true` is the PATCH shape: `name` may be omitted (left unchanged)
+// but, when present, must still be a non-empty string. Create keeps name
+// mandatory.
+export function validateFacilityInput(input, { partial = false } = {}) {
   const errors = [];
   if (!isPlainObject(input)) {
     return { valid: false, errors: ["input must be an object"] };
   }
-  if (!isNonEmptyString(input.name)) {
+  if (partial ? input.name !== undefined && !isNonEmptyString(input.name) : !isNonEmptyString(input.name)) {
     errors.push("name is required");
   }
   if (input.timezone !== undefined && input.timezone !== null) {

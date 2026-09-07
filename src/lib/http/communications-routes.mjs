@@ -1,5 +1,5 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
-import { requireAuthPermission, authCanAccessFacility } from "./guard.mjs";
+import { authCanAccessFacility, makeGuards } from "./guard.mjs";
 import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority } from "../communications.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
@@ -9,11 +9,7 @@ const PUBLISH = "communications.publish";
 const MESSAGE_COLUMNS =
   "id,facility_id,channel_id,author_employee_id,message_type,subject,body_text,priority,is_required_ack,ack_due_at,published_at,created_at,updated_at";
 const MESSAGE_AUDIENCES_COLUMNS = "id,facility_id,message_id,audience_type,audience_ref_id,rule_jsonb,created_at";
-const MESSAGE_ACKNOWLEDGEMENTS_COLUMNS =
-  "id,facility_id,message_id,employee_id,ack_state,acknowledged_at,ack_method,signature_path,created_at,updated_at";
 const CHANNEL_COLUMNS = "id,facility_id,name,channel_type,department_id,shift_scoped,emergency_enabled,created_at,updated_at";
-const MESSAGE_RECEIPTS_COLUMNS = "id,facility_id,message_id,employee_id,delivered_at,read_at,created_at";
-const DEVICE_TOKEN_COLUMNS = "id,facility_id,employee_id,platform,token,last_seen_at,revoked_at,created_at";
 const NOTIFICATION_PREFERENCE_COLUMNS =
   "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end,created_at,updated_at";
 
@@ -66,41 +62,9 @@ async function resolveAudienceRefs(client, facilityId, items) {
 // Reads require communications.read on the row's facility; creating or publishing
 // a message requires communications.publish. Acknowledgements require communications.read.
 export function registerCommunicationRoutes(router, { authenticate, sendJson, readBody }) {
-  async function parseJsonBody(request) {
-    try {
-      return { ok: true, payload: JSON.parse((await readBody(request)) || "{}") };
-    } catch {
-      return { ok: false };
-    }
-  }
-
-  async function withAuth(request, response, env, handler) {
-    const auth = await authenticate(request, env);
-    if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-    return handler(auth);
-  }
-
-  function requireRead(auth, facilityId, response) {
-    const guard = requireAuthPermission(auth, facilityId, READ);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function requirePerm(auth, facilityId, code, response) {
-    const guard = requireAuthPermission(auth, facilityId, code);
-    if (!guard.allowed) {
-      sendJson(response, 403, { error: guard.reason });
-      return false;
-    }
-    return true;
-  }
-
-  function queryParams(request) {
-    return new URL(request.url ?? "/", "http://localhost").searchParams;
-  }
+  const guards = makeGuards({ authenticate, sendJson, readBody });
+  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const requireRead = guards.requireRead(READ);
 
   async function loadMessage(client, messageId) {
     const rows = await pgSelect(client, "messages", {
