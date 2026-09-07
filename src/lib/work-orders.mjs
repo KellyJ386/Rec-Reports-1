@@ -95,3 +95,27 @@ export function createWorkOrderFromIncident(incident, defaults = {}, config = {}
     status: "open"
   };
 }
+
+// IN-17: the direct-insert half of the incident-followup -> work-order link
+// (POST .../followups/:followupId/work-order). Reuses createWorkOrderFromIncident
+// for the sourceType/sourceId/facilityId/priority/status shape and adds
+// sourceFollowupId (work_orders.source_followup_id, 0058) plus a title/
+// description derived from the FOLLOW-UP specifically (rather than the bare
+// incident) -- never from a client-supplied body, matching the RPC path
+// (internal.create_work_order_from_incident in 0058_incident_cross_module.sql)
+// this mirrors: both derive title/description/priority server-side from the
+// same two rows so a caller with work_orders.manage (this JS path) and one
+// without it (the RPC path) end up with an identical row shape regardless of
+// which permission got them there. `config` optional, same contract as
+// createWorkOrderFromIncident.
+export function createWorkOrderFromIncidentFollowup(incident, followup, config = {}) {
+  const base = createWorkOrderFromIncident(
+    incident,
+    {
+      title: `Follow up: ${incident.incidentNo} (${followup.actionType})`,
+      description: followup.description || incident.summary
+    },
+    config
+  );
+  return { ...base, sourceFollowupId: followup.id };
+}

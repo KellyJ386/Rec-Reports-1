@@ -508,3 +508,63 @@ export function evaluateOshaDecisionTree(tree, answers = {}, now = new Date()) {
   // Depth exhausted without reaching a terminal leaf -- a cyclic tree.
   return oshaFallback(path);
 }
+
+// --- Retention (IN-16) -------------------------------------------------------
+// Purely informational: retentionEligibleAt (and its class-selection helper
+// below) never purges, deletes, or flags anything -- Wave 4 IN-25 owns the
+// actual purge job, and per that plan row's own acceptance line ("skips
+// legal_hold=true and closed-within-retention rows") a held incident stays
+// under 0057's DB-layer delete guards regardless of what this function
+// returns for it. This is just the date past which that future job would be
+// PERMITTED to consider a row, exposed today on the incident detail response
+// (retention_eligible_at) so a caller can see it coming.
+//
+// Class selection, in priority order -- three settings-registry keys drive
+// the actual day counts (incidents.retentionDaysStandard/Osha/Minor):
+//   1. "osha"     -- requires_osha_review is true. OSHA 1904.33 requires
+//                    5-year retention of recordable injury/illness logs;
+//                    retentionDaysOsha ships 1825 days (5 years) to match.
+//   2. "minor"     -- a near_miss report, or a low-severity incident that
+//                    never triggered OSHA review -- the lightest-weight
+//                    record class this module tracks. retentionDaysMinor
+//                    ships 1095 days (3 years).
+//   3. "standard"  -- the fallback/default class: every other incident and
+//                    accident report (medium/high/critical, or any severity
+//                    once OSHA-recordable is excluded above).
+//                    retentionDaysStandard ships 2555 days (7 years) -- the
+//                    longest default, matching general liability/statute-of-
+//                    limitations practice for the baseline legal record this
+//                    module keeps when no narrower class applies.
+// `incident` accepts the same camelCase shape escalationDueAt/
+// shouldEscalateIncident already do (routes remap the raw snake_case DB row
+// before calling in, e.g. incidents-routes.mjs's escalationDueAt call site).
+export function incidentRetentionClass({ requiresOshaReview, reportType, severity } = {}) {
+  if (requiresOshaReview === true) return "osha";
+  if (reportType === "near_miss" || severity === "low") return "minor";
+  return "standard";
+}
+
+const RETENTION_CONFIG_KEY_BY_CLASS = Object.freeze({
+  osha: "incidents.retentionDaysOsha",
+  minor: "incidents.retentionDaysMinor",
+  standard: "incidents.retentionDaysStandard"
+});
+
+// Pure -- never reads the clock itself (matches escalationDueAt's own
+// contract). Anchor is occurredAt (falling back to createdAt, then
+// reportedAt) -- the incident's own factual date, the same anchor OSHA's
+// "following the end of the calendar year the records cover" convention
+// counts from, and the one timestamp every incident carries regardless of
+// status. Returns a Date (matching escalationDueAt's return shape) or null
+// when no anchor timestamp is available at all.
+export function retentionEligibleAt(incident, config = {}) {
+  const { occurredAt, createdAt, reportedAt } = incident ?? {};
+  const anchor = occurredAt ?? createdAt ?? reportedAt;
+  if (!anchor) return null;
+  const anchorDate = new Date(anchor);
+  if (Number.isNaN(anchorDate.getTime())) return null;
+
+  const retentionClass = incidentRetentionClass(incident);
+  const days = configValue(config, RETENTION_CONFIG_KEY_BY_CLASS[retentionClass]);
+  return new Date(anchorDate.getTime() + days * 24 * 60 * 60 * 1000);
+}

@@ -83,6 +83,29 @@ test("pgInsert posts rows and sets return=representation when returning", async 
   assert.deepEqual(result, [{ id: "1" }]);
 });
 
+test("pgInsert sends resolution=ignore-duplicates alongside on_conflict when ignoreDuplicates is set", async (t) => {
+  let capturedUrl;
+  let capturedInit;
+  withFetch(t, async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return { ok: true, status: 201, text: async () => JSON.stringify([{ id: "1" }]) };
+  });
+
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const result = await pgInsert(client, "notification_jobs", [{ dedupe_key: "inc-1:incident.escalated:emp-1" }], {
+    onConflict: "dedupe_key",
+    ignoreDuplicates: true
+  });
+
+  const parsed = new URL(capturedUrl);
+  assert.equal(parsed.searchParams.get("on_conflict"), "dedupe_key");
+  assert.match(capturedInit.headers.Prefer, /resolution=ignore-duplicates/);
+  assert.doesNotMatch(capturedInit.headers.Prefer, /merge-duplicates/);
+  assert.match(capturedInit.headers.Prefer, /return=representation/);
+  assert.deepEqual(result, [{ id: "1" }]);
+});
+
 test("pgUpdate patches filtered rows", async (t) => {
   let capturedUrl;
   let capturedInit;

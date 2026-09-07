@@ -181,6 +181,16 @@ export const settingsRegistry = Object.freeze(
       validation: { min: 1, max: 36500 },
       permission: "admin.manage"
     },
+    {
+      key: "incidents.maxEscalationLevel",
+      module: "incidents",
+      label: "Maximum auto-escalation level",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 5, // IN-21: incident-sla-sweep.mjs caps nextEscalationLevel chaining at this level
+      validation: { min: 1, max: 20 },
+      permission: "admin.manage"
+    },
 
     // --- Work orders (module code: work_orders) ----------------------------
     {

@@ -6,9 +6,11 @@ import {
   shouldEscalateIncident,
   escalationDueAt,
   isEscalationOverdue,
+  nextEscalationLevel,
   canTransitionIncident,
   buildIncidentAuditEvent,
   buildAmendment,
+  buildIncidentNotificationJobs,
   AMENDABLE_INCIDENT_FIELDS,
   formatIncidentNo,
   nextIncidentNo,
@@ -24,6 +26,79 @@ import {
   OSHA_OUTCOMES
 } from "../src/lib/incidents.mjs";
 import { settingsRegistry } from "../src/lib/settings-registry.mjs";
+
+// --- nextEscalationLevel (IN-21) ---------------------------------------------
+
+test("nextEscalationLevel returns currentLevel + 1", () => {
+  assert.equal(nextEscalationLevel(1), 2);
+  assert.equal(nextEscalationLevel(4), 5);
+});
+
+test("nextEscalationLevel treats a missing/non-positive level as 0, returning 1", () => {
+  assert.equal(nextEscalationLevel(0), 1);
+  assert.equal(nextEscalationLevel(-3), 1);
+  assert.equal(nextEscalationLevel(undefined), 1);
+  assert.equal(nextEscalationLevel(null), 1);
+});
+
+// --- buildIncidentNotificationJobs (IN-20) -----------------------------------
+
+const NOTIFY_ROUTE = {
+  id: "route-1",
+  facility_id: "fac-1",
+  priority: 5,
+  route_jsonb: { channels: ["in_app", "email"] }
+};
+
+test("buildIncidentNotificationJobs shapes one row per recipient with a per-recipient dedupe_key", () => {
+  const jobs = buildIncidentNotificationJobs("incident.escalated", NOTIFY_ROUTE, ["emp-1", "emp-2"], {
+    id: "inc-1",
+    severity: "medium"
+  });
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.escalated:emp-1");
+  assert.equal(jobs[1].dedupe_key, "inc-1:incident.escalated:emp-2");
+  assert.equal(jobs[0].facility_id, "fac-1");
+  assert.equal(jobs[0].event_type, "incident.escalated");
+  assert.deepEqual(jobs[0].payload_jsonb.recipients, ["emp-1"]);
+  assert.deepEqual(jobs[0].payload_jsonb.channels, ["in_app", "email"]);
+  assert.equal(jobs[0].payload_jsonb.incidentId, "inc-1");
+});
+
+test("buildIncidentNotificationJobs sets quietHoursBypass true for high/critical severity, false otherwise", () => {
+  const high = buildIncidentNotificationJobs("incident.escalated", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  });
+  assert.equal(high[0].payload_jsonb.quietHoursBypass, true);
+
+  const critical = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "critical"
+  });
+  assert.equal(critical[0].payload_jsonb.quietHoursBypass, true);
+
+  const low = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "low"
+  });
+  assert.equal(low[0].payload_jsonb.quietHoursBypass, false);
+
+  const medium = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "medium"
+  });
+  assert.equal(medium[0].payload_jsonb.quietHoursBypass, false);
+});
+
+test("buildIncidentNotificationJobs drops falsy recipient ids and returns [] for an empty recipient list", () => {
+  assert.deepEqual(buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, [], { id: "inc-1" }), []);
+  const jobs = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1", null, undefined, ""], {
+    id: "inc-1"
+  });
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.submitted:emp-1");
+});
 
 test("shouldEscalateIncident escalates high severity, legal hold, or OSHA review", () => {
   assert.equal(shouldEscalateIncident({ severity: "high" }), true);

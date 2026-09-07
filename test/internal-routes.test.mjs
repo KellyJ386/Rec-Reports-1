@@ -9,7 +9,17 @@ import { computeDbRowHash } from "../src/lib/audit.mjs";
 // one global fetch stub, recording every call so assertions can inspect
 // exactly what each subsystem sent -- same programmable-stub style as
 // test/audit-routes.test.mjs and test/notifications-worker.test.mjs.
-function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = [], reportWorkflowEvents = [] } = {}) {
+function stubFetch(
+  t,
+  {
+    facilities = [],
+    chains = {},
+    sweptAuthThrottleRows = [],
+    reportWorkflowEvents = [],
+    incidentEscalations = [],
+    incidentReports = []
+  } = {}
+) {
   const captured = { postgrest: [], observability: [] };
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -42,6 +52,17 @@ function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = []
       const match = reportWorkflowEvents.find((row) => row.id === id);
       data = match ? [{ ...match, status: "processing" }] : [];
     } else if (table === "report_workflow_events" && method === "PATCH") data = [];
+    // IN-21: the incident SLA sweep runs on the same drain invocation.
+    else if (table === "incident_escalations" && method === "GET") data = incidentEscalations;
+    else if (table === "incident_reports" && method === "GET") data = incidentReports;
+    else if (table === "incident_escalations" && method === "PATCH") {
+      const id = parsed.searchParams.get("id")?.replace("eq.", "");
+      const match = incidentEscalations.find((row) => row.id === id && row.status === "pending");
+      data = match ? [{ ...match, status: "expired" }] : [];
+    } else if (table === "incident_escalations" && method === "POST") {
+      data = body.map((row, index) => ({ id: `esc-new-${index}`, ...row }));
+    } else if (table === "incident_audit_events" && method === "POST") data = [];
+    else if (table === "notification_routes" && method === "GET") data = [];
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   t.after(() => {
@@ -241,6 +262,56 @@ test("drain: sweeps auth_throttle (lt filter on updated_at) and reports the dele
   const sweepRequest = captured.postgrest.find((req) => req.table === "auth_throttle" && req.method === "DELETE");
   assert.ok(sweepRequest, "expected exactly one DELETE against auth_throttle");
   assert.match(sweepRequest.url.searchParams.get("updated_at"), /^lt\./);
+});
+
+test("drain: folds an all-zero incidentSla summary into the response when nothing is overdue", async (t) => {
+  stubFetch(t, {});
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: BASE_ENV,
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.incidentSla, {
+    processed: 0,
+    expired: 0,
+    escalated: 0,
+    capped: 0,
+    notified: 0,
+    raced: 0
+  });
+});
+
+test("drain: incidentSla expires an overdue escalation and auto-escalates to the next level", async (t) => {
+  const overdueEscalation = {
+    id: "esc-1",
+    facility_id: "fac-1",
+    incident_id: "inc-1",
+    escalation_level: 1,
+    reason_code: "user_escalation",
+    target_role: "manager",
+    target_user_id: null,
+    status: "pending",
+    due_at: "2020-01-01T00:00:00.000Z" // long overdue relative to `now`
+  };
+  const captured = stubFetch(t, {
+    incidentEscalations: [overdueEscalation],
+    incidentReports: [{ id: "inc-1", facility_id: "fac-1", status: "under_review", severity: "high" }]
+  });
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: BASE_ENV,
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.incidentSla.processed, 1);
+  assert.equal(result.payload.incidentSla.expired, 1);
+  assert.equal(result.payload.incidentSla.escalated, 1);
+
+  const newEscalationInsert = captured.postgrest.find(
+    (req) => req.table === "incident_escalations" && req.method === "POST"
+  );
+  assert.equal(newEscalationInsert.body[0].escalation_level, 2);
 });
 
 test("drain: a sweep failure fails open -- the drain response still succeeds with authThrottleSwept: 0", async (t) => {

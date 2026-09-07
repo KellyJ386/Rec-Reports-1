@@ -1,7 +1,13 @@
 import { configValue } from "./settings-registry.mjs";
 import { computeRowHash } from "./audit.mjs";
+import { buildNotificationJob } from "./admin/notifications.mjs";
 
 const escalationSeverities = new Set(["high", "critical"]);
+// IN-20: severities whose notification jobs bypass quiet-hours suppression
+// (src/lib/notifications/worker.mjs honors payload_jsonb.quietHoursBypass ===
+// true on both the job-processing and outbox-translation paths already --
+// this is the incident module's own policy for which severities set it).
+const QUIET_HOURS_BYPASS_SEVERITIES = new Set(["high", "critical"]);
 const oshaReviewTriggers = new Set(["employee_injury", "hospitalization", "lost_time", "fatality"]);
 
 // `config` is optional. incidents.severityAutoEscalate=false stops severity
@@ -36,6 +42,65 @@ export function isEscalationOverdue(incident, now = new Date(), config = {}) {
   const dueAt = incident?.dueAt ? new Date(incident.dueAt) : escalationDueAt(incident, config);
   if (!dueAt) return false;
   return now > dueAt;
+}
+
+// IN-21: the level a new auto-escalation row should carry when the current
+// one (`currentLevel`, an incident_escalations.escalation_level value) has
+// gone overdue unacknowledged. Always currentLevel + 1 -- the cap against
+// incidents.maxEscalationLevel is a SEPARATE decision (decideEscalationSweep
+// in incident-sla-sweep.mjs), not folded in here, so this stays a one-line
+// arithmetic fact callers can rely on independent of whether the cap allows
+// creating that next level at all. Guards against a non-positive/non-finite
+// input (a malformed or missing escalation_level) by treating it as level 0,
+// so the result is always a positive integer >= 1.
+export function nextEscalationLevel(currentLevel) {
+  const level = Number.isFinite(currentLevel) && currentLevel > 0 ? Math.floor(currentLevel) : 0;
+  return level + 1;
+}
+
+// IN-20: shapes one notification_jobs row PER recipient for an incident
+// lifecycle event (incident.submitted / incident.escalated /
+// incident.sla_breached). Pure -- `route` is whatever the caller already
+// resolved (admin/notifications.mjs's resolveRoute against a facility's
+// active notification_routes for the event code) and `recipients` is
+// whatever employee-id list the caller already expanded (e.g.
+// notifications/worker.mjs's expandRouteRecipients, or a directly-targeted
+// escalation.target_user_id folded in); this function does no I/O of its
+// own, matching every other pure decision function in this file.
+//
+// One row per recipient (rather than admin/notifications.mjs's usual single
+// job carrying an array of recipients) is deliberate: it is what lets each
+// row carry its OWN dedupe_key. `dedupe_key` is `${incidentId}:${eventCode}:
+// ${recipientId}` -- the exact per-(incident, event, recipient) shape IN-20
+// specifies -- and is inserted via pgInsert's ignoreDuplicates option
+// against notification_jobs' new unique partial index on dedupe_key
+// (0058_incident_cross_module.sql), so a retried or re-run call site (e.g.
+// the SLA sweep re-processing the same escalation, or a route handler retried
+// after a network blip) can never enqueue the same recipient twice for the
+// same incident event.
+//
+// quietHoursBypass is stamped true whenever `incident.severity` is high or
+// critical (QUIET_HOURS_BYPASS_SEVERITIES) -- worker.mjs's processJob/
+// translateOutboxEvent both already honor payload_jsonb.quietHoursBypass ===
+// true (see its own quiet-hours check), so a severe incident's notification
+// still fires immediately instead of waiting out a facility's quiet-hours
+// window, exactly like communications-routes.mjs's shouldBypassQuietHours
+// does for urgent messages.
+//
+// `incident` needs only `{ id, severity }` -- callers pass the minimal shape
+// rather than a full incident_reports row, keeping this function's input
+// surface as small as its output.
+export function buildIncidentNotificationJobs(eventCode, route, recipients, incident) {
+  const incidentId = incident?.id ?? null;
+  const bypass = QUIET_HOURS_BYPASS_SEVERITIES.has(incident?.severity);
+  return (recipients ?? [])
+    .filter((recipientId) => recipientId)
+    .map((recipientId) => {
+      const job = buildNotificationJob(eventCode, route, [recipientId]);
+      job.dedupe_key = `${incidentId}:${eventCode}:${recipientId}`;
+      job.payload_jsonb = { ...job.payload_jsonb, incidentId, quietHoursBypass: bypass };
+      return job;
+    });
 }
 
 // `treeOutcome` (IN-14) is the terminal outcome of evaluateOshaDecisionTree
