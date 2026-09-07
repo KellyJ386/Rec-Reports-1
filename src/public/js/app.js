@@ -92,10 +92,21 @@ function hasPerm(code) {
 
 // Renders a 403 (or any) error as an inline message inside `container`
 // instead of leaving a panel broken/blank -- the shared failure mode every
-// write action in this batch's panels routes through.
+// write action in this batch's panels routes through. role="alert" +
+// aria-live="polite" (P-7) so a screen reader announces the failure the
+// moment it lands, the same as setError below; aria-busy is cleared here
+// too since this is the catch-side counterpart to setLoading(container,
+// true) in every panel's load().
 function renderInlineError(container, error) {
+  container.setAttribute("aria-busy", "false");
   container.textContent = "";
-  container.append(el("p", { class: "rr-error" }, `Error: ${error && error.message ? error.message : "request failed"}`));
+  container.append(
+    el(
+      "p",
+      { class: "rr-error", role: "alert", "aria-live": "polite" },
+      `Error: ${error && error.message ? error.message : "request failed"}`
+    )
+  );
 }
 
 // Helper: Get token from localStorage
@@ -586,6 +597,48 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// P-7 (mobile/accessibility pass): wraps `input` in a <label> so it has a
+// programmatically associated name (WCAG 4.1.2/3.3.2) -- implicit
+// association via wrapping (the same pattern index.html's own hand-written
+// labels already use, and the one buildCreateForm/buildComposeForm/
+// buildCreateShiftForm already followed before this batch) rather than a
+// `for`/id pair, since every one of these forms is thrown away and rebuilt
+// by its panel's render() on every state change, and matching ids would
+// just be extra bookkeeping for no benefit over wrapping. `error`, when
+// given, renders next to the control as a role="alert" live region so a
+// validation message is announced without moving focus.
+function labeledField(labelText, input, { required = false, error = null, rowClass = "report-field" } = {}) {
+  const row = el("div", { class: rowClass });
+  row.append(el("label", {}, [`${labelText}${required ? " *" : ""}`, input]));
+  if (error) row.append(el("div", { class: "field-error rr-error", role: "alert" }, error));
+  return row;
+}
+
+// P-7: focus management after a create/submit action or after a quick
+// action/search result opens a panel -- WCAG 2.4.3/3.2.2 (a state change
+// like this one should not leave keyboard/screen-reader focus stranded
+// wherever it happened to be). `target` is usually an <h3> heading (every
+// detail/create panel's own header already has one) which isn't natively
+// focusable, so a tabindex is added first when needed; harmless to call
+// again on an element that's already focusable (a button, an input).
+function focusElement(target) {
+  if (!target) return;
+  if (!target.hasAttribute("tabindex") && !/^(a|button|input|select|textarea)$/i.test(target.tagName)) {
+    target.setAttribute("tabindex", "-1");
+  }
+  target.focus({ preventScroll: false });
+}
+
+// Focuses the first focusable form control (or, failing that, button) inside
+// `root` -- used when a create form/panel first opens, so a keyboard user
+// lands directly in it instead of having to tab there from wherever they
+// activated the toggle.
+function focusFirstControl(root) {
+  if (!root) return;
+  const control = root.querySelector("input, select, textarea, button, [tabindex]");
+  if (control) control.focus({ preventScroll: false });
+}
+
 // --- Attachments (OP-17/OP-18) ---------------------------------------------
 // Shared by the reports, incidents, and work-orders panels below: an
 // "Attachments" toggle per item that lazily lists existing attachments and
@@ -700,12 +753,15 @@ function wireAttachmentToggles(container) {
 }
 
 async function loadAttachmentsPanel(moduleSegment, parentId, panel, canUpload) {
-  panel.innerHTML = "<p>Loading attachments…</p>";
+  panel.setAttribute("aria-busy", "true");
+  panel.replaceChildren(el("p", { role: "status", "aria-live": "polite" }, "Loading attachments…"));
   try {
     const attachments = await apiFetch(`/${moduleSegment}/${parentId}/attachments`);
     renderAttachmentsPanel(panel, moduleSegment, parentId, attachments || [], canUpload);
   } catch (error) {
-    panel.innerHTML = `<p class="rr-error">Error: ${escapeHtml(error.message)}</p>`;
+    panel.replaceChildren(el("p", { class: "rr-error", role: "alert" }, `Error: ${error.message}`));
+  } finally {
+    panel.setAttribute("aria-busy", "false");
   }
 }
 
@@ -831,6 +887,10 @@ async function loadReports() {
     renderReportsList(container, templates || [], reports || []);
   } catch (error) {
     setError(container, error.message);
+  } finally {
+    // P-7: setError already clears aria-busy on its own path; this covers
+    // the success path (renderReportsList doesn't touch the attribute).
+    container.setAttribute("aria-busy", "false");
   }
 }
 
@@ -928,7 +988,7 @@ async function startNewReport(template) {
   } catch (error) {
     if (area) {
       area.textContent = "";
-      area.append(el("p", { class: "rr-error" }, `Error: ${error.message}`));
+      area.append(el("p", { class: "rr-error", role: "alert" }, `Error: ${error.message}`));
     }
   }
 }
@@ -1124,12 +1184,21 @@ function createReportFormController({ areaId, editable, extra }) {
   function buildFileFieldInput(descriptor) {
     const wrapper = el("div", { class: "report-field-file" });
     const value = state.values[descriptor.key];
-    const status = el("span", { class: "item-subtitle" }, value ? "File on record for this field." : "No file uploaded yet.");
+    const status = el(
+      "span",
+      { class: "item-subtitle", role: "status", "aria-live": "polite" },
+      value ? "File on record for this field." : "No file uploaded yet."
+    );
     wrapper.append(status);
     if (!state.readOnly) {
       const input = document.createElement("input");
       input.type = "file";
       input.accept = descriptor.type === "signature" ? "image/png,image/jpeg" : ATTACHMENT_ACCEPT;
+      // P-7: this control sits inside a <fieldset>/<legend> (see
+      // buildFieldRow's isGroup branch), which names the GROUP but isn't
+      // reliably computed as this specific <input>'s own accessible name --
+      // aria-label makes that explicit rather than relying on it.
+      input.setAttribute("aria-label", descriptor.label || "Upload file");
       input.addEventListener("change", async () => {
         const file = input.files && input.files[0];
         if (!file) return;
@@ -1268,7 +1337,12 @@ function createReportFormController({ areaId, editable, extra }) {
     header.append(closeBtn);
     host.append(header);
 
-    const banner = el("div", { class: "rr-error report-form-banner", id: `${areaId}-banner` });
+    const banner = el("div", {
+      class: "rr-error report-form-banner",
+      id: `${areaId}-banner`,
+      role: "alert",
+      "aria-live": "polite"
+    });
     banner.hidden = state.formErrors.length === 0;
     for (const message of state.formErrors) banner.append(el("p", {}, message));
     host.append(banner);
@@ -1325,7 +1399,9 @@ function createReportFormController({ areaId, editable, extra }) {
     // styles.css) -- stays pinned to the bottom of the form area regardless
     // of which section/step is showing.
     const actionBar = el("div", { class: "report-form-actions" });
-    actionBar.append(el("span", { class: "report-form-status", id: `${areaId}-status` }));
+    actionBar.append(
+      el("span", { class: "report-form-status", id: `${areaId}-status`, role: "status", "aria-live": "polite" })
+    );
     if (editable && !state.readOnly) {
       const saveBtn = el("button", { type: "button" }, "Save draft");
       saveBtn.addEventListener("click", () => saveDraft());
@@ -1336,6 +1412,7 @@ function createReportFormController({ areaId, editable, extra }) {
         const reasonInput = document.createElement("textarea");
         reasonInput.className = "report-reason-input";
         reasonInput.placeholder = "Reason for submitting with warnings";
+        reasonInput.setAttribute("aria-label", "Reason for submitting with warnings");
         const reasonBtn = el("button", { type: "button", class: "primary" }, "Submit with reason");
         reasonBtn.addEventListener("click", () => submitReport({ reason: reasonInput.value }));
         actionBar.append(reasonInput, reasonBtn);
@@ -1364,7 +1441,8 @@ function createReportFormController({ areaId, editable, extra }) {
     }
     host.hidden = false;
     host.textContent = "";
-    host.append(el("p", {}, "Loading report…"));
+    host.setAttribute("aria-busy", "true");
+    host.append(el("p", { role: "status", "aria-live": "polite" }, "Loading report…"));
     try {
       const detail = await apiFetch(`/reports/${submissionId}/detail`);
       state.submissionId = submissionId;
@@ -1382,9 +1460,17 @@ function createReportFormController({ areaId, editable, extra }) {
       state.formErrors = [];
       state.detail = detail;
       render();
+      host.removeAttribute("aria-busy");
+      // P-7: focus management -- lands on the opened report's own heading,
+      // whether `open` was reached via startNewReport's freshly-created
+      // draft or the review inbox's "View" button.
+      focusElement(host.querySelector(".report-form-header h3"));
     } catch (error) {
       host.textContent = "";
-      host.append(el("p", { class: "rr-error" }, `Error loading report: ${error.message}`));
+      host.setAttribute("aria-busy", "false");
+      const errorEl = el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, `Error loading report: ${error.message}`);
+      host.append(errorEl);
+      focusElement(errorEl);
     }
   }
 
@@ -1467,7 +1553,7 @@ function renderInboxExtras(host, state) {
   host.append(attachSection);
 
   const pdfSection = el("div", { class: "report-inbox-pdf" });
-  const pdfStatus = el("span", { class: "item-subtitle" });
+  const pdfStatus = el("span", { class: "item-subtitle", role: "status", "aria-live": "polite" });
   const pdfBtn = el("button", { type: "button" }, "Download PDF");
   pdfBtn.addEventListener("click", () => downloadReportPdf(submission.id, pdfBtn, pdfStatus));
   pdfSection.append(pdfBtn, pdfStatus);
@@ -1618,6 +1704,8 @@ async function loadReportInboxList() {
     renderReportInboxList(container, rows || []);
   } catch (error) {
     setError(container, error.message);
+  } finally {
+    container.setAttribute("aria-busy", "false");
   }
 }
 
@@ -1677,6 +1765,8 @@ const schedulePanel = (function () {
       await reloadWeek();
     } catch (error) {
       renderInlineError(host, error);
+    } finally {
+      host.setAttribute("aria-busy", "false");
     }
   }
 
@@ -1843,7 +1933,7 @@ const schedulePanel = (function () {
     endInput.addEventListener("input", () => {
       fields.endsAt = endInput.value ? new Date(endInput.value).toISOString() : "";
     });
-    const errorEl = el("p", { class: "rr-error" });
+    const errorEl = el("p", { class: "rr-error", role: "alert" });
     const submitBtn = el("button", { type: "button", class: "primary" }, "Add shift");
     submitBtn.addEventListener("click", async () => {
       const validation = validateShiftCreate(fields);
@@ -1902,6 +1992,7 @@ const schedulePanel = (function () {
       card.append(el("span", { class: "item-subtitle" }, "Unassigned"));
       if (hasPerm("schedule.manage") && state.employees.length > 0) {
         const select = document.createElement("select");
+        select.setAttribute("aria-label", `Assign employee to ${shift.role_code} shift`);
         select.append(el("option", { value: "" }, "Assign to…"));
         for (const employee of state.employees) {
           select.append(el("option", { value: employee.id }, `${employee.first_name} ${employee.last_name}`));
@@ -1935,7 +2026,7 @@ const schedulePanel = (function () {
     picker.append(prevBtn, el("label", {}, ["Week of", dateInput]), nextBtn);
     host.append(picker);
 
-    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
 
     if (!state.period) {
       const empty = el("div", { class: "module-item" });
@@ -2093,6 +2184,8 @@ const incidentsPanel = (function () {
       render();
     } catch (error) {
       renderInlineError(host, error);
+    } finally {
+      host.setAttribute("aria-busy", "false");
     }
   }
 
@@ -2127,6 +2220,10 @@ const incidentsPanel = (function () {
     state.captureErrors = validation.errors;
     if (!validation.valid) {
       render();
+      // P-7: move focus to the first field-level validation message rather
+      // than leaving it on the submit button with no indication of what
+      // needs fixing.
+      focusElement(document.querySelector(".incident-capture-form .field-error"));
       return;
     }
     try {
@@ -2174,6 +2271,11 @@ const incidentsPanel = (function () {
     } catch (error) {
       state.detailError = error.message;
       render();
+      // P-7: focus management -- opening a detail panel (create/submit,
+      // View, or a global search result) moves focus to its heading so a
+      // keyboard/screen-reader user lands on the new content instead of
+      // wherever the triggering control happened to be.
+      focusElement(document.querySelector("#incident-detail-panel h3"));
       return;
     }
     const [followups, amendments] = await Promise.all([
@@ -2198,6 +2300,7 @@ const incidentsPanel = (function () {
     }
     await loadPeople();
     render();
+    focusElement(document.querySelector("#incident-detail-panel h3"));
   }
 
   function closeDetail() {
@@ -2222,6 +2325,7 @@ const incidentsPanel = (function () {
     state.personErrors = validation.errors;
     if (!validation.valid) {
       render();
+      focusElement(document.querySelector(".add-person-form .rr-error"));
       return;
     }
     try {
@@ -2235,6 +2339,11 @@ const incidentsPanel = (function () {
       state.personErrors = {};
       state.detailActionError = null;
       render();
+      // P-7: the add-person form just collapsed back into its toggle button
+      // -- move focus to the "People involved" section heading (right above
+      // the new row) rather than leaving it stranded on a button that no
+      // longer has the same content under it.
+      focusElement(document.getElementById("people-involved-heading"));
     } catch (error) {
       state.detailActionError = error.message;
       render();
@@ -2441,12 +2550,12 @@ const incidentsPanel = (function () {
     const errors = state.captureErrors;
     const wrap = el("div", { class: "inline-form incident-capture-form" });
 
+    // P-7: labeledField wraps `input` inside the <label> (rather than the
+    // two being siblings, as this used to build them) so every capture-form
+    // control has a programmatically associated name -- see labeledField's
+    // own doc comment.
     function fieldRow(labelText, input, errorKey, required) {
-      const row = el("div", { class: "report-field" });
-      row.append(el("label", {}, `${labelText}${required ? " *" : ""}`));
-      row.append(input);
-      if (errors[errorKey]) row.append(el("div", { class: "field-error rr-error" }, errors[errorKey]));
-      return row;
+      return labeledField(labelText, input, { required, error: errors[errorKey] });
     }
 
     const typeSelect = document.createElement("select");
@@ -2513,7 +2622,7 @@ const incidentsPanel = (function () {
     const submitBtn = el("button", { type: "button", class: "primary" }, "Save draft incident");
     submitBtn.addEventListener("click", () => submitCapture());
     wrap.append(submitBtn);
-    if (state.formError) wrap.append(el("p", { class: "rr-error" }, state.formError));
+    if (state.formError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
     return wrap;
   }
 
@@ -2535,10 +2644,21 @@ const incidentsPanel = (function () {
     dueInput.addEventListener("input", () => {
       state.followupFields.dueAt = dueInput.value ? new Date(dueInput.value).toISOString() : "";
     });
-    const errorEl = el("p", { class: "rr-error" }, Object.values(state.followupErrors).join(" "));
+    const errorEl = el(
+      "p",
+      { class: "rr-error", role: "alert" },
+      Object.values(state.followupErrors).join(" ")
+    );
     const submitBtn = el("button", { type: "button", class: "primary" }, "Create follow-up");
     submitBtn.addEventListener("click", () => createFollowup());
-    wrap.append(typeSelect, descInput, dueInput, submitBtn, errorEl);
+    // P-7: wrap every control in a label -- see labeledField's doc comment.
+    wrap.append(
+      el("label", {}, ["Action type", typeSelect]),
+      el("label", {}, ["Description", descInput]),
+      el("label", {}, ["Due date", dueInput]),
+      submitBtn,
+      errorEl
+    );
     return wrap;
   }
 
@@ -2552,6 +2672,7 @@ const incidentsPanel = (function () {
 
     for (const fieldKey of AMENDABLE_INCIDENT_FIELDS) {
       const row = el("div", { class: "report-field-option" });
+      const fieldLabel = fieldKey.replace(/_/g, " ");
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       const existing = state.amendFields.patch[fieldKey];
@@ -2571,6 +2692,13 @@ const incidentsPanel = (function () {
         valueControl = document.createElement("textarea");
         if (existing !== undefined) valueControl.value = existing;
       }
+      // P-7: neither control had any accessible name before (a bare text
+      // node between them isn't a programmatic association) -- aria-label
+      // each individually rather than wrapping both in one <label> (which
+      // would give them the SAME name and make them indistinguishable to a
+      // screen reader).
+      checkbox.setAttribute("aria-label", `Amend ${fieldLabel}`);
+      valueControl.setAttribute("aria-label", `New value for ${fieldLabel}`);
 
       const syncPatch = () => {
         if (!checkbox.checked) {
@@ -2584,12 +2712,12 @@ const incidentsPanel = (function () {
       valueControl.addEventListener("input", syncPatch);
       valueControl.addEventListener("change", syncPatch);
 
-      row.append(checkbox, ` ${fieldKey.replace(/_/g, " ")} `, valueControl);
+      row.append(checkbox, ` ${fieldLabel} `, valueControl);
       wrap.append(row);
     }
 
     const errorText = [state.amendErrors.reason, state.amendErrors.patch].filter(Boolean).join(" ");
-    if (errorText) wrap.append(el("p", { class: "rr-error" }, errorText));
+    if (errorText) wrap.append(el("p", { class: "rr-error", role: "alert" }, errorText));
     const submitBtn = el("button", { type: "button", class: "primary" }, "Submit amendment");
     submitBtn.addEventListener("click", () => submitAmendment());
     wrap.append(submitBtn);
@@ -2598,7 +2726,7 @@ const incidentsPanel = (function () {
 
   // --- People / witness statements (IN-12) ----------------------------------
   function buildPersonForm() {
-    const wrap = el("div", { class: "inline-form" });
+    const wrap = el("div", { class: "inline-form add-person-form" });
     const roleSelect = document.createElement("select");
     roleSelect.append(el("option", { value: "" }, "Role"));
     for (const role of INCIDENT_PERSON_ROLES) {
@@ -2610,10 +2738,16 @@ const incidentsPanel = (function () {
     const nameInput = el("input", { type: "text", placeholder: "Full name", value: state.personFields.fullName });
     nameInput.addEventListener("input", () => (state.personFields.fullName = nameInput.value));
     const errorText = [state.personErrors.personRole, state.personErrors.fullName].filter(Boolean).join(" ");
-    const errorEl = el("p", { class: "rr-error" }, errorText);
+    const errorEl = el("p", { class: "rr-error", role: "alert" }, errorText);
     const submitBtn = el("button", { type: "button", class: "primary" }, "Add person");
     submitBtn.addEventListener("click", () => submitPerson());
-    wrap.append(roleSelect, nameInput, submitBtn, errorEl);
+    // P-7: wrap both controls in a label -- see labeledField's doc comment.
+    wrap.append(
+      el("label", {}, ["Role", roleSelect]),
+      el("label", {}, ["Full name", nameInput]),
+      submitBtn,
+      errorEl
+    );
     return wrap;
   }
 
@@ -2631,21 +2765,20 @@ const incidentsPanel = (function () {
     const errors = state.statementFieldErrorsByPersonId[personId] || {};
     const wrap = el("div", { class: "inline-form" });
     const textarea = document.createElement("textarea");
-    textarea.placeholder = "Statement text";
     textarea.value = fields.statementText;
     textarea.addEventListener("input", () => (fields.statementText = textarea.value));
     state.statementFieldByPersonId[personId] = fields;
-    if (errors.statementText) wrap.append(el("p", { class: "rr-error" }, errors.statementText));
+    if (errors.statementText) wrap.append(el("p", { class: "rr-error", role: "alert" }, errors.statementText));
     const submitBtn = el("button", { type: "button" }, "Add statement");
     submitBtn.addEventListener("click", () => submitStatement(personId));
-    wrap.append(textarea, submitBtn);
+    wrap.append(el("label", {}, ["Statement text", textarea]), submitBtn);
     return wrap;
   }
 
   function buildStatementHistory(person) {
     const wrap = el("div", { class: "module-section" });
     const statementError = state.statementErrorsByPersonId[person.id];
-    if (statementError) wrap.append(el("p", { class: "rr-error" }, statementError));
+    if (statementError) wrap.append(el("p", { class: "rr-error", role: "alert" }, statementError));
     const statements = state.statementsByPersonId[person.id];
     if (!statements) {
       wrap.append(el("p", { class: "item-subtitle" }, "Loading statements…"));
@@ -2685,7 +2818,7 @@ const incidentsPanel = (function () {
 
   function buildPeopleSection() {
     const wrap = el("div", {});
-    if (state.peopleError) wrap.append(el("p", { class: "rr-error" }, state.peopleError));
+    if (state.peopleError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.peopleError));
     if (state.people.length === 0) wrap.append(el("p", { class: "item-subtitle" }, "No people recorded for this incident."));
     for (const person of state.people) {
       const row = el("div", { class: "module-item" });
@@ -2694,7 +2827,7 @@ const incidentsPanel = (function () {
       const rowActions = el("div", { class: "detail-actions" });
       const historyBtn = el(
         "button",
-        { type: "button" },
+        { type: "button", "aria-expanded": state.openPersonId === person.id ? "true" : "false" },
         state.openPersonId === person.id ? "Hide statements" : "Statements"
       );
       historyBtn.addEventListener("click", () => togglePersonStatements(person.id));
@@ -2735,7 +2868,7 @@ const incidentsPanel = (function () {
     panel.append(header);
 
     if (state.detailError) {
-      panel.append(el("p", { class: "rr-error" }, state.detailError));
+      panel.append(el("p", { class: "rr-error", role: "alert" }, state.detailError));
       return panel;
     }
     if (!state.detail) {
@@ -2743,7 +2876,7 @@ const incidentsPanel = (function () {
       return panel;
     }
     const d = state.detail;
-    if (state.detailActionError) panel.append(el("p", { class: "rr-error" }, state.detailActionError));
+    if (state.detailActionError) panel.append(el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, state.detailActionError));
 
     const meta = el("div", { class: "report-inbox-meta" });
     meta.append(el("p", {}, `Status: ${d.status} · Severity: ${d.severity} · Type: ${d.report_type}`));
@@ -2764,19 +2897,20 @@ const incidentsPanel = (function () {
     }
     if (hasPerm("incidents.review") && d.status !== "draft" && d.status !== "closed") {
       const select = document.createElement("select");
+      select.setAttribute("aria-label", "Change status to");
       for (const status of INCIDENT_NEXT_STATUS_CHOICES) select.append(el("option", { value: status }, status));
-      const reasonInput = el("input", { type: "text", placeholder: "Reason (optional)" });
+      const reasonInput = el("input", { type: "text", placeholder: "Reason (optional)", "aria-label": "Reason for status change" });
       const changeBtn = el("button", { type: "button" }, "Change status");
       changeBtn.addEventListener("click", () => changeStatus(select.value, reasonInput.value));
       actionsRow.append(select, reasonInput, changeBtn);
     }
     if (actionsRow.childNodes.length > 0) panel.append(actionsRow);
 
-    panel.append(el("h4", {}, "People involved"));
+    panel.append(el("h4", { id: "people-involved-heading" }, "People involved"));
     panel.append(buildPeopleSection());
 
     panel.append(el("h4", {}, "Follow-up actions"));
-    if (state.followupsError) panel.append(el("p", { class: "rr-error" }, state.followupsError));
+    if (state.followupsError) panel.append(el("p", { class: "rr-error", role: "alert" }, state.followupsError));
     if (state.followups.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No follow-up actions yet."));
     for (const followup of state.followups) {
       const row = el("div", { class: "module-item" });
@@ -2803,7 +2937,7 @@ const incidentsPanel = (function () {
     }
 
     panel.append(el("h4", {}, "Escalation history"));
-    if (state.escalationsError) panel.append(el("p", { class: "rr-error" }, state.escalationsError));
+    if (state.escalationsError) panel.append(el("p", { class: "rr-error", role: "alert" }, state.escalationsError));
     if (state.escalations.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No escalations."));
     for (const escalation of state.escalations) {
       const row = el("div", { class: "module-item" });
@@ -2822,7 +2956,7 @@ const incidentsPanel = (function () {
     }
 
     panel.append(el("h4", {}, "Amendment history (immutable — every amendment is permanently retained)"));
-    if (state.amendmentsError) panel.append(el("p", { class: "rr-error" }, state.amendmentsError));
+    if (state.amendmentsError) panel.append(el("p", { class: "rr-error", role: "alert" }, state.amendmentsError));
     if (state.amendments.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No amendments."));
     for (const amendment of state.amendments) {
       const row = el("div", { class: "module-item" });
@@ -2907,6 +3041,11 @@ const incidentsPanel = (function () {
     if (!hasPerm("incidents.manage")) return;
     state.captureOpen = true;
     render();
+    // P-7: focus lands in the newly-opened capture form's first field --
+    // this is the target of the home dashboard's "Log incident" quick
+    // action, so without this a keyboard user would otherwise still be
+    // sitting on the quick-action button with no indication the form opened.
+    focusFirstControl(document.querySelector(".incident-capture-form"));
   }
 
   // openDetail exposed for P-8 (global search): its own "View" button
@@ -2965,6 +3104,9 @@ const workOrdersPanel = (function () {
     const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
     state.employees = employees || [];
     state.myEmployeeId = (state.employees.find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
+    // P-7: loadList() below always ends in a render() (success or its own
+    // catch), which is what actually clears aria-busy -- see render()'s own
+    // comment further down.
     await loadList();
   }
 
@@ -3058,6 +3200,8 @@ const workOrdersPanel = (function () {
     } catch (error) {
       state.detailError = error.message;
       render();
+      // P-7: see incidentsPanel.openDetail's identical comment.
+      focusElement(document.querySelector("#work-order-detail-panel h3"));
       return;
     }
     try {
@@ -3066,6 +3210,7 @@ const workOrdersPanel = (function () {
       state.updatesError = error.message;
     }
     render();
+    focusElement(document.querySelector("#work-order-detail-panel h3"));
   }
 
   function closeDetail() {
@@ -3120,7 +3265,7 @@ const workOrdersPanel = (function () {
 
   function buildCreateForm() {
     const f = state.createFields;
-    const wrap = el("div", { class: "inline-form" });
+    const wrap = el("div", { class: "inline-form work-order-create-form" });
     const titleInput = el("input", { type: "text", value: f.title, placeholder: "Title" });
     titleInput.addEventListener("input", () => (f.title = titleInput.value));
     const descInput = document.createElement("textarea");
@@ -3146,7 +3291,7 @@ const workOrdersPanel = (function () {
     });
     const submitBtn = el("button", { type: "button", class: "primary" }, "Create work order");
     submitBtn.addEventListener("click", () => createWorkOrder());
-    const errorEl = el("p", { class: "rr-error" }, Object.values(state.createErrors).join(" "));
+    const errorEl = el("p", { class: "rr-error", role: "alert" }, Object.values(state.createErrors).join(" "));
     wrap.append(
       el("label", {}, ["Title", titleInput]),
       el("label", {}, ["Description", descInput]),
@@ -3186,7 +3331,7 @@ const workOrdersPanel = (function () {
     panel.append(header);
 
     if (state.detailError) {
-      panel.append(el("p", { class: "rr-error" }, state.detailError));
+      panel.append(el("p", { class: "rr-error", role: "alert" }, state.detailError));
       return panel;
     }
     if (!state.detail) {
@@ -3194,7 +3339,7 @@ const workOrdersPanel = (function () {
       return panel;
     }
     const wo = state.detail;
-    if (state.detailActionError) panel.append(el("p", { class: "rr-error" }, state.detailActionError));
+    if (state.detailActionError) panel.append(el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, state.detailActionError));
 
     panel.append(el("p", { class: "item-subtitle" }, wo.description));
     panel.append(
@@ -3208,6 +3353,7 @@ const workOrdersPanel = (function () {
     if (hasPerm("work_orders.manage")) {
       const actionsRow = el("div", { class: "detail-actions" });
       const statusSelect = document.createElement("select");
+      statusSelect.setAttribute("aria-label", "Update work order status to");
       for (const status of WORK_ORDER_STATUSES) statusSelect.append(el("option", { value: status }, status));
       statusSelect.value = wo.status;
       const statusBtn = el("button", { type: "button" }, "Update status");
@@ -3216,6 +3362,7 @@ const workOrdersPanel = (function () {
 
       if (state.employees.length > 0) {
         const assignSelect = document.createElement("select");
+        assignSelect.setAttribute("aria-label", "Assign work order to");
         assignSelect.append(el("option", { value: "" }, "Unassigned"));
         for (const employee of state.employees) {
           const opt = el("option", { value: employee.id }, `${employee.first_name} ${employee.last_name}`);
@@ -3230,7 +3377,7 @@ const workOrdersPanel = (function () {
     }
 
     panel.append(el("h4", {}, "Comments"));
-    if (state.updatesError) panel.append(el("p", { class: "rr-error" }, state.updatesError));
+    if (state.updatesError) panel.append(el("p", { class: "rr-error", role: "alert" }, state.updatesError));
     if (state.updates.length === 0) panel.append(el("p", { class: "item-subtitle" }, "No updates yet."));
     for (const update of state.updates) {
       const row = el("div", { class: "module-item" });
@@ -3246,6 +3393,7 @@ const workOrdersPanel = (function () {
     if (hasPerm("work_orders.manage")) {
       const commentBox = document.createElement("textarea");
       commentBox.placeholder = "Add a comment";
+      commentBox.setAttribute("aria-label", "Add a comment");
       commentBox.value = state.commentText;
       commentBox.addEventListener("input", () => (state.commentText = commentBox.value));
       const postBtn = el("button", { type: "button", class: "primary" }, "Post comment");
@@ -3264,6 +3412,10 @@ const workOrdersPanel = (function () {
     const host = container();
     if (!host) return;
     host.textContent = "";
+    // P-7: loadList()'s try/catch (both branches end in render()) is this
+    // panel's only path to setLoading(host, true) -- clear aria-busy here
+    // rather than adding a redundant try/finally there.
+    host.setAttribute("aria-busy", "false");
 
     const chipsRow = el("div", { class: "filter-chips" });
     const chipLabels = { all: "All", open: "Open", overdue: "Overdue" };
@@ -3278,6 +3430,7 @@ const workOrdersPanel = (function () {
       chipsRow.append(mineBtn);
     }
     const prioritySelect = document.createElement("select");
+    prioritySelect.setAttribute("aria-label", "Filter by priority");
     prioritySelect.append(el("option", { value: "" }, "All priorities"));
     for (const priority of WORK_ORDER_PRIORITIES) {
       const opt = el("option", { value: priority }, priority);
@@ -3302,7 +3455,7 @@ const workOrdersPanel = (function () {
       if (state.createOpen) host.append(buildCreateForm());
     }
 
-    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
 
     const listWrap = el("div", { class: "module-list" });
     if (state.items.length === 0) {
@@ -3326,6 +3479,9 @@ const workOrdersPanel = (function () {
     if (!hasPerm("work_orders.manage")) return;
     state.createOpen = true;
     render();
+    // P-7: focus lands in the newly-opened create form's first field -- this
+    // is the target of the home dashboard's "New work order" quick action.
+    focusFirstControl(document.querySelector(".work-order-create-form"));
   }
 
   // openDetail exposed for P-8 (global search): the search box's work
@@ -3391,6 +3547,8 @@ const commsPanel = (function () {
       await loadMessagesList();
     } catch (error) {
       renderInlineError(host, error);
+    } finally {
+      host.setAttribute("aria-busy", "false");
     }
   }
 
@@ -3589,7 +3747,7 @@ const commsPanel = (function () {
     }
 
     if (Object.keys(errors).length > 0) {
-      wrap.append(el("p", { class: "rr-error" }, Object.values(errors).join(" ")));
+      wrap.append(el("p", { class: "rr-error", role: "alert" }, Object.values(errors).join(" ")));
     }
 
     wrap.append(el("h4", {}, "Audience"));
@@ -3597,6 +3755,7 @@ const commsPanel = (function () {
     state.audienceRows.forEach((row, index) => {
       const rowEl = el("div", { class: "audience-row" });
       const typeSelect = document.createElement("select");
+      typeSelect.setAttribute("aria-label", `Audience type, row ${index + 1}`);
       typeSelect.append(el("option", { value: "" }, "Type"));
       for (const type of AUDIENCE_TYPES) {
         const opt = el("option", { value: type }, type);
@@ -3604,7 +3763,12 @@ const commsPanel = (function () {
         typeSelect.append(opt);
       }
       typeSelect.addEventListener("change", () => (row.audienceType = typeSelect.value));
-      const refInput = el("input", { type: "text", value: row.audienceRefId, placeholder: "Target id" });
+      const refInput = el("input", {
+        type: "text",
+        value: row.audienceRefId,
+        placeholder: "Target id",
+        "aria-label": `Audience target id, row ${index + 1}`
+      });
       refInput.addEventListener("input", () => (row.audienceRefId = refInput.value));
       const removeBtn = el("button", { type: "button" }, "Remove");
       removeBtn.addEventListener("click", () => {
@@ -3622,7 +3786,7 @@ const commsPanel = (function () {
       render();
     });
     wrap.append(addRowBtn);
-    if (state.audienceError) wrap.append(el("p", { class: "rr-error" }, state.audienceError));
+    if (state.audienceError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.audienceError));
 
     const publishBtn = el("button", { type: "button", class: "primary" }, "Publish message");
     publishBtn.addEventListener("click", () => composeAndPublish());
@@ -3682,7 +3846,7 @@ const commsPanel = (function () {
       if (state.composeOpen) host.append(buildComposeForm());
     }
 
-    if (state.formError) host.append(el("p", { class: "rr-error" }, state.formError));
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
 
     const listWrap = el("div", { class: "module-list" });
     if (state.messages.length === 0) {
@@ -3742,6 +3906,8 @@ async function loadTraining() {
     });
   } catch (error) {
     setError(container, error.message);
+  } finally {
+    container.setAttribute("aria-busy", "false");
   }
 }
 
@@ -3787,19 +3953,32 @@ async function loadCertifications() {
     container.innerHTML = html;
   } catch (error) {
     setError(container, error.message);
+  } finally {
+    container.setAttribute("aria-busy", "false");
   }
 }
 
-// Helper: Set loading state
+// Helper: Set loading state. P-7: written into a role="status"
+// aria-live="polite" region (rather than a plain paragraph) so a screen
+// reader announces it, and toggles aria-busy on the container for the
+// duration of the fetch. Every setLoading(x, true) call site's surrounding
+// try/finally (or its panel's render(), which always runs host.textContent
+// = "" first) clears aria-busy again once the fetch settles either way --
+// see each call site's own comment.
 function setLoading(container, loading) {
   if (loading) {
-    container.innerHTML = '<p>Loading...</p>';
+    container.setAttribute("aria-busy", "true");
+    container.replaceChildren(el("p", { role: "status", "aria-live": "polite" }, "Loading…"));
   }
 }
 
-// Helper: Set error state
+// Helper: Set error state. P-7: role="alert" + aria-live="polite" so a
+// screen reader announces the failure; also clears aria-busy (this is one
+// of the two ways a setLoading(x, true) call resolves, alongside a
+// successful render replacing the container's content directly).
 function setError(container, message) {
-  container.innerHTML = `<p class="rr-error">Error: ${escapeHtml(message)}</p>`;
+  container.setAttribute("aria-busy", "false");
+  container.replaceChildren(el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, `Error: ${message}`));
 }
 
 // Helper: Escape HTML
@@ -3935,6 +4114,8 @@ function setupGlobalSearch() {
     closeResults();
     const container = scrollElementIntoView(SEARCH_LEG_CONTAINER_ID[legKey]);
     if (legKey === "incidents" && incidentsPanel.openDetail) {
+      // P-7: incidentsPanel.openDetail already moves focus to the detail
+      // panel's own heading once it renders -- nothing further needed here.
       await incidentsPanel.openDetail(item.id);
       flashSearchHighlight(scrollElementIntoView("incident-detail-panel") || container);
     } else if (legKey === "workOrders" && workOrdersPanel.openDetail) {
@@ -3945,11 +4126,16 @@ function setupGlobalSearch() {
       if (card) {
         card.scrollIntoView({ behavior: "smooth", block: "center" });
         flashSearchHighlight(card);
+        // P-7: employees/messages have no dedicated detail panel to focus a
+        // heading in -- focus the matched card itself instead.
+        focusElement(card);
       } else {
         flashSearchHighlight(container);
+        focusElement(container);
       }
     } else {
       flashSearchHighlight(container);
+      focusElement(container);
     }
   }
 

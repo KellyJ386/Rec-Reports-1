@@ -11,6 +11,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="app-header">
       <div class="user-info">Signed in as <span id="user-email">...</span></div>
       <div class="global-search" id="global-search">
@@ -30,7 +31,7 @@
       </div>
       <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
     </header>
-    <main class="shell">
+    <main class="shell" id="main-content" tabindex="-1">
       <section id="home-dashboard" aria-labelledby="home-heading">
         <div class="home-dashboard-header">
           <div>
