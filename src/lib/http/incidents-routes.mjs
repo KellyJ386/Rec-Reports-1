@@ -9,6 +9,7 @@ import {
   buildAmendment,
   nextIncidentNo,
   requiredIncidentFollowUps,
+  evaluateClosureGate,
   INCIDENT_STATUSES
 } from "../incidents.mjs";
 import { buildIncidentPdfPackage } from "../incident-pdf.mjs";
@@ -572,11 +573,18 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         const actorPermissions = actorPermissionsFor(auth, incident.facility_id);
 
         let openFollowUps = [];
+        let complianceChecks = [];
         if (to === "closed") {
-          openFollowUps = await pgSelect(auth.client, "incident_followup_actions", {
-            filters: { incident_id: incident.id, status: { in: OPEN_FOLLOWUP_STATUSES } },
-            select: "id"
-          });
+          [openFollowUps, complianceChecks] = await Promise.all([
+            pgSelect(auth.client, "incident_followup_actions", {
+              filters: { incident_id: incident.id, status: { in: OPEN_FOLLOWUP_STATUSES } },
+              select: "id"
+            }),
+            pgSelect(auth.client, "incident_compliance_checks", {
+              filters: { incident_id: incident.id },
+              select: "check_key,status"
+            })
+          ]);
         }
 
         const check = canTransitionIncident(incident.status, to, {
@@ -586,6 +594,28 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         });
         if (!check.allowed) {
           return sendJson(response, transitionStatusCode(check.reasonCode), { error: check.reason });
+        }
+
+        // IN-13/IN-15: the closure gate (evidence_complete for high/
+        // critical severity, supervisor_signoff when requires_osha_review)
+        // is checked here, AFTER canTransitionIncident's own follow-up/
+        // legal-hold gate, so a caller sees the most specific applicable
+        // rejection first -- and again, independently, at the database
+        // layer by fn_incident_report_transition_guard's guard 2.5
+        // (migration 0056), regardless of which check runs first for any
+        // given request.
+        let waivedChecks = [];
+        if (to === "closed") {
+          const gate = evaluateClosureGate(
+            { severity: incident.severity, requiresOshaReview: incident.requires_osha_review === true },
+            complianceChecks ?? []
+          );
+          if (!gate.allowed) {
+            return sendJson(response, 409, { error: gate.reason, blockingCheck: gate.blockingCheck });
+          }
+          waivedChecks = (complianceChecks ?? [])
+            .filter((row) => row.status === "waived")
+            .map((row) => row.check_key);
         }
 
         const rows = await pgUpdate(
@@ -605,7 +635,13 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
             incidentId: incident.id,
             actorUserId: auth.claims.sub,
             eventType: "incident.status_changed",
-            payload: { actor: auth.claims.sub, from: incident.status, to, reason: reason ?? null }
+            payload: {
+              actor: auth.claims.sub,
+              from: incident.status,
+              to,
+              reason: reason ?? null,
+              ...(waivedChecks.length > 0 ? { waivedChecks } : {})
+            }
           })
         );
         if (!auditOk) return;
@@ -663,6 +699,30 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         );
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // IN-19: a minimal reader for the review workspace's timeline -- lists an
+  // incident's own audit-event ledger, oldest first, so the client can
+  // merge it with GET .../amendments into one chronological view. This is
+  // deliberately NOT IN-22's full "chain verification endpoint" (that
+  // Wave-4 route additionally runs verifyChain and reports tamper status);
+  // this one only reads the rows incidents.read already grants access to
+  // per-row via incident_audit_events' own SELECT policy (0043(c)).
+  router.register(
+    "GET",
+    "/incidents/:id/audit-events",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+        if (!requireRead(auth, incident.facility_id, response)) return;
+        const rows = await pgSelect(auth.client, "incident_audit_events", {
+          filters: { incident_id: incident.id },
+          select: "id,facility_id,incident_id,event_type,actor_user_id,event_payload,created_at",
+          order: "id.asc"
+        });
+        return sendJson(response, 200, rows ?? []);
       })
   );
 

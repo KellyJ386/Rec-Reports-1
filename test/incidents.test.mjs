@@ -12,8 +12,16 @@ import {
   AMENDABLE_INCIDENT_FIELDS,
   formatIncidentNo,
   nextIncidentNo,
-  INCIDENT_STATUSES
+  INCIDENT_STATUSES,
+  SIGNATURE_ROLES,
+  validateAttestationText,
+  COMPLIANCE_CHECK_KEYS,
+  COMPLIANCE_CHECK_STATUSES,
+  evaluateClosureGate,
+  evaluateOshaDecisionTree,
+  OSHA_OUTCOMES
 } from "../src/lib/incidents.mjs";
+import { settingsRegistry } from "../src/lib/settings-registry.mjs";
 
 test("shouldEscalateIncident escalates high severity, legal hold, or OSHA review", () => {
   assert.equal(shouldEscalateIncident({ severity: "high" }), true);
@@ -58,6 +66,18 @@ test("classifyOshaReview only flags accident outcomes with OSHA-style triggers",
   assert.equal(classifyOshaReview("incident", ["employee_injury"]), false);
   assert.equal(classifyOshaReview("accident", ["first_aid"]), false);
   assert.equal(classifyOshaReview("accident", ["employee_injury", "lost_time"]), true);
+});
+
+// IN-14: the tree-outcome expansion is additive -- every existing 2-arg call
+// above is unaffected (treeOutcome defaults to null), and a "recordable"
+// tree outcome flags OSHA review on its own, independent of report_type.
+test("classifyOshaReview also flags a 'recordable' OSHA decision-tree outcome, independent of report_type/outcomes", () => {
+  assert.equal(classifyOshaReview("incident", [], "recordable"), true);
+  assert.equal(classifyOshaReview("near_miss", [], "recordable"), true);
+  assert.equal(classifyOshaReview("incident", [], "first_aid_only"), false);
+  assert.equal(classifyOshaReview("incident", [], "not_work_related"), false);
+  assert.equal(classifyOshaReview("incident", [], "needs_more_info"), false);
+  assert.equal(classifyOshaReview("incident", [], null), false);
 });
 
 test("requiredIncidentFollowUps returns deduplicated compliance actions", () => {
@@ -383,4 +403,274 @@ test("nextIncidentNo ignores malformed / non-matching values instead of throwing
 test("nextIncidentNo defaults year to the current UTC year when omitted", () => {
   const year = new Date().getUTCFullYear();
   assert.equal(nextIncidentNo([]), `INC-${year}-0001`);
+});
+
+// --- Signatures (IN-13) ------------------------------------------------------
+
+test("validateAttestationText rejects blank/whitespace-only text", () => {
+  assert.equal(validateAttestationText("").valid, false);
+  assert.equal(validateAttestationText("   ").valid, false);
+  assert.equal(validateAttestationText(undefined).valid, false);
+  assert.equal(validateAttestationText(null).valid, false);
+});
+
+test("validateAttestationText accepts trimmed non-blank text up to 2000 chars, rejects longer", () => {
+  assert.equal(validateAttestationText("I attest this is accurate.").valid, true);
+  assert.equal(validateAttestationText("a".repeat(2000)).valid, true);
+  const tooLong = validateAttestationText("a".repeat(2001));
+  assert.equal(tooLong.valid, false);
+  assert.match(tooLong.error, /2000/);
+});
+
+test("SIGNATURE_ROLES matches the design doc's fixed vocabulary, supervisor included", () => {
+  assert.deepEqual(SIGNATURE_ROLES, ["reporter", "witness", "supervisor", "manager"]);
+});
+
+// --- Compliance checks + closure gate (IN-15) --------------------------------
+
+test("COMPLIANCE_CHECK_KEYS/STATUSES match the design doc's fixed vocabularies", () => {
+  assert.deepEqual(COMPLIANCE_CHECK_KEYS, ["evidence_complete", "supervisor_signoff", "osha_recordability", "legal_review"]);
+  assert.deepEqual(COMPLIANCE_CHECK_STATUSES, ["pass", "fail", "waived"]);
+});
+
+test("evaluateClosureGate allows a low/medium-severity, non-OSHA incident with no compliance checks at all", () => {
+  assert.deepEqual(evaluateClosureGate({ severity: "low", requiresOshaReview: false }, []), {
+    allowed: true,
+    reason: null,
+    reasonCode: null,
+    blockingCheck: null
+  });
+  assert.equal(evaluateClosureGate({ severity: "medium", requiresOshaReview: false }, []).allowed, true);
+});
+
+test("evaluateClosureGate blocks a high/critical incident with no evidence_complete check", () => {
+  for (const severity of ["high", "critical"]) {
+    const gate = evaluateClosureGate({ severity, requiresOshaReview: false }, []);
+    assert.equal(gate.allowed, false);
+    assert.equal(gate.reasonCode, "compliance_check_failed");
+    assert.equal(gate.blockingCheck, "evidence_complete");
+    assert.match(gate.reason, /evidence_complete/);
+  }
+});
+
+test("evaluateClosureGate blocks a high-severity incident whose evidence_complete check failed", () => {
+  const gate = evaluateClosureGate(
+    { severity: "high", requiresOshaReview: false },
+    [{ check_key: "evidence_complete", status: "fail" }]
+  );
+  assert.equal(gate.allowed, false);
+  assert.match(gate.reason, /failed/);
+  assert.equal(gate.blockingCheck, "evidence_complete");
+});
+
+test("evaluateClosureGate allows a high-severity incident whose evidence_complete check passed or was waived", () => {
+  assert.equal(
+    evaluateClosureGate({ severity: "high", requiresOshaReview: false }, [{ check_key: "evidence_complete", status: "pass" }])
+      .allowed,
+    true
+  );
+  assert.equal(
+    evaluateClosureGate({ severity: "critical", requiresOshaReview: false }, [
+      { check_key: "evidence_complete", status: "waived" }
+    ]).allowed,
+    true
+  );
+});
+
+test("evaluateClosureGate additionally requires supervisor_signoff when requiresOshaReview is true, independent of severity", () => {
+  const lowSeverityOsha = evaluateClosureGate({ severity: "low", requiresOshaReview: true }, []);
+  assert.equal(lowSeverityOsha.allowed, false);
+  assert.equal(lowSeverityOsha.blockingCheck, "supervisor_signoff");
+
+  assert.equal(
+    evaluateClosureGate({ severity: "low", requiresOshaReview: true }, [
+      { check_key: "supervisor_signoff", status: "pass" }
+    ]).allowed,
+    true
+  );
+});
+
+test("evaluateClosureGate on a high-severity, requires_osha_review incident: evidence_complete is checked before supervisor_signoff", () => {
+  // Only evidence_complete recorded -- supervisor_signoff still blocks.
+  const gate = evaluateClosureGate({ severity: "high", requiresOshaReview: true }, [
+    { check_key: "evidence_complete", status: "pass" }
+  ]);
+  assert.equal(gate.allowed, false);
+  assert.equal(gate.blockingCheck, "supervisor_signoff");
+
+  // Both recorded -- passes.
+  assert.equal(
+    evaluateClosureGate({ severity: "high", requiresOshaReview: true }, [
+      { check_key: "evidence_complete", status: "pass" },
+      { check_key: "supervisor_signoff", status: "waived" }
+    ]).allowed,
+    true
+  );
+});
+
+// --- OSHA recordability decision tree (IN-14) --------------------------------
+
+const TEST_TREE = {
+  start: "fatality",
+  nodes: {
+    fatality: { question: "Fatality?", yes: { outcome: "recordable", timer: "fatality" }, no: "hospitalization" },
+    hospitalization: {
+      question: "Hospitalization?",
+      yes: { outcome: "recordable", timer: "hospitalization" },
+      no: "work_related"
+    },
+    work_related: { question: "Work-related?", yes: "recordable_criteria", no: { outcome: "not_work_related" } },
+    recordable_criteria: {
+      question: "Meets recordable criteria?",
+      yes: { outcome: "recordable", timer: "recordable" },
+      no: "first_aid"
+    },
+    first_aid: { question: "First aid only?", yes: { outcome: "first_aid_only" }, no: { outcome: "needs_more_info" } }
+  },
+  timers: {
+    fatality: { hours: 8 },
+    hospitalization: { hours: 24 },
+    recordable: { days: 7 }
+  }
+};
+
+test("evaluateOshaDecisionTree is the shipped default in settings-registry.mjs (incidents.oshaDecisionTree)", () => {
+  const definition = settingsRegistry.find((d) => d.key === "incidents.oshaDecisionTree");
+  assert.ok(definition, "expected an incidents.oshaDecisionTree setting definition");
+  assert.equal(definition.dataType, "json");
+  assert.equal(definition.module, "incidents");
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(definition.default, { fatality: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-01T08:00:00.000Z");
+});
+
+test("evaluateOshaDecisionTree: fatality path is recordable with an 8-hour timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(TEST_TREE, { fatality: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.recordable, true);
+  assert.equal(result.dueAt, "2026-07-01T08:00:00.000Z");
+  assert.deepEqual(result.path, [{ nodeId: "fatality", question: "Fatality?", answer: "yes" }]);
+});
+
+test("evaluateOshaDecisionTree: hospitalization path is recordable with a 24-hour timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-02T00:00:00.000Z");
+  assert.equal(result.path.length, 2);
+});
+
+test("evaluateOshaDecisionTree: ordinary recordable-criteria path gets a 7-day timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(
+    TEST_TREE,
+    { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "yes" },
+    now
+  );
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-08T00:00:00.000Z");
+});
+
+test("evaluateOshaDecisionTree: not-work-related and first-aid-only paths carry no timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const notWorkRelated = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "no", work_related: "no" }, now);
+  assert.equal(notWorkRelated.outcome, "not_work_related");
+  assert.equal(notWorkRelated.recordable, false);
+  assert.equal(notWorkRelated.dueAt, null);
+
+  const firstAid = evaluateOshaDecisionTree(
+    TEST_TREE,
+    { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "no", first_aid: "yes" },
+    now
+  );
+  assert.equal(firstAid.outcome, "first_aid_only");
+  assert.equal(firstAid.dueAt, null);
+});
+
+test("evaluateOshaDecisionTree: determinism -- identical tree/answers/now always produce identical output", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const answers = { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "yes" };
+  const first = evaluateOshaDecisionTree(TEST_TREE, answers, now);
+  const second = evaluateOshaDecisionTree(TEST_TREE, answers, now);
+  assert.deepEqual(first, second);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- null/undefined/shapeless tree", () => {
+  for (const badTree of [null, undefined, {}, { start: "fatality" }, "not an object", 42]) {
+    const result = evaluateOshaDecisionTree(badTree, { fatality: "yes" });
+    assert.equal(result.outcome, "needs_more_info");
+    assert.equal(result.recordable, false);
+    assert.equal(result.dueAt, null);
+    assert.equal(result.malformed, true);
+  }
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- missing/invalid answer for the current node", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const missingAnswer = evaluateOshaDecisionTree(TEST_TREE, {}, now);
+  assert.equal(missingAnswer.outcome, "needs_more_info");
+  assert.equal(missingAnswer.malformed, true);
+  assert.deepEqual(missingAnswer.path, []);
+
+  const invalidAnswer = evaluateOshaDecisionTree(TEST_TREE, { fatality: "maybe" }, now);
+  assert.equal(invalidAnswer.outcome, "needs_more_info");
+  assert.equal(invalidAnswer.malformed, true);
+
+  // Insufficient answers partway through the tree: path holds what WAS
+  // legally walked before the missing answer.
+  const partial = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "no" });
+  assert.equal(partial.outcome, "needs_more_info");
+  assert.equal(partial.malformed, true);
+  assert.equal(partial.path.length, 2);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- a node names a continuation absent from tree.nodes", () => {
+  const brokenTree = {
+    start: "fatality",
+    nodes: { fatality: { question: "Fatality?", yes: { outcome: "recordable" }, no: "nowhere" } }
+  };
+  const result = evaluateOshaDecisionTree(brokenTree, { fatality: "no" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- a cyclic tree does not hang, falls back after bounded depth", () => {
+  const cyclicTree = {
+    start: "a",
+    nodes: {
+      a: { question: "A?", yes: { outcome: "recordable" }, no: "b" },
+      b: { question: "B?", yes: { outcome: "recordable" }, no: "a" }
+    }
+  };
+  const result = evaluateOshaDecisionTree(cyclicTree, { a: "no", b: "no" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+});
+
+test("evaluateOshaDecisionTree: a terminal leaf naming an outcome outside OSHA_OUTCOMES falls back safely", () => {
+  const badOutcomeTree = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "totally_made_up" }, no: { outcome: "not_work_related" } } }
+  };
+  const result = evaluateOshaDecisionTree(badOutcomeTree, { a: "yes" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+  assert.ok(OSHA_OUTCOMES.includes("not_work_related")); // sanity: the OTHER leaf's outcome is legal
+});
+
+test("evaluateOshaDecisionTree: a recordable leaf with no `timer` key (or an unknown timer name) carries dueAt: null", () => {
+  const treeWithoutTimer = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "recordable" }, no: { outcome: "not_work_related" } } }
+  };
+  assert.equal(evaluateOshaDecisionTree(treeWithoutTimer, { a: "yes" }).dueAt, null);
+
+  const treeWithUnknownTimer = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "recordable", timer: "does_not_exist" }, no: { outcome: "not_work_related" } } },
+    timers: { fatality: { hours: 8 } }
+  };
+  assert.equal(evaluateOshaDecisionTree(treeWithUnknownTimer, { a: "yes" }).dueAt, null);
 });

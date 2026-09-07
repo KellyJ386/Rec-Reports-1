@@ -18,6 +18,19 @@ import {
   validateStatementInput,
   buildStatementPayload
 } from "./incident-form.mjs";
+import {
+  mergeIncidentTimeline,
+  evaluateClosureGatePreview,
+  SIGNATURE_ROLES,
+  validateSignatureInput,
+  buildSignaturePayload,
+  COMPLIANCE_CHECK_KEYS,
+  validateComplianceCheckInput,
+  complianceCheckStatusOptions,
+  buildCompliancePayload,
+  nextOshaQuestion,
+  buildOshaEvaluationPayload
+} from "./incident-review.mjs";
 import { paginate } from "./list-pagination.mjs";
 import {
   WORK_ORDER_STATUSES,
@@ -2317,7 +2330,28 @@ const incidentsPanel = (function () {
     statementErrorsByPersonId: {},
     openPersonId: null,
     statementFieldByPersonId: {},
-    statementFieldErrorsByPersonId: {}
+    statementFieldErrorsByPersonId: {},
+    // IN-19: the review workspace -- timeline (audit events + amendments),
+    // signatures, compliance checks, and the OSHA questionnaire. Only
+    // fetched/rendered for a submitted|under_review incident (openDetail).
+    reviewOpen: false,
+    auditEvents: [],
+    auditEventsError: null,
+    signatures: [],
+    signaturesError: null,
+    signOpen: false,
+    signFields: { role: "", attestationText: "", signedName: "" },
+    signErrors: {},
+    complianceChecks: [],
+    complianceChecksError: null,
+    complianceFields: { checkKey: "", status: "", notes: "" },
+    complianceErrors: {},
+    oshaTree: null,
+    oshaTreeError: null,
+    oshaOpen: false,
+    oshaAnswers: {},
+    oshaResult: null,
+    oshaError: null
   };
 
   function emptyCaptureFields() {
@@ -2378,8 +2412,34 @@ const incidentsPanel = (function () {
     state.openPersonId = null;
     state.statementFieldByPersonId = {};
     state.statementFieldErrorsByPersonId = {};
+    resetReviewWorkspace();
     const host = container();
     if (host) host.textContent = "";
+  }
+
+  // IN-19: resets every piece of review-workspace state -- shared by both
+  // reset() (leaving the module entirely) and openDetail() (switching to a
+  // different incident), matching every other sub-resource's own
+  // "cleared in both places" convention in this panel.
+  function resetReviewWorkspace() {
+    state.reviewOpen = false;
+    state.auditEvents = [];
+    state.auditEventsError = null;
+    state.signatures = [];
+    state.signaturesError = null;
+    state.signOpen = false;
+    state.signFields = { role: "", attestationText: "", signedName: "" };
+    state.signErrors = {};
+    state.complianceChecks = [];
+    state.complianceChecksError = null;
+    state.complianceFields = { checkKey: "", status: "", notes: "" };
+    state.complianceErrors = {};
+    state.oshaTree = null;
+    state.oshaTreeError = null;
+    state.oshaOpen = false;
+    state.oshaAnswers = {};
+    state.oshaResult = null;
+    state.oshaError = null;
   }
 
   async function submitCapture() {
@@ -2432,6 +2492,7 @@ const incidentsPanel = (function () {
     state.openPersonId = null;
     state.statementFieldByPersonId = {};
     state.statementFieldErrorsByPersonId = {};
+    resetReviewWorkspace();
     render();
     try {
       state.detail = await apiFetch(`/incidents/${id}`);
@@ -2466,8 +2527,43 @@ const incidentsPanel = (function () {
       state.escalationsError = error.message;
     }
     await loadPeople();
+    // IN-19: the review workspace (timeline, signatures, compliance checks)
+    // is only meaningful once an incident is under active review --
+    // matches the workspace's own gating in renderDetail() below.
+    if (isReviewableStatus(state.detail.status)) {
+      await loadReviewWorkspace();
+    }
     render();
     focusElement(document.querySelector("#incident-detail-panel h3"));
+  }
+
+  // IN-19: the review workspace applies to submitted|under_review
+  // incidents -- the two statuses the plan's split view targets ("a review
+  // view for submitted|under_review incidents").
+  function isReviewableStatus(status) {
+    return status === "submitted" || status === "under_review";
+  }
+
+  async function loadReviewWorkspace() {
+    if (!state.detailId) return;
+    const id = state.detailId;
+    const [auditEvents, signatures, complianceChecks] = await Promise.all([
+      apiFetch(`/incidents/${id}/audit-events`).catch((error) => {
+        state.auditEventsError = error.message;
+        return [];
+      }),
+      apiFetch(`/facilities/${currentFacility}/incidents/${id}/signatures`).catch((error) => {
+        state.signaturesError = error.message;
+        return [];
+      }),
+      apiFetch(`/facilities/${currentFacility}/incidents/${id}/compliance-checks`).catch((error) => {
+        state.complianceChecksError = error.message;
+        return [];
+      })
+    ]);
+    state.auditEvents = auditEvents || [];
+    state.signatures = signatures || [];
+    state.complianceChecks = complianceChecks || [];
   }
 
   function closeDetail() {
@@ -2682,6 +2778,138 @@ const incidentsPanel = (function () {
       render();
     } catch (error) {
       state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Review workspace (IN-19) -------------------------------------------
+
+  // Requests clarification: a follow-up action of type "documentation"
+  // whose description names what needs clarifying -- reuses the existing
+  // follow-up create route rather than a new endpoint, matching the plan's
+  // "request clarification (a follow-up)" wording.
+  async function requestClarification(note) {
+    const trimmed = (note || "").trim();
+    if (!trimmed) return;
+    try {
+      const created = await apiFetch(`/incidents/${state.detailId}/followups`, {
+        method: "POST",
+        body: { actionType: "documentation", description: `Clarification requested: ${trimmed}` }
+      });
+      state.followups.push(created);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Signatures (IN-13) ---------------------------------------------------
+  async function submitSignature() {
+    const validation = validateSignatureInput(state.signFields);
+    state.signErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      focusElement(document.querySelector(".incident-sign-form .rr-error"));
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/signatures`, {
+        method: "POST",
+        body: buildSignaturePayload(state.signFields)
+      });
+      state.signatures.push(created);
+      state.signOpen = false;
+      state.signFields = { role: "", attestationText: "", signedName: "" };
+      state.signErrors = {};
+      state.detailActionError = null;
+      if (created.role === "supervisor") {
+        // A supervisor signature auto-records a supervisor_signoff compliance
+        // check server-side (incidents-compliance-routes.mjs) -- refresh so
+        // the closure-gate preview reflects it immediately.
+        state.complianceChecks = (await apiFetch(
+          `/facilities/${currentFacility}/incidents/${state.detailId}/compliance-checks`
+        ).catch(() => state.complianceChecks)) || state.complianceChecks;
+      }
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Compliance checks (IN-15) ---------------------------------------------
+  async function submitComplianceCheck() {
+    const validation = validateComplianceCheckInput(state.complianceFields);
+    state.complianceErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const updated = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/compliance-checks`, {
+        method: "POST",
+        body: buildCompliancePayload(state.complianceFields)
+      });
+      const existingIndex = state.complianceChecks.findIndex((c) => c.check_key === updated.check_key);
+      if (existingIndex >= 0) state.complianceChecks[existingIndex] = updated;
+      else state.complianceChecks.push(updated);
+      state.complianceFields = { checkKey: "", status: "", notes: "" };
+      state.complianceErrors = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- OSHA decision-tree questionnaire (IN-14) ------------------------------
+  async function openOshaQuestionnaire() {
+    state.oshaOpen = true;
+    state.oshaAnswers = {};
+    state.oshaResult = null;
+    state.oshaError = null;
+    render();
+    if (!state.oshaTree) {
+      try {
+        const { tree } = await apiFetch(`/facilities/${currentFacility}/incidents/osha-decision-tree`);
+        state.oshaTree = tree;
+        state.oshaTreeError = null;
+      } catch (error) {
+        state.oshaTreeError = error.message;
+      }
+      render();
+    }
+  }
+
+  function answerOshaQuestion(nodeId, answer) {
+    state.oshaAnswers = { ...state.oshaAnswers, [nodeId]: answer };
+    render();
+  }
+
+  async function submitOshaEvaluation() {
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/osha-evaluation`, {
+        method: "POST",
+        body: buildOshaEvaluationPayload(state.oshaAnswers)
+      });
+      state.oshaResult = result;
+      if (result.complianceCheck) {
+        const existingIndex = state.complianceChecks.findIndex((c) => c.check_key === "osha_recordability");
+        if (existingIndex >= 0) state.complianceChecks[existingIndex] = result.complianceCheck;
+        else state.complianceChecks.push(result.complianceCheck);
+      }
+      if (result.followup) state.followups.push(result.followup);
+      if (result.incident) {
+        state.detail = { ...state.detail, ...result.incident };
+        refreshListItem(state.detail);
+      }
+      state.oshaError = null;
+      render();
+    } catch (error) {
+      state.oshaError = error.message;
       render();
     }
   }
@@ -3151,7 +3379,199 @@ const incidentsPanel = (function () {
     panel.append(buildAttachmentsToggle("incidents", d.id, hasPerm("incidents.manage")));
     wireAttachmentToggles(panel);
 
+    // IN-19: the supervisor review workspace -- timeline, compliance
+    // checks, signatures, and the OSHA questionnaire -- only makes sense
+    // while an incident is actively under review.
+    if (isReviewableStatus(d.status)) {
+      panel.append(buildReviewWorkspace(d));
+    }
+
     return panel;
+  }
+
+  // IN-19: split review view for a submitted|under_review incident.
+  // "Split" here means two labeled groups within the same collapsible
+  // section (timeline/history on one side of the model, evidence/
+  // compliance/signatures/OSHA on the other) rather than a literal two-
+  // column CSS layout -- the mobile-first single-column body this app
+  // already uses throughout (see report-form.mjs's own layout notes)
+  // applies here too.
+  function buildReviewWorkspace(d) {
+    const section = el("div", { class: "incident-review-workspace" });
+    const toggleBtn = el("button", { type: "button" }, state.reviewOpen ? "Hide review workspace" : "Open review workspace");
+    toggleBtn.addEventListener("click", () => {
+      state.reviewOpen = !state.reviewOpen;
+      render();
+    });
+    section.append(toggleBtn);
+    if (!state.reviewOpen) return section;
+
+    const canWrite = hasPerm("incidents.manage") || hasPerm("incidents.review");
+    const canWaive = hasPerm("incidents.review");
+
+    section.append(el("h4", {}, "Timeline (immutable — audit events + amendments, permanently retained)"));
+    if (state.auditEventsError) section.append(el("p", { class: "rr-error", role: "alert" }, state.auditEventsError));
+    const timeline = mergeIncidentTimeline(state.auditEvents, state.amendments);
+    if (timeline.length === 0) {
+      section.append(el("p", { class: "item-subtitle" }, "No history yet."));
+    } else {
+      for (const entry of timeline) {
+        const row = el("div", { class: "module-item" });
+        row.append(el("div", { class: "item-title" }, `${new Date(entry.at).toLocaleString()} · ${entry.eventType}`));
+        if (entry.kind === "amendment" && entry.payload.reason) {
+          row.append(el("div", { class: "item-subtitle" }, entry.payload.reason));
+        }
+        section.append(row);
+      }
+    }
+
+    section.append(el("h4", {}, "Closure gate"));
+    const gate = evaluateClosureGatePreview(d, state.complianceChecks);
+    section.append(
+      el(
+        "p",
+        { class: gate.allowed ? "item-subtitle" : "rr-error", role: gate.allowed ? undefined : "alert" },
+        gate.allowed ? "This incident currently meets the requirements to close." : gate.reason
+      )
+    );
+
+    section.append(el("h4", {}, "Compliance checks"));
+    if (state.complianceChecksError) section.append(el("p", { class: "rr-error", role: "alert" }, state.complianceChecksError));
+    if (state.complianceChecks.length === 0) {
+      section.append(el("p", { class: "item-subtitle" }, "No compliance checks recorded yet."));
+    }
+    for (const check of state.complianceChecks) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${check.check_key} · ${check.status}`));
+      if (check.notes) row.append(el("div", { class: "item-subtitle" }, check.notes));
+      section.append(row);
+    }
+    if (canWrite) section.append(buildComplianceCheckForm(canWaive));
+
+    section.append(el("h4", {}, "Signatures"));
+    if (state.signaturesError) section.append(el("p", { class: "rr-error", role: "alert" }, state.signaturesError));
+    if (state.signatures.length === 0) section.append(el("p", { class: "item-subtitle" }, "No signatures yet."));
+    for (const signature of state.signatures) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${signature.role} · ${signature.signed_name}`));
+      row.append(el("div", { class: "item-subtitle" }, `Signed ${new Date(signature.signed_at).toLocaleString()}`));
+      section.append(row);
+    }
+    if (canWrite) {
+      const signToggle = el("button", { type: "button" }, state.signOpen ? "Cancel" : "Sign incident");
+      signToggle.addEventListener("click", () => {
+        state.signOpen = !state.signOpen;
+        render();
+      });
+      section.append(signToggle);
+      if (state.signOpen) section.append(buildSignatureForm());
+    }
+
+    section.append(el("h4", {}, "OSHA recordability questionnaire"));
+    section.append(buildOshaQuestionnaire());
+
+    section.append(el("h4", {}, "Request clarification"));
+    section.append(buildClarificationForm());
+
+    return section;
+  }
+
+  function buildComplianceCheckForm(canWaive) {
+    const form = el("div", { class: "incident-compliance-form" });
+    const keySelect = document.createElement("select");
+    keySelect.setAttribute("aria-label", "Compliance check");
+    for (const key of COMPLIANCE_CHECK_KEYS) keySelect.append(el("option", { value: key }, key));
+    const statusSelect = document.createElement("select");
+    statusSelect.setAttribute("aria-label", "Result");
+    for (const status of complianceCheckStatusOptions(canWaive)) statusSelect.append(el("option", { value: status }, status));
+    const notesInput = el("input", { type: "text", placeholder: "Notes (optional)", "aria-label": "Notes" });
+    const submitBtn = el("button", { type: "button" }, "Record check");
+    submitBtn.addEventListener("click", () => {
+      state.complianceFields = { checkKey: keySelect.value, status: statusSelect.value, notes: notesInput.value };
+      submitComplianceCheck();
+    });
+    form.append(keySelect, statusSelect, notesInput, submitBtn);
+    if (state.complianceErrors.checkKey) form.append(el("div", { class: "rr-error", role: "alert" }, state.complianceErrors.checkKey));
+    if (state.complianceErrors.status) form.append(el("div", { class: "rr-error", role: "alert" }, state.complianceErrors.status));
+    return form;
+  }
+
+  function buildSignatureForm() {
+    const form = el("div", { class: "incident-sign-form" });
+    const roleSelect = document.createElement("select");
+    roleSelect.setAttribute("aria-label", "Signature role");
+    for (const role of SIGNATURE_ROLES) roleSelect.append(el("option", { value: role }, role));
+    const attestationInput = document.createElement("textarea");
+    attestationInput.setAttribute("aria-label", "Attestation statement");
+    const nameInput = el("input", { type: "text", "aria-label": "Signed name" });
+    const submitBtn = el("button", { type: "button" }, "Sign");
+    submitBtn.addEventListener("click", () => {
+      state.signFields = { role: roleSelect.value, attestationText: attestationInput.value, signedName: nameInput.value };
+      submitSignature();
+    });
+    form.append(
+      labeledField("Role", roleSelect, { required: true }),
+      labeledField("Attestation", attestationInput, { required: true, error: state.signErrors.attestationText }),
+      labeledField("Signed name", nameInput, { required: true, error: state.signErrors.signedName }),
+      submitBtn
+    );
+    return form;
+  }
+
+  function buildOshaQuestionnaire() {
+    const wrap = el("div", { class: "incident-osha-questionnaire" });
+    if (!state.oshaOpen) {
+      const startBtn = el("button", { type: "button" }, "Start OSHA evaluation");
+      startBtn.addEventListener("click", () => openOshaQuestionnaire());
+      wrap.append(startBtn);
+      return wrap;
+    }
+    if (state.oshaTreeError) {
+      wrap.append(el("p", { class: "rr-error", role: "alert" }, state.oshaTreeError));
+      return wrap;
+    }
+    if (!state.oshaTree) {
+      wrap.append(el("p", {}, "Loading questionnaire…"));
+      return wrap;
+    }
+    if (state.oshaError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.oshaError));
+    if (state.oshaResult) {
+      wrap.append(
+        el(
+          "p",
+          { class: "item-subtitle" },
+          `Outcome: ${state.oshaResult.outcome}${state.oshaResult.dueAt ? ` · due ${new Date(state.oshaResult.dueAt).toLocaleString()}` : ""}`
+        )
+      );
+      return wrap;
+    }
+    const step = nextOshaQuestion(state.oshaTree, state.oshaAnswers);
+    if (step.done) {
+      wrap.append(el("p", {}, `Outcome so far: ${step.outcome}. Submit to record this evaluation.`));
+      const submitBtn = el("button", { type: "button", class: "primary" }, "Submit evaluation");
+      submitBtn.addEventListener("click", () => submitOshaEvaluation());
+      wrap.append(submitBtn);
+      return wrap;
+    }
+    wrap.append(el("p", {}, step.question || step.nodeId));
+    const yesBtn = el("button", { type: "button" }, "Yes");
+    yesBtn.addEventListener("click", () => answerOshaQuestion(step.nodeId, "yes"));
+    const noBtn = el("button", { type: "button" }, "No");
+    noBtn.addEventListener("click", () => answerOshaQuestion(step.nodeId, "no"));
+    wrap.append(yesBtn, noBtn);
+    return wrap;
+  }
+
+  function buildClarificationForm() {
+    const form = el("div", { class: "incident-clarification-form" });
+    const noteInput = el("input", { type: "text", placeholder: "What needs clarifying?", "aria-label": "Clarification note" });
+    const submitBtn = el("button", { type: "button" }, "Request clarification");
+    submitBtn.addEventListener("click", () => {
+      requestClarification(noteInput.value);
+      noteInput.value = "";
+    });
+    form.append(noteInput, submitBtn);
+    return form;
   }
 
   function render() {
