@@ -28,6 +28,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
+import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -99,6 +100,16 @@ async function handleDrain(request, response, { env }, sendJson) {
   const limit = clampLimit(url.searchParams.get("limit"));
 
   const client = buildServiceClient(env);
+  // P-4/P-5: build the real email/push delivery adapters from
+  // EMAIL_PROVIDER/PUSH_PROVIDER (+ their credentials) on every drain --
+  // see adapters.mjs's buildAdaptersFromEnv for the noop-by-default and
+  // fail-loud-on-misconfiguration contract. A misconfigured provider throws
+  // here, which this route has no try/catch of its own around -- it is
+  // caught by handleRequest's outer net (scripts/server.mjs) and reported
+  // as a 500, same as any other unexpected drain failure; that is
+  // deliberate (a cron route silently swallowing "someone typo'd
+  // EMAIL_PROVIDER" would look identical to "delivery is working").
+  const { emailAdapter, pushAdapter } = buildAdaptersFromEnv(env);
   // OP-20: thread OBSERVABILITY_DSN down into the worker's own failure path
   // (src/lib/notifications/worker.mjs handleFailure / processOutboxEvent's
   // catch) so a job/outbox event that dead-letters or retries here also
@@ -106,7 +117,12 @@ async function handleDrain(request, response, { env }, sendJson) {
   // call site. Unset (dev default) flows through as `undefined`, which
   // reportError treats as a silent no-op -- identical to every other call
   // site in this codebase.
-  const summary = await drainAll({ client, now: new Date(), limit, config: { dsn: env.OBSERVABILITY_DSN } });
+  const summary = await drainAll({
+    client,
+    now: new Date(),
+    limit,
+    config: { dsn: env.OBSERVABILITY_DSN, emailAdapter, pushAdapter }
+  });
 
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
   // cadence as the drain -- the durable throttle store's equivalent of the

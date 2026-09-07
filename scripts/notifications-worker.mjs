@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
 import { drainAll } from "../src/lib/notifications/worker.mjs";
+import { buildAdaptersFromEnv } from "../src/lib/notifications/adapters.mjs";
 
 const DEFAULT_INTERVAL_SECONDS = 30;
 
@@ -20,9 +21,9 @@ function intervalMs(source = process.env) {
   return seconds * 1000;
 }
 
-async function drainPass(client) {
+async function drainPass(client, config) {
   const now = new Date();
-  const summary = await drainAll({ client, now });
+  const summary = await drainAll({ client, now, config });
   console.log(JSON.stringify({ at: now.toISOString(), ...summary }));
 }
 
@@ -46,6 +47,15 @@ export async function runLoop({ env = process.env, log = console.log, error = co
   }
   const client = createClient({ url: serverEnv.SUPABASE_URL, key: serverEnv.SUPABASE_SERVICE_ROLE_KEY });
   const delay = intervalMs(env);
+  // Built once for the life of this loop (not per drain pass): a real
+  // FCM adapter's minted OAuth2 access token is cached inside its own
+  // closure (see fcm.mjs), so reusing the same adapter object across every
+  // pass means most passes reuse that cached token instead of re-minting
+  // one every interval. A misconfigured provider (EMAIL_PROVIDER=resend
+  // with no EMAIL_API_KEY, etc.) throws here -- loudly, before the loop
+  // ever starts -- rather than on the first drain pass.
+  const { emailAdapter, pushAdapter } = buildAdaptersFromEnv(serverEnv);
+  const config = { dsn: serverEnv.OBSERVABILITY_DSN, emailAdapter, pushAdapter };
 
   let stopRequested = false;
   let abortSleep = null;
@@ -59,7 +69,7 @@ export async function runLoop({ env = process.env, log = console.log, error = co
   log(`Notification worker loop starting: draining every ${delay / 1000}s (Ctrl+C to stop).`);
   while (!stopRequested) {
     try {
-      await drainPass(client);
+      await drainPass(client, config);
     } catch (drainError) {
       error("notifications-worker: drain pass failed:", drainError);
     }
