@@ -521,10 +521,16 @@ test("POST status closing an incident with open follow-ups is blocked (409) and 
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
 });
 
+// IN-15: ACTION_PENDING_INCIDENT is severity "high", so closing it now also
+// requires a passing (or waived) evidence_complete compliance check
+// (evaluateClosureGate) -- stubbed here as already recorded 'pass'.
 test("POST status closing succeeds once follow-ups are all closed", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
     if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "pass" }];
+    }
     if (table === "incident_reports" && method === "PATCH") return [{ ...ACTION_PENDING_INCIDENT, status: "closed" }];
     if (table === "incident_audit_events" && method === "POST") return [];
     return [];
@@ -534,6 +540,80 @@ test("POST status closing succeeds once follow-ups are all closed", async (t) =>
   assert.equal(result.status, 200);
   assert.equal(result.payload.status, "closed");
   assert.ok(captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// IN-15: closing a high/critical incident with NO recorded evidence_complete
+// check is blocked, independent of (and checked after) the follow-ups/
+// legal-hold gate -- the closure-gate rejection names the blocking check.
+test("POST status closing a high-severity incident with no evidence_complete compliance check is blocked (409)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /evidence_complete/);
+  assert.equal(result.payload.blockingCheck, "evidence_complete");
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// IN-15: a FAILING evidence_complete check blocks the close the same way a
+// missing one does.
+test("POST status closing a high-severity incident with a failing evidence_complete compliance check is blocked (409)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "fail" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /evidence_complete/);
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// IN-15: a WAIVED evidence_complete check passes the gate, and the waiver
+// is recorded in the status-change audit event's payload.
+test("POST status closing a high-severity incident with a waived evidence_complete compliance check succeeds and records the waiver in the audit payload", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "waived" }];
+    }
+    if (table === "incident_reports" && method === "PATCH") return [{ ...ACTION_PENDING_INCIDENT, status: "closed" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 200);
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.deepEqual(auditInsert.body[0].event_payload.waivedChecks, ["evidence_complete"]);
+});
+
+// IN-15: an incident flagged requires_osha_review additionally needs a
+// passing/waived supervisor_signoff check, independent of severity.
+test("POST status closing a requires_osha_review incident with no supervisor_signoff compliance check is blocked (409)", async (t) => {
+  const OSHA_INCIDENT = { ...ACTION_PENDING_INCIDENT, severity: "low", requires_osha_review: true };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [OSHA_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /supervisor_signoff/);
+  assert.equal(result.payload.blockingCheck, "supervisor_signoff");
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
 });
 
 test("POST status closing a legal-hold incident without incidents.legal_hold.manage is blocked (409)", async (t) => {
@@ -553,6 +633,9 @@ test("POST status closing a legal-hold incident succeeds with incidents.legal_ho
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_LEGAL_HOLD_INCIDENT];
     if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "pass" }];
+    }
     if (table === "incident_reports" && method === "PATCH") {
       return [{ ...ACTION_PENDING_LEGAL_HOLD_INCIDENT, status: "closed" }];
     }
@@ -812,6 +895,37 @@ test("GET amendments returns the amendment history for a reader", async (t) => {
   const result = await call("GET", "/incidents/inc-1/amendments");
   assert.equal(result.status, 200);
   assert.equal(result.payload.length, 2);
+});
+
+// --- GET /incidents/:id/audit-events (IN-19 timeline reader) ----------------
+
+test("GET audit-events 404s when the incident is missing and denies a non-reader", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const missing = await call("GET", "/incidents/nope/audit-events");
+  assert.equal(missing.status, 404);
+});
+
+test("GET audit-events denies a non-reader with 403", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/incidents/inc-1/audit-events");
+  assert.equal(result.status, 403);
+});
+
+test("GET audit-events returns the ledger oldest-first for a reader", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "incident_audit_events") return [{ id: 1, event_type: "incident.created" }, { id: 2, event_type: "incident.submitted" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/audit-events");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 2);
+  const query = captured.find((c) => c.table === "incident_audit_events" && c.method === "GET");
+  assert.equal(query.url.searchParams.get("order"), "id.asc");
+  assert.equal(query.url.searchParams.get("incident_id"), "eq.inc-1");
 });
 
 // --- Follow-up actions CRUD + permission matrix (IN-05) ----------------------

@@ -38,9 +38,17 @@ export function isEscalationOverdue(incident, now = new Date(), config = {}) {
   return now > dueAt;
 }
 
-export function classifyOshaReview(reportType, outcomes = []) {
-  if (reportType !== "accident") return false;
-  return outcomes.some((outcome) => oshaReviewTriggers.has(outcome));
+// `treeOutcome` (IN-14) is the terminal outcome of evaluateOshaDecisionTree
+// below, e.g. from a POST .../osha-evaluation call. Optional and defaulted
+// to null so every existing 2-arg caller (report-workflow.mjs's
+// evaluateWorkflow) is unaffected; when given, a "recordable" tree outcome
+// flags OSHA review on its own, independent of (and in addition to) the
+// report_type/outcomes check above.
+export function classifyOshaReview(reportType, outcomes = [], treeOutcome = null) {
+  if (reportType === "accident" && outcomes.some((outcome) => oshaReviewTriggers.has(outcome))) {
+    return true;
+  }
+  return treeOutcome === "recordable";
 }
 
 export function requiredIncidentFollowUps(incident, config = {}) {
@@ -327,4 +335,176 @@ export function nextIncidentNo(existingIncidentNos = [], year = new Date().getUT
     if (sequence > maxSequence) maxSequence = sequence;
   }
   return formatIncidentNo(maxSequence + 1, year);
+}
+
+// --- Signatures (IN-13) ------------------------------------------------------
+// Verbatim from INCIDENT_ACCIDENT_REPORTING_SYSTEM.md 2.1's
+// `signature_role enum('reporter','witness','supervisor','manager')`.
+export const SIGNATURE_ROLES = Object.freeze(["reporter", "witness", "supervisor", "manager"]);
+
+const ATTESTATION_MAX_LENGTH = 2000;
+
+// Pure. Mirrors the incident_signatures.attestation_text NOT NULL column: a
+// blank attestation is never valid regardless of length, and the DB-facing
+// route caps it at ATTESTATION_MAX_LENGTH so a signature's legal-attestation
+// text can never silently grow unbounded. Returns { valid, error }, the same
+// shape convention as validateIncidentCapture (incident-form.mjs) uses.
+export function validateAttestationText(text) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (!trimmed) return { valid: false, error: "attestationText is required" };
+  if (trimmed.length > ATTESTATION_MAX_LENGTH) {
+    return { valid: false, error: `attestationText must be at most ${ATTESTATION_MAX_LENGTH} characters` };
+  }
+  return { valid: true, error: null };
+}
+
+// --- Compliance checks (IN-15) ------------------------------------------------
+// Verbatim from INCIDENT_ACCIDENT_REPORTING_SYSTEM.md 2.2's
+// `check_type enum('osha_recordability','supervisor_signoff','evidence_complete','legal_review')`.
+export const COMPLIANCE_CHECK_KEYS = Object.freeze([
+  "evidence_complete",
+  "supervisor_signoff",
+  "osha_recordability",
+  "legal_review"
+]);
+export const COMPLIANCE_CHECK_STATUSES = Object.freeze(["pass", "fail", "waived"]);
+
+// The severities design §9.4 ("require evidence checklist completion for
+// high/critical cases") and this module's own closure gate (IN-02's
+// canTransitionIncident) apply the evidence_complete requirement to.
+const CLOSURE_GATE_SEVERITIES = new Set(["high", "critical"]);
+
+function latestCheckStatus(complianceChecks, checkKey) {
+  const row = (complianceChecks ?? []).find((check) => check?.check_key === checkKey);
+  return row ? row.status : null;
+}
+
+// Pure. Decides whether an incident may close given its own severity/OSHA-
+// review flag and the compliance-check rows recorded against it (raw
+// snake_case rows as loaded from incident_compliance_checks -- {check_key,
+// status, ...} -- matching openFollowUps' own "pass the DB rows straight
+// through" convention elsewhere in this module). Mirrors the DB-side guard
+// migration 0056 adds to fn_incident_report_transition_guard (0043/0048) --
+// this function is what a route calls FIRST, for a specific, friendly
+// rejection naming which check blocked the close; the trigger is what
+// actually enforces the rule at the database layer, independent of write
+// path.
+//
+// Required checks:
+//   * "evidence_complete" -- any high/critical severity incident (design
+//     §9.4).
+//   * "supervisor_signoff" -- any incident with requiresOshaReview true
+//     (IN-13's acceptance criterion: "closure gate extended to require
+//     supervisor signoff when requires_osha_review").
+// A required check with no recorded row, or one recorded "fail", blocks the
+// close; "pass" or "waived" (waiving is itself gated to incidents.review at
+// the route/RLS layer, not re-checked here) both satisfy it.
+export function evaluateClosureGate(incident = {}, complianceChecks = []) {
+  const required = [];
+  if (CLOSURE_GATE_SEVERITIES.has(incident.severity)) required.push("evidence_complete");
+  if (incident.requiresOshaReview) required.push("supervisor_signoff");
+
+  for (const checkKey of required) {
+    const status = latestCheckStatus(complianceChecks, checkKey);
+    if (status === "pass" || status === "waived") continue;
+    return {
+      allowed: false,
+      reason:
+        status === "fail"
+          ? `cannot close: compliance check "${checkKey}" failed`
+          : `cannot close: compliance check "${checkKey}" has not passed`,
+      reasonCode: "compliance_check_failed",
+      blockingCheck: checkKey
+    };
+  }
+  return { allowed: true, reason: null, reasonCode: null, blockingCheck: null };
+}
+
+// --- OSHA recordability decision tree (IN-14) ---------------------------------
+// Every outcome the shipped default tree (settings-registry.mjs's
+// incidents.oshaDecisionTree default) and a tenant-authored replacement may
+// produce. "needs_more_info" is both a legitimate terminal leaf a tree can
+// name AND this evaluator's own fallback for a malformed tree/incomplete
+// answer set -- see evaluateOshaDecisionTree's header.
+export const OSHA_OUTCOMES = Object.freeze(["recordable", "first_aid_only", "not_work_related", "needs_more_info"]);
+const OSHA_RECORDABLE_OUTCOME = "recordable";
+const OSHA_FALLBACK_OUTCOME = "needs_more_info";
+const OSHA_MAX_TREE_DEPTH = 64; // guards a cyclic/malformed tenant-authored tree against an infinite walk
+
+function oshaFallback(path) {
+  return { outcome: OSHA_FALLBACK_OUTCOME, recordable: false, dueAt: null, path, malformed: true };
+}
+
+// Pure (except reading `now`, threaded in rather than read from the clock so
+// callers/tests get a deterministic dueAt). Walks `tree` (settings-registry's
+// incidents.oshaDecisionTree shape: { start, nodes: { [id]: { question, yes,
+// no } }, timers }) from `tree.start`, following `answers[nodeId]` ("yes" or
+// "no") at each node until a terminal leaf ({ outcome, timer? }) is reached.
+// `answers` is a flat { [nodeId]: "yes" | "no" } map, e.g. from
+// POST .../osha-evaluation's body.
+//
+// Returns { outcome, recordable, dueAt, path }:
+//   * outcome    -- one of OSHA_OUTCOMES.
+//   * recordable -- outcome === "recordable" (a plain convenience boolean so
+//                   callers don't need to compare strings themselves).
+//   * dueAt      -- an ISO string regulatory deadline (now + the terminal
+//                   leaf's `timer` entry from tree.timers, if any), or null
+//                   when the leaf carries no timer (every non-recordable
+//                   outcome, and any recordable leaf whose tree omits one).
+//   * path       -- [{ nodeId, question, answer }] in traversal order, for a
+//                   review UI to render exactly which questions led to the
+//                   outcome.
+//
+// Malformed-config / insufficient-answers fallback: a missing/non-object
+// tree, a missing start node, a node absent from tree.nodes, or an
+// answers[nodeId] that isn't "yes"/"no" all degrade to
+// { outcome: "needs_more_info", recordable: false, dueAt: null, path,
+// malformed: true } (path holds whatever nodes WERE legally walked before
+// the point of failure) rather than throwing -- an incomplete or
+// misconfigured determination must never crash the route, only fall back to
+// the one outcome that always means "a human still needs to look at this".
+export function evaluateOshaDecisionTree(tree, answers = {}, now = new Date()) {
+  if (!tree || typeof tree !== "object" || typeof tree.start !== "string" || !tree.nodes || typeof tree.nodes !== "object") {
+    return oshaFallback([]);
+  }
+
+  const path = [];
+  let currentId = tree.start;
+  for (let depth = 0; depth < OSHA_MAX_TREE_DEPTH; depth += 1) {
+    const node = tree.nodes[currentId];
+    if (!node || typeof node !== "object") return oshaFallback(path);
+
+    const answer = answers?.[currentId];
+    if (answer !== "yes" && answer !== "no") return oshaFallback(path);
+
+    const next = node[answer];
+    path.push({ nodeId: currentId, question: node.question ?? null, answer });
+
+    if (next && typeof next === "object" && typeof next.outcome === "string") {
+      if (!OSHA_OUTCOMES.includes(next.outcome)) return oshaFallback(path);
+      let dueAt = null;
+      if (next.timer && tree.timers && typeof tree.timers === "object") {
+        const timer = tree.timers[next.timer];
+        if (timer && typeof timer === "object") {
+          const ms =
+            (Number.isFinite(timer.hours) ? timer.hours * 60 * 60 * 1000 : 0) +
+            (Number.isFinite(timer.days) ? timer.days * 24 * 60 * 60 * 1000 : 0);
+          if (ms > 0) dueAt = new Date(now.getTime() + ms).toISOString();
+        }
+      }
+      return { outcome: next.outcome, recordable: next.outcome === OSHA_RECORDABLE_OUTCOME, dueAt, path };
+    }
+
+    if (typeof next === "string") {
+      currentId = next;
+      continue;
+    }
+
+    // `next` is undefined/null/some other shape -- the tree names no legal
+    // continuation for this answer.
+    return oshaFallback(path);
+  }
+
+  // Depth exhausted without reaching a terminal leaf -- a cyclic tree.
+  return oshaFallback(path);
 }
