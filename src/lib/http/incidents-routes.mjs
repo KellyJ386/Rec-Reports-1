@@ -1,6 +1,8 @@
 import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { reportError } from "../observability.mjs";
 import { requireAuthPermission, makeGuards } from "./guard.mjs";
+import { verifyIncidentAuditChain } from "../audit.mjs";
+import { loadModuleConfig } from "./module-config.mjs";
 import {
   escalationDueAt,
   isEscalationOverdue,
@@ -9,9 +11,10 @@ import {
   buildAmendment,
   nextIncidentNo,
   requiredIncidentFollowUps,
+  retentionEligibleAt,
   INCIDENT_STATUSES
 } from "../incidents.mjs";
-import { buildIncidentPdfPackage } from "../incident-pdf.mjs";
+import { buildIncidentPdfPackage, buildIncidentPacketPackage } from "../incident-pdf.mjs";
 
 const READ = "incidents.read";
 const MANAGE = "incidents.manage";
@@ -20,6 +23,26 @@ const LEGAL_HOLD_MANAGE = "incidents.legal_hold.manage";
 const TASKS_CREATE = "incidents.tasks.create";
 const EXPORT_PDF = "incidents.export.pdf";
 const ESCALATE = "incidents.escalate";
+const AUDIT_VIEW = "incidents.audit.view";
+const INCIDENTS_MODULE_CODE = "incidents";
+
+// IN-18: incident_signatures/incident_compliance_checks (design doc §2.2)
+// belong to a sibling Wave 3 migration (0056) that may not exist in every
+// tree this route runs against. Reads them the same way every other child
+// table here is read, but a missing-relation (or any other) PostgrestError
+// degrades to "no rows" instead of failing the whole packet -- the packet is
+// still a complete, correct legal document without a section this facility's
+// schema doesn't carry yet; renderIncidentPacket already treats an empty
+// array as "omit the section" (see that function's own doc comment).
+async function tryOptionalSelect(client, table, options) {
+  try {
+    const rows = await pgSelect(client, table, options);
+    return rows ?? [];
+  } catch (error) {
+    if (error instanceof PostgrestError) return [];
+    throw error;
+  }
+}
 
 // Follow-up action_type / status vocabularies, verbatim from the check
 // constraints on incident_followup_actions (0004_incidents.sql:74-75).
@@ -193,7 +216,14 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
       })
   );
 
-  // Returns a single incident report.
+  // Returns a single incident report, plus a computed (never stored)
+  // `retention_eligible_at` (IN-16b): the date past which a future purge job
+  // (Wave 4 IN-25) would be permitted to consider this row, per its report
+  // class and this facility's incidents.retentionDays{Standard,Osha,Minor}
+  // config (settings-registry, registry defaults when unconfigured). Pure
+  // display -- retentionEligibleAt never purges anything, and a currently
+  // legal_hold=true or protected-status incident is still delete-rejected at
+  // the DB layer (0057) regardless of what this field says.
   router.register(
     "GET",
     "/incidents/:id",
@@ -202,7 +232,28 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         const incident = await loadIncident(auth.client, params.id);
         if (!incident) return sendJson(response, 404, { error: "incident not found" });
         if (!requireRead(auth, incident.facility_id, response)) return;
-        return sendJson(response, 200, incident);
+
+        const config = await loadModuleConfig({
+          client: auth.client,
+          facilityId: incident.facility_id,
+          moduleCode: INCIDENTS_MODULE_CODE
+        });
+        const eligibleAt = retentionEligibleAt(
+          {
+            occurredAt: incident.occurred_at,
+            createdAt: incident.created_at,
+            reportedAt: incident.reported_at,
+            requiresOshaReview: incident.requires_osha_review,
+            reportType: incident.report_type,
+            severity: incident.severity
+          },
+          config
+        );
+
+        return sendJson(response, 200, {
+          ...incident,
+          retention_eligible_at: eligibleAt ? eligibleAt.toISOString() : null
+        });
       })
   );
 
@@ -666,6 +717,43 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
       })
   );
 
+  // IN-16c: legal-hold change history -- every incident.legal_hold_changed
+  // audit row for this incident, oldest first. 0043/0048's transition guard
+  // is what makes this the FULL history: legal_hold can only ever change
+  // through the guarded PATCH above (or the equally-guarded INSERT-time
+  // path), so there is no toggle this list could be missing. Gated the same
+  // as incident_audit_events' own SELECT policy (0044(e):
+  // incidents.audit.view OR incidents.manage OR incidents.review) so a
+  // caller who can attempt this read never gets a silently RLS-filtered
+  // empty array back instead of the 403 their permissions actually warrant.
+  router.register(
+    "GET",
+    "/incidents/:id/legal-hold",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+        if (!requireAnyPerm(auth, incident.facility_id, [AUDIT_VIEW, MANAGE, REVIEW], response)) return;
+
+        const rows = await pgSelect(auth.client, "incident_audit_events", {
+          filters: { incident_id: incident.id, event_type: "incident.legal_hold_changed" },
+          select: "id,actor_user_id,event_payload,created_at",
+          order: "id.asc"
+        });
+
+        return sendJson(response, 200, {
+          legalHold: incident.legal_hold === true,
+          history: (rows ?? []).map((row) => ({
+            id: row.id,
+            actorUserId: row.actor_user_id,
+            from: row.event_payload?.from ?? null,
+            to: row.event_payload?.to ?? null,
+            changedAt: row.created_at
+          }))
+        });
+      })
+  );
+
   // --- Amendments (IN-04) -----------------------------------------------
   // Lists an incident's amendment history, oldest first (a readable
   // chronological record of what changed over the incident's lifetime).
@@ -1042,6 +1130,173 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         // {contentType, filename, body, encoding, contentDisposition} shape
         // every other export route (reports-routes.mjs, workflow-routes.mjs,
         // audit-routes.mjs) already returns.
+        const { documentHash, ...envelope } = pkg;
+        return sendJson(response, 200, {
+          ...envelope,
+          contentDisposition: `attachment; filename="${pkg.filename}"`
+        });
+      })
+  );
+
+  // --- Legal packet (IN-18) ------------------------------------------------
+  // Renders the full legal packet: everything export.pdf covers, plus every
+  // witness statement version, signatures/compliance checks (when those
+  // rows exist -- see incident-pdf.mjs's renderIncidentPacket doc comment),
+  // an evidence index, and the FULL audit timeline with chain hashes. Same
+  // guard as export.pdf (incidents.export.pdf) -- the packet is a strictly
+  // broader export of the same underlying case, not a separately-gated
+  // capability.
+  //
+  // 409 while the incident is still a draft: unlike export.pdf (which
+  // deliberately allows a watermarked draft copy, see that route's own
+  // comment), a legal packet is the case-closing bundle -- statements,
+  // signatures, and a fixed audit timeline only make sense once there is a
+  // submitted case to bundle.
+  //
+  // Chain verification is run over the incident's FACILITY's full
+  // incident_audit_events chain, not just this incident's own rows --
+  // 0013_audit_chain.sql links prev_hash/row_hash per-facility, so verifying
+  // a per-incident-filtered subset would misreport a broken link at the
+  // first row whose true predecessor belongs to a different incident. The
+  // Audit Timeline section itself still only lists this incident's own rows
+  // (querying incident_audit_events a second time, filtered) -- a packet
+  // must never leak another incident's audit content.
+  //
+  // Every successful packet export writes an incident_audit_events row
+  // (event_type "incident.packet_exported") carrying the packet's own
+  // content hash and the chain-verification result, matching export.pdf's
+  // own "an export of a legal document is itself auditable" precedent.
+  router.register(
+    "GET",
+    "/incidents/:id/packet.pdf",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const incident = await loadIncident(auth.client, params.id);
+        if (!incident) return sendJson(response, 404, { error: "incident not found" });
+        if (!requirePerm(auth, incident.facility_id, EXPORT_PDF, response)) return;
+        if (incident.status === "draft") {
+          return sendJson(response, 409, {
+            error: "a legal packet can only be generated for a submitted-or-later incident"
+          });
+        }
+
+        const [
+          facilityRows,
+          departmentRows,
+          people,
+          statements,
+          attachments,
+          followups,
+          escalations,
+          amendments,
+          auditEvents,
+          chainRows,
+          signatures,
+          complianceChecks
+        ] = await Promise.all([
+          pgSelect(auth.client, "facilities", { filters: { id: incident.facility_id }, select: "id,name", limit: 1 }),
+          incident.department_id
+            ? pgSelect(auth.client, "departments", {
+                filters: { id: incident.department_id },
+                select: "id,name",
+                limit: 1
+              })
+            : Promise.resolve([]),
+          pgSelect(auth.client, "incident_people", {
+            filters: { incident_id: incident.id },
+            select: PEOPLE_COLUMNS,
+            order: "created_at.asc"
+          }),
+          pgSelect(auth.client, "incident_witness_statements", {
+            filters: { incident_id: incident.id },
+            select: "id,facility_id,incident_id,person_id,version_no,statement_text,submitted_by,submitted_at,signed_at,deleted_at",
+            order: "person_id.asc,version_no.asc"
+          }),
+          pgSelect(auth.client, "incident_attachments", {
+            filters: { incident_id: incident.id },
+            select:
+              "id,facility_id,incident_id,attachment_type,storage_path,captured_at,captured_by,checksum_sha256,metadata,created_at",
+            order: "created_at.asc"
+          }),
+          pgSelect(auth.client, "incident_followup_actions", {
+            filters: { incident_id: incident.id },
+            select: FOLLOWUP_COLUMNS,
+            order: "due_at.asc"
+          }),
+          pgSelect(auth.client, "incident_escalations", {
+            filters: { incident_id: incident.id },
+            select: ESCALATION_COLUMNS,
+            order: "created_at.asc"
+          }),
+          pgSelect(auth.client, "incident_amendments", {
+            filters: { incident_id: incident.id },
+            select: AMENDMENT_COLUMNS,
+            order: "amended_at.asc"
+          }),
+          pgSelect(auth.client, "incident_audit_events", {
+            filters: { incident_id: incident.id },
+            select: "id,incident_id,event_type,actor_user_id,event_payload,created_at,prev_hash,row_hash",
+            order: "id.asc"
+          }),
+          pgSelect(auth.client, "incident_audit_events", {
+            filters: { facility_id: incident.facility_id },
+            select: "id,event_type,incident_id,facility_id,event_payload,created_at,prev_hash,row_hash",
+            order: "created_at.asc,id.asc",
+            limit: 10000
+          }),
+          tryOptionalSelect(auth.client, "incident_signatures", {
+            filters: { incident_id: incident.id },
+            order: "created_at.asc"
+          }),
+          tryOptionalSelect(auth.client, "incident_compliance_checks", {
+            filters: { incident_id: incident.id },
+            order: "checked_at.asc"
+          })
+        ]);
+
+        const chainVerification = verifyIncidentAuditChain(chainRows ?? []);
+
+        // Stamped once, here -- incident-pdf.mjs never reads the clock
+        // itself (same contract renderIncidentPdf documents).
+        const generatedAt = new Date().toISOString();
+        const pkg = buildIncidentPacketPackage({
+          facilityName: (facilityRows ?? [])[0]?.name ?? null,
+          departmentName: (departmentRows ?? [])[0]?.name ?? null,
+          incident,
+          people: people ?? [],
+          statements: statements ?? [],
+          attachments: attachments ?? [],
+          amendments: amendments ?? [],
+          auditEvents: auditEvents ?? [],
+          followups: followups ?? [],
+          escalations: escalations ?? [],
+          signatures: signatures ?? [],
+          complianceChecks: complianceChecks ?? [],
+          chainVerification,
+          generatedAt,
+          generatedBy: auth.claims.sub
+        });
+
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.packet_exported",
+            payload: {
+              actor: auth.claims.sub,
+              format: "pdf",
+              documentHash: pkg.documentHash,
+              chainValid: chainVerification.valid,
+              chainBrokenAt: chainVerification.brokenAt
+            }
+          })
+        );
+        if (!auditOk) return;
+
         const { documentHash, ...envelope } = pkg;
         return sendJson(response, 200, {
           ...envelope,

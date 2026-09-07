@@ -1,0 +1,379 @@
+-- ===========================================================================
+-- 0057_incident_legal_hold_retention.sql
+-- Wave 3, Slice 3B, IN-16 (plans/INCIDENTS_PLAN.md / WAVES_1_4_IMPLEMENTATION_
+-- PLAN.md). PATCH /incidents/:id/legal-hold and the transition-guard
+-- permission check that backs it already shipped in Wave 1 (0043's guard 1,
+-- 0048's H3/M2 fixes) -- "legal-hold toggle, audited" is done. What is
+-- missing, closed here, is the DELETE side of the design's promise ("Legal
+-- hold flag blocks purge/archive jobs", INCIDENT_ACCIDENT_REPORTING_SYSTEM.md
+-- §4.7): a soft-delete of a held-or-protected incident_reports row, and a
+-- hard/soft delete of its children, was never actually rejected end to end.
+--
+-- (a) incident_reports gap: 0048's guard 3 (fn_incident_report_transition_
+--     guard) already freezes deleted_at for every authenticated actor once
+--     old.status <> 'draft' -- so submitted/under_review/escalated/
+--     action_pending/closed are ALL already covered (a strict superset of
+--     this task's "submitted, under_review, closed" list). The one gap left
+--     open: legal_hold can be set true on a still-DRAFT incident (guard 1
+--     runs independently of status), and guard 3 never engages for
+--     old.status = 'draft', so a draft incident already on legal hold could
+--     still be soft-deleted by any incidents.manage/review holder. New
+--     Guard 0 below closes exactly that gap; the function is otherwise
+--     carried over verbatim from 0048 (every migration touching it recreates
+--     the whole body per this file set's own convention).
+--
+-- (b) Children: incident_people, incident_attachments, incident_witness_
+--     statements, incident_amendments -- audited from their own migrations
+--     forward (0004, 0038, 0050, 0032):
+--       * incident_amendments: DELETE is already unconditionally rejected,
+--         held or not (fn_block_audit_mutation, 0032(b), a BEFORE trigger
+--         that fires for every role including the table owner -- RLS
+--         bypass never skips a trigger). Already satisfies "no delete while
+--         held" (a strictly stronger guarantee: no delete ever). Untouched.
+--       * incident_witness_statements: hard DELETE is already unconditionally
+--         rejected (fn_incident_witness_statement_guard, 0050(c)). Its own
+--         soft-delete path (an UPDATE setting deleted_at, null -> non-null,
+--         "in reserve" per 0050's header -- no route uses it yet) carried no
+--         legal-hold/status check at all. Closed below with an ADDITIONAL
+--         BEFORE UPDATE trigger (fn_incident_child_legal_hold_guard), left
+--         to coexist with the existing guard trigger rather than folding
+--         into it, so that trigger's own hard-won column-freeze logic is
+--         never touched by this migration.
+--       * incident_people: no DELETE policy actually admits a hard DELETE
+--         attempt today under normal use (incidents-people-routes.mjs's
+--         DELETE route is a soft-delete pgUpdate, per that file's own
+--         comment) -- but incident_people's write policy is still a `for
+--         all` grant (0038), which DOES admit a real SQL DELETE at the RLS
+--         layer for any incidents.manage holder reaching PostgREST directly.
+--         Both paths -- the real hard DELETE this leaves reachable, and the
+--         soft-delete UPDATE the route actually uses -- get the same new
+--         guard trigger (BEFORE DELETE, and BEFORE UPDATE OF deleted_at).
+--       * incident_attachments: identical shape to incident_people -- a
+--         `for all`/incidents.manage policy (0038) admits both a hard DELETE
+--         (unreachable from any route today, but not from raw PostgREST) and
+--         a soft-delete UPDATE (also unreachable from any route today -- no
+--         attachment removal route exists yet -- but the deleted_at column
+--         and the `... where deleted_at is null` read-side convention are
+--         already there, so this is forward-looking in exactly the same
+--         sense 0048's L3 was for incident_reports.deleted_at). Both guarded
+--         the same way as incident_people.
+--
+--     fn_incident_child_legal_hold_guard(): one generic SECURITY DEFINER
+--     function (TG_TABLE_NAME-driven, matching 0041's
+--     fn_attachment_path_facility precedent for a function shared across
+--     several child tables) rejects the triggering DELETE/UPDATE whenever
+--     the parent incident_reports row (looked up by incident_id, bypassing
+--     RLS the way every definer function here does) has legal_hold = true.
+--     Deliberately legal_hold ALONE, not also gated on the parent's status
+--     the way incident_reports' own guard 3 is for itself: the task's
+--     literal condition for children is "no delete while the parent is
+--     held" (legal_hold only), and supabase/tests/incident_people_
+--     statements.sql already exercises -- as INTENDED, currently-shipped
+--     behavior -- an incidents.review holder soft-deleting a person from a
+--     SUBMITTED (non-draft, unheld) incident (test 8c). A status-based
+--     freeze on the children, mirroring incident_reports' own guard 3,
+--     would have silently broken that shipped capability; legal_hold is the
+--     one condition this task actually asks for on the children, and the
+--     one that does not regress it. Exempted when auth.uid() is null (the
+--     same service-role/definer-context carve-out 0048's L3 established for
+--     incident_reports.deleted_at) -- a future retention/purge job (Wave 4
+--     IN-25) must still be able to remove a row once its hold is actually
+--     lifted; that job runs service-role, never as an RLS-subject
+--     authenticated actor, so it never reaches this guard at all.
+--
+-- (c) Retention config: three settings-registry keys added to the incidents
+--     module block (contiguous, per scripts/gen-settings-check.mjs), plus a
+--     pure retentionEligibleAt(incident, config) in src/lib/incidents.mjs
+--     (see that file's own diff -- no schema is needed for a value that is
+--     computed on read and never stored; retention/purge itself is Wave 4
+--     IN-25, out of this migration's scope entirely, matching this plan
+--     row's own "never purges anything" acceptance line).
+--
+-- Every helper call below is schema-qualified internal.<name>(...) per
+-- 0042's mandate for every migration >= 0043 (this migration calls none of
+-- the five internal.* scope/permission helpers directly -- both new guards
+-- are pure data checks against incident_reports.legal_hold/status, not
+-- permission checks -- so there is nothing to schema-qualify here, but the
+-- note is kept for the same reason every migration in this range keeps it:
+-- scripts/verify-migrations.mjs's bare-call scan covers this file too).
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- (a) fn_incident_report_transition_guard -- recreated whole (0048's body,
+-- verbatim) with new Guard 0 inserted right after the INSERT branch returns,
+-- ahead of every other UPDATE-only guard.
+-- ---------------------------------------------------------------------------
+create or replace function fn_incident_report_transition_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_manage_or_review boolean;
+begin
+  -- M2 (0048): BEFORE INSERT branch -- legal_hold may only be created true by
+  -- an actor holding incidents.legal_hold.manage. No OLD row exists yet, so
+  -- none of the UPDATE-only guards below (including the new Guard 0) apply.
+  if tg_op = 'INSERT' then
+    if new.legal_hold is true then
+      if not internal.has_permission(auth.uid(), new.facility_id, 'incidents.legal_hold.manage') then
+        raise exception 'incident_reports: legal_hold may only be created true by an actor holding incidents.legal_hold.manage.'
+          using errcode = 'check_violation';
+      end if;
+    end if;
+    return new;
+  end if;
+
+  -- From here on, tg_op = 'UPDATE'.
+
+  -- Guard 0 (0057, IN-16): a soft-delete (setting deleted_at) is rejected for
+  -- any authenticated actor when the incident is under legal hold, REGARDLESS
+  -- of status. This is the one gap 0048's L3/guard-3 freeze left open: guard
+  -- 3 below only ever engages once old.status <> 'draft', but legal_hold can
+  -- be set true on a still-draft incident (guard 1 below runs independently
+  -- of status) -- without this guard a draft incident already on legal hold
+  -- could still be soft-deleted by any incidents.manage/review holder.
+  -- Checked against OLD.legal_hold specifically (the hold state as it stood
+  -- BEFORE this UPDATE), so a single statement cannot smuggle a delete
+  -- through by simultaneously clearing legal_hold and setting deleted_at in
+  -- the same UPDATE -- the same "decide off the prior state" posture L2
+  -- already uses for submitted_by/submitted_at below. Exempted when
+  -- auth.uid() is null (L3's own service-role/definer-context exemption,
+  -- carried forward identically): a future retention/purge job (Wave 4
+  -- IN-25) must still be able to soft-delete a row once its hold is actually
+  -- lifted and its retention window has passed; that job runs service-role,
+  -- not as an RLS-subject authenticated actor, so this guard never sees it.
+  if new.deleted_at is distinct from old.deleted_at and auth.uid() is not null then
+    if old.legal_hold is true then
+      raise exception 'incident_reports %: an incident under legal hold may not be soft-deleted.', old.id
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Guard 1: legal_hold is a permission-gated field, independent of status.
+  if new.legal_hold is distinct from old.legal_hold then
+    if not internal.has_permission(auth.uid(), new.facility_id, 'incidents.legal_hold.manage') then
+      raise exception 'incident_reports %: legal_hold may only be changed by an actor holding incidents.legal_hold.manage.', old.id
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Guard 1b (H3, 0048): the incidents.legal_hold.manage UPDATE policy admits
+  -- an actor who holds ONLY that code -- neither incidents.manage nor
+  -- incidents.review. Without this, that RLS grant would double as a side
+  -- channel into editing or transitioning the rest of the row. Such an actor
+  -- may change legal_hold and updated_at only. Gated on auth.uid() is not
+  -- null (L3): a service-role/definer-context caller (auth.uid() is null)
+  -- never reaches incident_reports through any RLS policy at all -- it
+  -- bypasses RLS entirely -- so this guard's own concern (an RLS-admitted-but
+  -- -narrow actor exceeding their column scope) does not apply to it;
+  -- leaving it ungated here would otherwise also override L3's own
+  -- deleted_at exemption in guard 3 below for no reason.
+  v_manage_or_review := internal.has_permission(auth.uid(), new.facility_id, 'incidents.manage')
+    or internal.has_permission(auth.uid(), new.facility_id, 'incidents.review');
+  if auth.uid() is not null and not v_manage_or_review then
+    if new.status is distinct from old.status
+      or new.submitted_by is distinct from old.submitted_by
+      or new.submitted_at is distinct from old.submitted_at
+      or new.facility_id is distinct from old.facility_id
+      or new.department_id is distinct from old.department_id
+      or new.incident_no is distinct from old.incident_no
+      or new.report_type is distinct from old.report_type
+      or new.occurred_at is distinct from old.occurred_at
+      or new.reported_at is distinct from old.reported_at
+      or new.created_at is distinct from old.created_at
+      or new.deleted_at is distinct from old.deleted_at
+      or new.summary is distinct from old.summary
+      or new.immediate_actions is distinct from old.immediate_actions
+      or new.location_text is distinct from old.location_text
+      or new.severity is distinct from old.severity
+      or new.requires_osha_review is distinct from old.requires_osha_review
+    then
+      raise exception 'incident_reports %: an actor without incidents.manage or incidents.review may only change legal_hold (and updated_at).', old.id
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Guard 2: the status transition graph (src/lib/incidents.mjs:90-97),
+  -- verbatim from 0043.
+  if old.status is distinct from new.status then
+    if not (
+      (old.status = 'draft' and new.status = 'submitted')
+      or (old.status = 'submitted' and new.status = 'under_review')
+      or (old.status = 'under_review' and new.status in ('escalated', 'action_pending'))
+      or (old.status = 'escalated' and new.status in ('action_pending', 'closed'))
+      or (old.status = 'action_pending' and new.status in ('escalated', 'closed'))
+    ) then
+      raise exception 'incident_reports %: illegal status transition from % to %.', old.id, old.status, new.status
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Guard 3: once an incident has left draft, only status, updated_at,
+  -- legal_hold, and the amendable content fields may still change. L2:
+  -- submitted_by/submitted_at are frozen here too. L3: deleted_at is
+  -- exempted from the freeze when auth.uid() is null (a service-role/
+  -- definer-context caller) -- already covers submitted/under_review/
+  -- escalated/action_pending/closed for every authenticated actor, a
+  -- superset of this task's "submitted, under_review, closed" list.
+  if old.status <> 'draft' then
+    if new.facility_id is distinct from old.facility_id
+      or new.department_id is distinct from old.department_id
+      or new.incident_no is distinct from old.incident_no
+      or new.report_type is distinct from old.report_type
+      or new.occurred_at is distinct from old.occurred_at
+      or new.reported_at is distinct from old.reported_at
+      or new.created_at is distinct from old.created_at
+      or new.submitted_by is distinct from old.submitted_by
+      or new.submitted_at is distinct from old.submitted_at
+      or (new.deleted_at is distinct from old.deleted_at and auth.uid() is not null)
+    then
+      raise exception 'incident_reports %: no longer a draft; only status, updated_at, legal_hold, summary, immediate_actions, location_text, severity, and requires_osha_review may change (submitted_by/submitted_at are frozen once left draft).', old.id
+        using errcode = 'check_violation';
+    end if;
+
+    -- M1 (0048): the amendable content fields may change on a non-draft
+    -- incident ONLY via internal.apply_incident_amendment, which sets this
+    -- session-local flag inside the same transaction as its own UPDATE.
+    if (
+      new.summary is distinct from old.summary
+      or new.immediate_actions is distinct from old.immediate_actions
+      or new.location_text is distinct from old.location_text
+      or new.severity is distinct from old.severity
+      or new.requires_osha_review is distinct from old.requires_osha_review
+    ) and coalesce(current_setting('rec.amendment_in_progress', true), 'false') <> 'true' then
+      raise exception 'incident_reports %: amendable fields (summary, immediate_actions, location_text, severity, requires_osha_review) may only change via the amendment RPC (internal.apply_incident_amendment) once an incident has left draft.', old.id
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists incident_reports_transition_guard on incident_reports;
+create trigger incident_reports_transition_guard
+  before insert or update on incident_reports
+  for each row execute function fn_incident_report_transition_guard();
+
+revoke execute on function fn_incident_report_transition_guard() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_incident_report_transition_guard() from anon;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (b) fn_incident_child_legal_hold_guard(): generic BEFORE DELETE / BEFORE
+-- UPDATE OF deleted_at guard shared by incident_people, incident_attachments,
+-- and incident_witness_statements (see this file's header for why
+-- incident_amendments needs nothing further). SECURITY DEFINER + fixed
+-- search_path so the incident_reports lookup below resolves regardless of
+-- which role fires the trigger and always bypasses that table's own RLS
+-- (matching 0041's fn_attachment_path_facility and every other definer
+-- trigger in this file set). legal_hold ONLY -- see this file's header for
+-- why a parent-status check (mirroring incident_reports' own guard 3) is
+-- deliberately NOT applied to the children.
+-- ---------------------------------------------------------------------------
+create or replace function fn_incident_child_legal_hold_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_incident_id uuid;
+  v_row_id uuid;
+  v_legal_hold boolean;
+begin
+  -- Service-role/definer-context exemption (matches 0048's L3 precedent for
+  -- incident_reports.deleted_at): a future retention/purge job (Wave 4
+  -- IN-25) runs service-role, bypassing RLS -- and this trigger -- entirely
+  -- for most operations, but a trigger still fires for every role including
+  -- the table owner, so the exemption is made explicit here rather than
+  -- relying on RLS bypass alone.
+  if auth.uid() is null then
+    if tg_op = 'DELETE' then
+      return old;
+    end if;
+    return new;
+  end if;
+
+  v_incident_id := coalesce(new.incident_id, old.incident_id);
+  v_row_id := coalesce(new.id, old.id);
+
+  select legal_hold into v_legal_hold
+    from incident_reports
+    where id = v_incident_id;
+
+  if v_legal_hold is true then
+    raise exception '% %: parent incident % is under legal hold; delete is rejected.', tg_table_name, v_row_id, v_incident_id
+      using errcode = 'check_violation';
+  end if;
+
+  if tg_op = 'DELETE' then
+    return old;
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function fn_incident_child_legal_hold_guard() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_incident_child_legal_hold_guard() from anon;
+  end if;
+end
+$$;
+
+-- incident_people: guard both the real hard DELETE the `for all`/
+-- incidents.manage policy (0038) still structurally admits, and the
+-- soft-delete UPDATE the actual route (incidents-people-routes.mjs) uses.
+drop trigger if exists incident_people_legal_hold_delete_guard on incident_people;
+create trigger incident_people_legal_hold_delete_guard
+  before delete on incident_people
+  for each row execute function fn_incident_child_legal_hold_guard();
+
+drop trigger if exists incident_people_legal_hold_soft_delete_guard on incident_people;
+create trigger incident_people_legal_hold_soft_delete_guard
+  before update on incident_people
+  for each row
+  when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+
+-- incident_attachments: same shape as incident_people (forward-looking for
+-- the soft-delete side -- no attachment-removal route exists yet, matching
+-- 0048's L3 precedent for incident_reports.deleted_at).
+drop trigger if exists incident_attachments_legal_hold_delete_guard on incident_attachments;
+create trigger incident_attachments_legal_hold_delete_guard
+  before delete on incident_attachments
+  for each row execute function fn_incident_child_legal_hold_guard();
+
+drop trigger if exists incident_attachments_legal_hold_soft_delete_guard on incident_attachments;
+create trigger incident_attachments_legal_hold_soft_delete_guard
+  before update on incident_attachments
+  for each row
+  when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+
+-- incident_witness_statements: hard DELETE is already unconditionally
+-- rejected by fn_incident_witness_statement_guard (0050); this ADDS a
+-- second BEFORE UPDATE trigger (coexisting with, not replacing, that guard)
+-- that only fires when deleted_at is actually changing, guarding the
+-- one-time soft-delete path that guard never checked against legal_hold.
+drop trigger if exists incident_witness_statements_legal_hold_guard on incident_witness_statements;
+create trigger incident_witness_statements_legal_hold_guard
+  before update on incident_witness_statements
+  for each row
+  when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+
+-- incident_amendments: deliberately untouched -- fn_block_audit_mutation
+-- (0032(b)) already rejects every DELETE unconditionally, held or not, and
+-- the table carries no deleted_at column for a soft-delete path to exist.

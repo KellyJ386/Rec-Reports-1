@@ -88,6 +88,36 @@ export const settingsRegistry = Object.freeze(
       validation: {},
       permission: "admin.manage"
     },
+    {
+      key: "incidents.retentionDaysStandard",
+      module: "incidents",
+      label: "Retention period, standard incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 2555, // 7 years -- incidents.mjs retentionEligibleAt's "standard" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.retentionDaysOsha",
+      module: "incidents",
+      label: "Retention period, OSHA-recordable incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 1825, // 5 years -- OSHA 1904.33; incidents.mjs retentionEligibleAt's "osha" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.retentionDaysMinor",
+      module: "incidents",
+      label: "Retention period, minor incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 1095, // 3 years -- incidents.mjs retentionEligibleAt's "minor" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
 
     // --- Work orders (module code: work_orders) ----------------------------
     {

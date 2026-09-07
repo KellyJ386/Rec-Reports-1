@@ -12,6 +12,8 @@ import {
   AMENDABLE_INCIDENT_FIELDS,
   formatIncidentNo,
   nextIncidentNo,
+  incidentRetentionClass,
+  retentionEligibleAt,
   INCIDENT_STATUSES
 } from "../src/lib/incidents.mjs";
 
@@ -383,4 +385,60 @@ test("nextIncidentNo ignores malformed / non-matching values instead of throwing
 test("nextIncidentNo defaults year to the current UTC year when omitted", () => {
   const year = new Date().getUTCFullYear();
   assert.equal(nextIncidentNo([]), `INC-${year}-0001`);
+});
+
+// --- Retention (IN-16) -------------------------------------------------------
+
+test("incidentRetentionClass: OSHA-recordable incidents take priority over everything else", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: true, severity: "low", reportType: "near_miss" }), "osha");
+  assert.equal(incidentRetentionClass({ requiresOshaReview: true, severity: "critical" }), "osha");
+});
+
+test("incidentRetentionClass: near_miss or low severity (no OSHA review) is minor", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "near_miss", severity: "medium" }), "minor");
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "incident", severity: "low" }), "minor");
+});
+
+test("incidentRetentionClass: everything else falls back to standard", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "accident", severity: "high" }), "standard");
+  assert.equal(incidentRetentionClass({}), "standard");
+});
+
+test("retentionEligibleAt uses occurredAt as the anchor and the registry defaults when unconfigured", () => {
+  const standard = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(standard.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+
+  const osha = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", requiresOshaReview: true });
+  assert.equal(osha.toISOString(), new Date(Date.UTC(2026, 0, 1) + 1825 * 86400000).toISOString());
+
+  const minor = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", reportType: "near_miss" });
+  assert.equal(minor.toISOString(), new Date(Date.UTC(2026, 0, 1) + 1095 * 86400000).toISOString());
+});
+
+test("retentionEligibleAt honors facility-configured retention days", () => {
+  const eligible = retentionEligibleAt(
+    { occurredAt: "2026-01-01T00:00:00Z", severity: "high" },
+    { "incidents.retentionDaysStandard": 10 }
+  );
+  assert.equal(eligible.toISOString(), new Date(Date.UTC(2026, 0, 11)).toISOString());
+});
+
+test("retentionEligibleAt falls back to createdAt then reportedAt when occurredAt is absent", () => {
+  const fromCreated = retentionEligibleAt({ createdAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(fromCreated.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+
+  const fromReported = retentionEligibleAt({ reportedAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(fromReported.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+});
+
+test("retentionEligibleAt returns null when no anchor timestamp is available", () => {
+  assert.equal(retentionEligibleAt({ severity: "high" }), null);
+  assert.equal(retentionEligibleAt(null), null);
+});
+
+test("retentionEligibleAt is pure -- never reads the clock, deterministic for the same inputs", () => {
+  const incident = { occurredAt: "2026-01-01T00:00:00Z", requiresOshaReview: true };
+  const a = retentionEligibleAt(incident);
+  const b = retentionEligibleAt(incident);
+  assert.equal(a.toISOString(), b.toISOString());
 });
