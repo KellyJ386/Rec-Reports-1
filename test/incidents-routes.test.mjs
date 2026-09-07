@@ -25,6 +25,9 @@ const TASK_CREATOR = [
 const EXPORTER = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.export.pdf"] }
 ];
+const ESCALATOR = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.escalate"] }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -98,7 +101,7 @@ function stubFetch(t, respond) {
   return captured;
 }
 
-function mount({ memberships = CREATOR, userId = "user-1" } = {}) {
+function mount({ memberships = CREATOR, userId = "user-1", env = {} } = {}) {
   const router = createRouter();
   const sent = [];
   const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
@@ -110,7 +113,7 @@ function mount({ memberships = CREATOR, userId = "user-1" } = {}) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
     const request = { url: path, __body: body === undefined ? undefined : JSON.stringify(body) };
-    await handler(request, {}, { env: {}, params });
+    await handler(request, {}, { env, params });
     return sent[sent.length - 1];
   }
   return { call, captured: [] };
@@ -203,6 +206,30 @@ test("POST incidents happy path inserts a draft with a server-generated incident
   assert.equal(insert.body[0].status, "draft");
   assert.equal(insert.body[0].location_text, "Building A");
   assert.equal(insert.body[0].summary, "Test incident");
+});
+
+// M2 (0048): a client-supplied legalHold:true must never reach the insert --
+// creating an incident already on legal hold is gated on
+// incidents.legal_hold.manage, a permission this route's MANAGE-only guard
+// does not itself check. Matches the new BEFORE INSERT guard in 0048.
+test("POST incidents ignores a client-supplied legalHold:true; every draft is created with legal_hold=false", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [];
+    if (table === "incident_reports" && method === "POST") return [{ id: "inc-2" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("POST", "/facilities/fac-1/incidents", {
+    reportType: "incident",
+    severity: "high",
+    occurredAt: "2026-07-18T10:00:00Z",
+    locationText: "Building A",
+    summary: "Test incident",
+    legalHold: true
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_reports" && c.method === "POST");
+  assert.equal(insert.body[0].legal_hold, false);
 });
 
 test("POST incidents ignores a client-supplied incidentNo and generates its own", async (t) => {
@@ -321,6 +348,19 @@ test("POST escalate loads incident and denies non-manager with 403", async (t) =
   const { call } = mount({ memberships: READER });
   const result = await call("POST", "/incidents/inc-1/escalate");
   assert.equal(result.status, 403);
+});
+
+test("POST escalate allows an incidents.escalate holder without incidents.manage (S-5)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-3" }];
+    return [];
+  });
+  const { call } = mount({ memberships: ESCALATOR });
+  const result = await call("POST", "/incidents/inc-1/escalate");
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_escalations" && c.method === "POST");
+  assert.ok(insert, "expected an incident_escalations insert");
 });
 
 test("POST escalate happy path inserts an escalation row", async (t) => {
@@ -533,6 +573,50 @@ test("POST status 404s when the incident is missing", async (t) => {
   assert.equal(result.status, 404);
 });
 
+// --- PATCH /incidents/:id/legal-hold (S-5) ----------------------------------
+
+test("PATCH legal-hold validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: "yes" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH legal-hold 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/nope/legal-hold", { legalHold: true });
+  assert.equal(result.status, 404);
+});
+
+test("PATCH legal-hold denies a manager without incidents.legal_hold.manage", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: true });
+  assert.equal(result.status, 403);
+});
+
+test("PATCH legal-hold happy path flips legal_hold and writes an audit event", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, legal_hold: true }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("PATCH", "/incidents/inc-1/legal-hold", { legalHold: true });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.legal_hold, true);
+
+  const update = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
+  assert.equal(update.body.legal_hold, true);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  assert.equal(auditInsert.body[0].event_type, "incident.legal_hold_changed");
+});
+
 // --- POST /incidents/:id/submit: suggestedFollowUps (IN-05) -----------------
 
 test("POST submit response includes suggestedFollowUps for an auto-escalating severity", async (t) => {
@@ -575,6 +659,7 @@ test("POST amendments on a draft incident is rejected with 409 and no writes", a
   assert.ok(!captured.some((c) => c.table === "incident_amendments"));
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
   assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "rpc/apply_incident_amendment"));
 });
 
 test("POST amendments denies an actor without incidents.manage or incidents.review", async (t) => {
@@ -609,16 +694,23 @@ test("POST amendments rejects an empty patch, non-amendable fields, and a blank 
 
   assert.ok(!captured.some((c) => c.table === "incident_amendments"));
   assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "rpc/apply_incident_amendment"));
 });
 
-test("POST amendments on a submitted incident writes BOTH the incident_reports UPDATE and the incident_amendments row, plus an audit event", async (t) => {
+test("POST amendments on a submitted incident calls internal.apply_incident_amendment (RPC) and writes an audit event", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
-    if (table === "incident_reports" && method === "PATCH") {
-      return [{ ...SUBMITTED_INCIDENT, summary: "Updated after investigation" }];
-    }
-    if (table === "incident_amendments" && method === "POST") {
-      return [{ id: "amend-1", incident_id: "inc-1" }];
+    if (table === "rpc/apply_incident_amendment" && method === "POST") {
+      return {
+        incident: { ...SUBMITTED_INCIDENT, summary: "Updated after investigation" },
+        amendment: {
+          id: "amend-1",
+          facility_id: "fac-1",
+          incident_id: "inc-1",
+          amendment_reason: "Investigation revealed more detail",
+          amended_by: "user-9"
+        }
+      };
     }
     if (table === "incident_audit_events" && method === "POST") return [];
     return [];
@@ -632,20 +724,18 @@ test("POST amendments on a submitted incident writes BOTH the incident_reports U
   assert.equal(result.payload.incident.summary, "Updated after investigation");
   assert.equal(result.payload.amendment.id, "amend-1");
 
-  const incidentPatch = captured.find((c) => c.table === "incident_reports" && c.method === "PATCH");
-  assert.ok(incidentPatch, "expected incident_reports to be updated");
-  assert.equal(incidentPatch.body.summary, "Updated after investigation");
-  assert.equal(Object.keys(incidentPatch.body).length, 1); // only the amended field, nothing else
+  // M1 (0048): the incident_reports UPDATE and the incident_amendments
+  // INSERT no longer happen as two separate REST calls from this route --
+  // both are applied atomically inside the RPC, so this route now issues
+  // exactly one write call for them combined.
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "incident_amendments" && c.method === "POST"));
 
-  const amendmentInsert = captured.find((c) => c.table === "incident_amendments" && c.method === "POST");
-  assert.ok(amendmentInsert, "expected an incident_amendments insert");
-  const amendment = amendmentInsert.body[0];
-  assert.equal(amendment.facility_id, "fac-1");
-  assert.equal(amendment.incident_id, "inc-1");
-  assert.equal(amendment.amendment_reason, "Investigation revealed more detail");
-  assert.equal(amendment.amended_by, "user-9");
-  assert.equal(amendment.before_snapshot.summary, "Test incident");
-  assert.equal(amendment.after_snapshot.summary, "Updated after investigation");
+  const rpcCall = captured.find((c) => c.table === "rpc/apply_incident_amendment" && c.method === "POST");
+  assert.ok(rpcCall, "expected a call to internal.apply_incident_amendment via RPC");
+  assert.equal(rpcCall.body.incident_id, "inc-1");
+  assert.deepEqual(rpcCall.body.changes, { summary: "Updated after investigation" });
+  assert.equal(rpcCall.body.reason, "Investigation revealed more detail");
 
   const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
   assert.ok(auditInsert, "expected an incident_audit_events insert");
@@ -659,8 +749,12 @@ test("POST amendments on a submitted incident writes BOTH the incident_reports U
 test("POST amendments succeeds for an incidents.review holder (no incidents.manage)", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [SUBMITTED_INCIDENT];
-    if (table === "incident_reports" && method === "PATCH") return [{ ...SUBMITTED_INCIDENT, severity: "high" }];
-    if (table === "incident_amendments" && method === "POST") return [{ id: "amend-2" }];
+    if (table === "rpc/apply_incident_amendment" && method === "POST") {
+      return {
+        incident: { ...SUBMITTED_INCIDENT, severity: "high" },
+        amendment: { id: "amend-2" }
+      };
+    }
     return [];
   });
   const { call } = mount({ memberships: REVIEWER });
@@ -669,7 +763,36 @@ test("POST amendments succeeds for an incidents.review holder (no incidents.mana
     patch: { severity: "high" }
   });
   assert.equal(result.status, 201);
-  assert.ok(captured.some((c) => c.table === "incident_amendments" && c.method === "POST"));
+  assert.ok(captured.some((c) => c.table === "rpc/apply_incident_amendment" && c.method === "POST"));
+});
+
+test("POST amendments propagates a DB-level rejection (e.g. RPC's own permission/status guard) as the same status", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_reports" && init.method === "GET") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([SUBMITTED_INCIDENT]) };
+    }
+    if (table === "rpc/apply_incident_amendment") {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => JSON.stringify({ message: "missing permission: incidents.manage or incidents.review" })
+      };
+    }
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/amendments", {
+    reason: "why",
+    patch: { summary: "x" }
+  });
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /incidents\.manage/);
 });
 
 test("GET amendments 404s when the incident is missing and denies a non-reader", async (t) => {
@@ -1080,4 +1203,127 @@ test("GET export.pdf marks an amended incident's audit event and lists amendment
   const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
   assert.match(bytes, /\[AMENDED\]/);
   assert.match(bytes, /\(Amendment 1 Reason: corrected the location\) Tj/);
+});
+
+// --- Audit write failure handling (IN-22 interim, see writeAuditEvent) ------
+// The domain write and the incident_audit_events write are two separate REST
+// calls; these tests simulate the audit write itself failing (PostgREST
+// returns non-ok for that one table only) to verify: the caller gets a clean
+// 500 {error, entity_id} instead of a generic/unhandled 500, the domain write
+// that already happened is never rolled back or hidden, and the failure is
+// reported through observability.mjs's fire-and-forget reportError -- same
+// programmable-stub-by-hostname style as test/internal-routes.test.mjs.
+function stubFetchAuditFailure(t, respond, { dsnHostname = "observability.example" } = {}) {
+  const captured = { postgrest: [], observability: [] };
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === dsnHostname) {
+      captured.observability.push({ url: parsed.toString(), body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true, status: 200, text: async () => "" };
+    }
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    captured.postgrest.push({ table, method, url: parsed, body: init.body ? JSON.parse(init.body) : null });
+    if (table === "incident_audit_events" && method === "POST") {
+      return { ok: false, status: 500, text: async () => JSON.stringify({ message: "connection reset" }) };
+    }
+    const data = respond(table, method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  return captured;
+}
+
+test("POST escalate: a failing audit write returns 500 {error, entity_id} after the domain escalation row is already committed", async (t) => {
+  const captured = stubFetchAuditFailure(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-2" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, env: { OBSERVABILITY_DSN: "https://observability.example/report" } });
+  const result = await call("POST", "/incidents/inc-1/escalate", { level: 2 });
+
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
+
+  // The domain write (the escalation row itself) already happened and is
+  // never undone -- this is exactly the partial-write gap IN-22's future
+  // transactional RPC is meant to close.
+  const escalationInsert = captured.postgrest.find((c) => c.table === "incident_escalations" && c.method === "POST");
+  assert.ok(escalationInsert, "expected the escalation row to have already been inserted");
+
+  assert.equal(captured.observability.length, 1, "expected exactly one fire-and-forget error report");
+  assert.equal(captured.observability[0].body.route, "incidents.audit_write/incident.escalated");
+  assert.equal(captured.observability[0].body.status, 500);
+});
+
+test("PATCH followups completing a task: a failing audit write returns 500 but the completion PATCH is not undone", async (t) => {
+  const captured = stubFetchAuditFailure(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_followup_actions" && method === "PATCH") return [{ ...FOLLOWUP, status: "completed" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("PATCH", "/followups/fu-1", { status: "completed" });
+
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: FOLLOWUP.incident_id });
+
+  const patch = captured.postgrest.find((c) => c.table === "incident_followup_actions" && c.method === "PATCH");
+  assert.ok(patch, "expected the follow-up completion PATCH to have already been applied");
+});
+
+test("GET export.pdf: a failing audit write returns 500 instead of the PDF envelope", async (t) => {
+  const captured = stubFetchAuditFailure(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    return [];
+  });
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/export.pdf");
+
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
+  assert.equal(result.payload.body, undefined, "must not also send the PDF envelope");
+  const auditAttempt = captured.postgrest.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditAttempt, "expected the (failed) audit insert to have been attempted");
+});
+
+test("A failing audit write with no OBSERVABILITY_DSN configured stays a silent no-op for reporting, but still 500s the response", async (t) => {
+  stubFetchAuditFailure(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-3" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // default env: {} -- no OBSERVABILITY_DSN
+  const result = await call("POST", "/incidents/inc-1/escalate", {});
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
+});
+
+// L-8: with no DSN configured, reportError is a silent no-op (see
+// observability.mjs), so console.error is the ONLY local signal that the
+// audit write failed -- without it, "reported ... visible for manual
+// reconciliation" (writeAuditEvent's own doc comment) would be false
+// whenever OBSERVABILITY_DSN is unset, which is the normal local/dev state.
+test("A failing audit write with no OBSERVABILITY_DSN configured still logs locally via console.error", async (t) => {
+  stubFetchAuditFailure(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-4" }];
+    return [];
+  });
+  const originalConsoleError = console.error;
+  const calls = [];
+  console.error = (...args) => calls.push(args);
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  const { call } = mount({ memberships: CREATOR }); // default env: {} -- no OBSERVABILITY_DSN
+  const result = await call("POST", "/incidents/inc-1/escalate", {});
+  assert.equal(result.status, 500);
+  assert.equal(calls.length, 1, "expected exactly one console.error call for the failed audit write");
+  assert.match(calls[0][0], /incidents\.audit_write\/incident\.escalated/);
+  assert.match(calls[0][0], /inc-1/);
 });

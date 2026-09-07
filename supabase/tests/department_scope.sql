@@ -44,19 +44,19 @@ on conflict (id) do nothing;
 -- Scope semantics of both overloads.
 do $$
 begin
-  if has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
+  if internal.has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
     raise exception 'DEPT FAIL: department-scoped membership passed a facility-scope check';
   end if;
-  if not has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'admin.manage') then
+  if not internal.has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000da', 'admin.manage') then
     raise exception 'DEPT FAIL: department-scoped membership denied its own department';
   end if;
-  if has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'admin.manage') then
+  if internal.has_permission('d0000000-0000-0000-0000-0000000000aa', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'admin.manage') then
     raise exception 'DEPT FAIL: department-scoped membership granted a sibling department';
   end if;
-  if not has_permission('d0000000-0000-0000-0000-0000000000ab', 'd0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
+  if not internal.has_permission('d0000000-0000-0000-0000-0000000000ab', 'd0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
     raise exception 'DEPT FAIL: facility-wide membership lost its facility-scope grant';
   end if;
-  if not has_permission('d0000000-0000-0000-0000-0000000000ab', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'admin.manage') then
+  if not internal.has_permission('d0000000-0000-0000-0000-0000000000ab', 'd0000000-0000-0000-0000-0000000000c0', 'd0000000-0000-0000-0000-0000000000db', 'admin.manage') then
     raise exception 'DEPT FAIL: facility-wide membership denied a department-scoped check';
   end if;
 end;

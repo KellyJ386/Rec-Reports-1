@@ -63,16 +63,33 @@ create table if not exists storage.objects (
 alter table storage.objects enable row level security;
 
 -- storage.foldername(object_name): splits an object path into folder
--- segments, per Supabase's storage API. Returns an array of text where
--- each element is a path component (split by '/'). Returns null if the
--- path is empty or null.
+-- segments, matching Supabase's real storage.foldername (storage-api's
+-- migrations): split on '/' with NO trimming of leading/trailing slashes,
+-- then drop the LAST element (the object's own filename is not a
+-- "folder"). M-2 fix: the previous shim trimmed leading/trailing '/' and
+-- returned every component including the filename, which is MORE
+-- permissive than production -- it happily parsed a leading-slash path
+-- ("/facilities/.../x.jpg") or a root-level file ("facilities/.../certs")
+-- into a folder array that real Supabase's storage.foldername would
+-- instead return NULL (or a shorter array) for, so this shim's version of
+-- the S-1 proof (supabase/tests/storage_module_reads.sql) validated a
+-- different, laxer function than the one that actually runs in
+-- production. Returns null for an empty/null path (string_to_array's own
+-- behavior on '' would be {''}; guarded explicitly below to match the
+-- "no match" contract fn_storage_attachment_facility_id/
+-- fn_storage_attachment_module already rely on).
 create or replace function storage.foldername(object_name text)
 returns text[]
-language sql
+language plpgsql
 stable
 as $$
-  select case
-    when object_name is null or object_name = '' then null
-    else string_to_array(trim(object_name, '/'), '/')
-  end;
+declare
+  _parts text[];
+begin
+  if object_name is null or object_name = '' then
+    return null;
+  end if;
+  _parts := string_to_array(object_name, '/');
+  return _parts[1:array_length(_parts, 1) - 1];
+end;
 $$;

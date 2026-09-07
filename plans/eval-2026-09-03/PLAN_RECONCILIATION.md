@@ -5,6 +5,13 @@
 Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, checked against
 `MODULE_DEVELOPMENT_MASTER_PLAN.md` + `plans/*.md` (168 tasks) and `PHASED_MVP_ROADMAP.md` §1.2/§8.1.
 
+**Status update 2026-09-06 (Wave 1 landed on `claude/wave1-review-fixes`, PR #18):** five rows changed
+since the evaluation — DR-34, WO-27, OP-05 and OP-24 are DONE and IN-24 is PARTIAL, all on the strength of
+`plans/SECURITY_REVIEW_2026-09.md` (the S-12 sign-off) and migrations 0040–0049; the rollup tables in §2
+are updated in place and each changed row is dated. Everything else below is still as evaluated at
+`8d9b0d7`. Claim 3 in §4 ("WO-27 / OP-24 are not closed by a dedicated artifact") is resolved by that
+document; the `message_audiences.audience_ref_id` gap it mentions is closed by migrations 0047/0048.
+
 **Method notes**
 
 - Local gate re-run during this evaluation: `npm test` → **1311/1311 pass**; `format:check`, `lint`,
@@ -63,11 +70,11 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 | DR-31 | Retention, purge, legal hold | NOT STARTED | No purge script/legal_hold column for reports | Whole task |
 | DR-32 | Admin builder polish (version compare, preview) | NOT STARTED | No diff/preview code in `forms.js` beyond baseline | Whole task |
 | DR-33 | Performance/index pass (GIN indexes) | NOT STARTED | No GIN index migrations found | Whole task |
-| DR-34 | Security review / threat model | NOT STARTED | No dedicated review doc; ad hoc hardening happened via the schema-wide RLS audit, not a DR-scoped review | Formal review |
+| DR-34 | Security review / threat model | DONE (2026-09-06) | `plans/SECURITY_REVIEW_2026-09.md` — signed-URL path handling, cross-tenant object reads and the publish separation of duties reviewed and re-proved (H-1, M-1, M-2, H1). Re-review DR-18/DR-20 workflow escalation when those ship | — |
 
 **Spot-checks (DR):** DR-04 (`report-templates-routes.mjs` read fully — CRUD/publish/archive all present and 409-gated), DR-09 (traced `attachments-routes.mjs` → `storage.mjs` → migration `0030_storage.sql` bucket policy → test), DR-12 (`reports-compliance.mjs` pure calculator + route, date-range cap enforced).
 
-**DR rollup:** DONE 15, PARTIAL 1, NOT STARTED 18, OWNER-ONLY 0 (of 34).
+**DR rollup:** DONE 16, PARTIAL 1, NOT STARTED 17, OWNER-ONLY 0 (of 34). *(updated 2026-09-06: DR-34 done)*
 
 ---
 
@@ -98,12 +105,12 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 | IN-21 | SLA breach auto-escalation sweep | NOT STARTED | No `scripts/incident-sla-sweep.mjs` | Whole task |
 | IN-22 | Chain verification + access-audit endpoint | NOT STARTED | No `GET /incidents/:id/audit`; chain verify exists only generically (`admin/audit`, `OP-21`'s verify-all), not incident-scoped | Whole task |
 | IN-23 | Dashboard/analytics polish | NOT STARTED | No `/facilities/:id/incidents/summary` route | Whole task |
-| IN-24 | Rate limiting + break-glass read path | NOT STARTED | No rate limit on incident submit/export beyond the generic sign-in throttle (OP-23, unrelated) | Whole task |
+| IN-24 | Rate limiting + break-glass read path | PARTIAL (2026-09-06) | Security-review half closed by `plans/SECURITY_REVIEW_2026-09.md` (incident write-path guards, legal hold, audit payload, durable throttle). No 429 on incident submit/export and no justification-capturing break-glass read path | Feature half (Wave 4) |
 | IN-25 | Retention/purge honoring legal hold | NOT STARTED | No purge script | Whole task |
 
 **Spot-checks (IN):** IN-04 (traced amendment route → `buildAmendment`/hash → migration `0032` INSERT policy → `supabase/tests/incident_immutability.sql`), IN-08 (traced PDF route → `incident-pdf.mjs` → deterministic-render test), IN-09 (formatter + retry-on-unique-violation confirmed in route body).
 
-**IN rollup:** DONE 9, PARTIAL 1, NOT STARTED 15, OWNER-ONLY 0 (of 25).
+**IN rollup:** DONE 9, PARTIAL 2, NOT STARTED 14, OWNER-ONLY 0 (of 25). *(updated 2026-09-06: IN-24 partial)*
 
 ---
 
@@ -137,11 +144,11 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 | WO-24 | Audit + soft-delete/cancel semantics | NOT STARTED | `DELETE /work-orders/:id` doesn't exist; comment in `0026_soft_delete_policy_hardening.sql:67` explicitly flags this as future work needing a SECURITY DEFINER RPC | Whole task |
 | WO-25 | Entitlement/module gating (Ops Plus) | NOT STARTED | No entitlement check wraps WO M2 features (none of which exist yet) | Whole task |
 | WO-26 | Maintenance-window-aware PM scheduling | NOT STARTED | Depends on WO-17/18 | Whole task |
-| WO-27 | Module security review + full gate | PARTIAL | Covered implicitly by the schema-wide RLS audit (`aefc28f`) for the RLS half; no dedicated end-to-end WO review doc | No standalone WO-27 review artifact |
+| WO-27 | Module security review + full gate | DONE (2026-09-06) | `plans/SECURITY_REVIEW_2026-09.md` — guard ordering, facility inheritance and storage paths reviewed end to end; full gate (unit, RLS, replay, seed) green on the reviewed commit | — |
 
 **Spot-checks (WO):** WO-02 (`canTransition`/`applyStatusChange` traced into the PATCH handler, confirmed history-row-per-field write), WO-03 (dual-permission guard traced, confirmed facility always inherited from the incident not the body), WO-08 (`work_orders_scope.sql` read — cross-facility isolation + soft-delete assertions present).
 
-**WO rollup:** DONE 11 (WO-14 counted as delivered via the platform primitive), PARTIAL 1, NOT STARTED 15, OWNER-ONLY 0 (of 27).
+**WO rollup:** DONE 12 (WO-14 counted as delivered via the platform primitive), PARTIAL 0, NOT STARTED 15, OWNER-ONLY 0 (of 27). *(updated 2026-09-06: WO-27 done)*
 
 ---
 
@@ -244,7 +251,7 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 | OP-02 | Remaining Vercel env vars | OWNER-ONLY | Same as OP-01 | Dashboard action |
 | OP-03 | Connect repo + deploy | OWNER-ONLY | No CI/CD evidence of a live deployment target in-repo | Dashboard action |
 | OP-04 | `search_path` pin migration | DONE | `supabase/migrations/0024_advisor_hardening.sql`; commit `5b82345` | — |
-| OP-05 | SECURITY DEFINER RPC review | NOT STARTED (owner decision pending) | `0024_advisor_hardening.sql:27-28` explicitly says this "is out of scope here (tracked separately as OP-05)" | Owner decision + migration |
+| OP-05 | SECURITY DEFINER RPC review | DONE (2026-09-06; live apply pending) | Migration `0042_internal_helpers.sql` moves the six scope/permission helpers into an unexposed `internal` schema and revokes EXECUTE from PUBLIC/anon and from trigger functions; proven by `supabase/tests/internal_helpers.sql` and the CI replay. Applying 0040–0049 to the live project still needs the owner's go | Live apply + advisor re-run |
 | OP-06 | Enable leaked-password protection | OWNER-ONLY | Dashboard toggle, unverifiable from source | Dashboard action |
 | OP-07 | Env-var rename with fallbacks | DONE | `env.mjs` `legacyNames` fallback map; commit `5b82345`; `test/env.test.mjs` covers both spellings | — |
 | OP-08 | Post-deploy smoke script | DONE | `scripts/smoke.mjs`; commit `0c291d9` | — |
@@ -263,11 +270,11 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 | OP-21 | Scheduled audit-chain verification | DONE | `POST /internal/audit/verify-all`, daily Vercel cron; commit `b9088b3` | — |
 | OP-22 | Backup/retention review + runbook | OWNER-ONLY | No `docs/` runbook found in repo | Owner action + doc |
 | OP-23 | Auth-proxy throttle | DONE | Sliding-window limiter on `/auth/sign-in`, 5/email + 20/IP per 15 min; commit `a5eca94` | — |
-| OP-24 | Security review gate (Opus review of OP-05/11/13/15-17) | PARTIAL | The schema-wide RLS audit (`aefc28f`, `plans/RLS_AUDIT.md`) is a de facto security review covering storage/worker-adjacent RLS, but OP-05 itself (definer RPCs) remains an open, undecided item; no single consolidated "OP-24 sign-off" artifact | OP-05 resolution still pending |
+| OP-24 | Security review gate (Opus review of OP-05/11/13/15-17) | DONE (2026-09-06) | `plans/SECURITY_REVIEW_2026-09.md` — two adversarial reviews plus two re-verification rounds over Wave 1 (migrations 0040–0049), every High/Medium/Low closed or accepted with rationale, each bound to a named test | — |
 
 **Spot-checks (OP):** OP-11/13/14 (`worker.mjs` read end-to-end: `claimDueJobs` optimistic-claim → `processJob` → `drainOnce`/`drainOutboxOnce`; `internal-routes.mjs` guard logic confirmed 503-when-unset), OP-15/16/17 (migration `0030` → `storage.mjs` → `attachments-routes.mjs`, full chain), OP-20 (`observability.mjs` read in full — AbortController+timeout, whitelist payload confirmed by description; not independently re-tested here but code matches commit's stated behavior and its own test file exists).
 
-**OP rollup:** DONE 15, PARTIAL 1, NOT STARTED 2 (OP-05, OP-12), OWNER-ONLY 6 (OP-01, OP-02, OP-03, OP-06, OP-09, OP-22) (of 24).
+**OP rollup:** DONE 17, PARTIAL 0, NOT STARTED 1 (OP-12), OWNER-ONLY 6 (OP-01, OP-02, OP-03, OP-06, OP-09, OP-22) (of 24). *(updated 2026-09-06: OP-05 and OP-24 done)*
 
 ---
 
@@ -275,14 +282,14 @@ Evaluated at HEAD `8d9b0d7` (2026-08-19), tip of `main`, working tree clean, che
 
 | Module | DONE | PARTIAL | NOT STARTED | OWNER-ONLY | Total |
 |---|---|---|---|---|---|
-| Daily Reports (DR) | 15 | 1 | 18 | 0 | 34 |
-| Incidents (IN) | 9 | 1 | 15 | 0 | 25 |
-| Work Orders (WO) | 11 | 1 | 15 | 0 | 27 |
+| Daily Reports (DR) | 16 | 1 | 17 | 0 | 34 |
+| Incidents (IN) | 9 | 2 | 14 | 0 | 25 |
+| Work Orders (WO) | 12 | 0 | 15 | 0 | 27 |
 | Scheduling (SC) | 8 | 1 | 15 | 0 | 24 |
 | Communications (CM) | 9 | 1 | 8 | 0 | 18 |
 | Training (TR) | 6 | 0 | 10 | 0 | 16 |
-| Platform/Ops (OP) | 15 | 1 | 2 | 6 | 24 |
-| **Total** | **73** | **6** | **83** | **6** | **168** |
+| Platform/Ops (OP) | 17 | 0 | 1 | 6 | 24 |
+| **Total** | **77** | **5** | **80** | **6** | **168** |
 
 ### By plan milestone (M1/M2/M3, per each module's own plan phasing)
 
@@ -291,13 +298,13 @@ Each module plan phases its own tasks M1/M2/M3; OP's P1/P2/P3 are treated as the
 
 | Milestone | Planned | Done | Partial | Not started | Owner-only |
 |---|---|---|---|---|---|
-| M1 (MVP) | 67 | 59 | 3 | 1 | 4 |
+| M1 (MVP) | 67 | 60 | 3 | 0 | 4 |
 | M2 (design-complete) | 62 | 9 | 1 | 51 | 1 |
-| M3 (polish) | 39 | 5 | 2 | 31 | 1 |
-| **Total** | **168** | **73** | **6** | **83** | **6** |
+| M3 (polish) | 39 | 8 | 1 | 29 | 1 |
+| **Total** | **168** | **77** | **5** | **80** | **6** |
 
-**Headline: essentially all of M1 (MVP) is built and working — 59 of 67 fully, 3 with a real but narrow
-gap, 1 (OP-05) an explicitly-deferred owner decision, 4 pure dashboard actions (OP-01/02/03/06).
+**Headline: essentially all of M1 (MVP) is built and working — 60 of 67 fully (OP-05 closed by Wave 1's
+migration 0042 on 2026-09-06), 3 with a real but narrow gap, 4 pure dashboard actions (OP-01/02/03/06).
 M2 is *not* uniformly untouched, contrary to a surface read of the wave commits: because the platform
 workstream front-loaded its storage and notification-worker primitives (both nominally OP "P2"/M2-phase
 work) ahead of schedule to unblock every module's M1 slice, 9 of M2's 62 tasks are done — all of them

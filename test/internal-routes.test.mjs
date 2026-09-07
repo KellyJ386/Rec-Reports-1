@@ -9,7 +9,7 @@ import { computeDbRowHash } from "../src/lib/audit.mjs";
 // one global fetch stub, recording every call so assertions can inspect
 // exactly what each subsystem sent -- same programmable-stub style as
 // test/audit-routes.test.mjs and test/notifications-worker.test.mjs.
-function stubFetch(t, { facilities = [], chains = {} } = {}) {
+function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = [] } = {}) {
   const captured = { postgrest: [], observability: [] };
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -27,7 +27,9 @@ function stubFetch(t, { facilities = [], chains = {} } = {}) {
     else if (table === "audit_events" && method === "GET") {
       const facilityId = parsed.searchParams.get("facility_id")?.replace("eq.", "");
       data = chains[facilityId] ?? [];
-    }
+    } else if (table === "outbox_events" && method === "GET") data = [];
+    else if (table === "notification_jobs" && method === "GET") data = [];
+    else if (table === "auth_throttle" && method === "DELETE") data = sweptAuthThrottleRows;
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   t.after(() => {
@@ -206,6 +208,50 @@ test("a tampered chain fixture produces a broken entry AND a fire-and-forget obs
   const wire = JSON.stringify(report.body);
   assert.equal(wire.includes("correct-cron-secret"), false);
   assert.equal(wire.includes("service-key"), false);
+});
+
+// ---------------------------------------------------------------------------
+// S-7: POST/GET /internal/notifications/drain sweeps stale auth_throttle
+// rows after each drain and folds the deleted count into the response.
+// ---------------------------------------------------------------------------
+
+test("drain: sweeps auth_throttle (lt filter on updated_at) and reports the deleted count", async (t) => {
+  const captured = stubFetch(t, { sweptAuthThrottleRows: [{ key: "email:a@b.com" }, { key: "ip:203.0.113.7" }] });
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: BASE_ENV,
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.authThrottleSwept, 2);
+
+  const sweepRequest = captured.postgrest.find((req) => req.table === "auth_throttle" && req.method === "DELETE");
+  assert.ok(sweepRequest, "expected exactly one DELETE against auth_throttle");
+  assert.match(sweepRequest.url.searchParams.get("updated_at"), /^lt\./);
+});
+
+test("drain: a sweep failure fails open -- the drain response still succeeds with authThrottleSwept: 0", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "auth_throttle" && init.method === "DELETE") {
+      throw new Error("postgrest unreachable");
+    }
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.authThrottleSwept, 0);
 });
 
 test("when OBSERVABILITY_DSN is unset, a broken chain is still reported in the response but no fetch fires", async (t) => {

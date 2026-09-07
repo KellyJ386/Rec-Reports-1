@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { readServerEnv } from "../src/lib/env.mjs";
 import { createRouter } from "../src/lib/http/router.mjs";
 import { createJwtVerifier, loadMemberships, loadPlatformAdmin } from "../src/lib/http/auth.mjs";
-import { requireAuthOrgAdmin } from "../src/lib/http/guard.mjs";
+import { requireAuthOrgAdminRow } from "../src/lib/http/guard.mjs";
 import { validateModuleTogglePayload } from "../src/lib/http/validate.mjs";
 import { registerAdminRoutes } from "../src/lib/http/admin-routes.mjs";
 import { registerAuditRoutes } from "../src/lib/http/audit-routes.mjs";
@@ -28,6 +28,7 @@ import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs
 import { registerInternalRoutes } from "../src/lib/http/internal-routes.mjs";
 import { createClient, pgSelect, pgInsert } from "../src/lib/supabase-rest.mjs";
 import { reportError } from "../src/lib/observability.mjs";
+import { createDurableRateLimiter } from "../src/lib/http/durable-rate-limit.mjs";
 
 const root = process.argv[2] === "dist" ? "dist" : "src/public";
 const port = Number(process.env.PORT ?? 3000);
@@ -134,14 +135,6 @@ async function authenticate(request, env) {
   return { claims, client, memberships, platformAdmin, error: null };
 }
 
-async function orgFacilityIds(client, organizationId) {
-  const rows = await pgSelect(client, "facilities", {
-    filters: { organization_id: organizationId },
-    select: "id"
-  });
-  return (rows ?? []).map((row) => row.id);
-}
-
 export const router = createRouter();
 
 router.register("GET", "/modules", async (request, response, { env }) => {
@@ -157,8 +150,12 @@ router.register("GET", "/modules", async (request, response, { env }) => {
 router.register("GET", "/org/:id/module-settings", async (request, response, { env, params }) => {
   const auth = await authenticate(request, env);
   if (auth.error) return sendJson(response, auth.error.status, auth.error.body);
-  const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
+  // M4 (S-6/0048): matches the actual SQL rule (0019 -- admin.manage on any
+  // one org facility no longer implies org-wide authority; an explicit
+  // organization_admins row is required), same as admin-routes.mjs and
+  // billing-routes.mjs. The deprecated requireAuthOrgAdmin/orgFacilityIds
+  // pair this replaced enforced the older, looser pre-0019 rule.
+  const guardResult = await requireAuthOrgAdminRow(auth, params.id);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
   const rows = await pgSelect(auth.client, "organization_module_settings", {
     filters: { organization_id: params.id },
@@ -181,8 +178,7 @@ router.register("PUT", "/org/:id/module-settings/:moduleId", async (request, res
   const { valid, errors } = validateModuleTogglePayload(payload);
   if (!valid) return sendJson(response, 422, { errors });
 
-  const facilityIds = await orgFacilityIds(auth.client, params.id);
-  const guardResult = requireAuthOrgAdmin(auth, facilityIds);
+  const guardResult = await requireAuthOrgAdminRow(auth, params.id);
   if (!guardResult.allowed) return sendJson(response, 403, { error: guardResult.reason });
 
   const rows = await pgInsert(
@@ -267,7 +263,25 @@ userRouter.register("GET", "/public-config", (request, response, { env }) =>
 
 // Email + password sign-in / refresh, proxied server-side to Supabase Auth so
 // the client stays same-origin under the strict CSP. Logic in auth-routes.mjs.
-registerAuthRoutes(userRouter, { sendJson, readBody });
+//
+// S-7: layer the durable, cross-instance throttle backstop (src/lib/http/
+// durable-rate-limit.mjs, auth_throttle table) behind auth-routes.mjs's own
+// in-memory limiter whenever a service-role key is configured. Read directly
+// from process.env (like the OBSERVABILITY_DSN read below) rather than
+// readServerEnv(), since this client is built once at module load -- before
+// any request's per-call loadEnv() -- and local/dev without
+// SUPABASE_SERVICE_ROLE_KEY must keep working exactly as before (in-memory
+// only).
+const durableLimiter =
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+    ? createDurableRateLimiter({
+        client: createClient({ url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_ROLE_KEY }),
+        windowMs: 15 * 60 * 1000,
+        max: 30,
+        dsn: process.env.OBSERVABILITY_DSN
+      })
+    : null;
+registerAuthRoutes(userRouter, { sendJson, readBody, durableLimiter });
 
 // GET /me — the signed-in user plus the facilities they can act in. Logic in
 // me-route.mjs; used by the end-user app to populate its facility switcher.

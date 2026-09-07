@@ -40,22 +40,22 @@ on conflict (id) do nothing;
 -- has_permission: bypass for the platform admin, unchanged for everyone else.
 do $$
 begin
-  if not is_platform_admin('f0000000-0000-0000-0000-0000000000aa') then
+  if not internal.is_platform_admin('f0000000-0000-0000-0000-0000000000aa') then
     raise exception 'PLATFORM FAIL: roster row not recognized by is_platform_admin';
   end if;
-  if is_platform_admin('f0000000-0000-0000-0000-0000000000ab') then
+  if internal.is_platform_admin('f0000000-0000-0000-0000-0000000000ab') then
     raise exception 'PLATFORM FAIL: plain member reported as platform admin';
   end if;
-  if not has_permission('f0000000-0000-0000-0000-0000000000aa', 'f0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
+  if not internal.has_permission('f0000000-0000-0000-0000-0000000000aa', 'f0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
     raise exception 'PLATFORM FAIL: platform admin denied admin.manage on facility A';
   end if;
-  if not has_permission('f0000000-0000-0000-0000-0000000000aa', 'f0000000-0000-0000-0000-0000000000c1', 'training.manage') then
+  if not internal.has_permission('f0000000-0000-0000-0000-0000000000aa', 'f0000000-0000-0000-0000-0000000000c1', 'training.manage') then
     raise exception 'PLATFORM FAIL: platform admin denied training.manage on cross-org facility B';
   end if;
-  if has_permission('f0000000-0000-0000-0000-0000000000ab', 'f0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
+  if internal.has_permission('f0000000-0000-0000-0000-0000000000ab', 'f0000000-0000-0000-0000-0000000000c0', 'admin.manage') then
     raise exception 'PLATFORM FAIL: plain member gained admin.manage from the migration';
   end if;
-  if has_permission('f0000000-0000-0000-0000-0000000000ab', 'f0000000-0000-0000-0000-0000000000c1', 'reports.read') then
+  if internal.has_permission('f0000000-0000-0000-0000-0000000000ab', 'f0000000-0000-0000-0000-0000000000c1', 'reports.read') then
     raise exception 'PLATFORM FAIL: plain member gained cross-facility reports.read';
   end if;
 end;
@@ -67,7 +67,7 @@ select set_config('request.jwt.claims', '{"sub":"f0000000-0000-0000-0000-0000000
 set local role authenticated;
 do $$
 begin
-  if not exists (select 1 from current_facility_ids() f(id) where id = 'f0000000-0000-0000-0000-0000000000c1') then
+  if not exists (select 1 from internal.current_facility_ids() f(id) where id = 'f0000000-0000-0000-0000-0000000000c1') then
     raise exception 'PLATFORM FAIL: current_facility_ids missing cross-org facility for platform admin';
   end if;
   -- Concrete consequence: the platform admin can read both organizations.
@@ -86,7 +86,7 @@ select set_config('request.jwt.claims', '{"sub":"f0000000-0000-0000-0000-0000000
 set local role authenticated;
 do $$
 begin
-  if exists (select 1 from current_facility_ids() f(id) where id = 'f0000000-0000-0000-0000-0000000000c1') then
+  if exists (select 1 from internal.current_facility_ids() f(id) where id = 'f0000000-0000-0000-0000-0000000000c1') then
     raise exception 'PLATFORM FAIL: plain member sees a facility they are not a member of';
   end if;
   -- The roster is invisible to non-platform users.

@@ -31,6 +31,15 @@ function orgFacilities(table, method) {
   return null;
 }
 
+// requireAuthOrgAdminRow (S-6) answers the org-scope branch of guardRuleWrite
+// off an organization_admins row rather than admin.manage-on-any-facility;
+// ORG_ADMIN's membership only grants the latter, so a "for an org admin"
+// stub must also seed this select or the write is denied 403.
+function orgAdmin(table, method) {
+  if (table === "organization_admins" && method === "GET") return [{ id: "oa-1" }];
+  return null;
+}
+
 // Grants the advanced_flags entitlement to the org so the feature-flag-rule
 // write handlers' 402 guard passes. Returns null for any table it does not
 // own, so the per-test responder can supply the rest.
@@ -134,6 +143,8 @@ test("POST feature-flag-rules happy path inserts the shaped row for an org admin
   const captured = stubFetch(t, (table, method) => {
     const of = orgFacilities(table, method);
     if (of) return of;
+    const oa = orgAdmin(table, method);
+    if (oa) return oa;
     const ent = entitled(table, method);
     if (ent) return ent;
     if (table === "feature_flag_rules" && method === "POST") return [{ id: "rule-1" }];
@@ -160,6 +171,8 @@ test("POST feature-flag-rules rejects with 402 when the org's plan lacks advance
   const captured = stubFetch(t, (table, method) => {
     const of = orgFacilities(table, method);
     if (of) return of;
+    const oa = orgAdmin(table, method);
+    if (oa) return oa;
     // No subscription -> loadEntitlements returns empty entitlements (fail closed).
     if (table === "tenant_subscriptions" && method === "GET") return [];
     return [];
@@ -246,6 +259,8 @@ test("PATCH feature-flag-rules happy path updates the rule for an org admin", as
     }
     const of = orgFacilities(table, method);
     if (of) return of;
+    const oa = orgAdmin(table, method);
+    if (oa) return oa;
     const ent = entitled(table, method);
     if (ent) return ent;
     return [];
@@ -264,6 +279,8 @@ test("PATCH feature-flag-rules rejects with 402 when the rule's org plan lacks a
     }
     const of = orgFacilities(table, method);
     if (of) return of;
+    const oa = orgAdmin(table, method);
+    if (oa) return oa;
     // No subscription -> loadEntitlements returns empty entitlements (fail closed).
     if (table === "tenant_subscriptions" && method === "GET") return [];
     return [];

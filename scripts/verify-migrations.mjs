@@ -81,7 +81,8 @@ const requiredRlsTables = [
   "employee_notification_preferences",
   "subscription_plans",
   "tenant_subscriptions",
-  "usage_counters"
+  "usage_counters",
+  "auth_throttle"
 ];
 
 for (const table of requiredRlsTables) {
@@ -100,10 +101,100 @@ for (const helper of [
   "fn_audit_admin_change",
   "fn_protect_system_role",
   "fn_audit_chain_link",
-  "fn_enforce_change_request_transition"
+  "fn_enforce_change_request_transition",
+  "fn_storage_attachment_facility_id",
+  "fn_storage_attachment_module",
+  "fn_message_audience_ref_facility",
+  "fn_incident_report_audit",
+  "fn_incident_report_transition_guard",
+  "internal.apply_incident_amendment",
+  "public.apply_incident_amendment"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
+  }
+}
+
+// 0042 moved the five internal scope/permission helper names (has_permission
+// covers both its overloads) into the `internal` schema and locked them down
+// so PostgREST can never expose them as /rest/v1/rpc/<name>. Any later
+// migration that redefines one of them must keep it there -- a bare or
+// `public.`-qualified `create [or replace] function <name>(...)` from 0043
+// onward would silently recreate the old public-schema, PUBLIC-executable
+// version (CREATE FUNCTION defaults to a new object in the search_path's
+// first schema and grants EXECUTE to PUBLIC), re-opening OP-05.
+const internalHelperNames = new Set([
+  "current_facility_ids",
+  "has_permission",
+  "fn_assert_same_facility",
+  "is_organization_admin",
+  "is_platform_admin"
+]);
+const createFunctionPattern = /create\s+(?:or\s+replace\s+)?function\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\(/gi;
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 43) {
+    continue;
+  }
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  createFunctionPattern.lastIndex = 0;
+  let helperMatch;
+  while ((helperMatch = createFunctionPattern.exec(fileSql)) !== null) {
+    const qualifiedName = helperMatch[1];
+    const parts = qualifiedName.split(".");
+    const bareName = parts[parts.length - 1];
+    const schema = parts.length > 1 ? parts[0] : null;
+    if (internalHelperNames.has(bareName) && schema !== "internal") {
+      throw new Error(
+        `${file}: "create function ${qualifiedName}(...)" redefines an internal helper outside the internal schema; use internal.${bareName}(...).`
+      );
+    }
+  }
+}
+
+// M-3: the guard above only caught a bad *definition* -- a >=0043
+// migration that CALLS one of the five internal helpers bare (or
+// `public.`-qualified), e.g. inside a new policy predicate, was never
+// checked at all, even though 0042's own header promises
+// "scripts/verify-migrations.mjs enforces this for every migration
+// numbered >= 0043" for exactly that shape of reference. Such a call is
+// self-detecting today (H-2's `alter database ... set search_path =
+// public, internal` makes a bare reference resolve and WORK correctly, so
+// it is no longer even self-detecting the way it was before that fix --
+// it would just silently succeed), so this is the only thing left
+// enforcing the "always write internal.<helper>(...)" convention the
+// header documents. `has_permission` covers both its overloads; a call is
+// any occurrence of the bare name immediately followed by `(`, not already
+// qualified with `internal.` right before it.
+const helperCallPattern = new RegExp(
+  `(?<!internal\\.)\\b(${[...internalHelperNames].sort((a, b) => b.length - a.length).join("|")})\\s*\\(`,
+  "g"
+);
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 43) {
+    continue;
+  }
+  // Match against code only: `--` line comments and `/* */` blocks routinely
+  // mention the helpers by name when explaining a policy, and a mention is
+  // not a call.
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/--[^\n]*/g, "");
+  helperCallPattern.lastIndex = 0;
+  let callMatch;
+  while ((callMatch = helperCallPattern.exec(fileSql)) !== null) {
+    // Definitions ("create [or replace] function <name>(") are already
+    // reported by the more specific error above -- skip them here so a bad
+    // definition doesn't also get flagged as a bad call, muddying the
+    // error message.
+    const precedingText = fileSql.slice(0, callMatch.index);
+    if (/create\s+(?:or\s+replace\s+)?function\s+$/i.test(precedingText)) {
+      continue;
+    }
+    throw new Error(
+      `${file}: bare reference to internal helper "${callMatch[1]}(...)" outside the internal schema; call it as internal.${callMatch[1]}(...).`
+    );
   }
 }
 

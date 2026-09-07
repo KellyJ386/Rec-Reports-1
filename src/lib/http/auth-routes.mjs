@@ -1,4 +1,12 @@
+import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { createRateLimiter } from "./rate-limit.mjs";
+import {
+  REFRESH_COOKIE_NAME,
+  buildRefreshCookie,
+  clearRefreshCookie,
+  parseCookies
+} from "./cookies.mjs";
 
 // Server-side authentication proxy for the email + password sign-in flow.
 //
@@ -9,6 +17,13 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // anon key and return the resulting session. The access token is then stored
 // client-side under the existing `rr_admin_token` key and sent as a bearer
 // token to /api/admin/v1/* and /api/v1/*, where auth.mjs verifies it.
+//
+// Refresh token (S-11): the response body never carries `refresh_token` --
+// it travels only in an HttpOnly `rr_refresh` cookie (see ./cookies.mjs), so
+// XSS that steals the access token from localStorage cannot also mint a new
+// indefinite session. /auth/refresh reads the cookie, not the body; a
+// `refresh_token` in the body is accepted for one release as a migration
+// path for sessions that signed in before this change (removed in Wave 2).
 //
 // Injected primitives match the other route modules:
 //   sendJson(response, status, payload)
@@ -26,9 +41,19 @@ import { createRateLimiter } from "./rate-limit.mjs";
 // tests can inject a fake, steppable clock and tiny windows instead of
 // sleeping in real time; production callers (scripts/server.mjs) get the
 // defaults below by omitting them.
+//
+// Durable throttle (S-7)
+// -----------------------------------------------------------------------
+// `durableLimiter` is an optional second-line backstop behind every
+// in-memory limiter below -- same {check, recordFailure, reset} shape,
+// backed by the auth_throttle table (src/lib/http/durable-rate-limit.mjs,
+// supabase/migrations/0046_auth_throttle.sql) instead of a per-process Map,
+// so a lockout survives across serverless instances. `null` (the default)
+// keeps this module exactly as before -- in-memory only, e.g. in tests and
+// anywhere SUPABASE_SERVICE_ROLE_KEY isn't configured.
 export function registerAuthRoutes(
   router,
-  { sendJson, readBody, now = Date.now, signInRateLimit = {} }
+  { sendJson, readBody, now = Date.now, signInRateLimit = {}, durableLimiter = null }
 ) {
   const emailLimiter = createRateLimiter({
     windowMs: signInRateLimit.emailWindowMs ?? 15 * 60 * 1000,
@@ -45,6 +70,38 @@ export function registerAuthRoutes(
     now,
     sweepEvery: signInRateLimit.sweepEvery ?? 500
   });
+  // POST /auth/refresh throttle (S-7): same two-bucket shape as sign-in
+  // above (a token bucket and an IP bucket), sized looser than sign-in's
+  // since a legitimate client refreshes far more often than it signs in.
+  const refreshLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+  const refreshIpLimiter = createRateLimiter({
+    windowMs: signInRateLimit.refreshIpWindowMs ?? 15 * 60 * 1000,
+    max: signInRateLimit.refreshIpMax ?? 30,
+    now,
+    sweepEvery: signInRateLimit.sweepEvery ?? 500
+  });
+
+  // Awaits the durable check for both buckets only when a durableLimiter is
+  // configured (see the file header); the in-memory pair passed in has
+  // already been checked synchronously by the caller. Small shared helper so
+  // the sign-in and refresh handlers below don't repeat this Promise.all
+  // shape.
+  async function checkDurable(keyA, keyB) {
+    if (!durableLimiter) return { blocked: false, retryAfterMs: 0 };
+    const [a, b] = await Promise.all([durableLimiter.check(keyA), durableLimiter.check(keyB)]);
+    if (!a.blocked && !b.blocked) return { blocked: false, retryAfterMs: 0 };
+    return { blocked: true, retryAfterMs: Math.max(a.retryAfterMs, b.retryAfterMs) };
+  }
+
+  async function recordDurableFailure(keyA, keyB) {
+    if (!durableLimiter) return;
+    await Promise.all([durableLimiter.recordFailure(keyA), durableLimiter.recordFailure(keyB)]);
+  }
 
   async function parseJsonBody(request) {
     try {
@@ -54,25 +111,110 @@ export function registerAuthRoutes(
     }
   }
 
-  // Behind Vercel, x-forwarded-for's leftmost entry is the client IP Vercel's
-  // edge network observed. It is still just a request header: nothing stops
-  // a caller from sending their own x-forwarded-for to a deployment that
-  // isn't behind Vercel, and even on Vercel the value is attacker-supplied
-  // in the sense that it's never cryptographically verified. Treat it as a
-  // throttle *bucket*, never as an identity or an audit fact -- worst case
-  // a spoofed value just gives an attacker their own private bucket, which
-  // is no worse than having no per-IP throttle at all for that request.
+  // Which address a request "comes from", for throttle bucketing only. It is
+  // derived from request headers, so it is never an identity or an audit
+  // fact: whoever can reach a deployment that is not behind a proxy can
+  // send any header they like, and the worst case is that a spoofer gets a
+  // private bucket -- no worse than having no per-IP throttle at all for
+  // that request. What this DOES guard against is the cheap evasion of a
+  // proxy-fronted deployment: behind a proxy that APPENDS to
+  // x-forwarded-for (nginx, most load balancers), the leftmost hop is the
+  // attacker's own free-text and only the rightmost hop is what the proxy
+  // itself observed, so this reads the rightmost. It is consulted before
+  // x-real-ip on purpose: every proxy that sets x-real-ip also writes the
+  // matching x-forwarded-for hop (Vercel overwrites both with the address
+  // its edge saw), whereas a proxy that only appends to x-forwarded-for
+  // may pass a client-supplied x-real-ip through untouched. Anything that
+  // is not a syntactically valid IPv4/IPv6 address collapses into one
+  // shared "invalid" bucket rather than a per-request bucket an attacker
+  // could mint at will.
   function clientIp(request) {
-    const header = request.headers?.["x-forwarded-for"];
-    if (header) {
-      const first = String(header).split(",")[0]?.trim();
-      if (first) return first;
+    const headers = request.headers ?? {};
+    const candidates = [];
+    if (headers["x-forwarded-for"]) {
+      const hops = String(headers["x-forwarded-for"])
+        .split(",")
+        .map((hop) => hop.trim())
+        .filter(Boolean);
+      if (hops.length > 0) candidates.push(hops[hops.length - 1]);
     }
+    if (headers["x-real-ip"]) candidates.push(String(headers["x-real-ip"]).trim());
+    for (const candidate of candidates) {
+      if (isIP(candidate)) return candidate;
+    }
+    if (candidates.length > 0) return "invalid";
     return request.socket?.remoteAddress || "unknown";
+  }
+
+  // M5: the durable store's IP key is hashed like the email key below --
+  // clientIp() already bounds the value to a real address or a fixed
+  // sentinel, but hashing keeps every auth_throttle key the same fixed-width
+  // hex shape regardless of source, so nothing derived from a request header
+  // ever reaches the table, the sweep's `in.(...)` filter, or a reported
+  // error verbatim.
+  function ipThrottleKey(prefix, ip) {
+    return `${prefix}:${createHash("sha256").update(String(ip)).digest("hex")}`;
   }
 
   function normalizeEmail(email) {
     return String(email).trim().toLowerCase();
+  }
+
+  // M5/L1: the durable throttle key for sign-in must not be the plaintext
+  // email -- unlike the in-memory `emailLimiter` above (a per-process Map
+  // that never leaves this instance and is never reported anywhere), this
+  // key is written to the auth_throttle table (durable-rate-limit.mjs) and,
+  // on a PostgREST failure, forwarded to reportError -> OBSERVABILITY_DSN as
+  // requestId (L1). Hashing it here -- the same sha256(...).digest("hex")
+  // shape refreshThrottleKeys already uses for the refresh token -- means
+  // neither the durable store nor the DSN ever carries a real address, and
+  // the fixed 64-hex-char output is always far under durable-rate-limit.mjs's
+  // own MAX_KEY_LENGTH cap regardless of how long an attacker-supplied email
+  // string is.
+  function emailThrottleKey(email) {
+    const hash = createHash("sha256").update(normalizeEmail(email)).digest("hex");
+    return `email:${hash}`;
+  }
+
+  // Whether the refresh cookie should carry `Secure`. Real deployments (Vercel
+  // and anything behind a TLS-terminating proxy) set `x-forwarded-proto`, so
+  // that wins first; a direct TLS listener with no proxy in front falls back
+  // to the raw socket's `encrypted` flag; failing both (no proxy header, plain
+  // HTTP socket) the only case allowed to omit `Secure` is local dev over
+  // `http://localhost` -- every other host defaults to secure so a
+  // misconfigured/absent proxy header never silently downgrades a cookie sent
+  // to a real domain.
+  function isSecureRequest(request) {
+    const forwardedProto = request.headers?.["x-forwarded-proto"];
+    if (forwardedProto) {
+      return (
+        String(forwardedProto)
+          .split(",")[0]
+          .trim()
+          .toLowerCase() === "https"
+      );
+    }
+    if (request.socket?.encrypted !== undefined) {
+      return !!request.socket.encrypted;
+    }
+    const host = String(request.headers?.host || "")
+      .split(":")[0]
+      .toLowerCase();
+    return host !== "localhost" && host !== "127.0.0.1";
+  }
+
+  // CSRF check for /auth/refresh: `SameSite=Strict` already stops the cookie
+  // from riding along on a cross-site navigation or fetch in any modern
+  // browser, but `Strict` cookies are still attached to same-site requests
+  // and (in older/non-compliant clients) `sec-fetch-site` may be the only
+  // signal available -- so this is defense in depth, not the only guard.
+  // Missing header (older browsers, some non-browser clients) fails open on
+  // purpose: it is the same trust boundary SameSite=Strict already draws.
+  function isSameSiteRequest(request) {
+    const secFetchSite = request.headers?.["sec-fetch-site"];
+    if (!secFetchSite) return true;
+    const value = String(secFetchSite).trim().toLowerCase();
+    return value === "same-origin" || value === "none";
   }
 
   function retryAfterSeconds(retryAfterMs) {
@@ -86,7 +228,7 @@ export function registerAuthRoutes(
   // account-existence note above the sign-in handler for the matching
   // point about the 401 body.
   function sendThrottled(response, retryAfterMs) {
-    response.setHeader?.("Retry-After", String(retryAfterSeconds(retryAfterMs)));
+    response.setHeader("Retry-After", String(retryAfterSeconds(retryAfterMs)));
     return sendJson(response, 429, { error: "too many attempts, try again later" });
   }
 
@@ -101,10 +243,11 @@ export function registerAuthRoutes(
 
   // Shapes the session GoTrue returns into the minimal payload the client
   // needs. access_token is what the app's JWT verifier consumes.
+  // `refresh_token` never appears here (S-11) -- it only ever travels as the
+  // HttpOnly `rr_refresh` cookie set alongside this body.
   function sessionPayload(data) {
     return {
       access_token: data.access_token,
-      refresh_token: data.refresh_token,
       token_type: data.token_type ?? "bearer",
       expires_in: data.expires_in ?? null,
       expires_at: data.expires_at ?? null,
@@ -187,6 +330,8 @@ export function registerAuthRoutes(
 
       const ip = clientIp(request);
       const emailKey = normalizeEmail(email);
+      const durableIpKey = ipThrottleKey("ip", ip);
+      const durableEmailKey = emailThrottleKey(email);
 
       const ipCheck = ipLimiter.check(ip);
       const emailCheck = emailLimiter.check(emailKey);
@@ -194,34 +339,94 @@ export function registerAuthRoutes(
         const retryAfterMs = Math.max(ipCheck.retryAfterMs, emailCheck.retryAfterMs);
         return sendThrottled(response, retryAfterMs);
       }
+      const durableCheck = await checkDurable(durableIpKey, durableEmailKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
 
       const result = await callGotrue(env, "token?grant_type=password", { email, password });
       if (!result.ok) {
         ipLimiter.recordFailure(ip);
         emailLimiter.recordFailure(emailKey);
+        await recordDurableFailure(durableIpKey, durableEmailKey);
         return sendJson(response, 401, { error: "invalid email or password" });
       }
       emailLimiter.reset(emailKey);
+      if (durableLimiter) await durableLimiter.reset(durableEmailKey);
+      response.setHeader(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure: isSecureRequest(request) })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
 
-  // POST /auth/refresh { refresh_token } -> session
+  // Throttle key material for POST /auth/refresh (S-7): the raw refresh
+  // token itself must never become a throttle-store key or land in a
+  // reported error, so this hashes it (sha256) instead. Reads the
+  // `rr_refresh` HttpOnly cookie first, falling back to body.refresh_token --
+  // the same precedence the route's own token lookup uses, so the throttle
+  // bucket lines up with whichever token the request is actually redeeming.
+  function refreshTokenForThrottle(request, body) {
+    const cookies = parseCookies(request.headers?.cookie);
+    return cookies[REFRESH_COOKIE_NAME] || body?.payload?.refresh_token;
+  }
+
+  function refreshThrottleKeys(request, body) {
+    const tokenHash = createHash("sha256")
+      .update(String(refreshTokenForThrottle(request, body) ?? ""))
+      .digest("hex");
+    return { tokenKey: `refresh:${tokenHash}`, ipKey: ipThrottleKey("refresh-ip", clientIp(request)) };
+  }
+
+  // POST /auth/refresh {} -> session
+  //
+  // The refresh token itself comes from the HttpOnly `rr_refresh` cookie, not
+  // the body -- the body fallback below exists only so sessions started
+  // before this change (refresh token still in the client's localStorage)
+  // keep working for one release; remove the fallback in Wave 2 once every
+  // live session has rotated through the cookie at least once.
   router.register("POST", "/auth/refresh", (request, response, { env }) =>
     (async () => {
       if (!requireConfigured(env, response)) return;
+      if (!isSameSiteRequest(request)) {
+        return sendJson(response, 403, { error: "cross-site request" });
+      }
       const body = await parseJsonBody(request);
       if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
-      const refreshToken = body.payload.refresh_token;
+
+      const { tokenKey, ipKey } = refreshThrottleKeys(request, body);
+      const tokenCheck = refreshLimiter.check(tokenKey);
+      const ipCheck = refreshIpLimiter.check(ipKey);
+      if (tokenCheck.blocked || ipCheck.blocked) {
+        return sendThrottled(response, Math.max(tokenCheck.retryAfterMs, ipCheck.retryAfterMs));
+      }
+      const durableCheck = await checkDurable(tokenKey, ipKey);
+      if (durableCheck.blocked) return sendThrottled(response, durableCheck.retryAfterMs);
+
+      const cookies = parseCookies(request.headers?.cookie);
+      const refreshToken = cookies[REFRESH_COOKIE_NAME] || body.payload.refresh_token;
       if (!refreshToken) {
         return sendJson(response, 400, { errors: ["refresh_token is required"] });
       }
+      const secure = isSecureRequest(request);
       const result = await callGotrue(env, "token?grant_type=refresh_token", {
         refresh_token: refreshToken
       });
       if (!result.ok) {
+        refreshLimiter.recordFailure(tokenKey);
+        refreshIpLimiter.recordFailure(ipKey);
+        await recordDurableFailure(tokenKey, ipKey);
+        // The refresh token was rejected (expired/revoked/reused) -- drop the
+        // cookie so the browser stops offering a token GoTrue will never
+        // accept again.
+        response.setHeader("Set-Cookie", clearRefreshCookie({ secure }));
         return sendJson(response, 401, { error: "could not refresh session" });
       }
+      refreshLimiter.reset(tokenKey);
+      if (durableLimiter) await durableLimiter.reset(tokenKey);
+      response.setHeader(
+        "Set-Cookie",
+        buildRefreshCookie({ token: result.data.refresh_token, secure })
+      );
       return sendJson(response, 200, sessionPayload(result.data));
     })()
   );
@@ -231,6 +436,28 @@ export function registerAuthRoutes(
   // Always answers 200: the browser clears its own copy of the session either
   // way, so a token GoTrue has already forgotten (expired, revoked, missing
   // header) is not an error the user can act on. Signing out must never fail.
+  //
+  // L-9: revocation only happens when an `Authorization` bearer is present.
+  // GoTrue's `/auth/v1/logout` identifies WHICH session/refresh-token family
+  // to revoke from the access token's own claims in the Authorization
+  // header it is called with -- it has no endpoint that accepts a bare
+  // refresh token and revokes by that alone (the token-exchange endpoint,
+  // `token?grant_type=refresh_token`, MINTS a new session rather than
+  // killing the old one, which is the opposite of what sign-out needs).
+  // So when the caller's access token has already expired (the common case
+  // for a tab left open past its ~1 hour lifetime) but the `rr_refresh`
+  // cookie is still live, there is no GoTrue call this route can make to
+  // revoke that refresh token server-side -- only the browser's own copy of
+  // it can be, and is, discarded (clearRefreshCookie below). The token
+  // itself stays valid upstream for the rest of its ~30-day lifetime,
+  // exactly as noted in the review this fixes: pre-existing shape, unchanged
+  // risk, since the token is HttpOnly and never leaves the browser as
+  // anything an XSS payload could read. A future fix would need either a
+  // GoTrue admin-API call (service-role, out of scope for a user-initiated
+  // sign-out) or refreshing first purely to get a fresh access token to log
+  // out with -- the latter defeats the purpose (it would mint a session
+  // just to kill it, racing any other tab's own refresh) so this is left as
+  // documented, accepted residual risk rather than "fixed."
   router.register("POST", "/auth/sign-out", (request, response, { env }) =>
     (async () => {
       if (!requireConfigured(env, response)) return;
@@ -238,6 +465,7 @@ export function registerAuthRoutes(
       if (authorization) {
         await callGotrue(env, "logout", {}, { authorization });
       }
+      response.setHeader("Set-Cookie", clearRefreshCookie({ secure: isSecureRequest(request) }));
       return sendJson(response, 200, { signed_out: true });
     })()
   );
