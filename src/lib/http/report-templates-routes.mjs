@@ -6,7 +6,7 @@ import {
   buildTemplateDraftUpdate,
   buildTemplatePublish
 } from "../report-templates.mjs";
-import { validateReportTemplateSchema } from "../report-schema.mjs";
+import { validateReportTemplateSchema, validateSignatureRequirements } from "../report-schema.mjs";
 
 const TEMPLATE_MANAGE = "reports.template.manage";
 // Sibling-added catalog code (this batch): a template manager can author and
@@ -199,7 +199,15 @@ export function registerReportTemplatesRoutes(router, { authenticate, sendJson, 
       const schemaErrors = validateReportTemplateSchema(body.payload.schema).map(
         (schemaError) => `schema: ${schemaError}`
       );
-      if (schemaErrors.length > 0) return sendJson(response, 400, { errors: schemaErrors });
+      // DR-17: signature_requirements lives on validation_json (a template-
+      // level submission-completeness policy, not a per-field schema rule --
+      // see report-schema.mjs's own doc comment on validateSignatureRequirements),
+      // so it is validated here rather than folded into validateReportTemplateSchema.
+      const signatureErrors = validateSignatureRequirements(
+        body.payload.validationJson?.signature_requirements
+      ).map((signatureError) => `validationJson.signature_requirements: ${signatureError}`);
+      const errors = [...schemaErrors, ...signatureErrors];
+      if (errors.length > 0) return sendJson(response, 400, { errors });
 
       const template = await loadTemplateById(auth.client, params.id);
       if (!template) return sendJson(response, 404, { error: "report template not found" });

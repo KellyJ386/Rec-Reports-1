@@ -107,6 +107,42 @@ test("fieldDescriptors reads help_text as a fallback for helpText", () => {
   assert.equal(fieldDescriptors(schema)[0].helpText, "hi");
 });
 
+// --- DR-16: datetime/counter/rating descriptors -----------------------------
+
+const newTypesSchema = {
+  sections: [
+    {
+      title: "Shift",
+      fields: [
+        { key: "checked_in", label: "Checked in", type: "datetime", required: true },
+        { key: "laps", label: "Laps counted", type: "counter", step: 5 },
+        { key: "cleanliness", label: "Cleanliness", type: "rating", scale: 4, required: true }
+      ]
+    }
+  ]
+};
+
+test("fieldDescriptors carries datetime/counter/rating through, including step/scale", () => {
+  const descriptors = fieldDescriptors(newTypesSchema);
+  assert.deepEqual(
+    descriptors.map((d) => d.type),
+    ["datetime", "counter", "rating"]
+  );
+  assert.equal(descriptors[0].step, undefined);
+  assert.equal(descriptors[1].step, 5);
+  assert.equal(descriptors[2].scale, 4);
+});
+
+test("collectPayload coerces counter/rating like number, and passes datetime through as a string", () => {
+  const descriptors = fieldDescriptors(newTypesSchema);
+  const payload = collectPayload(descriptors, {
+    checked_in: "2026-07-08T06:30",
+    laps: "10",
+    cleanliness: "3"
+  });
+  assert.deepEqual(payload, { checked_in: "2026-07-08T06:30", laps: 10, cleanliness: 3 });
+});
+
 test("collectPayload round-trips a full answer set through DOM-shaped form state", () => {
   const descriptors = fieldDescriptors(twoSectionSchema);
   // Simulates exactly what app.js reads off the real controls: strings for

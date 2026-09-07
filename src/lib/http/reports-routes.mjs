@@ -1,10 +1,12 @@
+import { createHash } from "node:crypto";
 import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
 import { makeGuards } from "./guard.mjs";
 import { hasDepartmentPermission } from "../permissions.mjs";
 import {
   validateReportSubmission,
   validateReportSubmissionPartial,
-  unknownPayloadKeys
+  unknownPayloadKeys,
+  hiddenFieldKeys
 } from "../report-schema.mjs";
 import { computeCompliance, dateRange } from "../reports-compliance.mjs";
 import { buildReportPdfPackage } from "../admin/report-pdf.mjs";
@@ -26,6 +28,35 @@ const SUBMISSION_COLUMNS =
   "submitted_by,submitted_at,payload_json,validation_results,source,created_at,updated_at";
 const ATTACHMENT_COLUMNS =
   "id,facility_id,submission_id,field_key,storage_path,mime_type,checksum,metadata,created_at";
+const SIGNATURE_COLUMNS =
+  "id,facility_id,submission_id,signer_user_id,signer_role,signed_at,signature_hash,created_at";
+
+// Deterministic (key-sorted) JSON stringification, so signatureHash below
+// hashes the same payload_json object identically regardless of the wire/DB
+// round-trip's own key order -- object key order is not part of jsonb's
+// equality semantics, but it WOULD change the raw string this hashes if left
+// unsorted, which would make an unrelated re-fetch look like a payload
+// change.
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+// DR-17: signature_hash = sha256(`${submissionId}|${userId}|${role}|${sha256(payload)}`)
+// so a later edit to the submission's payload_json is detectable against a
+// previously-recorded signature without storing the payload itself a second
+// time. payload_json is folded into the outer hash as its own hash (rather
+// than inlined raw) so an arbitrarily large payload never inflates the
+// signed composite string.
+function signatureHash({ submissionId, userId, role, payload }) {
+  const payloadHash = createHash("sha256").update(canonicalJson(payload ?? {})).digest("hex");
+  const composite = `${submissionId}|${userId}|${role}|${payloadHash}`;
+  return createHash("sha256").update(composite).digest("hex");
+}
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 // Matches the report_submissions.status check constraint in 0002.
@@ -292,7 +323,11 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           submission,
           schema_json: version?.schema_json ?? null,
           template_name: template?.name ?? null,
-          attachments: attachments ?? []
+          attachments: attachments ?? [],
+          // DR-17: lets the fill/review UI know which roles it should offer
+          // "Sign as <role>" buttons for, without a second round trip just
+          // to read the pinned version's validation_json.
+          signature_requirements: version?.validation_json?.signature_requirements ?? null
         });
       })
   );
@@ -435,9 +470,37 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       const unknownKeys = unknownKeysError(version.schema_json, payload);
       if (unknownKeys) return sendJson(response, 422, unknownKeys);
 
+      // DR-17 submit-time completeness: when the pinned version requires
+      // signatures, every listed role must already have a
+      // report_submission_signatures row for this submission (recorded via
+      // POST .../signatures, only ever reachable while the submission is
+      // still a draft -- see 0052's trigger). Checked BEFORE field
+      // validation so a caller sees exactly what's missing (signatures)
+      // rather than a mix of concerns; 400, not 422, since this is a
+      // precondition on the submission as a whole, not a per-field payload
+      // error.
+      const signatureRequirements = version.validation_json?.signature_requirements;
+      if (signatureRequirements?.required === true) {
+        const requiredRoles = Array.isArray(signatureRequirements.roles) ? signatureRequirements.roles : [];
+        const signatures = await pgSelect(auth.client, "report_submission_signatures", {
+          filters: { submission_id: submission.id },
+          select: "signer_role"
+        });
+        const signedRoles = new Set((signatures ?? []).map((row) => row.signer_role));
+        const missingRoles = requiredRoles.filter((role) => !signedRoles.has(role));
+        if (missingRoles.length > 0) {
+          return sendJson(response, 400, { error: "missing required signatures", missingRoles });
+        }
+      }
+
       const errors = validateReportSubmission(version.schema_json, payload);
       const submitPolicy =
         version.validation_json?.submit_policy === "warn_and_submit" ? "warn_and_submit" : DEFAULT_SUBMIT_POLICY;
+      // DR-16: fields hidden by their own visibility_rules at submit time are
+      // recorded on validation_results for auditability, independent of
+      // whether there are any other warnings -- see report-schema.mjs's
+      // evaluateVisibility/hiddenFieldKeys.
+      const hiddenFields = hiddenFieldKeys(version.schema_json, payload);
 
       const patch = {
         status: "submitted",
@@ -456,7 +519,9 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
             error: "reason is required to submit with validation warnings under warn_and_submit"
           });
         }
-        patch.validation_results = { warnings: errors, reason };
+        patch.validation_results = { warnings: errors, reason, hidden_fields: hiddenFields };
+      } else if (hiddenFields.length > 0) {
+        patch.validation_results = { hidden_fields: hiddenFields };
       }
 
       const rows = await pgUpdate(auth.client, "report_submissions", { id: params.id }, patch, {
@@ -464,6 +529,83 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       });
       return sendJson(response, 200, (rows ?? [])[0] ?? null);
     })
+  );
+
+  // --- Signatures (DR-17) ------------------------------------------------
+  // Signer is always the authenticated caller (never taken from the body);
+  // signature_hash binds the submission id, signer, role, and a hash of the
+  // payload at signing time, so a later payload edit is detectable against
+  // an already-recorded signature. Only reachable while the submission is
+  // still a draft (409 otherwise, backed at the DB layer by 0052's INSERT
+  // trigger); the role must be one the pinned version's
+  // validation_json.signature_requirements lists (400 otherwise).
+  router.register(
+    "POST",
+    "/facilities/:facilityId/reports/:id/signatures",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const role = typeof body.payload.role === "string" ? body.payload.role.trim() : "";
+        if (!role) return sendJson(response, 400, { errors: ["role is required"] });
+
+        const submission = await loadSubmission(auth.client, params.id);
+        if (!submission || submission.facility_id !== params.facilityId) {
+          return sendJson(response, 404, { error: "report not found" });
+        }
+        // Department-scoped (DR-11): mirrors PATCH/submit's own gate.
+        if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, SUBMIT, response)) {
+          return;
+        }
+        if (submission.status !== "draft") {
+          return sendJson(response, 409, { error: "only a draft report can be signed" });
+        }
+
+        const version = await loadVersionById(auth.client, submission.template_version_id);
+        if (!version) return sendJson(response, 409, { error: "template version not found" });
+        const allowedRoles = Array.isArray(version.validation_json?.signature_requirements?.roles)
+          ? version.validation_json.signature_requirements.roles
+          : [];
+        if (!allowedRoles.includes(role)) {
+          return sendJson(response, 400, {
+            error: `role "${role}" is not a listed signature role for this template`
+          });
+        }
+
+        const row = {
+          facility_id: submission.facility_id,
+          submission_id: submission.id,
+          signer_user_id: auth.claims.sub,
+          signer_role: role,
+          signature_hash: signatureHash({
+            submissionId: submission.id,
+            userId: auth.claims.sub,
+            role,
+            payload: submission.payload_json
+          })
+        };
+        const rows = await pgInsert(auth.client, "report_submission_signatures", [row], { returning: true });
+        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  router.register(
+    "GET",
+    "/facilities/:facilityId/reports/:id/signatures",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const submission = await loadSubmission(auth.client, params.id);
+        if (!submission || submission.facility_id !== params.facilityId) {
+          return sendJson(response, 404, { error: "report not found" });
+        }
+        if (!requireRead(auth, submission.facility_id, response)) return;
+        const rows = await pgSelect(auth.client, "report_submission_signatures", {
+          filters: { submission_id: submission.id },
+          select: SIGNATURE_COLUMNS,
+          order: "signed_at.asc"
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
   );
 
   // --- Compliance (DR-12) -----------------------------------------------
