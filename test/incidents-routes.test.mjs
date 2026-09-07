@@ -28,6 +28,20 @@ const EXPORTER = [
 const ESCALATOR = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.escalate"] }
 ];
+// IN-17 permission fixtures: CREATOR (incidents.manage, no work_orders.manage)
+// and REVIEWER (incidents.review, no work_orders.manage/training.manage)
+// are reused for the RPC-elevation path; these add work_orders.manage /
+// training.manage on top of the same incidents.manage/review base for the
+// direct-insert path.
+const MANAGE_WITH_WORK_ORDERS = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.manage", "work_orders.manage"] }
+];
+const REVIEW_WITH_WORK_ORDERS = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.review", "work_orders.manage"] }
+];
+const MANAGE_WITH_TRAINING = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.manage", "training.manage"] }
+];
 
 const INCIDENT = {
   id: "inc-1",
@@ -1326,4 +1340,411 @@ test("A failing audit write with no OBSERVABILITY_DSN configured still logs loca
   assert.equal(calls.length, 1, "expected exactly one console.error call for the failed audit write");
   assert.match(calls[0][0], /incidents\.audit_write\/incident\.escalated/);
   assert.match(calls[0][0], /inc-1/);
+});
+
+// =============================================================================
+// IN-20: notification emission on submit / escalate
+// =============================================================================
+
+const SUBMITTED_ROUTE = {
+  id: "route-sub",
+  facility_id: "fac-1",
+  event_code: "incident.submitted",
+  priority: 1,
+  route_jsonb: { channels: ["in_app"], distributionListId: "list-1" },
+  active: true
+};
+
+const ESCALATED_ROUTE = {
+  id: "route-esc",
+  facility_id: "fac-1",
+  event_code: "incident.escalated",
+  priority: 1,
+  route_jsonb: { channels: ["in_app", "email"], distributionListId: "list-1" },
+  active: true
+};
+
+function stubDistributionList(table, method) {
+  if (table === "distribution_lists" && method === "GET") {
+    return [{ id: "list-1", facility_id: "fac-1", active: true }];
+  }
+  if (table === "distribution_list_members" && method === "GET") {
+    return [{ distribution_list_id: "list-1", member_type: "employee", member_ref_id: "emp-route-1" }];
+  }
+  if (table === "employees" && method === "GET") return [{ id: "emp-route-1" }];
+  return undefined;
+}
+
+test("POST submit emits an incident.submitted notification job when a route is configured", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT]; // severity: high
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return [SUBMITTED_ROUTE];
+    const dist = stubDistributionList(table, method);
+    if (dist !== undefined) return dist;
+    if (table === "notification_jobs" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+
+  const jobsInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.ok(jobsInsert, "expected a notification_jobs insert");
+  assert.match(jobsInsert.url.search, /on_conflict=dedupe_key/);
+  assert.equal(jobsInsert.body.length, 1);
+  assert.equal(jobsInsert.body[0].dedupe_key, "inc-1:incident.submitted:emp-route-1");
+  assert.equal(jobsInsert.body[0].event_type, "incident.submitted");
+  assert.equal(jobsInsert.body[0].payload_jsonb.quietHoursBypass, true); // INCIDENT.severity === 'high'
+});
+
+test("POST submit inserts no notification_jobs row when no active route is configured", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return []; // no route
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+});
+
+test("POST escalate emits an incident.escalated notification job that folds in the escalation's own target_user_id", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-9" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return [ESCALATED_ROUTE];
+    const dist = stubDistributionList(table, method);
+    if (dist !== undefined) return dist;
+    if (table === "notification_jobs" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-6" });
+  const result = await call("POST", "/incidents/inc-1/escalate", { targetUserId: "emp-target" });
+  assert.equal(result.status, 201);
+
+  const jobsInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.ok(jobsInsert, "expected a notification_jobs insert");
+  const dedupeKeys = jobsInsert.body.map((job) => job.dedupe_key).sort();
+  assert.deepEqual(dedupeKeys, ["inc-1:incident.escalated:emp-route-1", "inc-1:incident.escalated:emp-target"]);
+});
+
+test("POST escalate: a failed notification emission does not fail the response (best-effort)", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-10" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") throw new Error("network blip");
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-6" });
+  const result = await call("POST", "/incidents/inc-1/escalate", {});
+  assert.equal(result.status, 201, "escalation still succeeds even though notification emission threw");
+});
+
+// =============================================================================
+// IN-17: cross-module creation -- work order from a follow-up
+// =============================================================================
+
+test("POST followups/:followupId/work-order 404s when the follow-up is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/nope/work-order");
+  assert.equal(result.status, 404);
+});
+
+test("POST followups/:followupId/work-order 404s when the follow-up belongs to a different incident", async (t) => {
+  stubFetch(t, (table) => (table === "incident_followup_actions" ? [{ ...FOLLOWUP, incident_id: "inc-other" }] : []));
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 404);
+});
+
+test("POST followups/:followupId/work-order denies a caller with neither incidents.manage nor incidents.review", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_followup_actions") return [FOLLOWUP];
+    if (table === "incident_reports") return [INCIDENT];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 403);
+});
+
+test("POST followups/:followupId/work-order: caller WITH work_orders.manage inserts directly (no RPC call)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return []; // no existing row -- not idempotent yet
+    if (table === "work_orders" && method === "POST") {
+      return [{ id: "wo-1", source_type: "incident", source_id: "inc-1", source_followup_id: "fu-1" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.created, true);
+  assert.equal(result.payload.workOrder.id, "wo-1");
+
+  assert.ok(!captured.some((c) => c.table === "rpc/create_work_order_from_incident"), "must not call the RPC");
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].source_type, "incident");
+  assert.equal(insert.body[0].source_id, "inc-1");
+  assert.equal(insert.body[0].source_followup_id, "fu-1");
+  assert.match(insert.body[0].title, /INC-2026-001/);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  assert.equal(auditInsert.body[0].event_type, "incident.work_order_created");
+  assert.equal(auditInsert.body[0].event_payload.source, "incident_followup");
+  assert.equal(auditInsert.body[0].event_payload.followup_id, "fu-1");
+});
+
+test("POST followups/:followupId/work-order: direct-insert path is idempotent -- a repeat call returns the existing row with created:false and inserts nothing", async (t) => {
+  const EXISTING = { id: "wo-1", source_type: "incident", source_id: "inc-1", source_followup_id: "fu-1" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return [EXISTING];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.created, false);
+  assert.equal(result.payload.workOrder.id, "wo-1");
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "POST"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events"));
+});
+
+test("POST followups/:followupId/work-order: caller WITHOUT work_orders.manage (incidents.manage only) goes through the RPC", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-2", source_followup_id: "fu-1" }, created: true };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage, no work_orders.manage
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.created, true);
+  assert.equal(result.payload.workOrder.id, "wo-2");
+
+  const rpcCall = captured.find((c) => c.table === "rpc/create_work_order_from_incident");
+  assert.ok(rpcCall, "expected the RPC to be called");
+  assert.equal(rpcCall.body.followup_id, "fu-1");
+  // The direct-insert path's own work_orders POST must never fire here.
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "POST"));
+});
+
+test("POST followups/:followupId/work-order: a reviewer who ALSO holds work_orders.manage inserts directly (no RPC call)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return [];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-4", source_followup_id: "fu-1" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEW_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.ok(!captured.some((c) => c.table === "rpc/create_work_order_from_incident"));
+});
+
+test("POST followups/:followupId/work-order: caller with incidents.review only (no work_orders.manage) also goes through the RPC", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-3" }, created: true };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  const rpcCall = captured.find((c) => c.table === "rpc/create_work_order_from_incident");
+  assert.ok(rpcCall, "expected the RPC to be called for a review-only caller");
+});
+
+test("POST followups/:followupId/work-order: the RPC path is idempotent -- created:false from the RPC returns 200", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-2" }, created: false };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.created, false);
+});
+
+test("POST followups/:followupId/work-order: an RPC 403 (e.g. permission re-check failed server-side) surfaces as a 403", async (t) => {
+  stubFetchStatus(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return { status: 200, data: [FOLLOWUP] };
+    if (table === "incident_reports" && method === "GET") return { status: 200, data: [INCIDENT] };
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { status: 403, data: { message: "missing permission: incidents.manage or incidents.review" } };
+    }
+    return { status: 200, data: [] };
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 403);
+});
+
+// A second stub-fetch helper: like stubFetch, but `respond` returns
+// { status, data } so a test can simulate a non-2xx PostgREST response
+// (needed for the RPC-rejection test above -- the plain stubFetch always
+// returns ok:true/status:200).
+function stubFetchStatus(t, respond) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const { status, data } = respond(table, method, parsed);
+    return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(data) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+}
+
+// =============================================================================
+// IN-17: cross-module creation -- training triggers
+// =============================================================================
+
+test("POST training-triggers validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", { employeeId: "emp-1" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST training-triggers rejects both certificationTypeId and trainingModuleId set together", async (t) => {
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    certificationTypeId: "cert-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 400);
+});
+
+test("POST training-triggers denies a caller with neither incidents.manage nor incidents.review", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST training-triggers 404s when the employee does not belong to this facility", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "employees") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 404);
+});
+
+test("POST training-triggers: caller WITH training.manage and a resolvable trainingModuleId creates trigger + assignment", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") {
+      return [{ id: "trig-1", employee_id: "emp-1", target: { trainingModuleId: "mod-1" } }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "course_modules" && method === "GET") return [{ id: "mod-1", course_id: "course-1", facility_id: "fac-1" }];
+    if (table === "training_assignments" && method === "POST") {
+      return [{ id: "assign-1", employee_id: "emp-1", course_id: "course-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "near miss follow-up"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.trigger.id, "trig-1");
+  assert.equal(result.payload.assignment.id, "assign-1");
+  assert.equal(result.payload.assignmentSkipped, null);
+
+  const triggerInsert = captured.find((c) => c.table === "incident_training_triggers" && c.method === "POST");
+  assert.deepEqual(triggerInsert.body[0].target, { trainingModuleId: "mod-1" });
+
+  const assignmentInsert = captured.find((c) => c.table === "training_assignments" && c.method === "POST");
+  assert.equal(assignmentInsert.body[0].course_id, "course-1");
+  assert.equal(assignmentInsert.body[0].source_type, "incident_rule");
+  assert.equal(assignmentInsert.body[0].source_ref_id, "trig-1");
+});
+
+test("POST training-triggers: caller WITHOUT training.manage creates only the trigger row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") return [{ id: "trig-2" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage, no training.manage
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "near miss follow-up"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.trigger.id, "trig-2");
+  assert.equal(result.payload.assignment, null);
+  assert.match(result.payload.assignmentSkipped, /training\.manage/);
+  assert.ok(!captured.some((c) => c.table === "training_assignments"));
+});
+
+test("POST training-triggers: certificationTypeId never creates a training_assignments row, even with training.manage", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") return [{ id: "trig-3" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    certificationTypeId: "cert-1",
+    reason: "cert gap"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.assignment, null);
+  assert.match(result.payload.assignmentSkipped, /certificationTypeId/);
+  assert.ok(!captured.some((c) => c.table === "training_assignments"));
 });

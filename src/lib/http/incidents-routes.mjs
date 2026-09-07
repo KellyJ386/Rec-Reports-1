@@ -9,8 +9,11 @@ import {
   buildAmendment,
   nextIncidentNo,
   requiredIncidentFollowUps,
+  buildIncidentNotificationJobs,
   INCIDENT_STATUSES
 } from "../incidents.mjs";
+import { createWorkOrderFromIncidentFollowup } from "../work-orders.mjs";
+import { loadActiveRoute, expandRouteRecipients } from "../notifications/worker.mjs";
 import { buildIncidentPdfPackage } from "../incident-pdf.mjs";
 
 const READ = "incidents.read";
@@ -20,6 +23,20 @@ const LEGAL_HOLD_MANAGE = "incidents.legal_hold.manage";
 const TASKS_CREATE = "incidents.tasks.create";
 const EXPORT_PDF = "incidents.export.pdf";
 const ESCALATE = "incidents.escalate";
+// IN-17 cross-module permission codes: work_orders.manage decides which of
+// the two POST .../work-order write paths runs (direct insert vs the
+// SECURITY DEFINER RPC); training.manage decides whether
+// POST .../training-triggers also creates a training_assignments row.
+const WORK_ORDERS_MANAGE = "work_orders.manage";
+const TRAINING_MANAGE = "training.manage";
+
+// Minimal projection for the IN-17 work-order idempotency check-then-insert
+// (POST .../followups/:followupId/work-order's direct-insert path) -- kept
+// separate from work-orders-routes.mjs's own WORK_ORDER_COLUMNS on purpose,
+// same reasoning as INCIDENT_FOR_WORK_ORDER_COLUMNS there: this module never
+// imports from that one.
+const WORK_ORDER_MIN_COLUMNS =
+  "id,facility_id,source_type,source_id,source_followup_id,title,description,priority,status,created_at";
 
 // Follow-up action_type / status vocabularies, verbatim from the check
 // constraints on incident_followup_actions (0004_incidents.sql:74-75).
@@ -123,6 +140,57 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
       });
       sendJson(response, 500, { error: "audit write failed", entity_id: event.incident_id });
       return false;
+    }
+  }
+
+  // IN-20: emits notification_jobs for one incident lifecycle event
+  // (incident.submitted / incident.escalated / incident.sla_breached).
+  // Resolves the facility's live active route for `eventCode` via
+  // loadActiveRoute (notifications/worker.mjs -- the same resolveRoute
+  // query the drain itself uses), expands its distribution list via
+  // expandRouteRecipients, folds in `extraRecipientIds` (e.g. an
+  // escalation's own target_user_id, so the specifically-targeted actor is
+  // notified even when the route's distribution list doesn't happen to
+  // include them), and inserts one buildIncidentNotificationJobs row per
+  // recipient with ignoreDuplicates so a retried call can never double-
+  // enqueue. When no active route is configured for this facility+event, or
+  // it resolves to zero recipients, this is a silent no-op -- exactly
+  // matching translateOutboxEvent's "no active route -> skip" contract
+  // (worker.mjs), the existing behavior for every other event in this
+  // codebase (no facility ships a seeded notification_routes row).
+  //
+  // Deliberately best-effort: notification emission is not this module's
+  // legal-defensibility surface (writeAuditEvent above is, and stays
+  // strict/blocking) -- a delivery-pipeline hiccup must never turn a
+  // successful incident submit/escalate into a failed request. Errors are
+  // caught, logged, and fire-and-forget reported (OP-20's reportError
+  // contract), never re-thrown.
+  async function emitIncidentNotifications(auth, env, eventCode, incident, extraRecipientIds = []) {
+    try {
+      const route = await loadActiveRoute({ client: auth.client, facilityId: incident.facility_id, eventCode });
+      if (!route) return;
+      const expanded = await expandRouteRecipients({ client: auth.client, facilityId: incident.facility_id, route });
+      const recipients = [...new Set([...(expanded ?? []), ...(extraRecipientIds ?? [])])].filter(Boolean);
+      if (recipients.length === 0) return;
+      const jobs = buildIncidentNotificationJobs(eventCode, route, recipients, {
+        id: incident.id,
+        severity: incident.severity
+      });
+      if (jobs.length === 0) return;
+      await pgInsert(auth.client, "notification_jobs", jobs, {
+        onConflict: "dedupe_key",
+        ignoreDuplicates: true,
+        returning: false
+      });
+    } catch (error) {
+      console.error(`incidents.notify/${eventCode} failed for incident ${incident?.id}:`, error);
+      reportError(error, {
+        dsn: env?.OBSERVABILITY_DSN,
+        route: `incidents.notify/${eventCode}`,
+        status: 500,
+        requestId: incident?.id ?? null,
+        userId: auth?.claims?.sub ?? null
+      });
     }
   }
 
@@ -361,6 +429,15 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         );
         if (!auditOk) return;
 
+        // IN-20: fire-and-forget (see emitIncidentNotifications) --
+        // never awaited-for-failure the way writeAuditEvent above is, so a
+        // notification-pipeline hiccup can never turn a successful
+        // escalation into a failed response. targetUserId (when the
+        // escalation names one) is folded in as an extra recipient
+        // alongside whatever the facility's incident.escalated route's
+        // distribution list already resolves.
+        await emitIncidentNotifications(auth, env, "incident.escalated", incident, [escalation.target_user_id]);
+
         return sendJson(response, 201, createdEscalation);
       })
   );
@@ -536,6 +613,16 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           })
         );
         if (!auditOk) return;
+
+        // IN-20: "on submit" -- fire-and-forget, matching the escalate
+        // route's call below (see emitIncidentNotifications). This is the
+        // ONLY place "incident.submitted" fires: the generic
+        // POST /incidents/:id/status route below can also legally drive
+        // draft->submitted (the same canTransitionIncident edge), but it
+        // always writes its audit event as "incident.status_changed", not
+        // "incident.submitted" -- this route is the sole owner of that
+        // event, so it is also the sole notification-emission site for it.
+        await emitIncidentNotifications(auth, env, "incident.submitted", incident);
 
         const suggestedFollowUps = requiredIncidentFollowUps({
           severity: incident.severity,
@@ -928,6 +1015,246 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         }
 
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Cross-module creation (IN-17) --------------------------------------
+  // Creates a work_orders row linked to one follow-up action. Guarded by
+  // incidents.manage OR incidents.review -- deliberately NOT work_orders.manage
+  // (see 0058_incident_cross_module.sql's header for the full elevation-model
+  // writeup, which this route implements). Two write paths, chosen purely by
+  // whether the caller ALSO holds work_orders.manage:
+  //   * holds it -> insert straight into work_orders through the caller's
+  //     own RLS-scoped client (createWorkOrderFromIncidentFollowup,
+  //     work-orders.mjs) -- ordinary RLS does the gating.
+  //   * does not hold it -> call public.create_work_order_from_incident via
+  //     pgRpc, the SECURITY DEFINER RPC that re-checks incidents.manage/
+  //     review itself and derives every written field server-side.
+  // Both paths are idempotent per follow-up (work_orders.source_followup_id's
+  // UNIQUE partial index) and return the identical envelope shape
+  // { workOrder, created }, so a caller cannot tell which path ran from the
+  // response alone -- created:false on a repeat call either way, never a 409.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/incidents/:incidentId/followups/:followupId/work-order",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const followup = await loadFollowup(auth.client, params.followupId);
+        if (!followup || followup.incident_id !== params.incidentId) {
+          return sendJson(response, 404, { error: "follow-up action not found" });
+        }
+        const incident = await loadIncident(auth.client, params.incidentId);
+        if (!incident || incident.facility_id !== params.facilityId) {
+          return sendJson(response, 404, { error: "incident not found" });
+        }
+        if (!requireAnyPerm(auth, incident.facility_id, [MANAGE, REVIEW], response)) return;
+
+        const hasWorkOrdersManage = requireAuthPermission(auth, incident.facility_id, WORK_ORDERS_MANAGE).allowed;
+
+        if (hasWorkOrdersManage) {
+          // Idempotency check-then-insert, mirroring the RPC's own shape
+          // (0058) -- a repeat call under this path returns the existing
+          // row rather than hitting the unique index and surfacing a raw
+          // 409 from PostgREST.
+          const existingRows = await pgSelect(auth.client, "work_orders", {
+            filters: { source_followup_id: followup.id },
+            select: WORK_ORDER_MIN_COLUMNS,
+            limit: 1
+          });
+          const existing = (existingRows ?? [])[0] ?? null;
+          if (existing) {
+            return sendJson(response, 200, { workOrder: existing, created: false });
+          }
+
+          const built = createWorkOrderFromIncidentFollowup(
+            {
+              id: incident.id,
+              facilityId: incident.facility_id,
+              incidentNo: incident.incident_no,
+              severity: incident.severity,
+              summary: incident.summary
+            },
+            { id: followup.id, actionType: followup.action_type, description: followup.description }
+          );
+          const row = {
+            facility_id: built.facilityId,
+            source_type: built.sourceType,
+            source_id: built.sourceId,
+            source_followup_id: built.sourceFollowupId,
+            title: built.title,
+            description: built.description,
+            priority: built.priority,
+            status: built.status,
+            created_by: auth.claims.sub
+          };
+          const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
+          const workOrder = (rows ?? [])[0] ?? null;
+
+          const auditOk = await writeAuditEvent(
+            auth,
+            response,
+            env,
+            buildIncidentAuditEvent({
+              facilityId: incident.facility_id,
+              incidentId: incident.id,
+              actorUserId: auth.claims.sub,
+              eventType: "incident.work_order_created",
+              payload: {
+                source: "incident_followup",
+                followup_id: followup.id,
+                work_order_id: workOrder?.id ?? null,
+                actor: auth.claims.sub
+              }
+            })
+          );
+          if (!auditOk) return;
+
+          return sendJson(response, 201, { workOrder, created: true });
+        }
+
+        // Elevation path: the caller lacks work_orders.manage. The RPC
+        // re-checks incidents.manage/review itself, derives every field
+        // from the follow-up + incident it loads, and writes its own
+        // incident_audit_events row atomically with the work_orders insert
+        // -- no separate writeAuditEvent call here, unlike the direct-insert
+        // branch above.
+        let rpcResult;
+        try {
+          rpcResult = await pgRpc(auth.client, "create_work_order_from_incident", {
+            followup_id: followup.id
+          });
+        } catch (error) {
+          if (error instanceof PostgrestError && (error.status === 403 || error.status === 404 || error.status === 400)) {
+            return sendJson(response, error.status, {
+              error: error.body?.message ?? "work order creation rejected"
+            });
+          }
+          throw error;
+        }
+        const created = rpcResult?.created === true;
+        return sendJson(response, created ? 201 : 200, {
+          workOrder: rpcResult?.work_order ?? null,
+          created
+        });
+      })
+  );
+
+  // Creates an incident_training_triggers row (IN-17), and -- only when the
+  // caller ALSO holds training.manage -- a linked training_assignments row.
+  // No elevation RPC here: unlike the work-order half above, a caller who
+  // lacks training.manage never gets a training_assignments write on their
+  // behalf; they get a durable trigger row a training admin can act on
+  // instead. Body: { employeeId, certificationTypeId | trainingModuleId,
+  // reason } -- exactly one of certificationTypeId/trainingModuleId.
+  //
+  // trainingModuleId resolves to a training_assignments.course_id via
+  // course_modules.course_id (0007); certificationTypeId has NO course
+  // linkage anywhere in this schema (certification_types and courses are
+  // unrelated tables), so a certificationTypeId target NEVER creates a
+  // training_assignments row, regardless of training.manage -- documented
+  // in `assignmentSkipped` on the response rather than silently succeeding
+  // with a misleading assignment.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/incidents/:incidentId/training-triggers",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const { employeeId, certificationTypeId, trainingModuleId, reason } = body.payload;
+        const shape = [];
+        if (!employeeId) shape.push("employeeId is required");
+        if (!certificationTypeId && !trainingModuleId) {
+          shape.push("exactly one of certificationTypeId or trainingModuleId is required");
+        }
+        if (certificationTypeId && trainingModuleId) {
+          shape.push("only one of certificationTypeId or trainingModuleId may be set");
+        }
+        if (!reason || typeof reason !== "string" || !reason.trim()) shape.push("reason is required");
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const incident = await loadIncident(auth.client, params.incidentId);
+        if (!incident || incident.facility_id !== params.facilityId) {
+          return sendJson(response, 404, { error: "incident not found" });
+        }
+        if (!requireAnyPerm(auth, incident.facility_id, [MANAGE, REVIEW], response)) return;
+
+        const employeeRows = await pgSelect(auth.client, "employees", {
+          filters: { id: employeeId, facility_id: incident.facility_id },
+          select: "id",
+          limit: 1
+        });
+        if (!(employeeRows ?? [])[0]) {
+          return sendJson(response, 404, { error: "employee not found for this facility" });
+        }
+
+        const target = trainingModuleId ? { trainingModuleId } : { certificationTypeId };
+        const triggerRow = {
+          facility_id: incident.facility_id,
+          incident_id: incident.id,
+          employee_id: employeeId,
+          target,
+          reason: reason.trim(),
+          created_by: auth.claims.sub
+        };
+        const triggerRows = await pgInsert(auth.client, "incident_training_triggers", [triggerRow], {
+          returning: true
+        });
+        const trigger = (triggerRows ?? [])[0] ?? null;
+
+        const auditOk = await writeAuditEvent(
+          auth,
+          response,
+          env,
+          buildIncidentAuditEvent({
+            facilityId: incident.facility_id,
+            incidentId: incident.id,
+            actorUserId: auth.claims.sub,
+            eventType: "incident.training_trigger_created",
+            payload: { actor: auth.claims.sub, triggerId: trigger?.id ?? null, employeeId, target, reason: reason.trim() }
+          })
+        );
+        if (!auditOk) return;
+
+        const hasTrainingManage = requireAuthPermission(auth, incident.facility_id, TRAINING_MANAGE).allowed;
+        let assignment = null;
+        let assignmentSkipped = null;
+
+        if (!hasTrainingManage) {
+          assignmentSkipped = "missing permission: training.manage";
+        } else if (certificationTypeId) {
+          assignmentSkipped = "certificationTypeId has no course linkage; create a training_assignments row manually";
+        } else {
+          const moduleRows = await pgSelect(auth.client, "course_modules", {
+            filters: { id: trainingModuleId, facility_id: incident.facility_id },
+            select: "id,course_id,facility_id",
+            limit: 1
+          });
+          const module = (moduleRows ?? [])[0] ?? null;
+          if (!module) {
+            assignmentSkipped = "trainingModuleId not found for this facility";
+          } else {
+            const assignmentRows = await pgInsert(
+              auth.client,
+              "training_assignments",
+              [
+                {
+                  facility_id: incident.facility_id,
+                  employee_id: employeeId,
+                  course_id: module.course_id,
+                  assigned_by: auth.claims.sub,
+                  reason_code: "incident_training_trigger",
+                  source_type: "incident_rule",
+                  source_ref_id: trigger?.id ?? null
+                }
+              ],
+              { returning: true }
+            );
+            assignment = (assignmentRows ?? [])[0] ?? null;
+          }
+        }
+
+        return sendJson(response, 201, { trigger, assignment, assignmentSkipped });
       })
   );
 

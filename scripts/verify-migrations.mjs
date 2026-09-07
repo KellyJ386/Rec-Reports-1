@@ -87,7 +87,8 @@ const requiredRlsTables = [
   "auth_throttle",
   "report_workflow_events",
   "report_distribution_lists",
-  "report_deliveries"
+  "report_deliveries",
+  "incident_training_triggers"
 ];
 
 for (const table of requiredRlsTables) {
@@ -121,7 +122,9 @@ for (const helper of [
   "internal.mint_workflow_incident",
   "public.mint_workflow_incident",
   "internal.mint_workflow_work_order",
-  "public.mint_workflow_work_order"
+  "public.mint_workflow_work_order",
+  "internal.create_work_order_from_incident",
+  "public.create_work_order_from_incident"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

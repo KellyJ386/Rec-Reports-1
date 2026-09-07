@@ -37,6 +37,7 @@ import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
+import { sweepIncidentEscalations } from "../incident-sla-sweep.mjs";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -172,12 +173,28 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
+  // IN-21: the SLA breach auto-escalation sweep runs in the SAME drain
+  // invocation, on the same service-role client and cadence as every other
+  // sweep above. Never throws on its own notification leg (see
+  // incident-sla-sweep.mjs's notifySlaBreach) -- a broken notification
+  // pipeline can dead-letter a job, but can never fail this route. A
+  // top-level failure here (a genuine PostgREST outage, etc.) is NOT
+  // caught -- same "fail loud, don't look healthy while broken" rationale
+  // as the report workflow/distribution/PDF passes above. No `config` is
+  // threaded in here, same as drainAll's own quiet-hours resolution above
+  // (worker.mjs:518-519) -- both run on the settings-registry's shipped
+  // defaults (incidents.maxEscalationLevel, incidents.escalationSlaHours)
+  // rather than resolving each escalation's own facility's tenant
+  // overrides, matching this drain's existing global-defaults posture.
+  const incidentSla = await sweepIncidentEscalations(client, { now, limit });
+
   sendJson(response, 200, {
     ...summary,
     reportWorkflow,
     reportDistribution: reportDistributionSummary,
     reportPdf,
-    authThrottleSwept: authThrottleSwept.deleted
+    authThrottleSwept: authThrottleSwept.deleted,
+    incidentSla
   });
 }
 
