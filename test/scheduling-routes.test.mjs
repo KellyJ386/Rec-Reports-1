@@ -79,6 +79,10 @@ const ASSIGNMENT = {
   assigned_by: null
 };
 
+// Mirrors scheduling-routes.mjs's ASSIGNMENT_COLUMNS, used to assert the
+// GET /shift-assignments route's select= query param.
+const ASSIGNMENT_SELECT = "id,facility_id,shift_id,employee_id,assignment_type,status,assigned_by,created_at,updated_at";
+
 const CERT_TYPE = {
   id: "ct-1",
   facility_id: "fac-1",
@@ -1140,6 +1144,103 @@ test("POST generate re-run only inserts the still-missing template/date pairs", 
   assert.deepEqual(
     insert.body.map((r) => r.shift_date),
     ["2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"]
+  );
+});
+
+// =============================================================================
+// P-2 (SC-08) -- GET shift-assignments (read path)
+// =============================================================================
+
+test("GET shift-assignments denies a non-member with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?shift_id=shift-1");
+  assert.equal(result.status, 403);
+});
+
+test("GET shift-assignments 400s when neither period_id nor shift_id is given (no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET shift-assignments 400s when both period_id and shift_id are given (no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?period_id=per-1&shift_id=shift-1");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("GET shift-assignments maps a non-uuid filter's 22P02 PostgrestError to 400", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "shift_assignments") {
+      return errorResponse(400, { code: "22P02", message: 'invalid input syntax for type uuid: "nope"' });
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?shift_id=nope");
+  assert.equal(result.status, 400);
+});
+
+test("GET shift-assignments by shift_id returns ASSIGNMENT_COLUMNS rows, active-only by default", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "shift_assignments" ? [ASSIGNMENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?shift_id=shift-1");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, [ASSIGNMENT]);
+
+  const req = captured.find((c) => c.table === "shift_assignments" && c.method === "GET");
+  assert.ok(req, "expected a shift_assignments GET request");
+  assert.equal(req.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(req.url.searchParams.get("shift_id"), "eq.shift-1");
+  assert.equal(req.url.searchParams.get("status"), "in.(pending,approved)");
+  assert.equal(req.url.searchParams.get("select"), ASSIGNMENT_SELECT);
+});
+
+test("GET shift-assignments include_cancelled=true drops the active-only status filter", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "shift_assignments" ? [ASSIGNMENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?shift_id=shift-1&include_cancelled=true");
+  assert.equal(result.status, 200);
+  const req = captured.find((c) => c.table === "shift_assignments" && c.method === "GET");
+  assert.equal(req.url.searchParams.get("status"), null);
+});
+
+test("GET shift-assignments by period_id resolves the period's shift ids first, then filters shift_id in(...)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts" && method === "GET") return [{ id: "shift-1" }, { id: "shift-2" }];
+    if (table === "shift_assignments" && method === "GET") return [ASSIGNMENT];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?period_id=per-1");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, [ASSIGNMENT]);
+
+  const shiftsReq = captured.find((c) => c.table === "schedule_shifts" && c.method === "GET");
+  assert.ok(shiftsReq, "expected a schedule_shifts lookup scoped to the period");
+  assert.equal(shiftsReq.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(shiftsReq.url.searchParams.get("schedule_period_id"), "eq.per-1");
+  assert.equal(shiftsReq.url.searchParams.get("select"), "id");
+
+  const assignmentsReq = captured.find((c) => c.table === "shift_assignments" && c.method === "GET");
+  assert.ok(assignmentsReq, "expected a shift_assignments lookup filtered to the resolved shift ids");
+  assert.equal(assignmentsReq.url.searchParams.get("shift_id"), "in.(shift-1,shift-2)");
+});
+
+test("GET shift-assignments by period_id with no shifts short-circuits to [] without querying shift_assignments", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "schedule_shifts" ? [] : [ASSIGNMENT]));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/shift-assignments?period_id=per-empty");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, []);
+  assert.equal(
+    captured.some((c) => c.table === "shift_assignments"),
+    false
   );
 });
 
