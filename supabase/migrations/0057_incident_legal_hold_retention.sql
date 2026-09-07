@@ -100,7 +100,7 @@
 
 -- ---------------------------------------------------------------------------
 -- (a) fn_incident_report_transition_guard -- recreated whole (0048's body,
--- verbatim) with new Guard 0 inserted right after the INSERT branch returns,
+-- verbatim, plus 0056's Guard 2.5 closure gate) with new Guard 0 inserted right after the INSERT branch returns,
 -- ahead of every other UPDATE-only guard.
 -- ---------------------------------------------------------------------------
 create or replace function fn_incident_report_transition_guard()
@@ -207,6 +207,39 @@ begin
     ) then
       raise exception 'incident_reports %: illegal status transition from % to %.', old.id, old.status, new.status
         using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Guard 2.5 (0056, IN-13/IN-15; carried forward here because this
+  -- migration recreates the whole function -- the last definition wins): closing a high/critical incident requires
+  -- a passing (or reviewer-waived) evidence_complete compliance check; an
+  -- incident additionally flagged requires_osha_review also needs a
+  -- passing (or waived) supervisor_signoff check. See migration header (e).
+  if old.status is distinct from new.status and new.status = 'closed' then
+    if new.severity in ('high', 'critical') then
+      if not exists (
+        select 1 from incident_compliance_checks
+        where incident_id = new.id
+          and check_key = 'evidence_complete'
+          and status in ('pass', 'waived')
+          and deleted_at is null
+      ) then
+        raise exception 'incident_reports %: cannot close a % incident without a passing (or waived) evidence_complete compliance check.', new.id, new.severity
+          using errcode = 'check_violation';
+      end if;
+    end if;
+
+    if new.requires_osha_review then
+      if not exists (
+        select 1 from incident_compliance_checks
+        where incident_id = new.id
+          and check_key = 'supervisor_signoff'
+          and status in ('pass', 'waived')
+          and deleted_at is null
+      ) then
+        raise exception 'incident_reports %: cannot close an incident requiring OSHA review without a passing (or waived) supervisor_signoff compliance check.', new.id
+          using errcode = 'check_violation';
+      end if;
     end if;
   end if;
 
