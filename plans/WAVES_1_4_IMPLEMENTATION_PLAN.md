@@ -231,3 +231,28 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
   run after the RLS suite; Haiku factual claims are re-verified before use.
 - **Next:** Wave 2, Slice 2A first (guard factory, error translation, lint, missing tests, smoke in CI,
   changelog and runbook), branched from `main` once PR #18 merges.
+
+## Execution status (2026-09-07) — Wave 2 built, open as a stacked chain
+
+- **Landed:** every Slice 2A–2D task. Chain on GitHub: #19 (2A, targets `main`), #20 (2C, on 2A), #21 (2B +
+  2D after the owner merged #22 into it, on 2A), #24 (P-7 accessibility + Unicode search, on 2B). Migrations
+  0050 (`incident_witness_statements`) and 0051 (trigram search indexes); Wave 3 migrations therefore start at
+  **0052**.
+- **Reviews:** four independent reviews (2A gating, 2C secrets/fail-safety/OAuth, 2B routes + migration 0050
+  with an RLS probe, 2D search injection + dashboard gating): no defects; one Medium in 2A fixed before
+  merge (query-shape PostgREST errors were translated to unreported 400s). Two real bugs found by the new
+  tests and fixed: facility PATCH required a name; the cert-gap report was gated by membership only. One
+  pre-existing RLS bug fixed: soft-deleting an `incident_people` row failed the row-visibility check for
+  everyone.
+- **Deliberately not done:** browser-side FCM token minting (messaging SDK cannot load under the self-only
+  CSP; button, permission prompt and device-token POST are complete); SMS (CM-14's other half); IN-11's
+  signatures/compliance checks/training triggers (Wave 3); arrow-key navigation in search results; the admin
+  control centre's own accessibility pass (Wave 4).
+- **Owner actions now due:** merge the chain (#19 → #20/#21 → #24); apply migrations 0040–0051 to the live
+  project on an explicit go, then the sign-off's post-deploy checklist; set `EMAIL_PROVIDER`, `EMAIL_API_KEY`,
+  `EMAIL_FROM`, `PUSH_PROVIDER`, `FCM_SERVICE_ACCOUNT_JSON`, `FIREBASE_WEB_CONFIG_JSON` in Vercel; tag
+  `v0.2.0` once merged; pilot walkthrough on phones.
+- **Lesson:** a stacked PR merged into its base by the owner, followed by a rebase of that base, leaves the
+  other stacked branches without shared history; they were rebased (content-identical) rather than merged.
+- **Next:** Wave 3, Slice 3A (reports workflow and distribution: DR-16 … DR-26, migrations 0052–0054) once
+  #19 merges; 3B–3F follow per the table above with numbering shifted by two.

@@ -352,6 +352,15 @@ applying 0040–0049 to the live project and the live advisor re-run, both waiti
 Exit gate: a pilot facility can run a day end to end on phones; ack compliance and the board are truthful
 across sessions; email goes out; `v0.2.0` tagged.
 
+**Status 2026-09-07:** P-1 … P-13 are built, reviewed and open as a stacked chain of PRs: #19 (2A: P-9,
+P-10, P-11, P-12, P-13), #20 (2C: P-4, P-5), #21 (2B + 2D: P-1, P-2, P-6, P-3, P-8; migrations 0050–0051)
+and #24 (P-7 plus a Unicode-aware search fix). Independent reviews of each slice found no defects. Gate on
+the top of the stack: 1756 unit tests, 31 RLS suites, 51-migration replay, contrast check 21/21, on-demand
+accessibility check pass. Still open from the exit gate: the owner's credentials for Resend and FCM (email
+"goes out" only once `EMAIL_API_KEY`/`EMAIL_FROM` are set), browser-side FCM token minting (blocked by the
+self-only CSP, deliberately not loosened), the pilot-facility walkthrough on real phones, and the `v0.2.0`
+tag after the chain merges to `main`.
+
 ### 5.5 Wave 3 — Design-complete (M2, 51 tasks; 4–6 weeks of agent time)
 
 Order by module value, same as before: reports → incidents → work orders → scheduling → communications

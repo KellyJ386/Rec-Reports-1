@@ -1,16 +1,145 @@
+/* --- P-7 (plans/WAVES_1_4_IMPLEMENTATION_PLAN.md, Slice 2D): shared palette
+   as CSS custom properties, matching src/public/admin/admin.css's --rr-*
+   naming so both apps read as one design system. Every text/background pair
+   drawn from these tokens is checked for WCAG AA (4.5:1 normal text) by
+   scripts/contrast-check.mjs (logic in src/public/js/a11y.mjs, unit-tested
+   in test/a11y.test.mjs) -- see that script's output for the full table.
+   Two values below were changed from this file's original hex literals
+   specifically to pass that check (each noted at its own declaration). */
 :root {
-  color: #172033;
-  background: #f4f7fb;
+  color-scheme: light;
+  --rr-bg: #f4f7fb;
+  --rr-surface: #ffffff;
+  --rr-surface-muted: #f9fbfe;
+  --rr-surface-alt: #eef4ff;
+  --rr-border: #dce5f2;
+  --rr-border-strong: #b9c7d9;
+  --rr-text: #172033;
+  --rr-text-muted: #52647a;
+  /* Was #8a97ab (2.86:1 on --rr-surface-muted -- fails AA). Darkened to the
+     nearest value that clears 4.5:1 while staying visually "muted/lighter
+     than --rr-text-muted", since this token exists specifically to read as
+     de-emphasized ("Unavailable" tile values). */
+  --rr-text-faint: #616e82;
+  --rr-accent: #1c6dd0;
+  --rr-accent-contrast: #ffffff;
+  --rr-accent-strong: #173b72;
+  --rr-focus: #0b57d0;
+  --rr-danger: #d32f2f;
+  --rr-danger-bg: #fff1f1;
+  --rr-danger-border: #f0a0a0;
+  --rr-danger-text: #663333;
+  --rr-success-bg: #effaf2;
+  --rr-success-border: #9ec5a9;
+  --rr-success-text: #315a3a;
+  --rr-info-bg: #f5f1ff;
+  --rr-info-border: #b8a7f5;
+  --rr-info-text: #44336d;
+  --rr-teal-bg: #eefbff;
+  --rr-teal-border: #7ab7c7;
+  --rr-teal-text: #285766;
+  --rr-warning-bg: #fff8e8;
+  --rr-warning-border: #d1b06f;
+  --rr-warning-text: #6a4b12;
+  --rr-badge-danger-bg: #fde3e3;
+  --rr-badge-danger-text: #a12727;
+  --rr-badge-warning-bg: #fff2cf;
+  --rr-badge-warning-text: #7a5b09;
+  --rr-badge-success-bg: #dff3e4;
+  --rr-badge-success-text: #1f6b34;
+  --rr-badge-info-bg: #e4ecfb;
+  --rr-badge-info-text: #1c4d8f;
+  --rr-validation-bg: #f0f8ff;
+  --rr-validation-success-text: #1a7a1a;
+  /* Was the "red" keyword (#ff0000), 3.73:1 on --rr-validation-bg -- fails
+     AA. Reused --rr-danger's darker sibling (#b3261e, the same danger red
+     src/public/admin/admin.css's --rr-danger already uses) instead of a
+     one-off value. */
+  --rr-validation-error-text: #b3261e;
+  --rr-caution-border: #f2c36b;
+  --rr-hover-alt: #d6e4f7;
+  --rr-highlight: #f2a71b;
+  --rr-shadow: 0 18px 50px rgba(23, 32, 51, 0.08);
+  color: var(--rr-text);
+  background: var(--rr-bg);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-body { margin: 0; }
-.shell { min-height: 100vh; padding: 32px; }
-.eyebrow { color: #1c6dd0; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--rr-bg); color: var(--rr-text); overflow-x: hidden; }
+
+/* Skip link (P-7): first focusable element on the page, visually hidden
+   until it receives keyboard focus. Matches admin.css's .skip-link so the
+   two apps' keyboard-navigation experience is identical. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  min-height: 44px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+  padding: 10px 16px;
+  border-radius: 0 0 10px 0;
+  z-index: 100;
+}
+.skip-link:focus {
+  left: 0;
+}
+
+/* P-7: one focus-visible rule for every focusable element in the app, so a
+   keyboard/switch user always gets a clearly visible, high-contrast (6.4:1
+   on white, see contrast-check.mjs) indicator, regardless of which control
+   it lands on. Individual components (e.g. .global-search-input) may still
+   layer their own outline-offset on top; none should ever set `outline:
+   none` without replacing it with an equally visible alternative. */
+:focus-visible {
+  outline: 3px solid var(--rr-focus);
+  outline-offset: 2px;
+}
+
+/* P-7: a single shared rule for the 44x44 CSS-pixel minimum tap target
+   (WCAG 2.5.5) across every button, link-as-button, <summary>, <select>,
+   and <input> in the app -- rather than hand-tuning padding on each one.
+   min-height/min-width (not height/width) so a control that needs to be
+   taller/wider for its own content (e.g. a filter <select> with a long
+   option) is never shrunk back down. display:inline-flex + centered
+   content keeps short-label buttons (e.g. icon-only ones, if any are ever
+   added) visually centered inside the enlarged box instead of top/left
+   aligned. Checkboxes and radios are deliberately excluded: enlarging the
+   native control itself would look broken next to its label text; every
+   checkbox/radio in this app is instead wrapped in a <label> (see
+   .report-field-option) whose full row is the actual 44px tap target. */
+button,
+a.primary,
+.quick-action-btn,
+input,
+select,
+textarea,
+details.panel > summary {
+  min-height: 44px;
+}
+button,
+a.primary,
+.quick-action-btn {
+  min-width: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+input[type="checkbox"],
+input[type="radio"] {
+  min-height: 0;
+  min-width: 0;
+}
+
+.eyebrow { color: var(--rr-accent); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
 h1 { font-size: clamp(2rem, 5vw, 4rem); line-height: 1; margin: 0; }
-.facility-switcher { background: #ffffff; border: 1px solid #dce5f2; border-radius: 18px; padding: 20px; display: grid; gap: 8px; min-width: 240px; }
+.facility-switcher { background: var(--rr-surface); border: 1px solid var(--rr-border); border-radius: 18px; padding: 20px; display: grid; gap: 8px; min-width: 240px; }
 .facility-switcher span { font-weight: 700; }
-select { border: 1px solid #b9c7d9; border-radius: 10px; padding: 10px; }
+select { border: 1px solid var(--rr-border-strong); border-radius: 10px; padding: 10px; }
 @media (max-width: 720px) { .shell { padding: 16px; } }
 
 /* --- P-3: role-based home dashboard -----------------------------------
@@ -22,8 +151,8 @@ select { border: 1px solid #b9c7d9; border-radius: 10px; padding: 10px; }
   display: flex;
   flex-direction: column;
   gap: 20px;
-  background: #ffffff;
-  border: 1px solid #dce5f2;
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
   border-radius: 24px;
   padding: 32px;
   box-shadow: 0 18px 50px rgba(23, 32, 51, 0.08);
@@ -36,6 +165,24 @@ select { border: 1px solid #b9c7d9; border-radius: 10px; padding: 10px; }
 .quick-actions { display: flex; flex-wrap: wrap; gap: 12px; }
 .quick-action-btn { min-height: 44px; padding: 12px 20px; font-size: 1em; }
 
+/* P-7: on a phone-width viewport, keep the "Submit report / Log incident /
+   New work order" quick actions reachable while scrolling down through the
+   module panels below, instead of only living above the fold. Scoped to
+   <640px (this file's one mobile breakpoint narrower than the 720px one
+   used elsewhere) so a tablet/desktop layout -- where the quick actions are
+   already always on screen alongside everything else -- is untouched. */
+@media (max-width: 640px) {
+  .quick-actions {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    padding: 10px 0;
+    background: var(--rr-surface);
+    border-bottom: 1px solid var(--rr-border);
+    box-shadow: 0 8px 16px rgba(23, 32, 51, 0.06);
+  }
+}
+
 .home-tiles {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -46,26 +193,26 @@ select { border: 1px solid #b9c7d9; border-radius: 10px; padding: 10px; }
   gap: 4px;
   justify-items: start;
   text-align: left;
-  background: #f9fbfe;
-  border: 1px solid #dce5f2;
+  background: var(--rr-surface-muted);
+  border: 1px solid var(--rr-border);
   border-radius: 16px;
   padding: 16px;
   min-height: 44px;
   cursor: pointer;
 }
-.home-tile:hover, .home-tile:focus-visible { border-color: #1c6dd0; }
-.home-tile-title { font-weight: 700; font-size: 0.85em; color: #4a5b76; }
+.home-tile:hover, .home-tile:focus-visible { border-color: var(--rr-accent); }
+.home-tile-title { font-weight: 700; font-size: 0.85em; color: var(--rr-text-muted); }
 .home-tile-value { font-size: 1.6em; font-weight: 800; }
-.home-tile-hint { font-size: 0.85em; color: #4a5b76; }
-.home-tile-value.is-unavailable { color: #8a97ab; font-size: 1.1em; }
+.home-tile-hint { font-size: 0.85em; color: var(--rr-text-muted); }
+.home-tile-value.is-unavailable { color: var(--rr-text-faint); font-size: 1.1em; }
 
 .panel {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
   gap: 24px;
   margin-top: 24px;
-  background: #ffffff;
-  border: 1px solid #dce5f2;
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
   border-radius: 24px;
   padding: 28px;
 }
@@ -86,7 +233,7 @@ details.panel > summary > h2 {
   display: inline-block;
 }
 details.panel > summary > .eyebrow { display: block; }
-details.panel > summary::marker { color: #1c6dd0; }
+details.panel > summary::marker { color: var(--rr-accent); }
 
 .report-form {
   display: grid;
@@ -101,21 +248,21 @@ details.panel > summary::marker { color: #1c6dd0; }
 
 input,
 button {
-  border: 1px solid #b9c7d9;
+  border: 1px solid var(--rr-border-strong);
   border-radius: 10px;
   padding: 10px;
 }
 
 button {
-  background: #eef4ff;
-  color: #173b72;
+  background: var(--rr-surface-alt);
+  color: var(--rr-accent-strong);
   cursor: pointer;
   font-weight: 700;
 }
 
 button.primary {
-  background: #1c6dd0;
-  color: #ffffff;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
 }
 
 @media (max-width: 900px) {
@@ -129,86 +276,86 @@ button.primary {
 .schedule-list article {
   display: grid;
   gap: 4px;
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 14px;
   padding: 14px;
 }
 
 .schedule-list span {
-  color: #52647a;
+  color: var(--rr-text-muted);
 }
 
 .schedule-list .warning {
-  border-color: #f2c36b;
-  background: #fff8e8;
+  border-color: var(--rr-caution-border);
+  background: var(--rr-warning-bg);
 }
 .incident-card {
   display: grid;
   gap: 10px;
-  border: 1px solid #f0a0a0;
+  border: 1px solid var(--rr-danger-border);
   border-radius: 14px;
-  background: #fff1f1;
+  background: var(--rr-danger-bg);
   padding: 16px;
 }
 
 .incident-card span {
-  color: #663333;
+  color: var(--rr-danger-text);
 }
 .work-order-card {
   display: grid;
   gap: 10px;
-  border: 1px solid #9ec5a9;
+  border: 1px solid var(--rr-success-border);
   border-radius: 14px;
-  background: #effaf2;
+  background: var(--rr-success-bg);
   padding: 16px;
 }
 
 .work-order-card span {
-  color: #315a3a;
+  color: var(--rr-success-text);
 }
 .message-card {
   display: grid;
   gap: 10px;
-  border: 1px solid #b8a7f5;
+  border: 1px solid var(--rr-info-border);
   border-radius: 14px;
-  background: #f5f1ff;
+  background: var(--rr-info-bg);
   padding: 16px;
 }
 
 .message-card span {
-  color: #44336d;
+  color: var(--rr-info-text);
 }
 .training-card {
   display: grid;
   gap: 10px;
-  border: 1px solid #7ab7c7;
+  border: 1px solid var(--rr-teal-border);
   border-radius: 14px;
-  background: #eefbff;
+  background: var(--rr-teal-bg);
   padding: 16px;
 }
 
 .training-card span {
-  color: #285766;
+  color: var(--rr-teal-text);
 }
 .admin-card {
   display: grid;
   gap: 10px;
-  border: 1px solid #d1b06f;
+  border: 1px solid var(--rr-warning-border);
   border-radius: 14px;
-  background: #fff8e8;
+  background: var(--rr-warning-bg);
   padding: 16px;
 }
 
 .admin-card span {
-  color: #6a4b12;
+  color: var(--rr-warning-text);
 }
 a.primary {
   display: inline-block;
-  border: 1px solid #b9c7d9;
+  border: 1px solid var(--rr-border-strong);
   border-radius: 10px;
   padding: 10px 16px;
-  background: #1c6dd0;
-  color: #ffffff;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
   font-weight: 700;
   text-decoration: none;
   cursor: pointer;
@@ -216,13 +363,13 @@ a.primary {
 }
 
 a.primary:focus-visible {
-  outline: 3px solid #0b57d0;
+  outline: 3px solid var(--rr-focus);
   outline-offset: 2px;
 }
 
 .app-header {
-  background: #ffffff;
-  border-bottom: 1px solid #dce5f2;
+  background: var(--rr-surface);
+  border-bottom: 1px solid var(--rr-border);
   padding: 16px 32px;
   display: flex;
   justify-content: space-between;
@@ -231,13 +378,13 @@ a.primary:focus-visible {
 
 .user-info {
   font-size: 0.9em;
-  color: #666;
+  color: var(--rr-text-muted);
 }
 
 .sign-out-btn {
-  background: #eef4ff;
-  color: #173b72;
-  border: 1px solid #b9c7d9;
+  background: var(--rr-surface-alt);
+  color: var(--rr-accent-strong);
+  border: 1px solid var(--rr-border-strong);
   border-radius: 8px;
   padding: 8px 16px;
   cursor: pointer;
@@ -245,7 +392,115 @@ a.primary:focus-visible {
 }
 
 .sign-out-btn:hover {
-  background: #d6e4f7;
+  background: var(--rr-hover-alt);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* P-8: global search box in the app header. */
+.global-search {
+  position: relative;
+  flex: 1 1 320px;
+  max-width: 420px;
+  margin: 0 16px;
+}
+
+.global-search-input {
+  width: 100%;
+  min-height: 44px;
+  box-sizing: border-box;
+  border: 1px solid var(--rr-border-strong);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 0.95em;
+}
+
+.global-search-input:focus-visible {
+  outline: 3px solid var(--rr-focus);
+  outline-offset: 2px;
+}
+
+.global-search-results {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(23, 32, 51, 0.16);
+  padding: 6px;
+}
+
+.global-search-status {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--rr-text-muted);
+  font-size: 0.9em;
+}
+
+.global-search-group-label {
+  padding: 8px 12px 2px;
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--rr-accent);
+}
+
+.global-search-result {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-height: 44px;
+  box-sizing: border-box;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.global-search-result:hover,
+.global-search-result:focus-visible {
+  background: var(--rr-surface-alt);
+  outline: none;
+}
+
+.global-search-result-title {
+  font-weight: 700;
+}
+
+.global-search-result-subtitle {
+  font-size: 0.85em;
+  color: var(--rr-text-muted);
+}
+
+.search-result-highlight {
+  outline: 3px solid var(--rr-highlight);
+  outline-offset: 2px;
+  transition: outline-color 0.3s ease;
+}
+
+@media (max-width: 720px) {
+  .app-header { flex-wrap: wrap; gap: 12px; }
+  .global-search { flex: 1 1 100%; max-width: none; margin: 0; order: 3; }
 }
 
 .header-actions {
@@ -290,12 +545,12 @@ a.primary:focus-visible {
 
 .module-item {
   padding: 8px 0;
-  border-bottom: 1px solid #dce5f2;
+  border-bottom: 1px solid var(--rr-border);
 }
 
 .item-subtitle {
   font-size: 0.9em;
-  color: #666;
+  color: var(--rr-text-muted);
   display: block;
 }
 
@@ -305,7 +560,7 @@ a.primary:focus-visible {
 }
 
 .shift-item {
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 8px;
   padding: 12px;
   display: grid;
@@ -318,24 +573,24 @@ a.primary:focus-visible {
 
 .validation-result {
   padding: 12px;
-  background: #f0f8ff;
+  background: var(--rr-validation-bg);
   border-radius: 8px;
   margin-bottom: 12px;
 }
 
 .validation-success {
-  color: green;
+  color: var(--rr-validation-success-text);
   font-weight: bold;
 }
 
 .validation-error {
-  color: red;
+  color: var(--rr-validation-error-text);
   font-weight: bold;
 }
 
 .validation-issues {
   margin-top: 8px;
-  color: #d32f2f;
+  color: var(--rr-danger);
 }
 
 .issue-item {
@@ -343,7 +598,7 @@ a.primary:focus-visible {
 }
 
 .osha-warning {
-  color: #d32f2f;
+  color: var(--rr-danger);
   font-weight: bold;
   margin-top: 4px;
   display: block;
@@ -362,7 +617,7 @@ a.primary:focus-visible {
 }
 
 .rr-error {
-  color: #d32f2f;
+  color: var(--rr-danger);
 }
 
 /* --- Report entry form (DR-13) & manager review inbox detail pane (DR-14) --
@@ -372,10 +627,10 @@ a.primary:focus-visible {
 
 .report-form-area {
   margin-top: 16px;
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 18px;
   padding: 20px;
-  background: #f9fbfe;
+  background: var(--rr-surface-muted);
   display: grid;
   gap: 16px;
 }
@@ -392,8 +647,8 @@ a.primary:focus-visible {
 }
 
 .report-form-banner {
-  border: 1px solid #f0a0a0;
-  background: #fff1f1;
+  border: 1px solid var(--rr-danger-border);
+  background: var(--rr-danger-bg);
   border-radius: 10px;
   padding: 10px 14px;
   display: grid;
@@ -411,15 +666,15 @@ a.primary:focus-visible {
 }
 
 .report-step-btn {
-  background: #eef4ff;
-  color: #173b72;
-  border: 1px solid #b9c7d9;
+  background: var(--rr-surface-alt);
+  color: var(--rr-accent-strong);
+  border: 1px solid var(--rr-border-strong);
 }
 
 .report-step-btn.active {
-  background: #1c6dd0;
-  color: #ffffff;
-  border-color: #1c6dd0;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+  border-color: var(--rr-accent);
 }
 
 .report-step-nav {
@@ -434,6 +689,16 @@ a.primary:focus-visible {
   padding: 0;
   display: grid;
   gap: 6px;
+}
+
+/* P-7: the incident capture form's fieldRow() (app.js) wraps each control
+   in a label the same way .report-form label / .inline-form label already
+   do, for a programmatically associated name -- this rule just gives that
+   wrapping label the same stacked layout those two already have. */
+.report-field > label {
+  display: grid;
+  gap: 6px;
+  font-weight: 700;
 }
 
 .report-field legend {
@@ -476,8 +741,8 @@ a.primary:focus-visible {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: #ffffff;
-  border: 1px solid #dce5f2;
+  background: var(--rr-surface);
+  border: 1px solid var(--rr-border);
   border-radius: 12px;
   padding: 12px;
   box-shadow: 0 -6px 16px rgba(23, 32, 51, 0.06);
@@ -485,7 +750,7 @@ a.primary:focus-visible {
 
 .report-form-status {
   font-size: 0.9em;
-  color: #52647a;
+  color: var(--rr-text-muted);
   margin-right: auto;
 }
 
@@ -525,8 +790,8 @@ a.primary:focus-visible {
 }
 
 .report-validation-warnings {
-  border: 1px solid #f2c36b;
-  background: #fff8e8;
+  border: 1px solid var(--rr-caution-border);
+  background: var(--rr-warning-bg);
   border-radius: 10px;
   padding: 10px 14px;
   display: grid;
@@ -567,10 +832,10 @@ a.primary:focus-visible {
 .inline-form {
   display: grid;
   gap: 10px;
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 14px;
   padding: 16px;
-  background: #f9fbfe;
+  background: var(--rr-surface-muted);
 }
 
 .inline-form label {
@@ -584,7 +849,7 @@ a.primary:focus-visible {
   min-height: 70px;
   font-family: inherit;
   resize: vertical;
-  border: 1px solid #b9c7d9;
+  border: 1px solid var(--rr-border-strong);
   border-radius: 10px;
   padding: 10px;
 }
@@ -605,18 +870,18 @@ a.primary:focus-visible {
 }
 
 .chip {
-  background: #eef4ff;
-  color: #173b72;
-  border: 1px solid #b9c7d9;
+  background: var(--rr-surface-alt);
+  color: var(--rr-accent-strong);
+  border: 1px solid var(--rr-border-strong);
   border-radius: 999px;
   padding: 6px 14px;
   font-size: 0.9em;
 }
 
 .chip.active {
-  background: #1c6dd0;
-  color: #ffffff;
-  border-color: #1c6dd0;
+  background: var(--rr-accent);
+  color: var(--rr-accent-contrast);
+  border-color: var(--rr-accent);
 }
 
 .pagination-bar {
@@ -626,7 +891,7 @@ a.primary:focus-visible {
 }
 
 .pagination-status {
-  color: #52647a;
+  color: var(--rr-text-muted);
   font-size: 0.9em;
 }
 
@@ -640,23 +905,23 @@ a.primary:focus-visible {
 }
 
 .badge-danger {
-  background: #fde3e3;
-  color: #a12727;
+  background: var(--rr-badge-danger-bg);
+  color: var(--rr-badge-danger-text);
 }
 
 .badge-warning {
-  background: #fff2cf;
-  color: #7a5b09;
+  background: var(--rr-badge-warning-bg);
+  color: var(--rr-badge-warning-text);
 }
 
 .badge-success {
-  background: #dff3e4;
-  color: #1f6b34;
+  background: var(--rr-badge-success-bg);
+  color: var(--rr-badge-success-text);
 }
 
 .badge-info {
-  background: #e4ecfb;
-  color: #1c4d8f;
+  background: var(--rr-badge-info-bg);
+  color: var(--rr-badge-info-text);
 }
 
 .badge-row {
@@ -697,10 +962,10 @@ a.primary:focus-visible {
   display: grid;
   gap: 8px;
   align-content: start;
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 14px;
   padding: 12px;
-  background: #f9fbfe;
+  background: var(--rr-surface-muted);
   min-width: 0;
 }
 
@@ -711,10 +976,10 @@ a.primary:focus-visible {
 .shift-card {
   display: grid;
   gap: 6px;
-  border: 1px solid #dce5f2;
+  border: 1px solid var(--rr-border);
   border-radius: 12px;
   padding: 10px;
-  background: #ffffff;
+  background: var(--rr-surface);
 }
 
 @media (max-width: 900px) {

@@ -204,6 +204,13 @@ test("GET /search's messages leg ors subject/body_text", async (t) => {
   assert.equal(leg.url.searchParams.get("limit"), "10");
 });
 
+test("sanitizeSearchQuery keeps letters and digits from any script and still strips reserved characters", () => {
+  assert.equal(sanitizeSearchQuery("José"), "José");
+  assert.equal(sanitizeSearchQuery("北京 pool"), "北京 pool");
+  assert.equal(sanitizeSearchQuery("café,(x)*"), "caféx");
+  assert.equal(sanitizeSearchQuery("Ünïcödé.\"quote\""), "Ünïcödéquote");
+});
+
 test("GET /search strips reserved characters out of q before it reaches any leg's or filter", async (t) => {
   const captured = stubFetch(t, () => []);
   const { call } = mount({ memberships: ALL_ACCESS });

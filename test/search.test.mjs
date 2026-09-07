@@ -46,6 +46,12 @@ test("sanitizeQuery rejects empty, null, undefined, and non-string input", () =>
   assert.equal(sanitizeQuery(42), null);
 });
 
+test("sanitizeQuery keeps non-ASCII letters and digits", () => {
+  assert.equal(sanitizeQuery("José"), "José");
+  assert.equal(sanitizeQuery("北京"), "北京");
+  assert.equal(sanitizeQuery("café,(x)"), "caféx");
+});
+
 test("sanitizeQuery rejects a query that strips down to nothing", () => {
   assert.equal(sanitizeQuery(",.()*"), null);
 });

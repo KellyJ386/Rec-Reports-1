@@ -91,7 +91,11 @@ const LEGS = [
 // enforces.
 export function sanitizeSearchQuery(raw) {
   const trimmed = typeof raw === "string" ? raw.trim() : "";
-  const stripped = trimmed.replace(/[^\w\s-]/g, "");
+  // Unicode-aware: letters and digits in any script survive (an employee
+  // called "José" or a location in another language must be searchable);
+  // everything else -- including every character PostgREST's filter grammar
+  // reserves -- is removed.
+  const stripped = trimmed.replace(/[^\p{L}\p{N}_\s-]/gu, "");
   if (stripped.length < MIN_QUERY_LENGTH || stripped.length > MAX_QUERY_LENGTH) return null;
   return stripped;
 }
