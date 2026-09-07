@@ -11,7 +11,12 @@ import {
   INCIDENT_REPORT_TYPES,
   INCIDENT_SEVERITIES,
   FOLLOWUP_ACTION_TYPES,
-  AMENDABLE_INCIDENT_FIELDS
+  AMENDABLE_INCIDENT_FIELDS,
+  INCIDENT_PERSON_ROLES,
+  validatePersonInput,
+  buildPersonPayload,
+  validateStatementInput,
+  buildStatementPayload
 } from "./incident-form.mjs";
 import { paginate } from "./list-pagination.mjs";
 import {
@@ -1803,10 +1808,8 @@ const schedulePanel = (function () {
 // --- Incidents module (IN-10) -------------------------------------------------
 // Capture form (draft -> submit), paginated list, and a detail view: status +
 // submit/status actions, follow-ups (create/complete), escalation history
-// (acknowledge/resolve), amendment history (clearly labeled immutable), and
-// attachments. A "People involved" section is intentionally a placeholder --
-// no incident_people/witness API exists anywhere in this codebase yet
-// (IN-12 is unbuilt), so nothing is fabricated for it.
+// (acknowledge/resolve), amendment history (clearly labeled immutable),
+// people involved + witness statement history (IN-12), and attachments.
 const incidentsPanel = (function () {
   const state = {
     items: [],
@@ -1831,7 +1834,20 @@ const incidentsPanel = (function () {
     amendmentsError: null,
     amendOpen: false,
     amendFields: { reason: "", patch: {} },
-    amendErrors: {}
+    amendErrors: {},
+    // IN-12: people involved + their witness statement history.
+    people: [],
+    peopleError: null,
+    personOpen: false,
+    personFields: { personRole: "", fullName: "" },
+    personErrors: {},
+    // Statement history/composer state, keyed by person id, so multiple
+    // people's histories can be loaded/expanded independently.
+    statementsByPersonId: {},
+    statementErrorsByPersonId: {},
+    openPersonId: null,
+    statementFieldByPersonId: {},
+    statementFieldErrorsByPersonId: {}
   };
 
   function emptyCaptureFields() {
@@ -1880,6 +1896,16 @@ const incidentsPanel = (function () {
     state.followups = [];
     state.escalations = [];
     state.amendments = [];
+    state.people = [];
+    state.peopleError = null;
+    state.personOpen = false;
+    state.personFields = { personRole: "", fullName: "" };
+    state.personErrors = {};
+    state.statementsByPersonId = {};
+    state.statementErrorsByPersonId = {};
+    state.openPersonId = null;
+    state.statementFieldByPersonId = {};
+    state.statementFieldErrorsByPersonId = {};
     const host = container();
     if (host) host.textContent = "";
   }
@@ -1920,6 +1946,16 @@ const incidentsPanel = (function () {
     state.escalationsError = null;
     state.amendments = [];
     state.amendmentsError = null;
+    state.people = [];
+    state.peopleError = null;
+    state.personOpen = false;
+    state.personFields = { personRole: "", fullName: "" };
+    state.personErrors = {};
+    state.statementsByPersonId = {};
+    state.statementErrorsByPersonId = {};
+    state.openPersonId = null;
+    state.statementFieldByPersonId = {};
+    state.statementFieldErrorsByPersonId = {};
     render();
     try {
       state.detail = await apiFetch(`/incidents/${id}`);
@@ -1948,6 +1984,7 @@ const incidentsPanel = (function () {
     } catch (error) {
       state.escalationsError = error.message;
     }
+    await loadPeople();
     render();
   }
 
@@ -1955,6 +1992,121 @@ const incidentsPanel = (function () {
     state.detailId = null;
     state.detail = null;
     render();
+  }
+
+  // --- People / witness statements (IN-12) ----------------------------------
+  async function loadPeople() {
+    if (!currentFacility || !state.detailId) return;
+    try {
+      state.people = (await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people`)) || [];
+      state.peopleError = null;
+    } catch (error) {
+      state.peopleError = error.message;
+    }
+  }
+
+  async function submitPerson() {
+    const validation = validatePersonInput(state.personFields);
+    state.personErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people`, {
+        method: "POST",
+        body: buildPersonPayload(state.personFields)
+      });
+      state.people.push(created);
+      state.personOpen = false;
+      state.personFields = { personRole: "", fullName: "" };
+      state.personErrors = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function removePerson(personId) {
+    try {
+      await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}`, {
+        method: "DELETE"
+      });
+      state.people = state.people.filter((p) => p.id !== personId);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function togglePersonStatements(personId) {
+    if (state.openPersonId === personId) {
+      state.openPersonId = null;
+      render();
+      return;
+    }
+    state.openPersonId = personId;
+    if (!state.statementFieldByPersonId[personId]) {
+      state.statementFieldByPersonId[personId] = { statementText: "" };
+    }
+    render();
+    if (!state.statementsByPersonId[personId]) {
+      try {
+        state.statementsByPersonId[personId] =
+          (await apiFetch(
+            `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements`
+          )) || [];
+        delete state.statementErrorsByPersonId[personId];
+      } catch (error) {
+        state.statementErrorsByPersonId[personId] = error.message;
+      }
+      render();
+    }
+  }
+
+  async function submitStatement(personId) {
+    const fields = state.statementFieldByPersonId[personId] || { statementText: "" };
+    const validation = validateStatementInput(fields);
+    state.statementFieldErrorsByPersonId[personId] = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(
+        `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements`,
+        { method: "POST", body: buildStatementPayload(fields) }
+      );
+      const existing = state.statementsByPersonId[personId] || [];
+      state.statementsByPersonId[personId] = [...existing, created];
+      state.statementFieldByPersonId[personId] = { statementText: "" };
+      state.statementFieldErrorsByPersonId[personId] = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function signStatement(personId, statementId) {
+    try {
+      const updated = await apiFetch(
+        `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements/${statementId}/sign`,
+        { method: "POST" }
+      );
+      const existing = state.statementsByPersonId[personId] || [];
+      state.statementsByPersonId[personId] = existing.map((s) => (s.id === statementId ? updated : s));
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
   }
 
   async function submitIncident() {
@@ -2232,6 +2384,130 @@ const incidentsPanel = (function () {
     return wrap;
   }
 
+  // --- People / witness statements (IN-12) ----------------------------------
+  function buildPersonForm() {
+    const wrap = el("div", { class: "inline-form" });
+    const roleSelect = document.createElement("select");
+    roleSelect.append(el("option", { value: "" }, "Role"));
+    for (const role of INCIDENT_PERSON_ROLES) {
+      const opt = el("option", { value: role }, role.replace(/_/g, " "));
+      if (state.personFields.personRole === role) opt.selected = true;
+      roleSelect.append(opt);
+    }
+    roleSelect.addEventListener("change", () => (state.personFields.personRole = roleSelect.value));
+    const nameInput = el("input", { type: "text", placeholder: "Full name", value: state.personFields.fullName });
+    nameInput.addEventListener("input", () => (state.personFields.fullName = nameInput.value));
+    const errorText = [state.personErrors.personRole, state.personErrors.fullName].filter(Boolean).join(" ");
+    const errorEl = el("p", { class: "rr-error" }, errorText);
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Add person");
+    submitBtn.addEventListener("click", () => submitPerson());
+    wrap.append(roleSelect, nameInput, submitBtn, errorEl);
+    return wrap;
+  }
+
+  // contact_json is an open, free-form object -- rendered as
+  // "key: value" pairs joined by commas rather than assuming any particular
+  // shape, since nothing in the schema constrains its keys.
+  function formatContact(contactJson) {
+    const entries = Object.entries(contactJson || {});
+    if (entries.length === 0) return "No contact info on file.";
+    return entries.map(([key, value]) => `${key}: ${value}`).join(", ");
+  }
+
+  function buildStatementComposer(personId) {
+    const fields = state.statementFieldByPersonId[personId] || { statementText: "" };
+    const errors = state.statementFieldErrorsByPersonId[personId] || {};
+    const wrap = el("div", { class: "inline-form" });
+    const textarea = document.createElement("textarea");
+    textarea.placeholder = "Statement text";
+    textarea.value = fields.statementText;
+    textarea.addEventListener("input", () => (fields.statementText = textarea.value));
+    state.statementFieldByPersonId[personId] = fields;
+    if (errors.statementText) wrap.append(el("p", { class: "rr-error" }, errors.statementText));
+    const submitBtn = el("button", { type: "button" }, "Add statement");
+    submitBtn.addEventListener("click", () => submitStatement(personId));
+    wrap.append(textarea, submitBtn);
+    return wrap;
+  }
+
+  function buildStatementHistory(person) {
+    const wrap = el("div", { class: "module-section" });
+    const statementError = state.statementErrorsByPersonId[person.id];
+    if (statementError) wrap.append(el("p", { class: "rr-error" }, statementError));
+    const statements = state.statementsByPersonId[person.id];
+    if (!statements) {
+      wrap.append(el("p", { class: "item-subtitle" }, "Loading statements…"));
+      return wrap;
+    }
+    if (statements.length === 0) {
+      wrap.append(el("p", { class: "item-subtitle" }, "No statements recorded yet."));
+    }
+    const anySigned = statements.some((s) => s.signed_at);
+    for (const statement of statements) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `Version ${statement.version_no}`));
+      row.append(el("div", { class: "item-subtitle" }, statement.statement_text));
+      row.append(
+        el(
+          "div",
+          { class: "item-subtitle" },
+          statement.signed_at
+            ? `Signed ${new Date(statement.signed_at).toLocaleString()}`
+            : `Submitted ${new Date(statement.submitted_at).toLocaleString()}`
+        )
+      );
+      if (!statement.signed_at && (hasPerm("incidents.manage") || hasPerm("incidents.review"))) {
+        const signBtn = el("button", { type: "button" }, "Sign");
+        signBtn.addEventListener("click", () => signStatement(person.id, statement.id));
+        row.append(signBtn);
+      }
+      wrap.append(row);
+    }
+    if (!anySigned && (hasPerm("incidents.manage") || hasPerm("incidents.review"))) {
+      wrap.append(buildStatementComposer(person.id));
+    } else if (anySigned) {
+      wrap.append(el("p", { class: "item-subtitle" }, "A signed statement exists; no further versions may be added."));
+    }
+    return wrap;
+  }
+
+  function buildPeopleSection() {
+    const wrap = el("div", {});
+    if (state.peopleError) wrap.append(el("p", { class: "rr-error" }, state.peopleError));
+    if (state.people.length === 0) wrap.append(el("p", { class: "item-subtitle" }, "No people recorded for this incident."));
+    for (const person of state.people) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${person.full_name} · ${person.person_role.replace(/_/g, " ")}`));
+      row.append(el("div", { class: "item-subtitle" }, formatContact(person.contact_json)));
+      const rowActions = el("div", { class: "detail-actions" });
+      const historyBtn = el(
+        "button",
+        { type: "button" },
+        state.openPersonId === person.id ? "Hide statements" : "Statements"
+      );
+      historyBtn.addEventListener("click", () => togglePersonStatements(person.id));
+      rowActions.append(historyBtn);
+      if (hasPerm("incidents.manage") || hasPerm("incidents.review")) {
+        const removeBtn = el("button", { type: "button" }, "Remove");
+        removeBtn.addEventListener("click", () => removePerson(person.id));
+        rowActions.append(removeBtn);
+      }
+      row.append(rowActions);
+      if (state.openPersonId === person.id) row.append(buildStatementHistory(person));
+      wrap.append(row);
+    }
+    if (hasPerm("incidents.manage") || hasPerm("incidents.review")) {
+      const toggleBtn = el("button", { type: "button" }, state.personOpen ? "Cancel" : "Add person");
+      toggleBtn.addEventListener("click", () => {
+        state.personOpen = !state.personOpen;
+        render();
+      });
+      wrap.append(toggleBtn);
+      if (state.personOpen) wrap.append(buildPersonForm());
+    }
+    return wrap;
+  }
+
   const INCIDENT_NEXT_STATUS_CHOICES = ["under_review", "escalated", "action_pending", "closed"];
 
   function renderDetail() {
@@ -2282,7 +2558,7 @@ const incidentsPanel = (function () {
     if (actionsRow.childNodes.length > 0) panel.append(actionsRow);
 
     panel.append(el("h4", {}, "People involved"));
-    panel.append(el("p", { class: "item-subtitle" }, "Person/witness tracking isn't available in this release yet."));
+    panel.append(buildPeopleSection());
 
     panel.append(el("h4", {}, "Follow-up actions"));
     if (state.followupsError) panel.append(el("p", { class: "rr-error" }, state.followupsError));

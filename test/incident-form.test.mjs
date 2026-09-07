@@ -8,7 +8,12 @@ import {
   buildFollowupPayload,
   validateAmendmentInput,
   buildAmendmentPayload,
-  nextEscalationAction
+  nextEscalationAction,
+  INCIDENT_PERSON_ROLES,
+  validatePersonInput,
+  buildPersonPayload,
+  validateStatementInput,
+  buildStatementPayload
 } from "../src/public/js/incident-form.mjs";
 
 test("severityRequiresGating is true only for high/critical", () => {
@@ -153,4 +158,55 @@ test("nextEscalationAction maps pending->acknowledge, acknowledged->resolve, els
   assert.equal(nextEscalationAction("acknowledged"), "resolve");
   assert.equal(nextEscalationAction("resolved"), null);
   assert.equal(nextEscalationAction("expired"), null);
+});
+
+// --- People / witness statements (IN-12) ------------------------------------
+
+test("validatePersonInput requires a known personRole and a non-blank fullName", () => {
+  const bad = validatePersonInput({ personRole: "bystander", fullName: "" });
+  assert.equal(bad.valid, false);
+  assert.ok(bad.errors.personRole);
+  assert.ok(bad.errors.fullName);
+
+  for (const role of INCIDENT_PERSON_ROLES) {
+    const good = validatePersonInput({ personRole: role, fullName: "Jamie Rivera" });
+    assert.equal(good.valid, true, `${role} should be a valid personRole`);
+  }
+});
+
+test("validatePersonInput rejects a whitespace-only fullName", () => {
+  const result = validatePersonInput({ personRole: "witness", fullName: "   " });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.fullName);
+});
+
+test("buildPersonPayload trims fullName and omits empty contact/injury objects", () => {
+  const payload = buildPersonPayload({ personRole: "witness", fullName: "  Jamie Rivera  " });
+  assert.deepEqual(payload, { personRole: "witness", fullName: "Jamie Rivera" });
+});
+
+test("buildPersonPayload includes contact/injury only when they carry keys", () => {
+  const payload = buildPersonPayload({
+    personRole: "injured_party",
+    fullName: "Alex Kim",
+    contact: { phone: "555-0100" },
+    injury: { bodyPart: "wrist" }
+  });
+  assert.deepEqual(payload, {
+    personRole: "injured_party",
+    fullName: "Alex Kim",
+    contact: { phone: "555-0100" },
+    injury: { bodyPart: "wrist" }
+  });
+});
+
+test("validateStatementInput requires non-blank statementText", () => {
+  assert.equal(validateStatementInput({}).valid, false);
+  assert.equal(validateStatementInput({ statementText: "   " }).valid, false);
+  assert.equal(validateStatementInput({ statementText: "I saw it happen." }).valid, true);
+});
+
+test("buildStatementPayload trims statementText", () => {
+  const payload = buildStatementPayload({ statementText: "  I saw it happen.  " });
+  assert.deepEqual(payload, { statementText: "I saw it happen." });
 });
