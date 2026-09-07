@@ -47,6 +47,8 @@ import {
   formatComplianceSummary
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
+import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
+import { sanitizeQuery, groupResults, debounce } from "./search.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 // S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
@@ -63,6 +65,12 @@ let currentFacility = null;
 let facilities = [];
 let platformAdmin = false;
 let reportTemplatesById = new Map();
+// Full published-template rows for the active facility (as opposed to
+// reportTemplatesById's id->name lookup, used by the inbox) -- kept so the
+// home dashboard's "Submit report" quick action can jump straight into
+// startNewReport when there is exactly one template to choose from, without
+// a second fetch.
+let publishedReportTemplates = [];
 
 // Permission gating: a user without the relevant write permission must never
 // see write controls (rule applies to every panel added this batch). Platform
@@ -355,8 +363,18 @@ async function loadAllModules() {
   schedulePanel.reset();
   commsPanel.reset();
 
+  // P-3: quick actions render synchronously (permission-driven, no fetch of
+  // their own) so they're on screen immediately -- above the fold on mobile
+  // -- rather than waiting on the Promise.all below. The dashboard's summary
+  // tiles are fetched first in that Promise.all (loadHomeDashboardTiles),
+  // ahead of every module panel's own load, per the "rendered first" plan
+  // requirement; each tile's fetch is still independent of the others (see
+  // loadHomeDashboardTiles) and of every panel's own load below.
+  renderQuickActions();
+
   try {
     await Promise.all([
+      loadHomeDashboardTiles(),
       loadReports(),
       loadReportInbox(),
       schedulePanel.load(),
@@ -369,6 +387,180 @@ async function loadAllModules() {
   } catch (error) {
     console.error("Error loading modules:", error);
   }
+}
+
+// --- Home dashboard (P-3) ---------------------------------------------------
+// Quick-action buttons + summary tiles rendered above every module panel.
+// Pure selection/shaping logic lives in home-dashboard.mjs (buildQuickActions,
+// buildTiles, computeTodayShiftsForMe); everything here is I/O (apiFetch) and
+// DOM (el()) glue.
+
+// Mirrors hasPerm()'s platform-admin bypass for the fixed set of permission
+// codes home-dashboard.mjs's quick actions/tiles ever check: a platform admin
+// has no membership row (hence no `permissions` array) for a facility they
+// don't belong to, so hasPerm() special-cases them to "always allowed"
+// instead of reading `permissions` at all -- this passes the pure functions
+// below the equivalent of "every code", rather than teaching them their own
+// platformAdmin bypass.
+function homeDashboardPermissions() {
+  if (platformAdmin) return HOME_DASHBOARD_PERMISSION_CODES;
+  const facility = currentFacilityRecord();
+  return (facility && facility.permissions) || [];
+}
+
+// Scrolls a module panel into view and, since every panel is a <details>
+// (collapsed by default under 640px, see collapsePanelsOnMobile), opens it
+// first so scrolling doesn't land on a collapsed, empty-looking section.
+function revealPanel(panelId) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  if (panel.tagName === "DETAILS") panel.open = true;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function handleQuickAction(action) {
+  revealPanel(action.panelId);
+  if (action.key === "log-incident") {
+    incidentsPanel.openCreate();
+  } else if (action.key === "new-work-order") {
+    workOrdersPanel.openCreate();
+  } else if (action.key === "submit-report" && publishedReportTemplates.length === 1) {
+    // Exactly one published template: skip the extra tap and open its draft
+    // directly. With more than one, there's no single right choice --
+    // revealPanel above has already scrolled the reports panel's template
+    // list into view for the caller to pick from.
+    startNewReport(publishedReportTemplates[0]);
+  }
+}
+
+function renderQuickActions() {
+  const container = document.getElementById("home-quick-actions");
+  if (!container || !currentFacility) return;
+  container.textContent = "";
+  const actions = buildQuickActions(homeDashboardPermissions());
+  for (const action of actions) {
+    const btn = el("button", { type: "button", class: "primary quick-action-btn" }, action.label);
+    btn.addEventListener("click", () => handleQuickAction(action));
+    container.append(btn);
+  }
+}
+
+// Resolves messages that still need the caller's own acknowledgement:
+// published, is_required_ack messages this facility has, minus whichever of
+// those the caller has already acked (checked per-message via the same
+// GET .../messages/:id/acknowledgements?employeeId=me route commsPanel's own
+// seedAckStateForVisibleMessages uses). A per-message ack-check failure is
+// treated as "already acked" (excluded) rather than "still needs it", so a
+// transient error on one message never inflates the tile's count -- the
+// worst case is silently under-counting one message, not over-alarming.
+async function loadUnackedMessages() {
+  const messages = (await apiFetch(`/facilities/${currentFacility}/messages?status=published`)) || [];
+  const requiredAck = messages.filter((message) => message.is_required_ack);
+  if (requiredAck.length === 0) return [];
+  const ackedFlags = await Promise.all(
+    requiredAck.map((message) =>
+      apiFetch(`/facilities/${currentFacility}/messages/${message.id}/acknowledgements?employeeId=me`)
+        .then((rows) => ackedMessageIdsFromRows(rows).size > 0)
+        .catch(() => true)
+    )
+  );
+  return requiredAck.filter((_, index) => !ackedFlags[index]);
+}
+
+// Resolves the caller's own shifts for `today`: the current Mon-Sun period
+// (same facility-wide, department_id-null period schedulePanel's own
+// reloadWeek() selects), its shifts, and its assignments, joined down to
+// "mine, today" by home-dashboard.mjs's computeTodayShiftsForMe. Returns []
+// (not an error) when the caller has no employee record in this facility --
+// there is nothing "mine" to show, same convention as the work-orders tile.
+async function loadTodayShifts(myEmployeeId, today) {
+  if (!myEmployeeId) return [];
+  const periods = (await apiFetch(`/facilities/${currentFacility}/schedule-periods`)) || [];
+  const { weekStartDate } = weekBoundsFor(today);
+  const period = periods.find((p) => p.week_start_date === weekStartDate && !p.department_id) || null;
+  if (!period) return [];
+  const [shifts, assignments] = await Promise.all([
+    apiFetch(`/facilities/${currentFacility}/shifts?period_id=${period.id}`),
+    apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${period.id}`)
+  ]);
+  return computeTodayShiftsForMe({ shifts: shifts || [], assignments: assignments || [], myEmployeeId, today });
+}
+
+// Fires all six of the dashboard's data fetches independently (a permission
+// the caller lacks skips its fetch entirely rather than requesting a 403;
+// one that's held but fails is caught to null, which buildTiles renders as
+// "Unavailable" for just that tile -- no fetch's failure blocks another's or
+// blanks the rest of the page), then renders whatever buildTiles returns.
+async function loadHomeDashboardTiles() {
+  const container = document.getElementById("home-tiles");
+  if (!container || !currentFacility) return;
+
+  const permissions = homeDashboardPermissions();
+  const permSet = new Set(permissions);
+  const myEmployeeId = (currentFacilityRecord() || {}).employeeId || null;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [compliance, workOrders, incidents, unackedMessages, certifications, todayShifts] = await Promise.all([
+    permSet.has("reports.read")
+      ? apiFetch(`/facilities/${currentFacility}/reports/compliance?from=${today}&to=${today}`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("work_orders.read")
+      ? myEmployeeId
+        ? apiFetch(
+            `/facilities/${currentFacility}/work-orders?assignee=${encodeURIComponent(myEmployeeId)}&status=open`
+          ).catch(() => null)
+        : Promise.resolve([])
+      : Promise.resolve(null),
+    permSet.has("incidents.read")
+      ? apiFetch(`/facilities/${currentFacility}/incidents?status=submitted`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("communications.read") ? loadUnackedMessages().catch(() => null) : Promise.resolve(null),
+    apiFetch(`/facilities/${currentFacility}/employee-certifications`).catch(() => null),
+    permSet.has("schedule.read") ? loadTodayShifts(myEmployeeId, today).catch(() => null) : Promise.resolve(null)
+  ]);
+
+  renderTiles(
+    container,
+    buildTiles({ permissions, compliance, workOrders, incidents, unackedMessages, certifications, todayShifts, now: new Date() })
+  );
+}
+
+function renderTiles(container, tiles) {
+  container.textContent = "";
+  if (tiles.length === 0) {
+    container.append(el("p", { class: "item-subtitle" }, "No summary tiles available for your role yet."));
+    return;
+  }
+  for (const tile of tiles) {
+    const isUnavailable = tile.value === "Unavailable";
+    const card = el(
+      "button",
+      {
+        type: "button",
+        class: "home-tile",
+        "aria-label": `${tile.title}: ${tile.value}${tile.hint ? ", " + tile.hint : ""}`
+      },
+      [
+        el("div", { class: "home-tile-title" }, tile.title),
+        el("div", { class: isUnavailable ? "home-tile-value is-unavailable" : "home-tile-value" }, tile.value),
+        el("div", { class: "home-tile-hint" }, tile.hint)
+      ]
+    );
+    card.addEventListener("click", () => revealPanel(tile.panelId));
+    container.append(card);
+  }
+}
+
+// P-3: panels are <details>/<summary> disclosures so they can start
+// collapsed on narrow viewports without hiding them from a caller with
+// JavaScript disabled -- called once at startup (DOMContentLoaded, below),
+// not re-run on resize, matching "start collapsed" rather than "stay in sync
+// with the viewport forever".
+function collapsePanelsOnMobile() {
+  if (!window.matchMedia || window.matchMedia("(min-width: 640px)").matches) return;
+  document.querySelectorAll("main > details.panel[open]").forEach((panel) => {
+    panel.open = false;
+  });
 }
 
 // Small DOM builder used by every schema-driven view added in this batch
@@ -632,6 +824,10 @@ async function loadReports() {
       apiFetch(`/facilities/${currentFacility}/reports`)
     ]);
 
+    // GET .../report-templates defaults to ?status=published (no ?status=all
+    // here), so `templates` is already published-only -- safe to hand
+    // straight to the home dashboard's quick action.
+    publishedReportTemplates = templates || [];
     renderReportsList(container, templates || [], reports || []);
   } catch (error) {
     setError(container, error.message);
@@ -2527,7 +2723,10 @@ const incidentsPanel = (function () {
   const INCIDENT_NEXT_STATUS_CHOICES = ["under_review", "escalated", "action_pending", "closed"];
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area incident-detail" });
+    // P-8: a static id, safe because only one incident detail is ever open
+    // at a time -- lets the global search box scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area incident-detail", id: "incident-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.incident_no : "Loading incident…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -2700,7 +2899,20 @@ const incidentsPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "Report new incident" capture form (P-3's "Log incident" quick
+  // action): same gate as the toggle button in render() above, so a caller
+  // without incidents.manage silently does nothing rather than a form
+  // magically appearing that submitCapture's own POST would 403 on anyway.
+  function openCreate() {
+    if (!hasPerm("incidents.manage")) return;
+    state.captureOpen = true;
+    render();
+  }
+
+  // openDetail exposed for P-8 (global search): its own "View" button
+  // above already calls it internally; the search box's incidents leg
+  // calls the same function to deep-link into a matched incident.
+  return { load, reset, openCreate, openDetail };
 })();
 
 // --- Work orders module (WO-10) -----------------------------------------------
@@ -2962,7 +3174,10 @@ const workOrdersPanel = (function () {
   }
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area work-order-detail" });
+    // P-8: a static id (only one work order detail is ever open at a
+    // time) so the global search box can scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area work-order-detail", id: "work-order-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.title : "Loading work order…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -3105,7 +3320,17 @@ const workOrdersPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "New work order" create form (P-3's "New work order" quick
+  // action): same gate as the toggle button in render() above.
+  function openCreate() {
+    if (!hasPerm("work_orders.manage")) return;
+    state.createOpen = true;
+    render();
+  }
+
+  // openDetail exposed for P-8 (global search): the search box's work
+  // orders leg calls the same function its own "View" button uses.
+  return { load, reset, openCreate, openDetail };
 })();
 
 // --- Communications module (CM-08/CM-09/P-1) -----------------------------------
@@ -3406,7 +3631,12 @@ const commsPanel = (function () {
   }
 
   function buildMessageCard(message) {
-    const card = el("div", { class: "message-card" });
+    // P-8: an id per card (messages have no dedicated detail view the way
+    // incidents/work orders do) so the global search box can scroll to and
+    // highlight the specific card when it's on the currently rendered
+    // page; when it isn't (client-side pagination, P-1), the search box
+    // falls back to scrolling to the panel itself.
+    const card = el("div", { class: "message-card", id: `message-card-${message.id}` });
     card.append(el("strong", {}, `${message.priority} · ${message.subject}`));
     card.append(el("div", { class: "item-subtitle" }, (message.body_text || "").slice(0, 140)));
 
@@ -3609,8 +3839,200 @@ function setupSignOut() {
   });
 }
 
+// --- Global search (P-8) ----------------------------------------------------
+// Header search box: debounced GET /api/v1/search?facilityId=&q=, grouped
+// results (incidents/work orders/employees/messages, only the legs the
+// server included -- see search.mjs's groupResults), each deep-linking into
+// its panel. Every DOM node is built with el() (never innerHTML with
+// interpolation -- see el()'s doc comment above), so a result's own text
+// (an incident summary, a message subject, ...) can never be parsed as
+// markup even though it is attacker-influenced content from another user
+// in the same facility.
+
+// Container each leg's results scroll to. Employees have no dedicated list
+// panel of their own (scheduling-routes.mjs's employees endpoint backs the
+// schedule board -- see search-routes.mjs's leg comment), so that leg
+// scrolls to the schedule panel; incidents/work orders additionally open
+// their own detail view (openDetail, exposed above) once scrolled to;
+// messages have no detail view, so the specific message card is
+// highlighted instead when it's on the currently rendered page.
+const SEARCH_LEG_CONTAINER_ID = {
+  incidents: "incidents-workspace",
+  workOrders: "work-orders-workspace",
+  employees: "schedule-workspace",
+  messages: "comms-workspace"
+};
+
+function scrollElementIntoView(elementId, options) {
+  const target = document.getElementById(elementId);
+  if (target) target.scrollIntoView({ behavior: "smooth", block: "start", ...options });
+  return target;
+}
+
+// Briefly outlines `target` so a deep-linked result is visually obvious
+// after the scroll lands, then removes the outline -- a transient cue, not
+// a persistent style change.
+function flashSearchHighlight(target) {
+  if (!target) return;
+  target.classList.add("search-result-highlight");
+  setTimeout(() => target.classList.remove("search-result-highlight"), 2000);
+}
+
+function searchResultPrimaryText(legKey, item) {
+  switch (legKey) {
+    case "incidents":
+      return `${item.incident_no || "Incident"} · ${item.summary || ""}`;
+    case "workOrders":
+      return item.title || "Work order";
+    case "employees":
+      return `${item.first_name || ""} ${item.last_name || ""}`.trim() || item.employee_no || "Employee";
+    case "messages":
+      return item.subject || "Message";
+    default:
+      return "";
+  }
+}
+
+function searchResultSecondaryText(legKey, item) {
+  switch (legKey) {
+    case "incidents":
+      return item.location_text || (item.status ? `Status: ${item.status}` : "");
+    case "workOrders":
+      return item.status ? `Status: ${item.status}` : item.description || "";
+    case "employees":
+      return item.employee_no ? `#${item.employee_no}` : item.status || "";
+    case "messages":
+      return (item.body_text || "").slice(0, 100);
+    default:
+      return "";
+  }
+}
+
+// Registers the header search box: reads/writes only #global-search's own
+// subtree plus the four panel containers it deep-links into, and the
+// module-level `currentFacility` every other panel already relies on --
+// no new global state of its own.
+function setupGlobalSearch() {
+  const wrapper = document.getElementById("global-search");
+  const input = document.getElementById("global-search-input");
+  const resultsEl = document.getElementById("global-search-results");
+  if (!wrapper || !input || !resultsEl) return;
+
+  function closeResults() {
+    resultsEl.hidden = true;
+    resultsEl.textContent = "";
+    input.setAttribute("aria-expanded", "false");
+  }
+
+  function renderStatus(text, { isError = false } = {}) {
+    resultsEl.textContent = "";
+    resultsEl.append(el("p", { class: isError ? "global-search-status rr-error" : "global-search-status" }, text));
+    resultsEl.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  async function openResult(legKey, item) {
+    closeResults();
+    const container = scrollElementIntoView(SEARCH_LEG_CONTAINER_ID[legKey]);
+    if (legKey === "incidents" && incidentsPanel.openDetail) {
+      await incidentsPanel.openDetail(item.id);
+      flashSearchHighlight(scrollElementIntoView("incident-detail-panel") || container);
+    } else if (legKey === "workOrders" && workOrdersPanel.openDetail) {
+      await workOrdersPanel.openDetail(item.id);
+      flashSearchHighlight(scrollElementIntoView("work-order-detail-panel") || container);
+    } else if (legKey === "messages") {
+      const card = document.getElementById(`message-card-${item.id}`);
+      if (card) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+        flashSearchHighlight(card);
+      } else {
+        flashSearchHighlight(container);
+      }
+    } else {
+      flashSearchHighlight(container);
+    }
+  }
+
+  function renderResults(groups) {
+    resultsEl.textContent = "";
+    if (groups.length === 0) {
+      renderStatus("No matches.");
+      return;
+    }
+    for (const group of groups) {
+      resultsEl.append(el("div", { class: "global-search-group-label" }, group.label));
+      for (const item of group.items) {
+        const row = el(
+          "button",
+          { type: "button", class: "global-search-result", role: "option" },
+          [
+            el("span", { class: "global-search-result-title" }, searchResultPrimaryText(group.key, item)),
+            el("span", { class: "global-search-result-subtitle" }, searchResultSecondaryText(group.key, item))
+          ]
+        );
+        row.addEventListener("click", () => openResult(group.key, item));
+        resultsEl.append(row);
+      }
+    }
+    resultsEl.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  // Guards against an in-flight response landing after the input has moved
+  // on to a different (or cleared) query -- sanitizeQuery is a pure,
+  // deterministic function of the input's CURRENT value, so re-deriving
+  // and comparing here is enough to detect that without any request-id
+  // bookkeeping.
+  async function runSearch(rawValue) {
+    const q = sanitizeQuery(rawValue);
+    if (!q || !currentFacility) {
+      closeResults();
+      return;
+    }
+    renderStatus("Searching…");
+    try {
+      const payload = await apiFetch(`/search?facilityId=${encodeURIComponent(currentFacility)}&q=${encodeURIComponent(q)}`);
+      if (sanitizeQuery(input.value) !== q) return; // stale response
+      renderResults(groupResults(payload));
+    } catch (error) {
+      if (sanitizeQuery(input.value) !== q) return; // stale response
+      renderStatus(error.message || "Search failed", { isError: true });
+    }
+  }
+
+  // P-8: >=300ms debounce, and only ever fires for a sanitized q of at
+  // least 2 characters (sanitizeQuery's own MIN_QUERY_LENGTH) -- a shorter
+  // or entirely-reserved-characters value closes the dropdown immediately
+  // instead of debouncing a search the server would just 400 anyway.
+  const debouncedSearch = debounce(runSearch, 300);
+
+  input.addEventListener("input", (event) => {
+    const value = event.target.value;
+    if (sanitizeQuery(value) === null) {
+      debouncedSearch.cancel();
+      closeResults();
+      return;
+    }
+    debouncedSearch(value);
+  });
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      debouncedSearch.cancel();
+      closeResults();
+      input.blur();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!wrapper.contains(event.target)) closeResults();
+  });
+}
+
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
+  collapsePanelsOnMobile();
+  setupGlobalSearch();
   migrateLegacyRefreshToken().finally(initialize);
 });
