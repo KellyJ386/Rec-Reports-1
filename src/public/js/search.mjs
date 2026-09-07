@@ -13,14 +13,14 @@
 export const MIN_QUERY_LENGTH = 2;
 export const MAX_QUERY_LENGTH = 64;
 
-// Trims, then strips every character outside [\w\s-] (PostgREST's filter
+// Trims, then strips every character outside Unicode letters/digits, _, whitespace and - (PostgREST's filter
 // grammar reserves `,`, `.`, `(`, `)`, `*` -- see the server-side doc
 // comment for the full rationale), then enforces the length bound on the
 // STRIPPED result, not the raw input. Returns the sanitized string, or null
 // when it's out of bounds after stripping (too short, too long, or empty).
 export function sanitizeQuery(raw) {
   const trimmed = typeof raw === "string" ? raw.trim() : "";
-  const stripped = trimmed.replace(/[^\w\s-]/g, "");
+  const stripped = trimmed.replace(/[^\p{L}\p{N}_\s-]/gu, "");
   if (stripped.length < MIN_QUERY_LENGTH || stripped.length > MAX_QUERY_LENGTH) return null;
   return stripped;
 }
