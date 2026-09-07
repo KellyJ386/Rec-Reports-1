@@ -37,6 +37,26 @@ export function registerMeRoute(router, { authenticate, sendJson }) {
           : [];
       }
 
+      // P-3 (home dashboard): expose the caller's own employees.id per
+      // facility so the client can build "my open work orders"/"my shifts"
+      // queries without a separate GET .../employees round trip per facility.
+      // One extra select on employees by user_id, scoped to exactly the
+      // facilities /me is already returning (a platform admin's facility
+      // list, or a real member's) -- null for a facility where the caller
+      // has no employee row (an admin with no membership row there, or a
+      // member who was never onboarded as staff).
+      const facilityIds = (facilities ?? []).map((f) => f.id);
+      const employeeIdByFacility = {};
+      if (facilityIds.length) {
+        const employeeRows = await pgSelect(auth.client, "employees", {
+          filters: { user_id: auth.claims.sub, facility_id: { in: facilityIds } },
+          select: "id,facility_id"
+        });
+        for (const row of employeeRows ?? []) {
+          employeeIdByFacility[row.facility_id] = row.id;
+        }
+      }
+
       return sendJson(response, 200, {
         user: { id: auth.claims.sub, email: auth.claims.email ?? null },
         platformAdmin: auth.platformAdmin === true,
@@ -48,7 +68,8 @@ export function registerMeRoute(router, { authenticate, sendJson }) {
           // organization picker without a second round trip (and without the
           // user pasting an organization UUID by hand).
           organizationName: f.organizations?.name ?? null,
-          permissions: permsByFacility[f.id] ?? []
+          permissions: permsByFacility[f.id] ?? [],
+          employeeId: employeeIdByFacility[f.id] ?? null
         }))
       });
     })()
