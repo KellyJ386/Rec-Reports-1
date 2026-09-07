@@ -78,7 +78,6 @@ export function registerFormsRoutes(router, { authenticate, sendJson, readBody }
     return true;
   }
 
-
   // --- Custom fields ---------------------------------------------------------
   router.register(
     "GET",

@@ -30,6 +30,12 @@ import { PostgrestError } from "../supabase-rest.mjs";
 //   404 with body.code === "PGRST205" (PostgREST's "could not find the
 //     table/view in the schema cache" -- an unknown table, i.e. a typo or a
 //     migration that never ran) -> 500 (a server bug, never a client error)
+//   any status whose body.code is a QUERY-SHAPE error (below) -> 500: these
+//     mean the query the route built is broken (undefined column/table/
+//     function, a malformed PostgREST filter), which is never the caller's
+//     fault and must stay a reported server error -- otherwise a stale
+//     column name after a migration would surface as "invalid request",
+//     look like the client's mistake, and never reach observability.
 //   everything else                          -> 500
 //
 // Returns null when `error` is not a PostgrestError at all, so every call
@@ -37,18 +43,47 @@ import { PostgrestError } from "../supabase-rest.mjs";
 //   const translated = translatePostgrestError(error);
 //   if (translated && translated.status < 500) { ...respond, don't rethrow... }
 //   else { ...rethrow/report, exactly as before this function existed... }
+// Postgres SQLSTATEs and PostgREST codes that indicate the route's own query
+// is malformed rather than the caller's input: 42703 undefined_column,
+// 42P01 undefined_table, 42883 undefined_function, 42601 syntax_error,
+// 42P10 invalid_column_reference (bad ORDER/ON CONFLICT target), 42804
+// datatype_mismatch, PGRST100 (unparsable filter/order/select syntax),
+// PGRST102 (unparsable request body), PGRST200/201/203/204 (unknown
+// embedded relationship or column in select/on_conflict), PGRST205
+// (unknown table/view). PostgREST puts the code in body.code for both
+// families. The list is intentionally explicit rather than "everything
+// starting with 42" so a genuine caller-supplied bad value (e.g. 22P02
+// invalid_text_representation for a non-uuid id) still maps to 400.
+const QUERY_SHAPE_CODES = new Set([
+  "42703",
+  "42P01",
+  "42883",
+  "42601",
+  "42P10",
+  "42804",
+  "PGRST100",
+  "PGRST102",
+  "PGRST200",
+  "PGRST201",
+  "PGRST203",
+  "PGRST204",
+  "PGRST205"
+]);
+
+export function isQueryShapeError(error) {
+  return error instanceof PostgrestError && QUERY_SHAPE_CODES.has(String(error.body?.code ?? ""));
+}
+
 export function translatePostgrestError(error) {
   if (!(error instanceof PostgrestError)) return null;
 
+  if (isQueryShapeError(error)) return { status: 500, body: { error: "internal server error" } };
   if (error.status === 409) return { status: 409, body: { error: "conflict" } };
   if (error.status === 400 || error.status === 422) {
     return { status: 400, body: { error: "invalid request" } };
   }
   if (error.status === 401) return { status: 401, body: { error: "unauthorized" } };
   if (error.status === 403) return { status: 403, body: { error: "forbidden" } };
-  if (error.status === 404 && error.body?.code === "PGRST205") {
-    return { status: 500, body: { error: "internal server error" } };
-  }
   return { status: 500, body: { error: "internal server error" } };
 }
 
