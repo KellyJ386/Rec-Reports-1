@@ -840,6 +840,277 @@ test("PATCH work-order rejects a cross-facility assigned_to_employee_id with 400
   assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "PATCH"), "must not attempt the update");
 });
 
+// --- WO-15: SLA fields (server-derived sla_due_at, rejected client writes,
+// first_response_at stamping, list filter) ----------------------------------
+
+test("POST work-orders derives sla_due_at from the resolved workOrders SLA config, ignoring due_at", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "modules" && method === "GET") return [{ id: "mod-wo", code: "work_orders" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings" && method === "GET") return [];
+    if (table === "facility_module_overrides" && method === "GET") {
+      return [{ config_patch_jsonb: { "workOrders.slaHoursUrgent": 6 } }];
+    }
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const before = Date.now();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    due_at: "2099-01-01T00:00:00Z"
+  });
+  const after = Date.now();
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].due_at, "2099-01-01T00:00:00Z"); // client's human target, untouched
+  assert.ok(insert.body[0].sla_due_at, "sla_due_at should be set");
+  const slaDueAtMs = new Date(insert.body[0].sla_due_at).getTime();
+  assert.ok(slaDueAtMs >= before + 6 * 60 * 60 * 1000);
+  assert.ok(slaDueAtMs <= after + 6 * 60 * 60 * 1000);
+});
+
+test("POST work-orders rejects a client-supplied sla_due_at with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/work-orders", {
+    title: "Fix leak",
+    description: "Water leak in basement",
+    priority: "high",
+    sla_due_at: "2026-01-01T00:00:00Z"
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.errors[0], /sla_due_at/);
+  assert.equal(captured.length, 0);
+});
+
+test("POST work-orders rejects client-supplied sla_breached_at/first_response_at/resolved_at with 400", async (t) => {
+  const { call } = mount();
+  for (const field of ["sla_breached_at", "first_response_at", "resolved_at"]) {
+    const result = await call("POST", "/facilities/fac-1/work-orders", {
+      title: "Fix leak",
+      description: "Water leak in basement",
+      priority: "high",
+      [field]: "2026-01-01T00:00:00Z"
+    });
+    assert.equal(result.status, 400, `expected 400 for field ${field}`);
+    assert.match(result.payload.errors[0], new RegExp(field));
+  }
+});
+
+test("POST incidents/:id/work-orders derives sla_due_at from config even when dueAt is overridden", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    const incident = stubIncident(table, method, { severity: "high" });
+    if (incident) return incident;
+    if (table === "modules" && method === "GET") return [{ id: "mod-wo", code: "work_orders" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings" && method === "GET") return [];
+    if (table === "facility_module_overrides" && method === "GET") return [];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { dueAt: "2099-06-01T00:00:00Z" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].due_at, "2099-06-01T00:00:00Z");
+  assert.notEqual(insert.body[0].sla_due_at, "2099-06-01T00:00:00Z");
+  assert.ok(insert.body[0].sla_due_at, "sla_due_at should still be set from config");
+});
+
+test("POST incidents/:id/work-orders rejects a client-supplied sla_due_at with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: INCIDENT_AND_WO_MANAGER });
+  const result = await call("POST", "/incidents/inc-1/work-orders", { sla_due_at: "2026-01-01T00:00:00Z" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH work-order rejects a client-supplied sla_breached_at with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { sla_breached_at: "2026-01-01T00:00:00Z" });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.errors[0], /sla_breached_at/);
+  assert.equal(captured.length, 0);
+});
+
+test("PATCH work-order rejects sla_due_at/first_response_at/resolved_at in the body with 400", async (t) => {
+  const { call } = mount();
+  for (const field of ["sla_due_at", "first_response_at", "resolved_at"]) {
+    const result = await call("PATCH", "/work-orders/wo-1", { [field]: "2026-01-01T00:00:00Z" });
+    assert.equal(result.status, 400, `expected 400 for field ${field}`);
+  }
+});
+
+test("PATCH work-order stamps first_response_at on the first status change off open", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "open", first_response_at: null }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "in_progress" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.ok(patch.body.first_response_at, "first_response_at should be stamped");
+});
+
+test("PATCH work-order does not re-stamp first_response_at once already set", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [
+        {
+          id: "wo-1",
+          facility_id: "fac-1",
+          status: "open",
+          first_response_at: "2026-01-01T00:00:00Z"
+        }
+      ];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "in_progress" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.first_response_at, undefined);
+});
+
+test("PATCH work-order stamps resolved_at on entering resolved and preserves it through resolved -> closed", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", status: "in_progress", priority: "medium" }];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "resolved" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "resolved" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.ok(patch.body.resolved_at, "resolved_at should be stamped on resolve");
+});
+
+test("PATCH work-order clears resolved_at when reopening", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [
+        { id: "wo-1", facility_id: "fac-1", status: "resolved", resolved_at: "2026-01-01T00:00:00Z" }
+      ];
+    }
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", status: "in_progress" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.resolved_at, null);
+});
+
+test("POST work-order updates stamps first_response_at on the first comment", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", first_response_at: null }];
+    }
+    if (table === "work_order_updates" && method === "POST") {
+      return [{ id: "u-1", update_type: "comment", body: "hi" }];
+    }
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "hi" });
+  assert.equal(result.status, 201);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.ok(patch, "expected a work_orders PATCH stamping first_response_at");
+  assert.ok(patch.body.first_response_at);
+});
+
+test("POST work-order updates does not re-stamp first_response_at once already set", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", first_response_at: "2026-01-01T00:00:00Z" }];
+    }
+    if (table === "work_order_updates" && method === "POST") {
+      return [{ id: "u-1", update_type: "comment", body: "hi" }];
+    }
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/work-orders/wo-1/updates", { body: "hi" });
+  assert.equal(result.status, 201);
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "PATCH"));
+});
+
+test("GET work-order by id exposes an sla state alongside the row", async (t) => {
+  stubFetch(t, (table) =>
+    table === "work_orders"
+      ? [{ id: "wo-1", facility_id: "fac-1", sla_due_at: "2099-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z" }]
+      : []
+  );
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/work-orders/wo-1");
+  assert.equal(result.status, 200);
+  assert.ok(result.payload.sla, "expected an sla object on the detail response");
+  assert.equal(result.payload.sla.state, "on_track");
+});
+
+test("GET work-orders exposes sla on every listed row", async (t) => {
+  stubFetch(t, (table) =>
+    table === "work_orders" ? [{ id: "wo-1", facility_id: "fac-1", sla_due_at: null }] : []
+  );
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload[0].sla, { state: "on_track", dueAt: null, remainingHours: null });
+});
+
+test("GET work-orders?sla=breached filters on the durable sla_breached_at stamp via SQL", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  await call("GET", "/facilities/fac-1/work-orders?sla=breached");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("sla_breached_at"), "not.is.null");
+});
+
+test("GET work-orders?sla=at_risk over-fetches candidates and filters/paginates in JS", async (t) => {
+  const now = new Date();
+  const past = new Date(now.getTime() - 1000).toISOString(); // already breached window edge case guard
+  const atRisk = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString(); // 2h out, under the 4h floor
+  const onTrack = new Date(now.getTime() + 30 * 60 * 60 * 1000).toISOString(); // 30h out
+  const captured = stubFetch(t, (table) =>
+    table === "work_orders"
+      ? [
+          { id: "wo-risk", facility_id: "fac-1", status: "open", sla_due_at: atRisk, created_at: past },
+          { id: "wo-safe", facility_id: "fac-1", status: "open", sla_due_at: onTrack, created_at: past }
+        ]
+      : []
+  );
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?sla=at_risk");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  assert.equal(result.payload[0].id, "wo-risk");
+  const get = captured.find((c) => c.table === "work_orders");
+  assert.equal(get.url.searchParams.get("sla_breached_at"), "is.null");
+  assert.equal(get.url.searchParams.get("sla_due_at"), "not.is.null");
+  assert.match(get.url.search, /status=in\.%28open%2Cin_progress%2Con_hold%29|status=in\.\(open,in_progress,on_hold\)/);
+});
+
+test("GET work-orders?sla=bogus 400s before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/work-orders?sla=bogus");
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
 test("POST incidents/:id/work-orders rejects a cross-facility assignee override with 400, not a 500", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     const incident = stubIncident(table, method);

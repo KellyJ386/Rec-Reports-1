@@ -414,6 +414,23 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           successorId = (successorRows ?? [])[0]?.id ?? null;
         }
 
+        // WO-21: pending/failed counts across this submission's own
+        // report_workflow_events ledger (DR-19, 0053) -- lets the review UI
+        // surface "a workflow-minted work order/incident is still queued" or
+        // "one failed and needs attention" without exposing the raw ledger
+        // rows. 'processing' counts as pending (mid-flight, not yet a
+        // terminal outcome); 'skipped'/'processed' never contributed to
+        // either counter (both are terminal, non-failing outcomes).
+        const workflowEventRows = await pgSelect(auth.client, "report_workflow_events", {
+          filters: { submission_id: submission.id, status: { in: ["pending", "processing", "failed"] } },
+          select: "status"
+        });
+        const workflow = { pending: 0, failed: 0 };
+        for (const row of workflowEventRows ?? []) {
+          if (row.status === "failed") workflow.failed += 1;
+          else workflow.pending += 1;
+        }
+
         return sendJson(response, 200, {
           submission,
           schema_json: version?.schema_json ?? null,
@@ -423,7 +440,8 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           // "Sign as <role>" buttons for, without a second round trip just
           // to read the pinned version's validation_json.
           signature_requirements: version?.validation_json?.signature_requirements ?? null,
-          successorId
+          successorId,
+          workflow
         });
       })
   );

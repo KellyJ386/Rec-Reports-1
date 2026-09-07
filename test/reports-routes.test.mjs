@@ -893,6 +893,38 @@ test("GET reports/:id/detail leaves successorId null for a non-revised row", asy
   assert.ok(!captured.some((c) => c.table === "report_submissions" && c.url.searchParams.has("revision_of")));
 });
 
+// --- WO-21: workflow pending/failed counts on the detail response ----------
+
+test("GET reports/:id/detail surfaces workflow: {pending, failed} counts from report_workflow_events", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") return [SUBMITTED_REPORT];
+    if (table === "report_template_versions" && method === "GET") return [VERSION];
+    if (table === "report_templates" && method === "GET") return [PUBLISHED_TEMPLATE];
+    if (table === "report_submission_attachments" && method === "GET") return [];
+    if (table === "report_workflow_events" && method === "GET") {
+      return [{ status: "pending" }, { status: "processing" }, { status: "failed" }, { status: "failed" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/reports/sub-1/detail");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.workflow, { pending: 2, failed: 2 });
+});
+
+test("GET reports/:id/detail reports workflow: {pending:0, failed:0} when there are no ledger rows", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") return [SUBMITTED_REPORT];
+    if (table === "report_template_versions" && method === "GET") return [VERSION];
+    if (table === "report_templates" && method === "GET") return [PUBLISHED_TEMPLATE];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/reports/sub-1/detail");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.workflow, { pending: 0, failed: 0 });
+});
+
 // --- DR-24: lock / revise ----------------------------------------------------
 
 const PUBLISHER = [{ facilityId: "fac-1", status: "active", permissions: ["reports.read", "reports.publish"] }];
