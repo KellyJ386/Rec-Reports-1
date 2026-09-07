@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import {
@@ -6,6 +6,8 @@ import {
   WORK_ORDER_PRIORITIES,
   WORK_ORDER_SOURCE_TYPES,
   OPEN_STATUSES,
+  ASSET_STATUSES,
+  ASSET_CRITICALITY_LEVELS,
   canTransition,
   applyStatusChange,
   createWorkOrderFromIncident,
@@ -18,6 +20,52 @@ const INCIDENT_READ = "incidents.read";
 
 const WORK_ORDER_COLUMNS =
   "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status,assigned_to_employee_id,due_at,completed_at,created_by,created_at,updated_at";
+
+// WO-12: the assets registry (WO-11/0059) lives in this same file, not a
+// dedicated assets-routes.mjs module. It shares this file's permission
+// codes (see the header comment above the asset route registrations below
+// for the full "why work_orders.read/.manage, not a new assets.* code"
+// rationale), its resolveFacilityRefs/FACILITY_REF_TABLES helper for
+// department_id, and its PostgrestError-409-on-unique-violation convention
+// -- keeping it here avoids re-deriving all of that in a second file for a
+// table that has been part of this module's schema (0005) since day one.
+const ASSET_COLUMNS =
+  "id,facility_id,department_id,asset_tag,name,location_text,status,category,criticality,metadata,install_date,warranty_expires_at,created_at,updated_at";
+const ASSET_STATUS_SET = new Set(ASSET_STATUSES);
+const ASSET_CRITICALITY_SET = new Set(ASSET_CRITICALITY_LEVELS);
+
+// Same [\p{L}\p{N}_\s-] sanitizer and 2-64 length bound as
+// search-routes.mjs's sanitizeSearchQuery (that file's own comment gives
+// the full PostgREST-filter-grammar rationale for the character class).
+// Duplicated rather than imported: this module deliberately never imports
+// from a sibling route module (see the INCIDENT_FOR_WORK_ORDER_COLUMNS
+// comment above), so every route file stays independently readable/
+// testable without cross-module coupling.
+const ASSET_QUERY_MIN_LENGTH = 2;
+const ASSET_QUERY_MAX_LENGTH = 64;
+
+function sanitizeAssetQuery(raw) {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  const stripped = trimmed.replace(/[^\p{L}\p{N}_\s-]/gu, "");
+  if (stripped.length < ASSET_QUERY_MIN_LENGTH || stripped.length > ASSET_QUERY_MAX_LENGTH) return null;
+  return stripped;
+}
+
+// Builds `(name.ilike.*q*,asset_tag.ilike.*q*)` -- q has already passed
+// through sanitizeAssetQuery by the only call site below.
+function assetQueryOrFilter(q) {
+  return `(name.ilike.*${q}*,asset_tag.ilike.*${q}*)`;
+}
+
+// A generous but bounded cap on how many of an asset's OPEN work orders are
+// fetched to compute open_work_order_count (below) -- a plain row count, not
+// pgSelect's `count` option (unused/unwired: supabase-rest.mjs's `request()`
+// never surfaces the Content-Range header a count=exact Prefer would need,
+// and wiring that through is out of scope for this migration/route slice).
+// No real facility's open-work-order backlog against a single asset is
+// expected to approach this, so `.length` against a capped id-only fetch is
+// an exact count in practice while keeping the request itself bounded.
+const OPEN_WORK_ORDER_COUNT_CAP = 1000;
 
 // Minimal incident projection needed to derive a work order (WO-03). Kept
 // separate from incidents-routes.mjs's INCIDENT_COLUMNS on purpose -- this
@@ -75,6 +123,31 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadAsset(client, assetId) {
+    const rows = await pgSelect(client, "assets", {
+      filters: { id: assetId },
+      select: ASSET_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // WO-12: "Detail response includes open_work_order_count" -- counts the
+  // asset's OPEN work orders only (OPEN_STATUSES, imported above; the same
+  // set the work-orders list route's ?overdue=true filter uses), under the
+  // SAME caller-scoped client every other query in this route file uses, so
+  // it is naturally bounded by RLS (a caller who can read this asset via
+  // work_orders.read can, by construction, also read work_orders on the same
+  // facility -- both policies key off the identical permission code).
+  async function countOpenWorkOrders(client, assetId) {
+    const rows = await pgSelect(client, "work_orders", {
+      filters: { asset_id: assetId, status: { in: OPEN_STATUSES } },
+      select: "id",
+      limit: OPEN_WORK_ORDER_COUNT_CAP
+    });
+    return (rows ?? []).length;
   }
 
   // --- WO-09: facility-scope resolution for body-supplied foreign keys ------
@@ -184,6 +257,80 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     if (!paging.ok) return { ok: false, body: { error: paging.error } };
 
     return { ok: true, filters, order, limit: paging.limit, offset: paging.offset };
+  }
+
+  // WO-12: parses ?status=/?category=/?q=/?limit=/?offset= for the assets
+  // list route, entirely from the URL (no I/O) -- mirrors parseListQuery
+  // above's validate-shape-first shape: an unknown status or an out-of-
+  // bounds q/limit/offset 400s before any fetch. category has no DB
+  // check-constraint enum (free-text, unlike status) so any non-empty value
+  // is accepted as a plain eq filter.
+  function parseAssetListQuery(qp, facilityId) {
+    const errors = [];
+    const filters = { facility_id: facilityId };
+    const extra = {};
+
+    const status = qp.get("status");
+    if (status) {
+      if (!ASSET_STATUS_SET.has(status)) errors.push(`unknown status: ${status}`);
+      else filters.status = status;
+    }
+
+    const category = qp.get("category");
+    if (category) filters.category = category;
+
+    const rawQ = qp.get("q");
+    if (rawQ !== null) {
+      const q = sanitizeAssetQuery(rawQ);
+      if (!q) {
+        errors.push(
+          `q must be ${ASSET_QUERY_MIN_LENGTH}-${ASSET_QUERY_MAX_LENGTH} characters (letters, digits, spaces, hyphens) after sanitizing`
+        );
+      } else {
+        extra.or = assetQueryOrFilter(q);
+      }
+    }
+
+    if (errors.length > 0) return { ok: false, body: { errors } };
+
+    const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT });
+    if (!paging.ok) return { ok: false, body: { error: paging.error } };
+
+    return { ok: true, filters, extra, limit: paging.limit, offset: paging.offset };
+  }
+
+  // WO-12: shape-validates the fields an asset create/update body may carry
+  // (all optional on PATCH; name is additionally required on POST, checked
+  // by each route's own caller). Never touches the network -- every route
+  // below runs this before its permission guard, same convention as
+  // parseListQuery/the work-order create-body checks above.
+  function validateAssetFields(payload, { requireName }) {
+    const errors = [];
+    if (requireName && (!payload.name || typeof payload.name !== "string" || !payload.name.trim())) {
+      errors.push("name is required");
+    } else if (payload.name !== undefined && (typeof payload.name !== "string" || !payload.name.trim())) {
+      errors.push("name must be a non-empty string");
+    }
+    if (payload.status !== undefined && !ASSET_STATUS_SET.has(payload.status)) {
+      errors.push(`unknown status: ${payload.status}`);
+    }
+    if (payload.criticality !== undefined && payload.criticality !== null && !ASSET_CRITICALITY_SET.has(payload.criticality)) {
+      errors.push(`unknown criticality: ${payload.criticality}`);
+    }
+    if (
+      payload.metadata !== undefined &&
+      payload.metadata !== null &&
+      (typeof payload.metadata !== "object" || Array.isArray(payload.metadata))
+    ) {
+      errors.push("metadata must be an object");
+    }
+    for (const field of ["install_date", "warranty_expires_at"]) {
+      const value = payload[field];
+      if (value !== undefined && value !== null && (typeof value !== "string" || Number.isNaN(new Date(value).getTime()))) {
+        errors.push(`${field} must be a valid date string`);
+      }
+    }
+    return errors;
   }
 
   // --- Work Orders -----------------------------------------------------------
@@ -524,6 +671,228 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         };
         const rows = await pgInsert(auth.client, "work_order_updates", [row], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Assets registry (WO-12) -------------------------------------------
+  // Permission decision (escalated per the plan, decided here): stays on
+  // `work_orders.read` / `work_orders.manage` rather than adding a new
+  // `assets.*` code. Reasons:
+  //   1. Assets are this module's own equipment registry (0005_work_orders.sql
+  //      created `assets` in the SAME migration as `work_orders`, and it has
+  //      carried the work_orders.read/.manage RLS policies -- never a
+  //      dedicated pair -- since day one; WO-11/0059 only added columns, it
+  //      did not touch that boundary).
+  //   2. No pilot requirement on file asks for an asset-registry-specific
+  //      role (e.g. "a technician who can edit assets but not work orders,
+  //      or vice versa") -- the plan's own WO-12 note frames this as "stay
+  //      on the existing pair unless the pilot demands otherwise", and
+  //      nothing demands otherwise yet.
+  //   3. S-5 (plans/WAVES_1_4_IMPLEMENTATION_PLAN.md): any BFF-enforced
+  //      permission code with no `has_permission()` occurrence in RLS is a
+  //      known gap the plan is actively closing (see the eight codes listed
+  //      there). Introducing a brand-new `assets.manage` code here would add
+  //      a NINTH unless it were also wired into 0059's RLS policies -- extra
+  //      migration surface this slice's own scope (purely additive columns
+  //      plus routes) does not call for. Reusing work_orders.read/.manage
+  //      keeps every asset route backed by the SAME RLS boundary the SQL
+  //      suite below (assets_registry.sql) already proves, with zero new
+  //      policy surface.
+  // If a pilot facility later needs assets and work orders split apart by
+  // role, that is a follow-up migration (new code + 0059-style policy
+  // rewrite on `assets`), not a retrofit of this decision.
+
+  // Lists an facility's assets. Supports ?status=, ?category=, ?q= (ilike on
+  // name/asset_tag, same sanitizer rules as search-routes.mjs's global
+  // search -- see sanitizeAssetQuery above), ?limit=, ?offset=. Shape
+  // validated from the URL alone before the permission guard, matching this
+  // file's work-orders list route.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/assets",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const qp = queryParams(request);
+        const query = parseAssetListQuery(qp, params.facilityId);
+        if (!query.ok) return sendJson(response, 400, query.body);
+        if (!requireRead(auth, params.facilityId, response)) return;
+        const rows = await pgSelect(auth.client, "assets", {
+          filters: query.filters,
+          extra: query.extra,
+          select: ASSET_COLUMNS,
+          order: "name.asc",
+          limit: query.limit,
+          offset: query.offset
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Creates an asset. Requires `name`; every other field is optional. A
+  // body-supplied facility_id is never read -- it always comes from the
+  // :facilityId path param. department_id is resolved against that facility
+  // (WO-09's resolveFacilityRefs, reused as-is) before insert. A
+  // `(facility_id, asset_tag)` unique violation (0005's constraint,
+  // unchanged by 0059) is caught and answered 409, never left to surface as
+  // an uncaught PostgrestError -> 500 -- mirrors training-routes.mjs's
+  // course-code conflict handling exactly.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/assets",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const shape = validateAssetFields(body.payload, { requireName: true });
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
+          department_id: body.payload.department_id
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        const row = {
+          facility_id: params.facilityId,
+          department_id: body.payload.department_id ?? null,
+          asset_tag: body.payload.asset_tag ?? null,
+          name: body.payload.name.trim(),
+          location_text: body.payload.location_text ?? null,
+          status: body.payload.status ?? "active",
+          category: body.payload.category ?? null,
+          criticality: body.payload.criticality ?? null,
+          metadata: body.payload.metadata ?? {},
+          install_date: body.payload.install_date ?? null,
+          warranty_expires_at: body.payload.warranty_expires_at ?? null
+        };
+        try {
+          const rows = await pgInsert(auth.client, "assets", [row], { returning: true });
+          return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, { error: "an asset with this tag already exists for this facility" });
+          }
+          throw err;
+        }
+      })
+  );
+
+  // Returns a single asset, plus its open work order count (WO-12's
+  // acceptance criterion). facility_id is always taken from the loaded row
+  // -- a caller cannot steer the guard by URL alone -- so a wrong/foreign id
+  // 404s before any permission is even evaluated.
+  router.register(
+    "GET",
+    "/assets/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requireRead(auth, asset.facility_id, response)) return;
+        const openWorkOrderCount = await countOpenWorkOrders(auth.client, asset.id);
+        return sendJson(response, 200, { ...asset, open_work_order_count: openWorkOrderCount });
+      })
+  );
+
+  // Updates an asset's fields (name, tag, location, department, category,
+  // criticality, metadata, lifecycle dates, and/or status). Loads the row
+  // first and guards on ITS facility (never a body-supplied one), matching
+  // every other PATCH :id route in this file. A tag collision 409s the same
+  // way the create route does.
+  router.register(
+    "PATCH",
+    "/assets/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const {
+          name,
+          asset_tag: assetTag,
+          location_text: locationText,
+          department_id: departmentId,
+          category,
+          criticality,
+          metadata,
+          install_date: installDate,
+          warranty_expires_at: warrantyExpiresAt,
+          status
+        } = body.payload;
+        if (
+          [name, assetTag, locationText, departmentId, category, criticality, metadata, installDate, warrantyExpiresAt, status].every(
+            (value) => value === undefined
+          )
+        ) {
+          return sendJson(response, 400, { error: "nothing to update" });
+        }
+        const shape = validateAssetFields(body.payload, { requireName: false });
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requirePerm(auth, asset.facility_id, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, asset.facility_id, { department_id: departmentId });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        const patch = { updated_at: new Date().toISOString() };
+        if (name !== undefined) patch.name = name.trim();
+        if (assetTag !== undefined) patch.asset_tag = assetTag;
+        if (locationText !== undefined) patch.location_text = locationText;
+        if (departmentId !== undefined) patch.department_id = departmentId;
+        if (category !== undefined) patch.category = category;
+        if (criticality !== undefined) patch.criticality = criticality;
+        if (metadata !== undefined) patch.metadata = metadata;
+        if (installDate !== undefined) patch.install_date = installDate;
+        if (warrantyExpiresAt !== undefined) patch.warranty_expires_at = warrantyExpiresAt;
+        if (status !== undefined) patch.status = status;
+
+        try {
+          const rows = await pgUpdate(auth.client, "assets", { id: params.id }, patch, { returning: true });
+          const updated = (rows ?? [])[0] ?? null;
+          if (!updated) return sendJson(response, 200, updated);
+          const openWorkOrderCount = await countOpenWorkOrders(auth.client, updated.id);
+          return sendJson(response, 200, { ...updated, open_work_order_count: openWorkOrderCount });
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, { error: "an asset with this tag already exists for this facility" });
+          }
+          throw err;
+        }
+      })
+  );
+
+  // Retires an asset (status -> 'retired'). Deliberately touches ONLY the
+  // `assets` row -- no work_orders write of any kind, so any work order
+  // still referencing this asset (open or closed) is completely unaffected;
+  // supabase/tests/assets_registry.sql and test/assets-routes.test.mjs both
+  // assert this explicitly (WO-12's "retire does not cascade-delete work
+  // orders" acceptance criterion). Idempotent-but-not-silent: retiring an
+  // already-retired asset 409s, matching
+  // incidents-people-routes.mjs's "person already removed" convention for a
+  // repeated terminal state transition, rather than silently no-op
+  // succeeding a second time.
+  router.register(
+    "POST",
+    "/assets/:id/retire",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requirePerm(auth, asset.facility_id, MANAGE, response)) return;
+        if (asset.status === "retired") return sendJson(response, 409, { error: "asset already retired" });
+
+        const rows = await pgUpdate(
+          auth.client,
+          "assets",
+          { id: params.id },
+          { status: "retired", updated_at: new Date().toISOString() },
+          { returning: true }
+        );
+        const updated = (rows ?? [])[0] ?? null;
+        if (!updated) return sendJson(response, 200, updated);
+        const openWorkOrderCount = await countOpenWorkOrders(auth.client, updated.id);
+        return sendJson(response, 200, { ...updated, open_work_order_count: openWorkOrderCount });
       })
   );
 
