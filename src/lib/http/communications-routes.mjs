@@ -1,10 +1,13 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { authCanAccessFacility, makeGuards } from "./guard.mjs";
-import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority } from "../communications.mjs";
+import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority, summarizeAckCompliance } from "../communications.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
 const READ = "communications.read";
 const PUBLISH = "communications.publish";
+
+const DEFAULT_LIST_LIMIT = 50;
+const MAX_LIST_LIMIT = 200;
 
 const MESSAGE_COLUMNS =
   "id,facility_id,channel_id,author_employee_id,message_type,subject,body_text,priority,is_required_ack,ack_due_at,published_at,created_at,updated_at";
@@ -12,6 +15,9 @@ const MESSAGE_AUDIENCES_COLUMNS = "id,facility_id,message_id,audience_type,audie
 const CHANNEL_COLUMNS = "id,facility_id,name,channel_type,department_id,shift_scoped,emergency_enabled,created_at,updated_at";
 const NOTIFICATION_PREFERENCE_COLUMNS =
   "id,facility_id,employee_id,in_app_enabled,email_enabled,sms_enabled,push_enabled,quiet_hours_start,quiet_hours_end,created_at,updated_at";
+const ACKNOWLEDGEMENT_COLUMNS =
+  "id,facility_id,message_id,employee_id,ack_state,acknowledged_at,ack_method,signature_path,created_at,updated_at";
+const RECEIPT_COLUMNS = "id,facility_id,message_id,employee_id,delivered_at,read_at,device_id,created_at";
 
 // S-8: audience_ref_id is polymorphic (0006_communications.sql:32-41) --
 // which table it points into depends on the sibling audience_type. Mirrors
@@ -53,6 +59,95 @@ async function resolveAudienceRefs(client, facilityId, items) {
   return { ok: true };
 }
 
+// P-1: shared by the CM-03 publish route and the compliance routes below --
+// both need to expand a batch of message_audiences rows into the
+// employees/roleAssignments/shiftAssignments context resolveMessageAudience
+// requires. Extracted unchanged from the publish route (see its own doc
+// comment above for the per-query rationale, which still applies here
+// verbatim): the underlying employees/memberships/shift_assignments queries
+// each run at most once no matter how many audience rows are passed in --
+// including audience rows spanning MULTIPLE messages, which is what lets
+// the facility-wide compliance-summary route batch every required-ack
+// message's audience resolution into one call instead of one query set per
+// message.
+async function loadAudienceResolutionContext(client, facilityId, audiences, { shiftWindow = null } = {}) {
+  const resolvableAudiences = [];
+  const unresolvedAudiences = [];
+  for (const audience of audiences) {
+    if (audience.audience_type === "shift" && !shiftWindow) {
+      unresolvedAudiences.push({
+        id: audience.id,
+        audienceType: audience.audience_type,
+        audienceRefId: audience.audience_ref_id,
+        reason: "shiftWindow not supplied"
+      });
+      continue;
+    }
+    resolvableAudiences.push(audience);
+  }
+
+  const needsEmployees = resolvableAudiences.some(
+    (audience) => audience.audience_type === "department" || audience.audience_type === "role"
+  );
+  const roleRefIds = [
+    ...new Set(
+      resolvableAudiences.filter((audience) => audience.audience_type === "role").map((audience) => audience.audience_ref_id)
+    )
+  ];
+  const shiftRefIds = [
+    ...new Set(
+      resolvableAudiences.filter((audience) => audience.audience_type === "shift").map((audience) => audience.audience_ref_id)
+    )
+  ];
+
+  const employees = needsEmployees
+    ? (await pgSelect(client, "employees", {
+        filters: { facility_id: facilityId },
+        select: "id,department_id,user_id"
+      })) ?? []
+    : [];
+
+  let roleAssignments = [];
+  if (roleRefIds.length > 0) {
+    const memberships =
+      (await pgSelect(client, "memberships", {
+        filters: { facility_id: facilityId, role_id: { in: roleRefIds }, status: "active" },
+        select: "user_id,role_id"
+      })) ?? [];
+    const employeeIdByUserId = new Map(employees.map((employee) => [employee.user_id, employee.id]));
+    roleAssignments = memberships
+      .map((membership) => ({
+        role_id: membership.role_id,
+        employee_id: employeeIdByUserId.get(membership.user_id) ?? null
+      }))
+      .filter((assignment) => assignment.employee_id);
+  }
+
+  let shiftAssignments = [];
+  if (shiftRefIds.length > 0) {
+    shiftAssignments =
+      (await pgSelect(client, "shift_assignments", {
+        filters: { facility_id: facilityId, shift_id: { in: shiftRefIds }, status: { in: ["pending", "approved"] } },
+        select: "shift_id,employee_id"
+      })) ?? [];
+  }
+
+  return { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments };
+}
+
+// Groups a list of rows (message_audiences/message_receipts/
+// message_acknowledgements) by their message_id column, for the
+// compliance-summary route's per-message aggregation over a batch-fetched set.
+function groupByMessageId(rows) {
+  const map = new Map();
+  for (const row of rows ?? []) {
+    const list = map.get(row.message_id) ?? [];
+    list.push(row);
+    map.set(row.message_id, list);
+  }
+  return map;
+}
+
 // Registers the end-user Communications API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
 //   authenticate(request, env) -> { claims, client, memberships, error }
@@ -63,7 +158,7 @@ async function resolveAudienceRefs(client, facilityId, items) {
 // a message requires communications.publish. Acknowledgements require communications.read.
 export function registerCommunicationRoutes(router, { authenticate, sendJson, readBody }) {
   const guards = makeGuards({ authenticate, sendJson, readBody });
-  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const { withAuth, requirePerm, parseJsonBody, queryParams, parseListLimitOffset } = guards;
   const requireRead = guards.requireRead(READ);
 
   async function loadMessage(client, messageId) {
@@ -228,68 +323,8 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         })) ?? [];
 
         const shiftWindow = body.payload.shiftWindow ?? null;
-        const resolvableAudiences = [];
-        const unresolvedAudiences = [];
-        for (const audience of audiences) {
-          if (audience.audience_type === "shift" && !shiftWindow) {
-            unresolvedAudiences.push({
-              id: audience.id,
-              audienceType: audience.audience_type,
-              audienceRefId: audience.audience_ref_id,
-              reason: "shiftWindow not supplied"
-            });
-            continue;
-          }
-          resolvableAudiences.push(audience);
-        }
-
-        const needsEmployees = resolvableAudiences.some(
-          (audience) => audience.audience_type === "department" || audience.audience_type === "role"
-        );
-        const roleRefIds = [
-          ...new Set(
-            resolvableAudiences.filter((audience) => audience.audience_type === "role").map((audience) => audience.audience_ref_id)
-          )
-        ];
-        const shiftRefIds = [
-          ...new Set(
-            resolvableAudiences
-              .filter((audience) => audience.audience_type === "shift")
-              .map((audience) => audience.audience_ref_id)
-          )
-        ];
-
-        const employees = needsEmployees
-          ? (await pgSelect(auth.client, "employees", {
-              filters: { facility_id: message.facility_id },
-              select: "id,department_id,user_id"
-            })) ?? []
-          : [];
-
-        let roleAssignments = [];
-        if (roleRefIds.length > 0) {
-          const memberships =
-            (await pgSelect(auth.client, "memberships", {
-              filters: { facility_id: message.facility_id, role_id: { in: roleRefIds }, status: "active" },
-              select: "user_id,role_id"
-            })) ?? [];
-          const employeeIdByUserId = new Map(employees.map((employee) => [employee.user_id, employee.id]));
-          roleAssignments = memberships
-            .map((membership) => ({
-              role_id: membership.role_id,
-              employee_id: employeeIdByUserId.get(membership.user_id) ?? null
-            }))
-            .filter((assignment) => assignment.employee_id);
-        }
-
-        let shiftAssignments = [];
-        if (shiftRefIds.length > 0) {
-          shiftAssignments =
-            (await pgSelect(auth.client, "shift_assignments", {
-              filters: { facility_id: message.facility_id, shift_id: { in: shiftRefIds }, status: { in: ["pending", "approved"] } },
-              select: "shift_id,employee_id"
-            })) ?? [];
-        }
+        const { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments } =
+          await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, { shiftWindow });
 
         const recipients = resolveMessageAudience(
           { audiences: resolvableAudiences },
@@ -350,6 +385,250 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         };
         const rows = await pgInsert(auth.client, "message_acknowledgements", [row], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Ack/read state + compliance (P-1: CM-09/CM-11) -------------------------
+  // A message must exist AND belong to :facilityId (404 otherwise, mirroring
+  // the publish route's own facility check) before communications.read on
+  // that facility is checked (403). `?employeeId=me` resolves the caller's
+  // own employees.id the same way every other self-service route in this
+  // file does -- a caller with no employee row in the facility is not an
+  // error here (unlike acknowledge/receipt, which are writes on the
+  // caller's own behalf): it simply has never acknowledged/received
+  // anything, so the list is empty rather than a 403 or 500.
+  async function loadFacilityMessage(client, facilityId, messageId) {
+    const message = await loadMessage(client, messageId);
+    if (!message || message.facility_id !== facilityId) return null;
+    return message;
+  }
+
+  function resolveListEmployeeFilter(qp) {
+    const value = qp.get("employeeId");
+    if (value === null) return { present: false };
+    return { present: true, isMe: value === "me", value };
+  }
+
+  router.register(
+    "GET",
+    "/facilities/:facilityId/messages/:messageId/acknowledgements",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const message = await loadFacilityMessage(auth.client, params.facilityId, params.messageId);
+        if (!message) return sendJson(response, 404, { error: "message not found" });
+        if (!requireRead(auth, params.facilityId, response)) return;
+
+        const qp = queryParams(request);
+        const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIST_LIMIT, maxLimit: MAX_LIST_LIMIT });
+        if (!paging.ok) return sendJson(response, 400, { error: paging.error });
+
+        const filters = { facility_id: params.facilityId, message_id: params.messageId };
+        const employeeFilter = resolveListEmployeeFilter(qp);
+        if (employeeFilter.present) {
+          if (employeeFilter.isMe) {
+            const employeeId = await loadCallerEmployeeId(auth.client, params.facilityId, auth.claims.sub);
+            if (!employeeId) return sendJson(response, 200, []);
+            filters.employee_id = employeeId;
+          } else {
+            filters.employee_id = employeeFilter.value;
+          }
+        }
+
+        const rows = await pgSelect(auth.client, "message_acknowledgements", {
+          filters,
+          select: ACKNOWLEDGEMENT_COLUMNS,
+          order: "created_at.desc",
+          limit: paging.limit,
+          offset: paging.offset
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  router.register(
+    "GET",
+    "/facilities/:facilityId/messages/:messageId/receipts",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const message = await loadFacilityMessage(auth.client, params.facilityId, params.messageId);
+        if (!message) return sendJson(response, 404, { error: "message not found" });
+        if (!requireRead(auth, params.facilityId, response)) return;
+
+        const qp = queryParams(request);
+        const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIST_LIMIT, maxLimit: MAX_LIST_LIMIT });
+        if (!paging.ok) return sendJson(response, 400, { error: paging.error });
+
+        const filters = { facility_id: params.facilityId, message_id: params.messageId };
+        const employeeFilter = resolveListEmployeeFilter(qp);
+        if (employeeFilter.present) {
+          if (employeeFilter.isMe) {
+            const employeeId = await loadCallerEmployeeId(auth.client, params.facilityId, auth.claims.sub);
+            if (!employeeId) return sendJson(response, 200, []);
+            filters.employee_id = employeeId;
+          } else {
+            filters.employee_id = employeeFilter.value;
+          }
+        }
+
+        const rows = await pgSelect(auth.client, "message_receipts", {
+          filters,
+          select: RECEIPT_COLUMNS,
+          order: "created_at.desc",
+          limit: paging.limit,
+          offset: paging.offset
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Per-message compliance rollup (CM-11): resolves the message's own
+  // audience (exactly like the publish route, via the shared
+  // loadAudienceResolutionContext -- a message with a 'shift' audience and
+  // no shiftWindow reports that portion unresolved, same as publish, since
+  // there is no window to evaluate a snapshot-at-publish-time schedule
+  // against here) and rolls its receipts/acknowledgements up against it with
+  // the pure summarizeAckCompliance.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/messages/:messageId/compliance",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const message = await loadFacilityMessage(auth.client, params.facilityId, params.messageId);
+        if (!message) return sendJson(response, 404, { error: "message not found" });
+        if (!requireRead(auth, params.facilityId, response)) return;
+
+        const audiences =
+          (await pgSelect(auth.client, "message_audiences", {
+            filters: { message_id: params.messageId },
+            select: MESSAGE_AUDIENCES_COLUMNS
+          })) ?? [];
+        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
+          auth.client,
+          message.facility_id,
+          audiences
+        );
+        const audienceEmployeeIds = resolveMessageAudience(
+          { audiences: resolvableAudiences },
+          { employees, roleAssignments, shiftAssignments }
+        );
+
+        const receipts =
+          (await pgSelect(auth.client, "message_receipts", {
+            filters: { message_id: params.messageId },
+            select: RECEIPT_COLUMNS
+          })) ?? [];
+        const acks =
+          (await pgSelect(auth.client, "message_acknowledgements", {
+            filters: { message_id: params.messageId },
+            select: ACKNOWLEDGEMENT_COLUMNS
+          })) ?? [];
+
+        const summary = summarizeAckCompliance(audienceEmployeeIds, receipts, acks, new Date(), {
+          isRequiredAck: !!message.is_required_ack,
+          publishedAt: message.published_at
+        });
+        return sendJson(response, 200, summary);
+      })
+  );
+
+  // Facility-wide compliance rollup (CM-11) over messages PUBLISHED in
+  // [from, to] (defaults to the last 30 days) -- draft messages never carry
+  // recipients or acks yet, so they are excluded by the published_at filter
+  // itself rather than a separate is_required_ack-only check. Batches the
+  // audience-resolution and receipt/ack queries across every required-ack
+  // message in range (via loadAudienceResolutionContext + groupByMessageId)
+  // instead of one round-trip per message.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/communications/compliance-summary",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        if (!requireRead(auth, params.facilityId, response)) return;
+
+        const qp = queryParams(request);
+        const fromParam = qp.get("from");
+        const toParam = qp.get("to");
+        if (fromParam !== null && Number.isNaN(new Date(fromParam).getTime())) {
+          return sendJson(response, 400, { error: "from must be a valid ISO date" });
+        }
+        if (toParam !== null && Number.isNaN(new Date(toParam).getTime())) {
+          return sendJson(response, 400, { error: "to must be a valid ISO date" });
+        }
+        const to = toParam ? new Date(toParam) : new Date();
+        const from = fromParam ? new Date(fromParam) : new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+        const messages =
+          (await pgSelect(auth.client, "messages", {
+            filters: {
+              facility_id: params.facilityId,
+              published_at: { gte: from.toISOString(), lte: to.toISOString() }
+            },
+            select: MESSAGE_COLUMNS
+          })) ?? [];
+
+        const requiredMessages = messages.filter((message) => message.is_required_ack);
+        if (requiredMessages.length === 0) {
+          return sendJson(response, 200, {
+            messages: messages.length,
+            requiredAck: 0,
+            acknowledged: 0,
+            pending: 0,
+            overdue: 0
+          });
+        }
+
+        const requiredMessageIds = requiredMessages.map((message) => message.id);
+        const audiences =
+          (await pgSelect(auth.client, "message_audiences", {
+            filters: { message_id: { in: requiredMessageIds } },
+            select: MESSAGE_AUDIENCES_COLUMNS
+          })) ?? [];
+        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
+          auth.client,
+          params.facilityId,
+          audiences
+        );
+        const audiencesByMessageId = groupByMessageId(resolvableAudiences);
+
+        const receipts =
+          (await pgSelect(auth.client, "message_receipts", {
+            filters: { message_id: { in: requiredMessageIds } },
+            select: RECEIPT_COLUMNS
+          })) ?? [];
+        const acks =
+          (await pgSelect(auth.client, "message_acknowledgements", {
+            filters: { message_id: { in: requiredMessageIds } },
+            select: ACKNOWLEDGEMENT_COLUMNS
+          })) ?? [];
+        const receiptsByMessageId = groupByMessageId(receipts);
+        const acksByMessageId = groupByMessageId(acks);
+
+        const now = new Date();
+        const rollup = { acknowledged: 0, pending: 0, overdue: 0 };
+        for (const message of requiredMessages) {
+          const audienceEmployeeIds = resolveMessageAudience(
+            { audiences: audiencesByMessageId.get(message.id) ?? [] },
+            { employees, roleAssignments, shiftAssignments }
+          );
+          const summary = summarizeAckCompliance(
+            audienceEmployeeIds,
+            receiptsByMessageId.get(message.id) ?? [],
+            acksByMessageId.get(message.id) ?? [],
+            now,
+            { isRequiredAck: true, publishedAt: message.published_at }
+          );
+          rollup.acknowledged += summary.acknowledged;
+          rollup.pending += summary.pending;
+          rollup.overdue += summary.overdue;
+        }
+
+        return sendJson(response, 200, {
+          messages: messages.length,
+          requiredAck: requiredMessages.length,
+          acknowledged: rollup.acknowledged,
+          pending: rollup.pending,
+          overdue: rollup.overdue
+        });
       })
   );
 

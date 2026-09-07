@@ -138,3 +138,101 @@ export function acknowledgementState(message, receipts, now = new Date(), config
 export function shouldBypassQuietHours(message) {
   return message.priority === "emergency" || message.priority === "urgent";
 }
+
+// --- P-1 (CM-09/CM-11): ack/read compliance rollup -------------------------
+
+// Hours after a message's published_at before an unacknowledged recipient
+// counts as overdue. There is no settings-registry key for this yet (checked
+// against src/lib/settings-registry.mjs's communications module -- only
+// communications.requireAckDefault exists there today), so this is a plain
+// module default rather than a per-facility override; summarizeAckCompliance
+// accepts an `ackDueHours` option so a caller can still override it once one
+// exists, without this function changing shape.
+export const DEFAULT_ACK_DUE_HOURS = 48;
+
+// Same camelCase-first/snake_case-fallback accessor pattern as the
+// resolveMessageAudience helpers above, so summarizeAckCompliance serves
+// both hand-built test fixtures and live message_receipts/
+// message_acknowledgements rows unchanged.
+function receiptEmployeeId(receipt) {
+  return receipt?.employeeId ?? receipt?.employee_id ?? null;
+}
+
+function receiptDeliveredAt(receipt) {
+  return receipt?.deliveredAt ?? receipt?.delivered_at ?? null;
+}
+
+function receiptReadAt(receipt) {
+  return receipt?.readAt ?? receipt?.read_at ?? null;
+}
+
+function ackEmployeeId(ack) {
+  return ack?.employeeId ?? ack?.employee_id ?? null;
+}
+
+function ackAcknowledgedAt(ack) {
+  return ack?.acknowledgedAt ?? ack?.acknowledged_at ?? null;
+}
+
+// Rolls a message's resolved audience up against its receipts/acknowledgements
+// into `{delivered, read, acknowledged, pending, overdue, total}` (CM-11).
+//
+// - `audienceEmployeeIds` -- the deduped employee id list resolveMessageAudience
+//   produces for the message (or the facility-wide rollup route's per-message
+//   grouping of the same).
+// - `receipts`/`acks` -- that message's message_receipts/message_acknowledgements
+//   rows. Only rows whose employee is IN the audience are counted -- a stray
+//   receipt/ack from someone the audience no longer includes (e.g. a
+//   transferred employee) is ignored rather than inflating the totals.
+// - `pending`/`overdue` are only ever nonzero when `isRequiredAck` is true --
+//   for a message that does not require acknowledgement, a voluntary ack still
+//   counts toward `acknowledged`, but there is no compliance obligation to be
+//   "pending" or "overdue" against.
+// - `overdue` is the subset of `pending` recipients for whom
+//   `now > publishedAt + ackDueHours`; `publishedAt` is required for that
+//   window to ever open (a draft, or a rollup caller that omits it, is never
+//   overdue).
+export function summarizeAckCompliance(
+  audienceEmployeeIds = [],
+  receipts = [],
+  acks = [],
+  now = new Date(),
+  { ackDueHours = DEFAULT_ACK_DUE_HOURS, isRequiredAck = false, publishedAt = null } = {}
+) {
+  const audience = new Set((audienceEmployeeIds ?? []).filter((id) => id != null));
+  const total = audience.size;
+
+  const deliveredSet = new Set();
+  const readSet = new Set();
+  for (const receipt of receipts ?? []) {
+    const employeeId = receiptEmployeeId(receipt);
+    if (employeeId == null || !audience.has(employeeId)) continue;
+    if (receiptDeliveredAt(receipt)) deliveredSet.add(employeeId);
+    if (receiptReadAt(receipt)) readSet.add(employeeId);
+  }
+
+  const ackedSet = new Set();
+  for (const ack of acks ?? []) {
+    const employeeId = ackEmployeeId(ack);
+    if (employeeId == null || !audience.has(employeeId)) continue;
+    if (ackAcknowledgedAt(ack)) ackedSet.add(employeeId);
+  }
+
+  const delivered = deliveredSet.size;
+  const read = readSet.size;
+  const acknowledged = ackedSet.size;
+
+  let pending = 0;
+  let overdue = 0;
+  if (isRequiredAck) {
+    const dueAt = publishedAt != null ? new Date(new Date(publishedAt).getTime() + ackDueHours * 3_600_000) : null;
+    const overdueWindowOpen = dueAt !== null && now > dueAt;
+    for (const employeeId of audience) {
+      if (ackedSet.has(employeeId)) continue;
+      pending += 1;
+      if (overdueWindowOpen) overdue += 1;
+    }
+  }
+
+  return { delivered, read, acknowledged, pending, overdue, total };
+}

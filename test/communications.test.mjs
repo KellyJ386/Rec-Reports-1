@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   acknowledgementState,
   resolveMessageAudience,
-  shouldBypassQuietHours
+  shouldBypassQuietHours,
+  summarizeAckCompliance,
+  DEFAULT_ACK_DUE_HOURS
 } from "../src/lib/communications.mjs";
 
 test("resolveMessageAudience expands department, shift, and employee targets without duplicates", () => {
@@ -96,4 +98,145 @@ test("resolveMessageAudience: a null audience_ref_id on an employee row resolves
     }),
     []
   );
+});
+
+// --- summarizeAckCompliance (P-1: CM-09/CM-11) ------------------------------
+
+const ACK_AUDIENCE = ["emp-1", "emp-2", "emp-3"];
+
+test("summarizeAckCompliance: delivered but not read counts toward delivered only", () => {
+  const summary = summarizeAckCompliance(
+    ACK_AUDIENCE,
+    [{ employeeId: "emp-1", deliveredAt: "2026-07-18T08:00:00Z" }],
+    [],
+    new Date("2026-07-18T09:00:00Z"),
+    { isRequiredAck: true, publishedAt: "2026-07-18T08:00:00Z" }
+  );
+  assert.equal(summary.delivered, 1);
+  assert.equal(summary.read, 0);
+  assert.equal(summary.acknowledged, 0);
+  assert.equal(summary.total, 3);
+});
+
+test("summarizeAckCompliance: read but not acknowledged counts toward read only, and stays pending", () => {
+  const summary = summarizeAckCompliance(
+    ACK_AUDIENCE,
+    [{ employeeId: "emp-1", deliveredAt: "2026-07-18T08:00:00Z", readAt: "2026-07-18T08:05:00Z" }],
+    [],
+    new Date("2026-07-18T09:00:00Z"),
+    { isRequiredAck: true, publishedAt: "2026-07-18T08:00:00Z" }
+  );
+  assert.equal(summary.delivered, 1);
+  assert.equal(summary.read, 1);
+  assert.equal(summary.acknowledged, 0);
+  assert.equal(summary.pending, 3);
+  assert.equal(summary.overdue, 0);
+});
+
+test("summarizeAckCompliance: an acknowledged recipient is counted acknowledged, not pending", () => {
+  const summary = summarizeAckCompliance(
+    ACK_AUDIENCE,
+    [],
+    [{ employeeId: "emp-1", acknowledgedAt: "2026-07-18T08:10:00Z" }],
+    new Date("2026-07-18T09:00:00Z"),
+    { isRequiredAck: true, publishedAt: "2026-07-18T08:00:00Z" }
+  );
+  assert.equal(summary.acknowledged, 1);
+  assert.equal(summary.pending, 2);
+  assert.equal(summary.overdue, 0);
+  assert.equal(summary.total, 3);
+});
+
+test("summarizeAckCompliance: overdue boundary -- exactly at publishedAt + ackDueHours is NOT overdue, one tick past is", () => {
+  const publishedAt = "2026-07-18T08:00:00Z";
+  const dueAt = new Date(new Date(publishedAt).getTime() + 2 * 3_600_000);
+  const atBoundary = summarizeAckCompliance(ACK_AUDIENCE, [], [], dueAt, {
+    isRequiredAck: true,
+    publishedAt,
+    ackDueHours: 2
+  });
+  assert.equal(atBoundary.overdue, 0, "now === due instant is not yet overdue");
+  assert.equal(atBoundary.pending, 3);
+
+  const pastBoundary = summarizeAckCompliance(ACK_AUDIENCE, [], [], new Date(dueAt.getTime() + 1), {
+    isRequiredAck: true,
+    publishedAt,
+    ackDueHours: 2
+  });
+  assert.equal(pastBoundary.overdue, 3, "one millisecond past due, every still-pending recipient is overdue");
+});
+
+test("summarizeAckCompliance: overdue never counts an already-acknowledged recipient", () => {
+  const publishedAt = "2026-07-18T08:00:00Z";
+  const wayPastDue = new Date("2027-01-01T00:00:00Z");
+  const summary = summarizeAckCompliance(
+    ACK_AUDIENCE,
+    [],
+    [{ employeeId: "emp-1", acknowledgedAt: "2026-07-18T08:10:00Z" }],
+    wayPastDue,
+    { isRequiredAck: true, publishedAt, ackDueHours: 2 }
+  );
+  assert.equal(summary.acknowledged, 1);
+  assert.equal(summary.pending, 2);
+  assert.equal(summary.overdue, 2);
+});
+
+test("summarizeAckCompliance: a message that does not require acknowledgement is never overdue (and never pending)", () => {
+  const publishedAt = "2026-07-18T08:00:00Z";
+  const wayPastDue = new Date("2027-01-01T00:00:00Z");
+  const summary = summarizeAckCompliance(ACK_AUDIENCE, [], [], wayPastDue, {
+    isRequiredAck: false,
+    publishedAt,
+    ackDueHours: 2
+  });
+  assert.equal(summary.pending, 0);
+  assert.equal(summary.overdue, 0);
+  // A voluntary ack on a not-required message still counts toward `acknowledged`.
+  const withVoluntaryAck = summarizeAckCompliance(
+    ACK_AUDIENCE,
+    [],
+    [{ employeeId: "emp-1", acknowledgedAt: "2026-07-18T08:10:00Z" }],
+    wayPastDue,
+    { isRequiredAck: false, publishedAt, ackDueHours: 2 }
+  );
+  assert.equal(withVoluntaryAck.acknowledged, 1);
+  assert.equal(withVoluntaryAck.pending, 0);
+  assert.equal(withVoluntaryAck.overdue, 0);
+});
+
+test("summarizeAckCompliance: falls back to DEFAULT_ACK_DUE_HOURS when ackDueHours is not supplied", () => {
+  const publishedAt = "2026-07-18T08:00:00Z";
+  const justBeforeDefault = new Date(new Date(publishedAt).getTime() + DEFAULT_ACK_DUE_HOURS * 3_600_000 - 1);
+  const justAfterDefault = new Date(new Date(publishedAt).getTime() + DEFAULT_ACK_DUE_HOURS * 3_600_000 + 1);
+  assert.equal(summarizeAckCompliance(ACK_AUDIENCE, [], [], justBeforeDefault, { isRequiredAck: true, publishedAt }).overdue, 0);
+  assert.equal(summarizeAckCompliance(ACK_AUDIENCE, [], [], justAfterDefault, { isRequiredAck: true, publishedAt }).overdue, 3);
+});
+
+test("summarizeAckCompliance: a receipt/ack from someone outside the resolved audience is ignored", () => {
+  const summary = summarizeAckCompliance(
+    ["emp-1"],
+    [{ employeeId: "emp-1", deliveredAt: "t" }, { employeeId: "outsider", deliveredAt: "t", readAt: "t" }],
+    [{ employeeId: "outsider", acknowledgedAt: "t" }],
+    new Date("2026-07-18T09:00:00Z"),
+    { isRequiredAck: true, publishedAt: "2026-07-18T08:00:00Z" }
+  );
+  assert.equal(summary.total, 1);
+  assert.equal(summary.delivered, 1);
+  assert.equal(summary.read, 0);
+  assert.equal(summary.acknowledged, 0);
+  assert.equal(summary.pending, 1);
+});
+
+test("summarizeAckCompliance: accepts live snake_case PostgREST rows the same as camelCase test fixtures", () => {
+  const summary = summarizeAckCompliance(
+    ["emp-1", "emp-2"],
+    [{ employee_id: "emp-1", delivered_at: "2026-07-18T08:00:00Z", read_at: "2026-07-18T08:05:00Z" }],
+    [{ employee_id: "emp-2", acknowledged_at: "2026-07-18T08:10:00Z" }],
+    new Date("2026-07-18T09:00:00Z"),
+    { isRequiredAck: true, publishedAt: "2026-07-18T08:00:00Z" }
+  );
+  assert.equal(summary.delivered, 1);
+  assert.equal(summary.read, 1);
+  assert.equal(summary.acknowledged, 1);
+  assert.equal(summary.pending, 1);
 });

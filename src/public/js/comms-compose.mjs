@@ -1,7 +1,9 @@
 // Pure, DOM-free helpers behind the Communications compose form and message
-// list (CM-08/CM-09): compose-form validation/payload shaping, audience-row
-// assembly for POST /messages/:id/audiences, and a per-viewer acknowledgement
-// state derivation for the ack badge shown on each message card.
+// list (CM-08/CM-09/P-1): compose-form validation/payload shaping,
+// audience-row assembly for POST /messages/:id/audiences, a per-viewer
+// acknowledgement state derivation for the ack badge shown on each message
+// card, and the P-1 ack/compliance-fetch decisions (which messages' server
+// acks seed state.ackedMessageIds, and which get a compliance-count fetch).
 
 export const MESSAGE_PRIORITIES = ["low", "normal", "urgent", "emergency"];
 export const AUDIENCE_TYPES = ["role", "department", "shift", "employee"];
@@ -72,16 +74,60 @@ export function buildAudiencePayload(rows = []) {
     .map((row) => ({ audienceType: row.audienceType, audienceRefId: row.audienceRefId }));
 }
 
-// Per-viewer ack-state badge. Deliberately answers only "has the CURRENT
-// user acknowledged this message", not a facility-wide compliance rollup --
-// there is no rollup endpoint in this API surface (CM-11 is unbuilt), so
-// `ackedByMe` is derived by the caller from whether an acknowledgement
-// exists for the signed-in employee. Mirrors
-// src/lib/communications.mjs's acknowledgementState's not_required/pending/
-// overdue/complete vocabulary for a single-recipient view of it.
+// Per-viewer ack-state badge. Answers "has the CURRENT user acknowledged
+// this message" -- `ackedByMe` is derived by the caller from
+// state.ackedMessageIds, which is now seeded from the server on load (P-1's
+// GET .../acknowledgements?employeeId=me) rather than tracked only for the
+// current session. Mirrors src/lib/communications.mjs's acknowledgementState's
+// not_required/pending/overdue/complete vocabulary for a single-recipient
+// view of it.
 export function deriveAckState({ isRequiredAck, ackDueAt, ackedByMe } = {}, now = new Date()) {
   if (!isRequiredAck) return "not_required";
   if (ackedByMe) return "complete";
   if (ackDueAt && new Date(ackDueAt) < now) return "overdue";
   return "pending";
+}
+
+// --- P-1 (CM-09/CM-11): server-seeded ack state + compliance counts --------
+
+// Turns a GET .../messages/:id/acknowledgements?employeeId=me response into
+// the set of message ids it covers (empty when the caller acknowledged
+// nothing, or has no employee row in the facility -- the route answers an
+// empty list rather than an error either way, so this never needs to branch
+// on that). Accepts the live snake_case row shape and, defensively, a
+// camelCase one, matching every other accessor in this file/communications.mjs.
+export function ackedMessageIdsFromRows(rows = []) {
+  const ids = (rows || [])
+    .map((row) => row?.messageId ?? row?.message_id)
+    .filter((id) => id !== undefined && id !== null);
+  return new Set(ids);
+}
+
+// Decides whether a message card should fetch and show a compliance rollup
+// (delivered/read/acknowledged/pending/overdue counts): the caller either
+// holds communications.publish outright (an auditor's view over every
+// message, not just their own sends) or is that specific message's own
+// author. A message with no `authorEmployeeId` (the caller has no resolved
+// employee row, or the API row omits it) never matches the author branch --
+// canPublish is the only way in for that viewer.
+export function shouldFetchCompliance(message, { canPublish = false, myEmployeeId = null } = {}) {
+  if (!message) return false;
+  if (canPublish) return true;
+  const authorId = message.authorEmployeeId ?? message.author_employee_id ?? null;
+  return !!myEmployeeId && authorId === myEmployeeId;
+}
+
+// Formats a compliance rollup ({delivered, read, acknowledged, pending,
+// overdue, total}) into the compact string a message card shows next to its
+// ack badge. Returns "" for a missing/malformed rollup so a caller can
+// splice this straight into a conditional `if (text) ...` without a second
+// null check.
+export function formatComplianceSummary(compliance) {
+  if (!compliance || typeof compliance.total !== "number") return "";
+  const acknowledged = compliance.acknowledged ?? 0;
+  const total = compliance.total;
+  const overdue = compliance.overdue ?? 0;
+  let text = `${acknowledged}/${total} acknowledged`;
+  if (overdue > 0) text += `, ${overdue} overdue`;
+  return text;
 }
