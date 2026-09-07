@@ -400,7 +400,10 @@ export async function handleRequest(request, response) {
 
     const { env, error: envError } = loadEnv();
     if (envError) {
-      sendJson(response, 503, { error: "server environment is not configured", detail: envError.message });
+      sendJson(response, 503, {
+        error: "server environment is not configured",
+        ...(includeErrorDetail(process.env) ? { detail: envError.message } : {})
+      });
       return;
     }
 

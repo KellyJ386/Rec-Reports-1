@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { PostgrestError } from "../src/lib/supabase-rest.mjs";
-import { translatePostgrestError, includeErrorDetail } from "../src/lib/http/errors.mjs";
+import { translatePostgrestError, includeErrorDetail, isQueryShapeError } from "../src/lib/http/errors.mjs";
 import { handleRequest } from "../scripts/server.mjs";
 
 function postgrestError(status, body) {
@@ -51,6 +51,29 @@ test("translatePostgrestError maps 404 PGRST205 (unknown table) to a 500 server-
     postgrestError(404, { code: "PGRST205", message: "Could not find the table 'x' in the schema cache" })
   );
   assert.deepEqual(result, { status: 500, body: { error: "internal server error" } });
+});
+
+test("translatePostgrestError keeps query-shape errors (undefined column/table/function, bad filter syntax) as 500 even when PostgREST answers 400", () => {
+  const cases = [
+    ["42703", 'column "facilty_id" does not exist'],
+    ["42P01", 'relation "work_order" does not exist'],
+    ["42883", "function public.apply_incident_amendmnt(uuid, jsonb, text) does not exist"],
+    ["PGRST100", '"failed to parse filter (eq.)" (line 1, column 4)'],
+    ["PGRST204", "Could not find the 'facilty_id' column of 'work_orders' in the schema cache"]
+  ];
+  for (const [code, message] of cases) {
+    const translated = translatePostgrestError(postgrestError(400, { code, message }));
+    assert.equal(translated.status, 500, `${code} must not be blamed on the caller`);
+    assert.deepEqual(translated.body, { error: "internal server error" });
+    assert.equal(isQueryShapeError(postgrestError(400, { code, message })), true);
+  }
+});
+
+test("translatePostgrestError still maps a caller-supplied bad value (22P02 invalid uuid) to 400", () => {
+  const translated = translatePostgrestError(
+    postgrestError(400, { code: "22P02", message: 'invalid input syntax for type uuid: "nope"' })
+  );
+  assert.deepEqual(translated, { status: 400, body: { error: "invalid request" } });
 });
 
 test("translatePostgrestError does not treat every 404 as the PGRST205 server-bug case", () => {
