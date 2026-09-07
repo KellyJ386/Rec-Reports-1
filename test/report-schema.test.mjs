@@ -7,6 +7,7 @@ import {
   unknownPayloadKeys,
   unsafeRegexPatternReason,
   validateSignatureRequirements,
+  normalizeSignatureRoleRequirement,
   evaluateVisibility,
   hiddenFieldKeys,
   findFieldByKey,
@@ -331,9 +332,55 @@ test("unsafeRegexPatternReason rejects a pattern over 200 characters", () => {
 });
 
 test("unsafeRegexPatternReason rejects nested-quantifier (catastrophic backtracking) shapes", () => {
-  assert.match(unsafeRegexPatternReason("^(a+)+$"), /nest quantifiers/);
-  assert.match(unsafeRegexPatternReason("^(\\d*)*$"), /nest quantifiers/);
-  assert.match(unsafeRegexPatternReason("^(x{2,})+$"), /nest quantifiers/);
+  assert.match(unsafeRegexPatternReason("^(a+)+$"), /repeat a group/);
+  assert.match(unsafeRegexPatternReason("^(\\d*)*$"), /repeat a group/);
+  assert.match(unsafeRegexPatternReason("^(x{2,})+$"), /repeat a group/);
+});
+
+// H-2 (security review): every pattern the review proved catastrophic under
+// the OLD flat-group heuristic must be rejected by the new structural
+// allow-list grammar -- alternation overlap, a nested paren the old flat
+// `[^()]*` scan couldn't see into, ambiguity from a bare `?` inside a
+// repeated group, and a bounded-but-still-explosive `{n,m}`.
+test("unsafeRegexPatternReason rejects every ReDoS shape the security review measured", () => {
+  assert.match(unsafeRegexPatternReason("^(a|a)*$"), /alternation/);
+  assert.match(unsafeRegexPatternReason("^((a+))+$"), /nest groups/);
+  assert.match(unsafeRegexPatternReason("^(\\d\\d?)*$"), /repeat a group/);
+  assert.match(unsafeRegexPatternReason("^(a{1,2})*$"), /repeat a group/);
+});
+
+test("unsafeRegexPatternReason rejects lookaround assertions", () => {
+  assert.match(unsafeRegexPatternReason("^(?=foo)bar$"), /lookaround/);
+  assert.match(unsafeRegexPatternReason("^(?!foo)bar$"), /lookaround/);
+  assert.match(unsafeRegexPatternReason("^(?<=foo)bar$"), /lookaround/);
+  assert.match(unsafeRegexPatternReason("^(?<!foo)bar$"), /lookaround/);
+});
+
+test("unsafeRegexPatternReason rejects alternation nested inside a group (top-level alternation only)", () => {
+  assert.match(unsafeRegexPatternReason("^(foo|bar)$"), /alternation/);
+  assert.equal(unsafeRegexPatternReason("^foo$|^bar$"), null);
+});
+
+test("unsafeRegexPatternReason rejects groups nested more than one level deep", () => {
+  assert.match(unsafeRegexPatternReason("^(a(b)c)$"), /nest groups/);
+  assert.equal(unsafeRegexPatternReason("^(a)(b)$"), null);
+});
+
+test("unsafeRegexPatternReason allows a single optional-group quantifier but not a repeated one", () => {
+  assert.equal(unsafeRegexPatternReason("^\\d+(\\.\\d+)?$"), null);
+  assert.match(unsafeRegexPatternReason("^(a)???$"), /repeat a group/);
+});
+
+test("unsafeRegexPatternReason rejects more than 8 quantifiers", () => {
+  assert.match(
+    unsafeRegexPatternReason("^a{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}$"),
+    /more than 8 quantifiers/
+  );
+});
+
+test("unsafeRegexPatternReason accepts ordinary field-validation patterns", () => {
+  assert.equal(unsafeRegexPatternReason("^[A-Z]{2}-\\d{4}$"), null);
+  assert.equal(unsafeRegexPatternReason("^\\d+(\\.\\d+)?$"), null);
 });
 
 test("unsafeRegexPatternReason rejects backreferences", () => {
@@ -341,7 +388,13 @@ test("unsafeRegexPatternReason rejects backreferences", () => {
 });
 
 test("unsafeRegexPatternReason rejects a syntactically invalid pattern", () => {
-  assert.match(unsafeRegexPatternReason("^(unterminated$"), /not a valid regular expression/);
+  // Unbalanced parens are now caught by the structural scan itself (a more
+  // specific, still-correct rejection reason) -- ^[z-a]$ is structurally
+  // fine (balanced, no groups at all) but still an invalid regex (inverted
+  // character-class range), so it reaches -- and is rejected by -- the
+  // `new RegExp` validity check.
+  assert.match(unsafeRegexPatternReason("^(unterminated$"), /unbalanced parentheses/);
+  assert.match(unsafeRegexPatternReason("^[z-a]$"), /not a valid regular expression/);
 });
 
 test("unsafeRegexPatternReason rejects a non-string or empty pattern", () => {
@@ -566,6 +619,42 @@ test("validateSignatureRequirements accepts a well-formed policy and undefined/n
 test("validateSignatureRequirements rejects unknown keys, a non-boolean required, and bad roles", () => {
   assert.match(validateSignatureRequirements({ requird: true })[0], /unknown key/);
   assert.match(validateSignatureRequirements({ required: "yes" })[0], /required must be a boolean/);
-  assert.match(validateSignatureRequirements({ roles: ["manager", ""] })[0], /roles must be an array of non-empty strings/);
-  assert.match(validateSignatureRequirements({ roles: ["manager", "manager"] })[0], /must not contain duplicates/);
+  assert.match(validateSignatureRequirements({ roles: ["manager", ""] })[0], /role must be a non-empty string/);
+  assert.match(validateSignatureRequirements({ roles: ["manager", "manager"] })[0], /duplicate role "manager"/);
+});
+
+// M-3: roles[] entries are { role, permission } objects; a bare string is
+// still accepted for backward compatibility (normalizes to reports.submit).
+test("validateSignatureRequirements accepts { role, permission } entries and normalizes bare strings", () => {
+  assert.deepEqual(
+    validateSignatureRequirements({
+      required: true,
+      roles: [
+        { role: "supervisor", permission: "reports.publish" },
+        "manager"
+      ]
+    }),
+    []
+  );
+  assert.deepEqual(normalizeSignatureRoleRequirement("manager"), {
+    role: "manager",
+    permission: "reports.submit"
+  });
+  assert.deepEqual(normalizeSignatureRoleRequirement({ role: "supervisor", permission: "reports.publish" }), {
+    role: "supervisor",
+    permission: "reports.publish"
+  });
+});
+
+test("validateSignatureRequirements rejects an unknown permission code and an unrecognized entry shape", () => {
+  assert.match(
+    validateSignatureRequirements({ roles: [{ role: "supervisor", permission: "not.a.real.code" }] })[0],
+    /permission must be a known permission code/
+  );
+  assert.match(
+    validateSignatureRequirements({ roles: [{ role: "supervisor", extra: true }] })[0],
+    /must be a non-empty string or an object/
+  );
+  assert.equal(normalizeSignatureRoleRequirement(42), null);
+  assert.equal(normalizeSignatureRoleRequirement({ role: "supervisor", extra: true }), null);
 });

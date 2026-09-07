@@ -1,12 +1,19 @@
--- Verification intent: DR-19/DR-20 (0053_report_workflow_events.sql). Covers:
+-- Verification intent: DR-19/DR-20/H-1 (0053_report_workflow_events.sql).
+-- Covers:
 --   1. A submitter (reports.submit, NO incidents.manage/work_orders.manage)
---      can submit a draft and call public.enqueue_report_workflow, which
---      persists one report_workflow_events row per action (idempotent via
---      unique(submission_id, event_type) -- a second identical call adds no
---      new rows) plus one outbox_events 'report.submitted' row.
+--      can submit a draft and call public.enqueue_report_workflow(uuid),
+--      which persists EXACTLY ONE report_workflow_events row
+--      (event_type='evaluate', action='{}') plus EXACTLY ONE outbox_events
+--      'report.submitted' row -- idempotent: a second (or third, fourth...)
+--      identical call adds NOTHING further to either table (H-1/M-4).
+--   1b. H-1: public.enqueue_report_workflow takes ONLY a submission id --
+--      the two-argument (uuid, jsonb) overload that used to accept a
+--      caller-supplied action list no longer exists at all; calling it with
+--      a second argument fails with "function ... does not exist", not a
+--      permission error, proving there is no way to pass one any more.
 --   2. A reports.read-only reader can SELECT report_workflow_events.
 --   3. `authenticated` cannot INSERT into report_workflow_events directly --
---      no such policy exists; only the two RPC pairs write it.
+--      no such policy exists; only the RPC pairs below write it.
 --   4. public.enqueue_report_workflow is denied (42501) to a caller who
 --      lacks reports.submit, and to an outsider from a DIFFERENT facility
 --      (cross-facility rejection) even though the outsider holds
@@ -15,7 +22,9 @@
 --      service_role ONLY -- not authenticated, not public -- closing the
 --      exact privilege-elevation path DR-20's Opus review targets.
 --   6. Calling internal.mint_workflow_incident (standing in for the
---      service-role drain) mints a 'draft' incident attributed to the
+--      service-role drain, which in production only ever calls it with an
+--      action DERIVED server-side by report-workflow-executor.mjs, never a
+--      caller-controlled one) mints a 'draft' incident attributed to the
 --      report's submitter, with provenance ({source:'report_workflow',
 --      submission_id}) landing in the audit_events row via
 --      fn_incident_report_audit's session-setting hook, actor_user_id NULL.
@@ -120,29 +129,57 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 1b. public.enqueue_report_workflow: succeeds for the submitter, persisting
--- 3 pending events (idempotent -- a second identical call adds no new rows)
--- plus the outbox_events row.
+-- 1b/H-1/M-4: public.enqueue_report_workflow(uuid) -- succeeds for the
+-- submitter, persisting EXACTLY ONE 'evaluate' event with action='{}' and
+-- EXACTLY ONE outbox_events row. Called FIVE times total (idempotency
+-- proof, M-4's "repeated enqueues do not grow the outbox"): every call
+-- after the first is a true no-op against BOTH tables.
 -- ---------------------------------------------------------------------------
 do $$
 declare
   v_submission_id uuid := current_setting('rwe_test.submission_id')::uuid;
-  v_actions jsonb := '[{"type":"queue_pdf","params":{}},{"type":"create_incident","params":{"severity":"high"}},{"type":"create_work_order","params":{"priority":"high"}}]'::jsonb;
   v_result jsonb;
   v_event_count int;
+  v_event_row report_workflow_events%rowtype;
+  v_outbox_count int;
+  i int;
 begin
-  select public.enqueue_report_workflow(v_submission_id, v_actions) into v_result;
-  if jsonb_array_length(v_result -> 'event_ids') <> 3 then
-    raise exception 'RWE FAIL: expected 3 event_ids from enqueue_report_workflow, saw %', v_result -> 'event_ids';
+  select public.enqueue_report_workflow(v_submission_id) into v_result;
+  if (v_result ->> 'enqueued') <> 'true' then
+    raise exception 'RWE FAIL: expected enqueued:true on the first call, saw %', v_result;
   end if;
 
-  -- Idempotent re-call: same (submission_id, event_type) pairs -> ON
-  -- CONFLICT DO NOTHING, no new report_workflow_events rows.
-  perform public.enqueue_report_workflow(v_submission_id, v_actions);
+  select * into v_event_row from report_workflow_events where submission_id = v_submission_id;
+  if not found then
+    raise exception 'RWE FAIL: expected an evaluate event row after the first enqueue call';
+  end if;
+  if v_event_row.event_type <> 'evaluate' then
+    raise exception 'RWE FAIL: expected event_type=evaluate, saw %', v_event_row.event_type;
+  end if;
+  if v_event_row.action <> '{}'::jsonb then
+    raise exception 'RWE FAIL: expected action={} on the evaluate event, saw %', v_event_row.action;
+  end if;
+
+  -- Repeated calls (4 more, 5 total) -- H-1/M-4: every one is a no-op.
+  for i in 1..4 loop
+    select public.enqueue_report_workflow(v_submission_id) into v_result;
+    if (v_result ->> 'enqueued') <> 'false' then
+      raise exception 'RWE FAIL: expected enqueued:false on repeat call %, saw %', i, v_result;
+    end if;
+  end loop;
 
   select count(*) into v_event_count from report_workflow_events where submission_id = v_submission_id;
-  if v_event_count <> 3 then
-    raise exception 'RWE FAIL: expected exactly 3 report_workflow_events rows after two enqueue calls, saw %', v_event_count;
+  if v_event_count <> 1 then
+    raise exception 'RWE FAIL: expected exactly 1 report_workflow_events row after 5 enqueue calls, saw %', v_event_count;
+  end if;
+
+  select count(*) into v_outbox_count
+    from outbox_events
+    where facility_id = '53aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+      and event_type = 'report.submitted'
+      and (payload ->> 'submission_id')::uuid = v_submission_id;
+  if v_outbox_count <> 1 then
+    raise exception 'RWE FAIL: expected exactly 1 report.submitted outbox_events row after 5 enqueue calls, saw %', v_outbox_count;
   end if;
 exception
   when insufficient_privilege then
@@ -150,19 +187,23 @@ exception
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 1c/H-1: the two-argument overload is GONE, not merely unreachable -- a
+-- caller literally cannot pass an action list any more (a caller who tries
+-- gets "function ... does not exist", the PostgREST-visible signal that no
+-- such RPC exists at all, never a permission or validation error that might
+-- imply the parameter is merely ignored/checked).
+-- ---------------------------------------------------------------------------
 do $$
 declare
   v_submission_id uuid := current_setting('rwe_test.submission_id')::uuid;
-  v_outbox_count int;
 begin
-  select count(*) into v_outbox_count
-    from outbox_events
-    where facility_id = '53aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
-      and event_type = 'report.submitted'
-      and (payload ->> 'submission_id')::uuid = v_submission_id;
-  if v_outbox_count < 1 then
-    raise exception 'RWE FAIL: expected at least 1 report.submitted outbox_events row, saw %', v_outbox_count;
-  end if;
+  begin
+    perform public.enqueue_report_workflow(v_submission_id, '[{"type":"create_incident","params":{"severity":"critical"}}]'::jsonb);
+    raise exception 'RWE FAIL: the two-argument enqueue_report_workflow(uuid, jsonb) overload still exists';
+  exception
+    when undefined_function then null; -- expected
+  end;
 end;
 $$;
 
@@ -213,7 +254,7 @@ declare
   v_submission_id uuid := current_setting('rwe_test.submission_id')::uuid;
 begin
   begin
-    perform public.enqueue_report_workflow(v_submission_id, '[{"type":"queue_pdf"}]'::jsonb);
+    perform public.enqueue_report_workflow(v_submission_id);
     raise exception 'RWE FAIL: a reports.read-only caller was able to call enqueue_report_workflow';
   exception
     when insufficient_privilege then null; -- expected (42501)
@@ -222,7 +263,9 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 2. The reader CAN read report_workflow_events (reports.read).
+-- 2. The reader CAN read report_workflow_events (reports.read) -- exactly
+-- the 1 evaluate event from section 1b/1c (5 enqueue calls total collapsed
+-- to that 1 row, and the two-arg overload never existed to insert anything).
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -230,8 +273,8 @@ declare
   v_count int;
 begin
   select count(*) into v_count from report_workflow_events where submission_id = v_submission_id;
-  if v_count <> 3 then
-    raise exception 'RWE FAIL: reports.read holder saw % report_workflow_events rows, expected 3', v_count;
+  if v_count <> 1 then
+    raise exception 'RWE FAIL: reports.read holder saw % report_workflow_events rows, expected 1', v_count;
   end if;
 exception
   when insufficient_privilege then
@@ -254,7 +297,7 @@ declare
   v_submission_id uuid := current_setting('rwe_test.submission_id')::uuid;
 begin
   begin
-    perform public.enqueue_report_workflow(v_submission_id, '[{"type":"queue_pdf"}]'::jsonb);
+    perform public.enqueue_report_workflow(v_submission_id);
     raise exception 'RWE FAIL: an outsider from a different facility was able to call enqueue_report_workflow for facility A''s submission';
   exception
     when insufficient_privilege then null; -- expected (42501)
@@ -313,8 +356,10 @@ begin
   end if;
   -- enqueue_report_workflow, by contrast, IS meant for authenticated (the
   -- submitting user's own session) -- assert the opposite shape here so a
-  -- future edit cannot silently swap the two RPC pairs' grants.
-  if not has_function_privilege('authenticated', 'public.enqueue_report_workflow(uuid,jsonb)', 'execute') then
+  -- future edit cannot silently swap the two RPC pairs' grants. H-1: the
+  -- one-argument signature only -- the old (uuid,jsonb) overload was
+  -- dropped outright, already proven unreachable in section 1c above.
+  if not has_function_privilege('authenticated', 'public.enqueue_report_workflow(uuid)', 'execute') then
     raise exception 'RWE FAIL: authenticated cannot execute public.enqueue_report_workflow';
   end if;
 end;

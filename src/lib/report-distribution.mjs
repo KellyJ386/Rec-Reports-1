@@ -361,6 +361,15 @@ function legKey(leg) {
   return `${leg.submission.id}|${leg.binding.id}|${leg.employeeId}|${leg.channel}`;
 }
 
+// Same natural key as legKey, expressed over a raw report_deliveries row
+// (DB column names) instead of a leg object -- shared by both the
+// existing-rows lookup above and attachDeliveryRows' insert-pairing below,
+// so the two can never drift apart into two different notions of "the same
+// leg".
+function rowKey(row) {
+  return `${row.submission_id}|${row.report_distribution_list_id}|${row.recipient_employee_id}|${row.channel}`;
+}
+
 const TERMINAL_STATUSES = new Set(["sent", "bounced", "skipped"]);
 
 // Loads existing report_deliveries rows for every submission a batch of
@@ -376,9 +385,7 @@ async function attachDeliveryRows({ client, legs, config }) {
           select: DELIVERY_COLUMNS
         })
       : [];
-  const existingByKey = new Map(
-    (existingRows ?? []).map((row) => [`${row.submission_id}|${row.report_distribution_list_id}|${row.recipient_employee_id}|${row.channel}`, row])
-  );
+  const existingByKey = new Map((existingRows ?? []).map((row) => [rowKey(row), row]));
 
   const toInsert = [];
   for (const leg of legs) {
@@ -401,9 +408,19 @@ async function attachDeliveryRows({ client, legs, config }) {
       attempts: 0
     }));
     const inserted = await pgInsert(client, "report_deliveries", rows, { returning: true });
-    (inserted ?? rows).forEach((row, index) => {
-      toInsert[index].delivery = row;
-    });
+    // L-9 (security review): pair each inserted row back to the leg that
+    // produced it by NATURAL KEY (the same
+    // submission_id|report_distribution_list_id|recipient_employee_id|
+    // channel key existingByKey uses above), not by array index. True for
+    // PostgREST today that `return=representation` preserves request
+    // order, but a silently reordered or otherwise mismatched response
+    // would previously have attributed one recipient's delivery outcome to
+    // a completely different recipient row -- this makes the pairing
+    // correct regardless of response order.
+    const insertedByKey = new Map((inserted ?? rows).map((row) => [rowKey(row), row]));
+    for (const leg of toInsert) {
+      leg.delivery = insertedByKey.get(legKey(leg));
+    }
   }
 
   const maxAttempts = config.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
@@ -585,11 +602,22 @@ async function finalizeEvent({ client, event, legs, now, maxAttempts, config }) 
 
   const attempts = Number(event.attempts ?? 0) + 1;
   const exhausted = attempts >= maxAttempts;
+  // L-4 (security review): claimDueReportSubmittedEvents claims on
+  // `available_at.lte.now OR next_attempt_at.lte.now`. available_at
+  // defaults to insert time and this finalizer never touched it, so a
+  // retried event's next_attempt_at push into the future was moot -- the
+  // OR's available_at half was already <= now from the original insert, and
+  // matched again on the very next drain pass regardless of the intended
+  // backoff. Both columns are now advanced together on a retry, so the OR
+  // only ever re-admits the row once the backoff window has actually
+  // elapsed.
+  const backoffAt = exhausted ? null : toIso(new Date(now.getTime() + computeBackoffMs(attempts)));
   const patch = {
     attempts,
     last_error: "one or more deliveries are still retryable",
     status: exhausted ? "failed" : "pending",
-    next_attempt_at: exhausted ? null : toIso(new Date(now.getTime() + computeBackoffMs(attempts)))
+    next_attempt_at: backoffAt,
+    available_at: exhausted ? event.available_at : backoffAt
   };
   await pgUpdate(client, "outbox_events", { id: event.id }, patch, { returning: true });
   if (exhausted) {

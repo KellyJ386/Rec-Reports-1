@@ -6,13 +6,14 @@ import {
   validateReportSubmission,
   validateReportSubmissionPartial,
   unknownPayloadKeys,
-  hiddenFieldKeys
+  hiddenFieldKeys,
+  stripHiddenFields,
+  normalizeSignatureRoleRequirement
 } from "../report-schema.mjs";
 import { computeCompliance, dateRange } from "../reports-compliance.mjs";
 import { buildReportPdfPackage } from "../admin/report-pdf.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import { flagState } from "../admin/entitlements.mjs";
-import { evaluateWorkflow } from "../report-workflow.mjs";
 import { isSandboxTemplate } from "../report-templates.mjs";
 import {
   createStorageClientFromEnv,
@@ -46,8 +47,12 @@ const SUBMISSION_COLUMNS =
   "pdf_status,pdf_storage_path,pdf_content_hash,pdf_attempts,pdf_error,created_at,updated_at";
 const ATTACHMENT_COLUMNS =
   "id,facility_id,submission_id,field_key,storage_path,mime_type,checksum,metadata,created_at";
-const SIGNATURE_COLUMNS =
-  "id,facility_id,submission_id,signer_user_id,signer_role,signed_at,signature_hash,created_at";
+// L-1 (security review): report_submission_signatures (0052) has no
+// created_at column -- selecting it made PostgREST answer the whole request
+// with a 400, so this route was broken in production despite the unit tests
+// (which stub the client) passing. signed_at is that table's own timestamp
+// column and was already selected below.
+const SIGNATURE_COLUMNS = "id,facility_id,submission_id,signer_user_id,signer_role,signed_at,signature_hash";
 
 // Deterministic (key-sorted) JSON stringification, so signatureHash below
 // hashes the same payload_json object identically regardless of the wire/DB
@@ -70,7 +75,12 @@ function canonicalJson(value) {
 // time. payload_json is folded into the outer hash as its own hash (rather
 // than inlined raw) so an arbitrarily large payload never inflates the
 // signed composite string.
-function signatureHash({ submissionId, userId, role, payload }) {
+// Exported (only) so tests can build a fixture signature row whose hash
+// matches a given payload -- M-2's stale-signature check recomputes this
+// exact function against the CURRENT payload_json at submit time, so a test
+// fixture that wants to exercise the "still fresh" path needs to produce a
+// hash this same algorithm would accept.
+export function signatureHash({ submissionId, userId, role, payload }) {
   const payloadHash = createHash("sha256").update(canonicalJson(payload ?? {})).digest("hex");
   const composite = `${submissionId}|${userId}|${role}|${payloadHash}`;
   return createHash("sha256").update(composite).digest("hex");
@@ -193,55 +203,45 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     return (rows ?? [])[0] ?? null;
   }
 
-  // --- Workflow (DR-18/DR-19) -------------------------------------------
-  // Loads the facility's effective config across every module the
-  // workflow's incidents.mjs/work-orders.mjs helpers read from (daily_
-  // reports for the engine's own future keys, incidents for severity
-  // auto-escalation, work_orders for SLA hours), merged into one flat map --
-  // module.config_jsonb key strings are already globally unique (e.g.
-  // "incidents.escalationSlaHours"), so a plain Object.assign cannot
-  // collide. Never throws (loadModuleConfig itself degrades to {} on any
-  // lookup failure); each layer independently defaults to {} so a facility
-  // that has configured nothing behaves exactly like configValue's shipped
-  // defaults.
-  async function loadWorkflowConfig(client, facilityId) {
-    const [dailyReports, incidents, workOrders] = await Promise.all([
-      loadModuleConfig({ client, facilityId, moduleCode: "daily_reports" }),
-      loadModuleConfig({ client, facilityId, moduleCode: "incidents" }),
-      loadModuleConfig({ client, facilityId, moduleCode: "work_orders" })
-    ]);
-    return { ...dailyReports, ...incidents, ...workOrders };
-  }
-
-  // Evaluates the submission's pinned version's workflow_json and persists
-  // the result through the submitting user's own session (never
-  // service-role -- internal.enqueue_report_workflow, 0053, re-checks
-  // reports.submit itself). Swallows every error: a workflow failure must
-  // never block or fail a submit that has already landed.
-  async function enqueueWorkflow(client, { submission, version, payload }) {
+  // --- Workflow (DR-18/DR-19/H-1) -----------------------------------------
+  // H-1 (security review): this route used to derive the workflow's action
+  // list itself (evaluateWorkflow) and hand it to
+  // internal.enqueue_report_workflow(submission_id, actions) as a caller-
+  // supplied jsonb array. That RPC re-checked reports.submit but never
+  // validated the action list at all, so any reports.submit holder could
+  // call public.enqueue_report_workflow directly through PostgREST with an
+  // arbitrary action array and mint incidents/work orders/manager
+  // notifications the template's own workflow_json never configured, with
+  // no incidents.manage/work_orders.manage of their own. Fixed by moving
+  // derivation entirely server-side: internal.enqueue_report_workflow (0053)
+  // now takes ONLY p_submission_id, inserts exactly one 'evaluate' event
+  // (idempotent -- a second call is a no-op, closing M-4 too), and
+  // report-workflow-executor.mjs's executor -- running under the
+  // service-role client, which the caller can never impersonate -- is what
+  // loads the pinned version's workflow_json and runs evaluateWorkflow.
+  // There is nothing left here for a caller to inject.
+  async function enqueueWorkflow(client, { submission }) {
     try {
-      // DR-26: a sandbox template (report_templates.sandbox, 0055) produces
-      // no side effects at all -- no workflow events and no report.submitted
-      // outbox event, so distribution (DR-22) never sees it either.
+      // DR-26/L-6: a sandbox template (report_templates.sandbox, 0055)
+      // produces no side effects at all -- no workflow events and no
+      // report.submitted outbox event, so distribution (DR-22) never sees
+      // it either. L-6: the prior version re-read the template row under
+      // the CALLER's own RLS session and treated a lookup that returned
+      // zero rows (e.g. a reports.submit holder who does not separately
+      // hold reports.read on report_templates) the same as "not sandbox" --
+      // failing OPEN. This now fails CLOSED: any lookup that does not come
+      // back with a resolvable, non-sandbox template row (an RLS-narrowed
+      // empty result, a missing row, or the pgSelect itself throwing, which
+      // the outer catch below turns into "do not enqueue" as well) skips
+      // enqueueing entirely, rather than assuming the template is safe.
       const templateRows = await pgSelect(client, "report_templates", {
         filters: { id: submission.template_id },
         select: "id,sandbox",
         limit: 1
       });
-      if (isSandboxTemplate((templateRows ?? [])[0])) return;
-      const config = await loadWorkflowConfig(client, submission.facility_id);
-      const { actions } = evaluateWorkflow({
-        template: { id: submission.template_id },
-        version,
-        submission,
-        payload,
-        now: new Date(),
-        config
-      });
-      await pgRpc(client, "enqueue_report_workflow", {
-        p_submission_id: submission.id,
-        p_actions: actions
-      });
+      const template = (templateRows ?? [])[0] ?? null;
+      if (!template || isSandboxTemplate(template)) return;
+      await pgRpc(client, "enqueue_report_workflow", { p_submission_id: submission.id });
     } catch {
       // Intentionally swallowed -- see this function's own doc comment.
       // report_workflow_events has no authenticated-writable path for this
@@ -566,6 +566,31 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       const unknownKeys = unknownKeysError(version.schema_json, payload);
       if (unknownKeys) return sendJson(response, 422, unknownKeys);
 
+      // M-2 (security review): signature_hash bound the payload at signing
+      // time but nothing ever recomputed it -- a signer could sign a draft,
+      // the draft's payload_json could then be PATCHed (still legal: still
+      // draft, still reports.submit), and submit would succeed carrying a
+      // signature that attests to content the signer never saw. Every
+      // existing signature's hash is now re-derived against the CURRENT
+      // payload right here, before either the completeness check or field
+      // validation runs; any mismatch blocks the submit outright (409, not
+      // 422 -- this is a precondition on the submission's signatures, not a
+      // payload-shape error) rather than merely being recorded.
+      const signatures = await pgSelect(auth.client, "report_submission_signatures", {
+        filters: { submission_id: submission.id },
+        select: "signer_user_id,signer_role,signature_hash"
+      });
+      const staleRoles = (signatures ?? [])
+        .filter(
+          (row) =>
+            row.signature_hash !==
+            signatureHash({ submissionId: submission.id, userId: row.signer_user_id, role: row.signer_role, payload })
+        )
+        .map((row) => row.signer_role);
+      if (staleRoles.length > 0) {
+        return sendJson(response, 409, { error: "signatures are stale", staleRoles });
+      }
+
       // DR-17 submit-time completeness: when the pinned version requires
       // signatures, every listed role must already have a
       // report_submission_signatures row for this submission (recorded via
@@ -574,14 +599,15 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       // validation so a caller sees exactly what's missing (signatures)
       // rather than a mix of concerns; 400, not 422, since this is a
       // precondition on the submission as a whole, not a per-field payload
-      // error.
+      // error. M-3: signature_requirements.roles entries are { role,
+      // permission } (or a bare string, normalized) -- only the role LABEL
+      // matters for this completeness check; the permission is enforced at
+      // sign time (POST .../signatures below), not here.
       const signatureRequirements = version.validation_json?.signature_requirements;
       if (signatureRequirements?.required === true) {
-        const requiredRoles = Array.isArray(signatureRequirements.roles) ? signatureRequirements.roles : [];
-        const signatures = await pgSelect(auth.client, "report_submission_signatures", {
-          filters: { submission_id: submission.id },
-          select: "signer_role"
-        });
+        const requiredRoles = Array.isArray(signatureRequirements.roles)
+          ? signatureRequirements.roles.map(normalizeSignatureRoleRequirement).filter(Boolean).map((entry) => entry.role)
+          : [];
         const signedRoles = new Set((signatures ?? []).map((row) => row.signer_role));
         const missingRoles = requiredRoles.filter((role) => !signedRoles.has(role));
         if (missingRoles.length > 0) {
@@ -597,12 +623,21 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       // whether there are any other warnings -- see report-schema.mjs's
       // evaluateVisibility/hiddenFieldKeys.
       const hiddenFields = hiddenFieldKeys(version.schema_json, payload);
+      // L-3: a value submitted for a field hidden by its own visibility_rules
+      // was persisted with no type/range/regex check at all (it is never
+      // required, and collectSubmissionErrors skips validating it
+      // unconditionally) -- stripped out of what actually gets persisted at
+      // submit time, so payload_json can never carry a value nothing has
+      // ever validated. hiddenFields (above) still records which keys were
+      // hidden, independent of this.
+      const strippedPayload = stripHiddenFields(version.schema_json, payload);
 
       const patch = {
         status: "submitted",
         submitted_by: auth.claims.sub,
         submitted_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
+        payload_json: strippedPayload
       };
 
       if (errors.length > 0) {
@@ -625,21 +660,22 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
       });
       const submitted = (rows ?? [])[0] ?? null;
 
-      // DR-18/DR-19: evaluate this version's on_submit workflow and persist
-      // the resulting actions (+ the report.submitted outbox event) through
-      // internal.enqueue_report_workflow (0053) -- ALWAYS attempted on a
-      // successful submit, action list empty or not, so the outbox event
-      // fires uniformly. Wrapped end-to-end: a broken workflow rule, an RPC
+      // DR-18/DR-19/H-1: enqueue exactly one 'evaluate' workflow event
+      // through internal.enqueue_report_workflow (0053) -- ALWAYS attempted
+      // on a successful submit, so the outbox event fires uniformly; the
+      // executor (running under the service-role client) is what actually
+      // derives and persists the action list from the pinned version's
+      // workflow_json. Wrapped end-to-end: a broken workflow rule, an RPC
       // rejection, or a network failure must NEVER turn a successful submit
       // into an error response -- the submission is already durably
       // 'submitted' by the pgUpdate above.
-      await enqueueWorkflow(auth.client, { submission, version, payload });
+      await enqueueWorkflow(auth.client, { submission: submitted ?? submission });
 
       return sendJson(response, 200, submitted);
     })
   );
 
-  // --- Signatures (DR-17) ------------------------------------------------
+  // --- Signatures (DR-17/M-3) ---------------------------------------------
   // Signer is always the authenticated caller (never taken from the body);
   // signature_hash binds the submission id, signer, role, and a hash of the
   // payload at signing time, so a later payload edit is detectable against
@@ -647,6 +683,18 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
   // still a draft (409 otherwise, backed at the DB layer by 0052's INSERT
   // trigger); the role must be one the pinned version's
   // validation_json.signature_requirements lists (400 otherwise).
+  //
+  // M-3 (security review): a signer_role label carried no permission of its
+  // own, so any reports.submit holder could sign as every listed role in
+  // sequence and single-handedly clear a multi-party sign-off gate. Each
+  // roles[] entry now carries its own `permission`
+  // (normalizeSignatureRoleRequirement, report-schema.mjs -- a bare string
+  // entry still normalizes to reports.submit for backward compatibility);
+  // this route requires the caller to hold THAT permission on the
+  // submission's own facility/department (department-scoped, same
+  // hasDepartmentPermission check every other row guard here uses) before
+  // the signature is recorded, so a role requiring e.g. reports.publish can
+  // only ever be signed by someone who actually holds it.
   router.register(
     "POST",
     "/facilities/:facilityId/reports/:id/signatures",
@@ -671,13 +719,20 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
 
         const version = await loadVersionById(auth.client, submission.template_version_id);
         if (!version) return sendJson(response, 409, { error: "template version not found" });
-        const allowedRoles = Array.isArray(version.validation_json?.signature_requirements?.roles)
-          ? version.validation_json.signature_requirements.roles
+        const allowedRoleEntries = Array.isArray(version.validation_json?.signature_requirements?.roles)
+          ? version.validation_json.signature_requirements.roles.map(normalizeSignatureRoleRequirement).filter(Boolean)
           : [];
-        if (!allowedRoles.includes(role)) {
+        const matched = allowedRoleEntries.find((entry) => entry.role === role);
+        if (!matched) {
           return sendJson(response, 400, {
             error: `role "${role}" is not a listed signature role for this template`
           });
+        }
+        // M-3: holding reports.submit (checked above) is not enough on its
+        // own -- the caller must additionally hold the role's OWN mapped
+        // permission on this submission's facility/department.
+        if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, matched.permission, response)) {
+          return;
         }
 
         const row = {

@@ -192,6 +192,187 @@ test("create_work_order calls the mint_workflow_work_order RPC", async (t) => {
   assert.equal(rpcCall.body.p_submission_id, "sub-1");
 });
 
+// --- H-1: 'evaluate' events -- server-side action derivation ---------------
+// internal.enqueue_report_workflow (0053) inserts exactly one 'evaluate'
+// event per submission; THIS is what turns it into the concrete action
+// events the rest of this file's tests already dispatch on.
+
+function evaluateEvent(overrides = {}) {
+  return baseEvent({
+    event_type: "evaluate",
+    action: {},
+    ...overrides
+  });
+}
+
+const workflowSubmission = {
+  id: "sub-1",
+  facility_id: "fac-1",
+  department_id: null,
+  template_id: "tpl-1",
+  template_version_id: "ver-1",
+  report_date: "2026-08-13",
+  shift_ref: null,
+  status: "submitted",
+  payload_json: { pool_ready: "pass" },
+  submitted_by: "user-1",
+  submitted_at: "2026-08-13T11:55:00.000Z"
+};
+
+// Stubs the additional lookups executeEvaluate needs beyond the base
+// claim/patch pair every test in this file already gets from stubExecutor:
+// report_submissions (the submission itself), report_templates (the
+// sandbox re-check), report_template_versions (workflow_json), and
+// `modules` (loadWorkflowConfig's loadModuleConfig short-circuits to {} the
+// moment a module code resolves to no row, so returning [] here is enough
+// to keep every config layer at the registry default without also having
+// to stub facilities/organization_module_settings/facility_module_overrides).
+function stubEvaluate(t, event, { template = { id: "tpl-1", sandbox: false }, version, extra } = {}) {
+  const insertedActionEvents = [];
+  const captured = stubFetch(t, (table, method, url, body) => {
+    if (table === "report_workflow_events" && method === "GET") return [event];
+    if (table === "report_workflow_events" && method === "PATCH" && url.searchParams.get("status") === "eq.pending") {
+      return [{ ...event, status: "processing" }];
+    }
+    if (table === "report_submissions" && method === "GET") return [workflowSubmission];
+    if (table === "report_templates" && method === "GET") return [template];
+    if (table === "report_template_versions" && method === "GET") return [version];
+    if (table === "modules" && method === "GET") return [];
+    if (table === "report_workflow_events" && method === "POST") {
+      insertedActionEvents.push(body[0]);
+      return [];
+    }
+    return extra ? (extra(table, method, url, body) ?? []) : [];
+  });
+  return { captured, insertedActionEvents };
+}
+
+test("an evaluate event derives its action list from workflow_json and inserts one pending event per action", async (t) => {
+  const event = evaluateEvent();
+  const version = {
+    id: "ver-1",
+    workflow_json: { on_submit: [{ type: "queue_pdf" }, { type: "notify", params: { message: "hi" } }] }
+  };
+  const { captured, insertedActionEvents } = stubEvaluate(t, event, { version });
+
+  const summary = await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(summary.claimed, 1);
+  assert.equal(summary.processed, 1);
+  assert.equal(summary.failed, 0);
+
+  assert.equal(insertedActionEvents.length, 2);
+  assert.deepEqual(
+    insertedActionEvents.map((row) => row.event_type),
+    ["queue_pdf:0", "notify:1"]
+  );
+  assert.ok(insertedActionEvents.every((row) => row.status === "pending" && row.submission_id === "sub-1"));
+
+  const eventPatch = findPatch(captured, "report_workflow_events", (c) => c.body.status === "processed");
+  assert.equal(eventPatch.body.result.actions, 2);
+  assert.equal(eventPatch.body.result.inserted, 2);
+});
+
+test("an evaluate event for a sandbox template produces no action events at all", async (t) => {
+  const event = evaluateEvent();
+  const version = { id: "ver-1", workflow_json: { on_submit: [{ type: "queue_pdf" }] } };
+  const { captured, insertedActionEvents } = stubEvaluate(t, event, {
+    template: { id: "tpl-1", sandbox: true },
+    version
+  });
+
+  const summary = await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(summary.processed, 1);
+  assert.equal(insertedActionEvents.length, 0);
+
+  const eventPatch = findPatch(captured, "report_workflow_events", (c) => c.body.status === "processed");
+  assert.equal(eventPatch.body.result.sandbox, true);
+  assert.equal(eventPatch.body.result.actions, 0);
+});
+
+test("an evaluate event with an empty workflow_json inserts nothing and still marks processed", async (t) => {
+  const event = evaluateEvent();
+  const version = { id: "ver-1", workflow_json: {} };
+  const { captured, insertedActionEvents } = stubEvaluate(t, event, { version });
+
+  const summary = await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(summary.processed, 1);
+  assert.equal(insertedActionEvents.length, 0);
+  const eventPatch = findPatch(captured, "report_workflow_events", (c) => c.body.status === "processed");
+  assert.equal(eventPatch.body.result.actions, 0);
+});
+
+// H-1's whole point: nothing about which actions fire is caller-influenced
+// any more -- action.type/params on the 'evaluate' event itself (action =
+// '{}' per 0053) are irrelevant; only the pinned version's workflow_json
+// drives the outcome. A hand-crafted 'evaluate' event carrying an attacker
+// action in its own `action` column (impossible through the real RPC, which
+// hard-codes '{}', but worth proving the executor itself never reads it)
+// produces exactly the template-configured actions, nothing else.
+test("an evaluate event's own action payload is ignored -- only the pinned version's workflow_json drives the result", async (t) => {
+  const event = evaluateEvent({ action: { type: "create_incident", params: { severity: "critical" } } });
+  const version = { id: "ver-1", workflow_json: { on_submit: [{ type: "queue_pdf" }] } };
+  const { insertedActionEvents } = stubEvaluate(t, event, { version });
+
+  await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(insertedActionEvents.length, 1);
+  assert.equal(insertedActionEvents[0].event_type, "queue_pdf:0");
+});
+
+// A 409 (unique violation on report_workflow_events' own unique(submission_id,
+// event_type)) on one action insert means a prior pass already landed it --
+// treated as a no-op, not a failure, matching ON CONFLICT DO NOTHING.
+test("a 409 on one action-event insert is treated as already-enqueued, not a failure", async (t) => {
+  const event = evaluateEvent();
+  const version = {
+    id: "ver-1",
+    workflow_json: { on_submit: [{ type: "queue_pdf" }, { type: "notify", params: {} }] }
+  };
+  let postCount = 0;
+  const insertedActionEvents = [];
+  const captured = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (table === "report_workflow_events" && method === "POST") {
+      postCount += 1;
+      captured.push({ table, method, url: parsed, body });
+      if (postCount === 1) {
+        // Real PostgREST unique-violation shape, so pgInsert/request()
+        // (supabase-rest.mjs) throws a genuine PostgrestError with
+        // status 409 -- exactly what the executor's catch checks for.
+        return { ok: false, status: 409, text: async () => JSON.stringify({ code: "23505", message: "conflict" }) };
+      }
+      insertedActionEvents.push(body[0]);
+      return { ok: true, status: 201, text: async () => "[]" };
+    }
+    captured.push({ table, method, url: parsed, body });
+    let data = [];
+    if (table === "report_workflow_events" && method === "GET") data = [event];
+    else if (table === "report_workflow_events" && method === "PATCH" && parsed.searchParams.get("status") === "eq.pending") {
+      data = [{ ...event, status: "processing" }];
+    } else if (table === "report_workflow_events" && method === "PATCH") data = [event];
+    else if (table === "report_submissions" && method === "GET") data = [workflowSubmission];
+    else if (table === "report_templates" && method === "GET") data = [{ id: "tpl-1", sandbox: false }];
+    else if (table === "report_template_versions" && method === "GET") data = [version];
+    else if (table === "modules" && method === "GET") data = [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const summary = await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(summary.processed, 1);
+  assert.equal(summary.failed, 0);
+  assert.equal(insertedActionEvents.length, 1, "the second action still lands even though the first 409'd");
+  const eventPatch = findPatch(captured, "report_workflow_events", (c) => c.body.status === "processed");
+  assert.equal(eventPatch.body.result.actions, 2);
+  assert.equal(eventPatch.body.result.inserted, 1);
+});
+
 // --- Idempotency (re-running never duplicates -- the mint RPC itself is the
 // idempotency boundary; the executor just relays whatever it returns) ------
 

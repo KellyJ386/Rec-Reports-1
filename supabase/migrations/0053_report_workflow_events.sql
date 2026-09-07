@@ -6,35 +6,74 @@
 -- DR-19: report_workflow_events -- the durable ledger of actions a
 -- submission's on_submit workflow produced. SELECT-only for `authenticated`
 -- (reports.read); there is deliberately NO insert/update/delete policy for
--- `authenticated` -- every write goes through one of the two SECURITY
--- DEFINER RPC pairs below, following 0048's internal.apply_incident_amendment
--- pattern:
+-- `authenticated` -- every write goes through one of the RPC pairs below,
+-- following 0048's internal.apply_incident_amendment pattern:
 --   * internal.enqueue_report_workflow / public.enqueue_report_workflow --
 --     called by reports-routes.mjs's submit route UNDER THE SUBMITTING
---     USER'S OWN SESSION (never service-role). Re-checks reports.submit on
---     the submission's own facility/department itself (defense in depth --
---     the route already checked it, but this RPC must stand on its own the
---     way apply_incident_amendment does), inserts one pending event per
---     action (idempotent via report_workflow_events' own
---     unique(submission_id, event_type)) plus one outbox_events row
---     (event_type 'report.submitted'). Granted to `authenticated`.
+--     USER'S OWN SESSION (never service-role). Re-checks reports.submit (or
+--     submitted_by) on the submission's own facility/department itself
+--     (defense in depth -- the route already checked it, but this RPC must
+--     stand on its own the way apply_incident_amendment does), and inserts
+--     exactly ONE pending 'evaluate' event, idempotently
+--     (report_workflow_events' own unique(submission_id, event_type) +
+--     `on conflict do nothing`) plus one outbox_events row (event_type
+--     'report.submitted') ONLY when that insert actually happened. Granted
+--     to `authenticated`.
+--
+--   H-1 (security review): this RPC used to be
+--   enqueue_report_workflow(p_submission_id, p_actions jsonb) -- the
+--   caller-supplied `p_actions` array was written into
+--   report_workflow_events verbatim, with NO validation against the
+--   submission's own pinned template version at all. Any reports.submit
+--   holder could call public.enqueue_report_workflow directly through
+--   PostgREST with an arbitrary action list (create_incident with an
+--   attacker-chosen severity/summary, create_work_order with an
+--   attacker-chosen title/priority, notify with attacker-chosen text
+--   broadcast to every reports.export holder in the facility) and the
+--   drain would mint every one of them, with no incidents.manage/
+--   work_orders.manage of their own and no workflow configured on the
+--   template at all -- proved against a template whose workflow_json is
+--   `{}`. Fixed by removing the injection surface entirely rather than
+--   trying to validate it: the RPC now takes ONLY p_submission_id. It
+--   enqueues a single 'evaluate' event (action = '{}') and nothing else;
+--   src/lib/report-workflow-executor.mjs's executor -- running under the
+--   service-role client the caller can never reach or impersonate -- is
+--   what loads the pinned template version, re-derives the action list
+--   from workflow_json via the SAME pure evaluateWorkflow the route used to
+--   call, and inserts the concrete action events itself. There is nothing
+--   left here for a caller to inject.
+--
+--   This closes M-4 too (the same finding's twin): the old RPC inserted an
+--   outbox_events row UNCONDITIONALLY on every call, with no per-submission
+--   uniqueness, so a caller in a loop could grow both queues (and the
+--   drain's downstream fan-out, including outbound email) without bound.
+--   The new RPC's single 'evaluate' event is the only thing it ever writes,
+--   `on conflict (submission_id, event_type) do nothing` makes a second
+--   call for the same submission a true no-op (GET DIAGNOSTICS ... row_count
+--   right after the INSERT), and the outbox_events insert only runs when
+--   that INSERT actually landed a new row -- so calling this RPC any number
+--   of times for one submission produces exactly one report_workflow_events
+--   row and exactly one outbox_events row, period.
 --
 -- DR-20: execution. src/lib/report-workflow-executor.mjs (the CRON_SECRET
 -- drain, service-role client) claims pending events and dispatches on
--- action->>'type'. `notify`/`queue_pdf` need no elevated privilege (the
--- service-role client already bypasses RLS for a plain UPDATE/INSERT), but
--- `create_incident`/`create_work_order` go through a SECOND RPC pair:
+-- action->>'type'. An 'evaluate' event (see H-1 above) has its action list
+-- derived server-side and the concrete action events inserted from there;
+-- `notify`/`queue_pdf` need no elevated privilege (the service-role client
+-- already bypasses RLS for a plain UPDATE/INSERT), but `create_incident`/
+-- `create_work_order` go through a SECOND RPC pair:
 --   * internal.mint_workflow_incident / public.mint_workflow_incident
 --   * internal.mint_workflow_work_order / public.mint_workflow_work_order
 -- Both are granted ONLY to service_role -- NOT authenticated, NOT public --
 -- this is the Opus-reviewed privilege boundary: a submitter (even one
 -- lacking incidents.manage/work_orders.manage) can trigger these indirectly
--- through their own report submission, but can never call either RPC
--- directly, and no authenticated actor of any permission level can either.
--- The submission-derived facility_id/department_id/submitted_by are read
--- SERVER-SIDE from report_submissions by submission_id -- never accepted as
--- caller-supplied parameters -- so there is no cross-tenant injection
--- surface even though the function itself bypasses RLS.
+-- through their own report submission's *configured* workflow (H-1 above is
+-- what makes "configured" actually true end to end now), but can never call
+-- either RPC directly, and no authenticated actor of any permission level
+-- can either. The submission-derived facility_id/department_id/submitted_by
+-- are read SERVER-SIDE from report_submissions by submission_id -- never
+-- accepted as caller-supplied parameters -- so there is no cross-tenant
+-- injection surface even though the function itself bypasses RLS.
 --
 -- Provenance (DR-20's other acceptance criterion): incident_reports carries
 -- no metadata jsonb column, so internal.mint_workflow_incident sets two
@@ -146,6 +185,7 @@ begin
       v_event_type := 'incident.updated';
     end if;
 
+    -- H4: the list of changed column NAMES only -- never their content.
     if new.status is distinct from old.status then v_changed_columns := array_append(v_changed_columns, 'status'); end if;
     if new.severity is distinct from old.severity then v_changed_columns := array_append(v_changed_columns, 'severity'); end if;
     if new.summary is distinct from old.summary then v_changed_columns := array_append(v_changed_columns, 'summary'); end if;
@@ -164,6 +204,11 @@ begin
     v_actor := null;
   end if;
 
+  -- H4: allow-list only. status/severity before+after, the current
+  -- requires_osha_review/legal_hold, and the changed-column-name list are
+  -- everything the audit trail (and admin.manage readers, who hold no
+  -- incidents.read) legitimately need; the free-text narrative and any
+  -- incident_people content never enter audit_events at all.
   v_payload := jsonb_build_object(
     'incident_id', new.id,
     'facility_id', new.facility_id,
@@ -224,17 +269,34 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
--- DR-19: internal.enqueue_report_workflow -- called under the SUBMITTING
--- USER'S OWN session (reports-routes.mjs's POST /reports/:id/submit),
--- immediately after that route's own report_submissions UPDATE. Re-derives
--- facility_id/department_id from the submission row itself (never trusts a
--- caller-supplied facility/department), re-checks reports.submit, and
--- requires the submission to already be 'submitted' (this RPC only enqueues
--- workflow actions for a report that has actually finished submitting).
+-- H-1: drop the old two-argument overloads outright (rather than leaving
+-- them to coexist with the new one-argument signature as PostgREST-visible
+-- overloads, which would be ambiguous at best and reopen the caller-
+-- supplied-actions surface at worst).
+-- ---------------------------------------------------------------------------
+drop function if exists internal.enqueue_report_workflow(uuid, jsonb);
+drop function if exists public.enqueue_report_workflow(uuid, jsonb);
+
+-- ---------------------------------------------------------------------------
+-- DR-19/H-1: internal.enqueue_report_workflow(p_submission_id uuid) --
+-- called under the SUBMITTING USER'S OWN session (reports-routes.mjs's POST
+-- /reports/:id/submit), immediately after that route's own
+-- report_submissions UPDATE. Re-derives facility_id/department_id from the
+-- submission row itself (never trusts a caller-supplied facility/
+-- department), re-checks reports.submit (or that the caller IS the
+-- submission's own submitted_by -- the submitting user's own session should
+-- never be locked out of enqueueing their own already-submitted report's
+-- workflow purely because a later membership change cost them
+-- reports.submit at that department), and requires the submission to
+-- already be 'submitted'. Takes NO other parameter -- see the migration
+-- header's H-1 note for why the caller-supplied action list this used to
+-- accept was removed rather than validated. Inserts exactly ONE
+-- 'evaluate' event, idempotently, and the outbox_events row only when that
+-- insert actually happened -- so N calls for the same submission produce
+-- exactly one row in each table (closes M-4 too).
 -- ---------------------------------------------------------------------------
 create or replace function internal.enqueue_report_workflow(
-  p_submission_id uuid,
-  p_actions jsonb
+  p_submission_id uuid
 )
 returns jsonb
 language plpgsql
@@ -244,11 +306,8 @@ as $$
 declare
   v_actor uuid := auth.uid();
   v_submission report_submissions%rowtype;
-  v_action jsonb;
-  v_idx int := 0;
-  v_event_type text;
   v_event_id uuid;
-  v_event_ids uuid[] := array[]::uuid[];
+  v_inserted int;
 begin
   if v_actor is null then
     raise exception 'enqueue_report_workflow: authentication required'
@@ -261,7 +320,10 @@ begin
       using errcode = 'P0002';
   end if;
 
-  if not internal.has_permission(v_actor, v_submission.facility_id, v_submission.department_id, 'reports.submit') then
+  if not (
+    internal.has_permission(v_actor, v_submission.facility_id, v_submission.department_id, 'reports.submit')
+    or v_submission.submitted_by = v_actor
+  ) then
     raise exception 'enqueue_report_workflow: missing permission: reports.submit'
       using errcode = '42501';
   end if;
@@ -271,47 +333,39 @@ begin
       using errcode = 'check_violation';
   end if;
 
-  if p_actions is not null and jsonb_typeof(p_actions) = 'array' then
-    for v_action in select * from jsonb_array_elements(p_actions)
-    loop
-      v_event_type := coalesce(v_action ->> 'type', 'unknown') || ':' || v_idx::text;
-      v_event_id := null;
-      insert into report_workflow_events (facility_id, submission_id, event_type, action, status)
-      values (v_submission.facility_id, p_submission_id, v_event_type, v_action, 'pending')
-      on conflict (submission_id, event_type) do nothing
-      returning id into v_event_id;
-      if v_event_id is not null then
-        v_event_ids := array_append(v_event_ids, v_event_id);
-      end if;
-      v_idx := v_idx + 1;
-    end loop;
+  v_event_id := null;
+  insert into report_workflow_events (facility_id, submission_id, event_type, action, status)
+  values (v_submission.facility_id, p_submission_id, 'evaluate', '{}'::jsonb, 'pending')
+  on conflict (submission_id, event_type) do nothing
+  returning id into v_event_id;
+  get diagnostics v_inserted = row_count;
+
+  if v_inserted > 0 then
+    insert into outbox_events (facility_id, event_type, payload)
+    values (
+      v_submission.facility_id,
+      'report.submitted',
+      jsonb_build_object(
+        'submission_id', p_submission_id,
+        'template_id', v_submission.template_id
+      )
+    );
   end if;
 
-  insert into outbox_events (facility_id, event_type, payload)
-  values (
-    v_submission.facility_id,
-    'report.submitted',
-    jsonb_build_object(
-      'submission_id', p_submission_id,
-      'template_id', v_submission.template_id,
-      'action_count', v_idx
-    )
-  );
-
-  return jsonb_build_object('submission_id', p_submission_id, 'event_ids', to_jsonb(v_event_ids));
+  return jsonb_build_object('submission_id', p_submission_id, 'event_id', to_jsonb(v_event_id), 'enqueued', v_inserted > 0);
 end;
 $$;
 
-revoke execute on function internal.enqueue_report_workflow(uuid, jsonb) from public;
-grant execute on function internal.enqueue_report_workflow(uuid, jsonb) to authenticated;
+revoke execute on function internal.enqueue_report_workflow(uuid) from public;
+grant execute on function internal.enqueue_report_workflow(uuid) to authenticated;
 
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke execute on function internal.enqueue_report_workflow(uuid, jsonb) from anon;
+    revoke execute on function internal.enqueue_report_workflow(uuid) from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function internal.enqueue_report_workflow(uuid, jsonb) to service_role;
+    grant execute on function internal.enqueue_report_workflow(uuid) to service_role;
   end if;
 end
 $$;
@@ -319,27 +373,26 @@ $$;
 -- PostgREST-facing wrapper (see 0048's apply_incident_amendment pair for the
 -- rationale -- `internal` is never exposed by PostgREST, 0042).
 create or replace function public.enqueue_report_workflow(
-  p_submission_id uuid,
-  p_actions jsonb
+  p_submission_id uuid
 )
 returns jsonb
 language sql
 security invoker
 set search_path = public
 as $$
-  select internal.enqueue_report_workflow(p_submission_id, p_actions);
+  select internal.enqueue_report_workflow(p_submission_id);
 $$;
 
-revoke execute on function public.enqueue_report_workflow(uuid, jsonb) from public;
-grant execute on function public.enqueue_report_workflow(uuid, jsonb) to authenticated;
+revoke execute on function public.enqueue_report_workflow(uuid) from public;
+grant execute on function public.enqueue_report_workflow(uuid) to authenticated;
 
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke execute on function public.enqueue_report_workflow(uuid, jsonb) from anon;
+    revoke execute on function public.enqueue_report_workflow(uuid) from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
-    grant execute on function public.enqueue_report_workflow(uuid, jsonb) to service_role;
+    grant execute on function public.enqueue_report_workflow(uuid) to service_role;
   end if;
 end
 $$;

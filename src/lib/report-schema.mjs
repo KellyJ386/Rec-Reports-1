@@ -1,3 +1,5 @@
+import { permissions as PERMISSION_CODES } from "./permissions.mjs";
+
 const allowedFieldTypes = new Set([
   "text",
   "textarea",
@@ -32,15 +34,25 @@ export function isSupportedFieldType(type) {
   return allowedFieldTypes.has(type);
 }
 
-// --- DR-16: regex safety for validation_rules.regex -------------------------
+// --- DR-16/H-2: regex safety for validation_rules.regex ---------------------
 //
 // A field's validation_rules.regex is compiled once at schema-validation time
 // (authoring) and then `.test()`-ed against caller-supplied submission values
 // at every future validate call -- i.e. untrusted input reaches `.test()` on
 // a pattern an admin authored once. Node's regex engine can exhibit
 // catastrophic (exponential) backtracking on certain pattern shapes, so this
-// module never runs an *unvetted* pattern against user input. The rule,
-// applied in this exact order by unsafeRegexPatternReason:
+// module never runs an *unvetted* pattern against user input.
+//
+// H-2 (security review): the original check was a heuristic flat-group scan
+// (`(...quantifier...)` immediately followed by an outer `+`/`*`) that missed
+// three whole families of catastrophic-backtracking shapes: alternation
+// overlap with no inner quantifier at all (`(a|a)*`), ambiguity from a bare
+// `?` inside a repeated group (`(\d\d?)*`), a bounded-but-still-explosive
+// `{n,m}` the old regex's `\{\d*,\}` half didn't match (`(a{1,2})*`), and a
+// nested paren the flat `[^()]*` scan simply can't see into (`((a+))+`).
+// Replaced with a conservative, structural ALLOW-LIST grammar
+// (unsafeRegexStructureReason below), applied in this exact order by
+// unsafeRegexPatternReason:
 //   1. Must be a non-empty string, at most MAX_REGEX_PATTERN_LENGTH (200)
 //      characters -- bounds the search space of every check below and caps
 //      how much backtracking even a pathological pattern could ever attempt.
@@ -49,16 +61,36 @@ export function isSupportedFieldType(type) {
 //      not the end anchor) -- an unanchored pattern can be forced into more
 //      backtracking by a longer input than the author intended, and it also
 //      changes what "matches" means (substring vs whole-value).
-//   3. Must not contain a nested-quantifier shape -- a parenthesized group
-//      (with no further nesting) that itself ends in `+`/`*`/an open-ended
-//      `{n,}`, immediately followed by an outer `+`/`*` on that same group
-//      (e.g. `(a+)+`, `(\d*)*`, `(x{2,})+`). This is the textbook shape
-//      behind catastrophic backtracking; NESTED_QUANTIFIER_RE below is
-//      itself a simple, linear-time check (no nested groups, bounded input),
-//      so checking it is never itself a ReDoS risk.
-//   4. Must not contain a backreference (`\1`-`\9`) -- not needed for field
+//   3. Must not contain a backreference (`\1`-`\9`) -- not needed for field
 //      validation patterns and removes another engine-dependent complexity
 //      source.
+//   4. Structural grammar (unsafeRegexStructureReason), scanned left to
+//      right in one linear pass (character classes `[...]` are skipped
+//      verbatim -- their contents are literal, never quantifier/group
+//      syntax, so scanning into them cannot itself be a ReDoS risk):
+//        a. No lookaround assertions: `(?=`, `(?!`, `(?<=`, `(?<!`.
+//        b. No group nested more than one level deep -- `((a))` is
+//           rejected, `(a(b)c)` is rejected, `(a)(b)` (two SIBLING
+//           depth-1 groups) is fine.
+//        c. `|` alternation is legal only at the TOP level (depth 0) --
+//           `a|b` is fine, `(a|b)` is not, closing off the alternation-
+//           inside-a-repeated-group shape (`(a|a)*`) entirely regardless of
+//           whether the group is ever quantified.
+//        d. A GROUP may carry at most a single, non-repeated `?` (optional,
+//           greedy or lazy: `(a)?`, `(a)??`) -- any other quantifier
+//           immediately following a group's closing `)` (`*`, `+`, `{n,m}`,
+//           `{n,}`, or a second `?`) is rejected. This is the one rule that
+//           actually matters for catastrophic backtracking: a REPEATED group
+//           is what turns whatever ambiguity lives inside it (alternation,
+//           a nested quantifier, an optional sub-match) into exponential
+//           work: `(a+)+`, `(\d\d?)*`, `(a{1,2})*` are all caught here, on
+//           top of (c) already catching `(a|a)*`. Quantifiers on ordinary
+//           atoms outside a group (`\d+`, `[A-Z]{2}`, `a*`) are NOT
+//           restricted by this rule at all -- only a group's own trailing
+//           quantifier is.
+//        e. At most MAX_REGEX_QUANTIFIERS (8) quantifier occurrences in the
+//           whole pattern (belt-and-suspenders bound on authoring
+//           complexity, independent of (d)).
 //   5. Must be syntactically valid (`new RegExp(pattern)` does not throw).
 //      Constructing a RegExp only compiles it -- it never executes matching
 //      -- so this step carries no backtracking risk regardless of shape.
@@ -68,8 +100,114 @@ export function isSupportedFieldType(type) {
 // the static checks above.
 const MAX_REGEX_PATTERN_LENGTH = 200;
 const MAX_REGEX_INPUT_LENGTH = 2000;
-const NESTED_QUANTIFIER_RE = /\([^()]*(?:[+*]|\{\d*,\})[^()]*\)[+*]/;
+const MAX_REGEX_QUANTIFIERS = 8;
 const BACKREFERENCE_RE = /\\[1-9]/;
+const LOOKAROUND_AT_RE = /^\(\?(?:=|!|<=|<!)/;
+const GROUP_QUANTIFIER_RE = /^(?:\*|\+|\{\d*(?:,\d*)?\})/;
+const BRACE_QUANTIFIER_RE = /^\{\d*(?:,\d*)?\}/;
+
+// Structural allow-list scan over `pattern` (already known to be a string).
+// Returns a rejection reason, or null when the pattern's STRUCTURE is safe
+// (this does not by itself guarantee the pattern is syntactically valid --
+// unsafeRegexPatternReason still runs `new RegExp` afterwards). See the
+// module doc comment above for the grammar this enforces.
+function unsafeRegexStructureReason(pattern) {
+  let depth = 0;
+  let quantifiers = 0;
+  let i = 0;
+  const n = pattern.length;
+
+  while (i < n) {
+    const ch = pattern[i];
+
+    if (ch === "\\") {
+      // Escaped character (including a backreference digit, already
+      // rejected separately, and any other escape like \d, \., \s): skip
+      // both characters as one atom, never interpreted as structure.
+      i += 2;
+      continue;
+    }
+
+    if (ch === "[") {
+      // Character class: everything up to the matching unescaped `]` is
+      // literal (a leading `]` or `^]` is itself a literal `]`, standard
+      // regex-class syntax) -- `+`, `*`, `(`, `)`, `|` inside a class are
+      // ordinary characters, never quantifier/group/alternation syntax, so
+      // skip the whole class verbatim without touching depth/quantifiers.
+      i += 1;
+      if (pattern[i] === "^") i += 1;
+      if (pattern[i] === "]") i += 1;
+      while (i < n && pattern[i] !== "]") {
+        i += pattern[i] === "\\" ? 2 : 1;
+      }
+      i += 1; // consume the closing ']' (or run past the end -- new RegExp catches an unterminated class)
+      continue;
+    }
+
+    if (ch === "(") {
+      if (LOOKAROUND_AT_RE.test(pattern.slice(i))) {
+        return "must not use lookaround assertions";
+      }
+      depth += 1;
+      if (depth > 1) {
+        return "must not nest groups more than one level deep";
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return "has unbalanced parentheses";
+      i += 1;
+      const rest = pattern.slice(i);
+      if (GROUP_QUANTIFIER_RE.test(rest)) {
+        return "must not repeat a group -- only a single trailing ? is allowed after a group";
+      }
+      if (rest[0] === "?") {
+        quantifiers += 1;
+        i += 1;
+        if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") {
+          return "must not repeat a group -- only a single trailing ? is allowed after a group";
+        }
+      }
+      continue;
+    }
+
+    if (ch === "|") {
+      if (depth > 0) return "must not use alternation inside a group -- only top-level | is allowed";
+      i += 1;
+      continue;
+    }
+
+    if (ch === "*" || ch === "+" || ch === "?") {
+      quantifiers += 1;
+      i += 1;
+      if (pattern[i] === "?") i += 1; // lazy modifier on an ordinary atom
+      continue;
+    }
+
+    if (ch === "{") {
+      const match = BRACE_QUANTIFIER_RE.exec(pattern.slice(i));
+      if (match) {
+        quantifiers += 1;
+        i += match[0].length;
+        if (pattern[i] === "?") i += 1;
+        continue;
+      }
+      i += 1; // a literal '{' not forming a quantifier -- not structural
+      continue;
+    }
+
+    i += 1;
+  }
+
+  if (depth !== 0) return "has unbalanced parentheses";
+  if (quantifiers > MAX_REGEX_QUANTIFIERS) {
+    return `must not use more than ${MAX_REGEX_QUANTIFIERS} quantifiers`;
+  }
+  return null;
+}
 
 export function unsafeRegexPatternReason(pattern) {
   if (typeof pattern !== "string" || pattern.length === 0) {
@@ -81,12 +219,11 @@ export function unsafeRegexPatternReason(pattern) {
   if (!pattern.startsWith("^") || !pattern.endsWith("$") || pattern.endsWith("\\$")) {
     return "must be anchored with ^ at the start and an unescaped $ at the end";
   }
-  if (NESTED_QUANTIFIER_RE.test(pattern)) {
-    return "must not nest quantifiers (e.g. (a+)+) -- a catastrophic-backtracking shape";
-  }
   if (BACKREFERENCE_RE.test(pattern)) {
     return "must not use backreferences";
   }
+  const structural = unsafeRegexStructureReason(pattern);
+  if (structural) return structural;
   try {
     // eslint-disable-next-line no-new -- validity check only, never executed
     new RegExp(pattern);
@@ -396,14 +533,47 @@ export function validateReportTemplateSchema(schema) {
   return errors;
 }
 
-// --- DR-17: template-level signature policy shape ---------------------------
+// --- DR-17/M-3: template-level signature policy shape ------------------------
 // signature_requirements lives on a template VERSION's validation_json (the
 // same jsonb column submit_policy already lives on -- reports-routes.mjs's
 // version.validation_json?.submit_policy), not inside schema_json: "the
 // template's signature_requirements" (DR-17) is a submission-completeness
 // policy, not a per-field value-shape rule, so it is authored and stored
 // alongside the other submit-time policy knob rather than attached to one
-// specific field. { required: boolean, roles: [nonEmptyString, ...] }.
+// specific field.
+//
+// M-3 (security review): a bare role LABEL carried no permission of its own,
+// so any reports.submit holder could POST {"role":"supervisor"},
+// {"role":"manager"}, etc. in sequence on their own draft and single-
+// handedly clear a multi-party sign-off gate. Each roles[] entry is now
+// `{ role, permission }` -- `permission` is checked at sign time
+// (reports-routes.mjs's POST .../signatures) against the SAME
+// department-scoped permission check every other row guard in this file
+// uses, so a role that requires reports.publish can only ever be signed by
+// someone who actually holds it. A bare string entry is still accepted for
+// backward compatibility and normalizes to
+// `{ role: <string>, permission: DEFAULT_SIGNATURE_PERMISSION }`
+// (reports.submit -- the same permission every submitter already holds to
+// reach the sign route at all, so an all-bare-string roles[] list keeps
+// today's pre-M-3 behavior exactly).
+export const DEFAULT_SIGNATURE_PERMISSION = "reports.submit";
+const SIGNATURE_ROLE_ENTRY_KEYS = new Set(["role", "permission"]);
+
+// Normalizes one roles[] entry to { role, permission }, or returns null for
+// a shape neither a route nor validateSignatureRequirements can make sense
+// of (validateSignatureRequirements reports that as an error; the route
+// layer treats null as "not a match" for the role being signed). Never
+// throws.
+export function normalizeSignatureRoleRequirement(entry) {
+  if (typeof entry === "string") {
+    return { role: entry, permission: DEFAULT_SIGNATURE_PERMISSION };
+  }
+  if (isPlainObject(entry) && Object.keys(entry).every((key) => SIGNATURE_ROLE_ENTRY_KEYS.has(key))) {
+    return { role: entry.role, permission: entry.permission };
+  }
+  return null;
+}
+
 export function validateSignatureRequirements(value) {
   const errors = [];
   if (value === undefined || value === null) return errors;
@@ -419,13 +589,28 @@ export function validateSignatureRequirements(value) {
     errors.push("signature_requirements.required must be a boolean");
   }
   if (value.roles !== undefined) {
-    if (
-      !Array.isArray(value.roles) ||
-      value.roles.some((role) => typeof role !== "string" || role.trim().length === 0)
-    ) {
-      errors.push("signature_requirements.roles must be an array of non-empty strings");
-    } else if (new Set(value.roles).size !== value.roles.length) {
-      errors.push("signature_requirements.roles must not contain duplicates");
+    if (!Array.isArray(value.roles)) {
+      errors.push("signature_requirements.roles must be an array");
+    } else {
+      const seenRoles = new Set();
+      value.roles.forEach((entry, index) => {
+        const prefix = `signature_requirements.roles[${index}]`;
+        const normalized = normalizeSignatureRoleRequirement(entry);
+        if (!normalized) {
+          errors.push(`${prefix} must be a non-empty string or an object { role, permission }`);
+          return;
+        }
+        if (typeof normalized.role !== "string" || normalized.role.trim().length === 0) {
+          errors.push(`${prefix}.role must be a non-empty string`);
+        } else if (seenRoles.has(normalized.role)) {
+          errors.push(`signature_requirements.roles must not contain duplicate role "${normalized.role}"`);
+        } else {
+          seenRoles.add(normalized.role);
+        }
+        if (typeof normalized.permission !== "string" || !PERMISSION_CODES.includes(normalized.permission)) {
+          errors.push(`${prefix}.permission must be a known permission code`);
+        }
+      });
     }
   }
   return errors;
@@ -611,6 +796,24 @@ export function evaluateVisibility(schema, payload) {
 // JSON usefully.
 export function hiddenFieldKeys(schema, payload) {
   return [...evaluateVisibility(schema, payload)].sort();
+}
+
+// L-3 (security review): a field hidden by its own visibility_rules is never
+// required and never validated (collectSubmissionErrors, below, skips it
+// unconditionally) -- but a value submitted FOR a hidden key was still a
+// known schema key, so it passed unknownPayloadKeys and was persisted into
+// payload_json completely unchecked (no type/range/regex rule ever ran
+// against it). Strips every currently-hidden field's key out of `payload`
+// entirely (a shallow copy; `payload` itself is never mutated) so submit-time
+// persistence can never carry a value nothing has ever validated --
+// validation_results.hidden_fields (reports-routes.mjs) already records
+// which keys were hidden, for auditability of the fact itself.
+export function stripHiddenFields(schema, payload) {
+  const hidden = evaluateVisibility(schema, payload);
+  if (hidden.size === 0) return payload ?? {};
+  const stripped = { ...(payload ?? {}) };
+  for (const key of hidden) delete stripped[key];
+  return stripped;
 }
 
 // Shared driver for the full and partial submission validators. When

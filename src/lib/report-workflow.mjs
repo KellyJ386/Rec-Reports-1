@@ -248,8 +248,12 @@ export function evaluateWorkflow({ template, version, submission, payload, now, 
   return { actions, warnings };
 }
 
-// Exported for DR-19's event_type generation (`${type}:${index}`, matching
-// internal.enqueue_report_workflow's own algorithm) and for tests.
+// Exported for DR-19/H-1's event_type generation (`${type}:${index}`) --
+// used directly by report-workflow-executor.mjs's executeEvaluate when it
+// inserts each derived action's own report_workflow_events row (H-1 moved
+// action derivation server-side into the executor; this is the single
+// source of truth for that naming scheme now, not a duplicated SQL
+// algorithm) -- and by tests.
 export function actionEventType(action, index) {
   return `${action?.type ?? "unknown"}:${index}`;
 }

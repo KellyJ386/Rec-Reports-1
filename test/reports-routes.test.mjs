@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRouter } from "../src/lib/http/router.mjs";
-import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
+import { registerReportRoutes, signatureHash } from "../src/lib/http/reports-routes.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
 
 const CREATOR = [
@@ -553,6 +553,39 @@ test("POST submit records hidden_fields on validation_results even with no other
   assert.deepEqual(patch.body.validation_results, { hidden_fields: ["pool_temp"] });
 });
 
+// L-3 (security review): a value submitted FOR a hidden field was a known
+// schema key (passes unknownPayloadKeys) but never validated at all (never
+// required, never type/range/regex checked) -- persisted as unvalidated
+// garbage. Submit now strips every currently-hidden key out of what
+// actually gets written to payload_json.
+test("POST submit strips a value planted on a hidden field out of the persisted payload_json", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          // pool_temp is hidden (supervisor !== "nobody") but still carries
+          // an attacker/garbage-planted value that was never validated.
+          payload_json: { supervisor: "Sam", pool_temp: "not even a number" }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [VISIBILITY_VERSION];
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "report_submissions" && c.method === "PATCH");
+  assert.deepEqual(patch.body.payload_json, { supervisor: "Sam" });
+  assert.deepEqual(patch.body.validation_results, { hidden_fields: ["pool_temp"] });
+});
+
 // --- DR-17: signatures -------------------------------------------------------
 
 const SIG_REQUIRED_VERSION = {
@@ -585,7 +618,81 @@ test("POST submit is blocked (400) with the missing roles when a required signat
   assert.ok(!captured.some((c) => c.table === "report_submissions" && c.method === "PATCH"));
 });
 
-test("POST submit succeeds once every required role has signed", async (t) => {
+test("POST submit succeeds once every required role has signed with a fresh (non-stale) signature", async (t) => {
+  const submissionPayload = { supervisor: "Sam", attendance: 42 };
+  const freshHash = signatureHash({
+    submissionId: "sub-1",
+    userId: "user-5",
+    role: "manager",
+    payload: submissionPayload
+  });
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          payload_json: submissionPayload
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures") {
+      return [{ signer_user_id: "user-5", signer_role: "manager", signature_hash: freshHash }];
+    }
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+  assert.ok(captured.some((c) => c.table === "report_submissions" && c.method === "PATCH"));
+});
+
+// --- M-2: signature hashes are re-verified against the CURRENT payload -----
+
+test("POST submit is blocked (409) when the payload changed after a signature was recorded", async (t) => {
+  const signedPayload = { supervisor: "Sam", attendance: 42 };
+  const staleHash = signatureHash({
+    submissionId: "sub-1",
+    userId: "user-5",
+    role: "manager",
+    payload: signedPayload
+  });
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          // The payload was edited (attendance 42 -> 99) AFTER signing --
+          // still legal (still draft, still reports.submit), but the
+          // recorded hash no longer matches.
+          payload_json: { supervisor: "Sam", attendance: 99 }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures") {
+      return [{ signer_user_id: "user-5", signer_role: "manager", signature_hash: staleHash }];
+    }
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.error, "signatures are stale");
+  assert.deepEqual(result.payload.staleRoles, ["manager"]);
+  assert.ok(!captured.some((c) => c.table === "report_submissions" && c.method === "PATCH"));
+});
+
+test("POST submit succeeds with no signature rows at all (nothing to verify)", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") {
       return [
@@ -599,8 +706,8 @@ test("POST submit succeeds once every required role has signed", async (t) => {
         }
       ];
     }
-    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
-    if (table === "report_submission_signatures") return [{ signer_role: "manager" }];
+    if (table === "report_template_versions") return [VERSION];
+    if (table === "report_submission_signatures") return [];
     if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
     return [];
   });
@@ -694,6 +801,77 @@ test("POST reports/:id/signatures happy path inserts a signature attributed to t
   assert.match(insert.body[0].signature_hash, /^[0-9a-f]{64}$/);
 });
 
+// --- M-3: a signer_role requires its own mapped permission ------------------
+
+const PUBLISH_ROLE_VERSION = {
+  ...VERSION,
+  validation_json: {
+    signature_requirements: {
+      required: true,
+      roles: [{ role: "supervisor", permission: "reports.publish" }]
+    }
+  }
+};
+
+test("POST reports/:id/signatures denies a plain reports.submit holder signing a role that requires reports.publish (403)", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [{ id: "sub-1", facility_id: "fac-1", status: "draft", template_version_id: "ver-3" }];
+    }
+    if (table === "report_template_versions") return [PUBLISH_ROLE_VERSION];
+    return [];
+  });
+  // CREATOR holds reports.submit (enough to reach the route at all) but not
+  // reports.publish (the role's own mapped permission) -- one submitter
+  // cannot satisfy a role that requires reports.publish.
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "supervisor" });
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /reports\.publish/);
+});
+
+test("POST reports/:id/signatures allows a caller who holds the role's own mapped permission", async (t) => {
+  const publisher = [
+    {
+      facilityId: "fac-1",
+      status: "active",
+      permissions: ["reports.read", "reports.submit", "reports.publish"]
+    }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        { id: "sub-1", facility_id: "fac-1", status: "draft", template_version_id: "ver-3", payload_json: {} }
+      ];
+    }
+    if (table === "report_template_versions") return [PUBLISH_ROLE_VERSION];
+    if (table === "report_submission_signatures" && method === "POST") return [{ id: "sig-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: publisher, userId: "user-11" });
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "supervisor" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "report_submission_signatures" && c.method === "POST");
+  assert.equal(insert.body[0].signer_role, "supervisor");
+});
+
+test("POST reports/:id/signatures: a bare string role still normalizes to reports.submit (backward compatible)", async (t) => {
+  // SIG_REQUIRED_VERSION's roles are bare strings ["manager"] -- every
+  // existing CREATOR-shaped caller (reports.submit, nothing more) can still
+  // sign, exactly like before M-3.
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [{ id: "sub-1", facility_id: "fac-1", status: "draft", template_version_id: "ver-3", payload_json: {} }];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures" && method === "POST") return [{ id: "sig-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "manager" });
+  assert.equal(result.status, 201);
+});
+
 // GET /facilities/:facilityId/reports/:id/signatures
 
 test("GET reports/:id/signatures 404s when the submission belongs to a different facility", async (t) => {
@@ -715,7 +893,7 @@ test("GET reports/:id/signatures denies a caller without reports.read on that fa
 });
 
 test("GET reports/:id/signatures returns the recorded signatures", async (t) => {
-  stubFetch(t, (table, method) => {
+  const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") return [{ id: "sub-1", facility_id: "fac-1" }];
     if (table === "report_submission_signatures") {
       return [{ id: "sig-1", submission_id: "sub-1", signer_role: "manager" }];
@@ -727,20 +905,36 @@ test("GET reports/:id/signatures returns the recorded signatures", async (t) => 
   assert.equal(result.status, 200);
   assert.equal(result.payload.length, 1);
   assert.equal(result.payload[0].signer_role, "manager");
+
+  // L-1 (security review): report_submission_signatures (0052) has no
+  // created_at column -- selecting it made PostgREST answer the whole
+  // request with a 400 in production. Assert the select list this route
+  // actually sends never asks for it again.
+  const get = captured.find((c) => c.table === "report_submission_signatures" && c.method === "GET");
+  const selected = get.url.searchParams.get("select").split(",");
+  assert.ok(!selected.includes("created_at"), `select list must not include created_at: ${selected.join(",")}`);
+  assert.ok(selected.includes("signed_at"));
 });
 
-// --- DR-18/DR-19: submit-time workflow enqueue ------------------------------
+// --- DR-18/DR-19/H-1: submit-time workflow enqueue --------------------------
+// H-1 (security review): the route no longer evaluates the workflow or
+// builds an action list at all -- internal.enqueue_report_workflow (0053)
+// now takes ONLY p_submission_id, and report-workflow-executor.mjs's
+// executor is what derives the action list server-side. workflow_json on
+// the version is therefore irrelevant to this route entirely; these tests
+// only need a non-sandbox report_templates row so enqueueWorkflow's L-6
+// fail-closed sandbox re-check finds a resolvable template.
 
 const WORKFLOW_VERSION = {
   id: "ver-wf",
   template_id: "tpl-1",
   version_number: 1,
   schema_json: SCHEMA,
-  workflow_json: { on_submit: ["queue_pdf", "notify_managers"] },
   is_published: true
 };
+const NON_SANDBOX_TEMPLATE = { id: "tpl-1", sandbox: false };
 
-test("POST submit enqueues workflow events via internal.enqueue_report_workflow", async (t) => {
+test("POST submit calls internal.enqueue_report_workflow with ONLY the submission id", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") {
       return [
@@ -756,9 +950,12 @@ test("POST submit enqueues workflow events via internal.enqueue_report_workflow"
       ];
     }
     if (table === "report_template_versions") return [WORKFLOW_VERSION];
-    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    if (table === "report_templates") return [NON_SANDBOX_TEMPLATE];
+    if (table === "report_submissions" && method === "PATCH") {
+      return [{ id: "sub-1", facility_id: "fac-1", template_id: "tpl-1", status: "submitted" }];
+    }
     if (table === "rpc/enqueue_report_workflow" && method === "POST") {
-      return { submission_id: "sub-1", event_ids: ["evt-1", "evt-2"] };
+      return { submission_id: "sub-1", event_id: "evt-1", enqueued: true };
     }
     return [];
   });
@@ -769,12 +966,12 @@ test("POST submit enqueues workflow events via internal.enqueue_report_workflow"
   const rpcCall = captured.find((c) => c.table === "rpc/enqueue_report_workflow" && c.method === "POST");
   assert.ok(rpcCall, "expected the submit route to call internal.enqueue_report_workflow");
   assert.equal(rpcCall.body.p_submission_id, "sub-1");
-  assert.equal(rpcCall.body.p_actions.length, 2);
-  assert.equal(rpcCall.body.p_actions[0].type, "queue_pdf");
-  assert.equal(rpcCall.body.p_actions[1].type, "notify");
+  // H-1's whole point: no action list, no params of any kind -- there is
+  // nothing left for a caller-influenced route to inject.
+  assert.deepEqual(Object.keys(rpcCall.body), ["p_submission_id"]);
 });
 
-test("POST submit on a sandbox template (DR-26) enqueues nothing: no workflow RPC, no outbox event", async (t) => {
+test("POST submit on a sandbox template (DR-26) enqueues nothing: no workflow RPC", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "report_submissions" && method === "GET") {
       return [
@@ -798,6 +995,41 @@ test("POST submit on a sandbox template (DR-26) enqueues nothing: no workflow RP
   const result = await call("POST", "/reports/sub-1/submit");
   assert.equal(result.status, 200);
   assert.ok(!captured.some((c) => c.table === "rpc/enqueue_report_workflow"), "sandbox must not enqueue");
+});
+
+// L-6 (security review): the prior version re-read report_templates under
+// the CALLER's own RLS session and treated ANY empty result (a genuinely
+// missing row, OR a reports.submit holder who lacks reports.read on
+// report_templates and gets an RLS-narrowed empty read) the same as "not
+// sandbox" -- failing OPEN. Fixed to fail CLOSED: an unresolvable template
+// row now skips enqueueing entirely rather than assuming it is safe.
+test("POST submit does not enqueue when the template lookup returns no rows (fails closed, not open)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          department_id: null,
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-wf",
+          payload_json: { supervisor: "Sam", attendance: 42 }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [WORKFLOW_VERSION];
+    if (table === "report_templates") return []; // RLS-narrowed / missing -- unresolvable
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200, "the submit itself must still succeed");
+  assert.ok(
+    !captured.some((c) => c.table === "rpc/enqueue_report_workflow"),
+    "an unresolvable template must fail CLOSED -- no enqueue, not an assumed non-sandbox enqueue"
+  );
 });
 
 test("POST submit still returns 200 when the workflow enqueue RPC call itself rejects", async (t) => {
@@ -829,6 +1061,9 @@ test("POST submit still returns 200 when the workflow enqueue RPC call itself re
     }
     if (table === "report_template_versions") {
       return { ok: true, status: 200, text: async () => JSON.stringify([WORKFLOW_VERSION]) };
+    }
+    if (table === "report_templates") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([NON_SANDBOX_TEMPLATE]) };
     }
     if (table === "report_submissions" && method === "PATCH") {
       return { ok: true, status: 200, text: async () => JSON.stringify([{ id: "sub-1", status: "submitted" }]) };

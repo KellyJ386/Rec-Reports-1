@@ -24,6 +24,18 @@
 --      the row).
 --   7. report.locked / report.revised audit events land (0055's extension of
 --      fn_report_submission_audit, 0033).
+--   8. L-5 (security review): an authenticated reports.publish holder cannot
+--      write pdf_status/pdf_storage_path/pdf_content_hash/pdf_attempts/
+--      pdf_error on their own facility's submitted row -- only a session
+--      with no acting user at all (service-role shape) may. Tested both
+--      ways: authenticated rejected, service-role-shaped (RLS bypassed,
+--      auth.uid() null) accepted.
+--   9. L-8 (security review): revision_of is now department-checked, not
+--      just facility-checked -- a successor whose OWN department_id
+--      disagrees with the department of the submission it revises is
+--      rejected, even though both rows are in the same facility and the
+--      actor holds reports.publish in both departments (facility-wide
+--      membership).
 -- Runs against a migrated database inside a rolled-back transaction, so no
 -- fixture persists.
 begin;
@@ -104,7 +116,18 @@ insert into report_submissions (id, facility_id, template_id, template_version_i
   ('55000000-0000-0000-0000-000000001001', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-10', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"lock-me"}'::jsonb),
   ('55000000-0000-0000-0000-000000001002', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-11', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"revise-me-direct"}'::jsonb),
   ('55000000-0000-0000-0000-000000001003', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-12', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"lock-then-revise"}'::jsonb),
-  ('55000000-0000-0000-0000-000000001004', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-13', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"permission-boundary"}'::jsonb)
+  ('55000000-0000-0000-0000-000000001004', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-13', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"permission-boundary"}'::jsonb),
+  ('55000000-0000-0000-0000-000000001005', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-16', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"pdf-guard"}'::jsonb)
+on conflict (id) do nothing;
+
+-- L-8 fixtures: two departments in Facility A, and a submitted report filed
+-- against department X.
+insert into departments (id, facility_id, name) values
+  ('55dd0000-0000-0000-0000-00000000dd01', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'RL Dept X'),
+  ('55dd0000-0000-0000-0000-00000000dd02', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'RL Dept Y')
+on conflict (id) do nothing;
+insert into report_submissions (id, facility_id, department_id, template_id, template_version_id, report_date, status, submitted_by, submitted_at, payload_json) values
+  ('55000000-0000-0000-0000-000000001006', '55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55dd0000-0000-0000-0000-00000000dd01', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-17', 'submitted', '55000000-0000-0000-0000-000000000a02', now(), '{"note":"dept-x-original"}'::jsonb)
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------------
@@ -330,7 +353,95 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 9. L-8 (security review): revision_of is now department-checked, not just
+-- facility-checked. This actor holds reports.publish facility-wide (passes
+-- the department check on EITHER department), so the department mismatch
+-- below is caught by the trigger, not by a permission gap.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  begin
+    insert into report_submissions (facility_id, department_id, template_id, template_version_id, report_date, status, payload_json, revision_of)
+      values ('55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55dd0000-0000-0000-0000-00000000dd02', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-18', 'draft', '{}'::jsonb, '55000000-0000-0000-0000-000000001006');
+    raise exception 'RL FAIL: revision_of was allowed to point at a submission in a DIFFERENT department (dept X original, dept Y successor)';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+-- Same-department revision_of is still legal (including the both-null
+-- shape every other fixture in this file already exercises).
+do $$
+declare
+  v_successor_id uuid;
+begin
+  insert into report_submissions (facility_id, department_id, template_id, template_version_id, report_date, status, payload_json, revision_of)
+    values ('55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '55dd0000-0000-0000-0000-00000000dd01', '55e00000-0000-0000-0000-0000000000e1', '55f00000-0000-0000-0000-0000000000f1', '2026-07-19', 'draft', '{}'::jsonb, '55000000-0000-0000-0000-000000001006')
+    returning id into v_successor_id;
+  if v_successor_id is null then
+    raise exception 'RL FAIL: a same-department revision_of successor was unexpectedly rejected';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8. L-5 (security review): an authenticated reports.publish holder cannot
+-- write pdf_status/pdf_storage_path/pdf_content_hash/pdf_attempts/pdf_error
+-- on their own facility's submitted row -- only a nil-auth.uid() (service-
+-- role-shaped) session may. The RLS lock/revise policy's WITH CHECK would
+-- otherwise admit this (status stays 'submitted' -> not in its own status
+-- list, so RLS never even reaches it -- proving the previous fast path in
+-- fn_report_submission_transition_guard, not RLS, was the actual hole:
+-- status UNCHANGED content-only updates are governed by that trigger's
+-- v_content_unchanged fast path, which pdf_* columns deliberately sit
+-- outside of).
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  begin
+    update report_submissions
+      set pdf_status = 'generated',
+          pdf_content_hash = repeat('a', 64),
+          pdf_storage_path = 'facilities/55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/reports/55000000-0000-0000-0000-000000001005/snapshot-aaaaaaaa.pdf'
+      where id = '55000000-0000-0000-0000-000000001005';
+    raise exception 'RL FAIL: an authenticated reports.publish holder was able to write pdf_* columns';
+  exception
+    when insufficient_privilege then null; -- expected: fn_report_submission_transition_guard's v_pdf_changed guard
+  end;
+end;
+$$;
+
 reset role;
+-- `reset role` alone does not clear request.jwt.claims (set with
+-- is_local=true, so it otherwise stays active for the rest of THIS
+-- transaction) -- clear it explicitly so auth.uid() genuinely reads null
+-- below, simulating a real service-role-authenticated PostgREST call
+-- rather than an accidental continuation of the manager's own session
+-- (same pattern report_workflow_events.sql's suite already uses).
+select set_config('request.jwt.claims', '', true);
+
+-- L-5, other half: a service-role-shaped session (RLS bypassed, no acting
+-- user -- auth.uid() reads null) CAN write the same pdf_* columns.
+do $$
+declare
+  v_pdf_status text;
+begin
+  update report_submissions
+    set pdf_status = 'generated',
+        pdf_content_hash = repeat('a', 64),
+        pdf_storage_path = 'facilities/55aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/reports/55000000-0000-0000-0000-000000001005/snapshot-aaaaaaaa.pdf'
+    where id = '55000000-0000-0000-0000-000000001005';
+  select pdf_status into v_pdf_status from report_submissions where id = '55000000-0000-0000-0000-000000001005';
+  if v_pdf_status <> 'generated' then
+    raise exception 'RL FAIL: a service-role-shaped session could not write pdf_* columns (pdf_status=%)', v_pdf_status;
+  end if;
+exception
+  when insufficient_privilege then
+    raise exception 'RL FAIL: a service-role-shaped session (auth.uid() is null) was denied writing pdf_* columns';
+end;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 3. A revised row is permanently immutable, tested as the table owner

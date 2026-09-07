@@ -342,7 +342,14 @@ test("a retryable email outcome leaves the delivery 'failed' and the outbox even
   const outboxRow = store.state.outbox.get("outbox-1");
   assert.equal(outboxRow.status, "pending");
   assert.equal(outboxRow.attempts, 1);
-  assert.equal(outboxRow.next_attempt_at, new Date(NOON.getTime() + 2 * 60 * 1000).toISOString());
+  const backoffAt = new Date(NOON.getTime() + 2 * 60 * 1000).toISOString();
+  assert.equal(outboxRow.next_attempt_at, backoffAt);
+  // L-4 (security review): claimDueReportSubmittedEvents claims on
+  // `available_at.lte.now OR next_attempt_at.lte.now` -- available_at must
+  // ALSO be pushed to the backoff time on a retry, or the OR's available_at
+  // half (still <= now from the original insert) would make the very next
+  // drain pass re-claim the row immediately, defeating the backoff entirely.
+  assert.equal(outboxRow.available_at, backoffAt);
 });
 
 test("a retry re-attempts only the outstanding leg, never re-sending an already-sent one (idempotent via the existing delivery row)", async (t) => {
@@ -377,6 +384,61 @@ test("a retry re-attempts only the outstanding leg, never re-sending an already-
   assert.equal(adapter.calls.length, 0, "already-terminal leg must not be re-sent");
   assert.deepEqual(summary, { claimed: 1, processed: 1, skipped: 0, retried: 0, failed: 0, rescheduled: 0 });
   assert.equal(store.state.deliveries.get("del-existing").provider_message_id, "already-sent");
+});
+
+// L-9 (security review): attachDeliveryRows used to pair each freshly
+// INSERTed report_deliveries row back to its originating leg by ARRAY
+// INDEX, not by the natural (submission_id, report_distribution_list_id,
+// recipient_employee_id, channel) key. Two recipients, a reversed insert
+// response (simulating a provider that does not preserve request order),
+// and two DIFFERENT outcomes per recipient -- if pairing were still by
+// index, the outcomes would land on the wrong rows.
+test("attachDeliveryRows pairs inserted rows to the correct recipient even when the insert response is reordered", async (t) => {
+  const store = makeStore({
+    outbox: [outboxEvent()],
+    submissions: [submissionFixture()],
+    bindings: [bindingFixture()],
+    templates: [templateFixture()],
+    members: [
+      memberFixture({ id: "m-1", member_ref_id: "emp-1" }),
+      memberFixture({ id: "m-2", member_ref_id: "emp-2" })
+    ],
+    employees: [employeeFixture({ id: "emp-1", user_id: "user-1" }), employeeFixture({ id: "emp-2", user_id: "user-2" })],
+    appUsers: [appUserFixture({ id: "user-1", email: "emp1@test.example" }), appUserFixture({ id: "user-2", email: "emp2@test.example" })]
+  });
+  // Wrap the store's respond so ONLY the report_deliveries INSERT response
+  // comes back in REVERSED order relative to the request body -- everything
+  // else behaves exactly like the shared store.
+  const reorderedRespond = (table, method, url, body) => {
+    const result = store.respond(table, method, url, body);
+    if (table === "report_deliveries" && method === "POST" && Array.isArray(result)) {
+      return [...result].reverse();
+    }
+    return result;
+  };
+  stubFetch(t, reorderedRespond);
+
+  // A per-recipient outcome: emp1's address succeeds, emp2's is a
+  // retryable failure -- if the two rows were mis-paired by index, emp1's
+  // delivery row would end up 'failed' and emp2's 'sent' (swapped).
+  const adapter = {
+    async send({ to }) {
+      return to === "emp1@test.example"
+        ? { code: "ok", providerMessageId: "msg-emp1" }
+        : { code: "server_error", providerMessageId: null };
+    }
+  };
+
+  await processReportSubmittedEvents({ client: client(), now: NOON, adapters: { email: adapter } });
+
+  const deliveries = [...store.state.deliveries.values()];
+  assert.equal(deliveries.length, 2);
+  const emp1Delivery = deliveries.find((d) => d.recipient_employee_id === "emp-1");
+  const emp2Delivery = deliveries.find((d) => d.recipient_employee_id === "emp-2");
+  assert.ok(emp1Delivery && emp2Delivery);
+  assert.equal(emp1Delivery.status, "sent");
+  assert.equal(emp1Delivery.provider_message_id, "msg-emp1");
+  assert.equal(emp2Delivery.status, "failed");
 });
 
 test("a permanent provider rejection marks the delivery 'bounced' (terminal, no further retry)", async (t) => {

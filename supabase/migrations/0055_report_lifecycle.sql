@@ -94,6 +94,36 @@
 -- template-version publish specifically, without touching what admin.manage
 -- can already do for every other entity_table.
 --
+-- M-1 (security review): DR-26's two-person governance rule had two gaps,
+-- both closed by additions at the end of this migration (sections (g)-(i)):
+--   (a) The approval requirement (daily_reports.
+--       templatePublishRequiresApproval) was read and enforced ONLY inside
+--       report-templates-routes.mjs's publish route -- the RLS policy
+--       above ((0044(a), untouched) still permitted is_published=true for
+--       anyone holding reports.template.manage + reports.publish, with no
+--       reference to a change request at all, so the single actor set the
+--       governance flow exists to constrain could simply publish through
+--       PostgREST directly and skip it entirely. Closed by section (g): a
+--       BEFORE UPDATE trigger on report_template_versions that reads the
+--       SAME setting the BFF resolves (facility_module_overrides /
+--       organization_module_settings, keyed by the 'daily_reports' module
+--       row -- see (g)'s own comment for why this is resolved directly
+--       against those tables rather than needing a JS-only mirror column)
+--       and, when it is true, allows is_published false -> true only when
+--       an approved admin_change_requests row for that exact version
+--       already exists.
+--   (b) Self-approval was bypassable: 0014's
+--       fn_enforce_change_request_transition correctly rejects
+--       reviewed_by = requested_by, but only checks it when status itself
+--       changes -- a caller could UPDATE requested_by to someone else on a
+--       status-unchanged statement (a no-op as far as that trigger's early
+--       return is concerned), then approve as themselves against the NEW
+--       requested_by. Closed by section (h): requested_by is now frozen
+--       once set, checked unconditionally (before the status-unchanged
+--       early return), and section (i) adds `requested_by = auth.uid()` to
+--       this migration's own report_template_versions-scoped INSERT policy
+--       so a request can never even be CREATED with someone else's id.
+--
 -- Idempotency conventions (mirroring 0009-0051): drop policy/trigger if
 -- exists immediately before every create; create or replace for functions;
 -- add column/constraint if not exists (guarded with a DO block where
@@ -262,11 +292,31 @@ set search_path = public
 as $$
 declare
   v_content_unchanged boolean;
+  v_pdf_changed boolean;
 begin
   if tg_op = 'INSERT' then
-    if new.revision_of is not null and not internal.fn_assert_same_facility(new.facility_id, 'report_submissions', new.revision_of) then
-      raise exception 'report_submissions %: revision_of must reference a submission in the same facility.', new.id
-        using errcode = 'check_violation';
+    if new.revision_of is not null then
+      if not internal.fn_assert_same_facility(new.facility_id, 'report_submissions', new.revision_of) then
+        raise exception 'report_submissions %: revision_of must reference a submission in the same facility.', new.id
+          using errcode = 'check_violation';
+      end if;
+      -- L-8 (security review): fn_assert_same_facility only checked
+      -- facility_id, so a reports.publish holder scoped to department A
+      -- could mint a successor in department A claiming to revise a
+      -- department B report (the INSERT policy's has_permission check runs
+      -- against the NEW row's own department_id, not revision_of's) --
+      -- provenance confusion, since it could never modify the B row itself
+      -- (the guard below + department-scoped policies both stop that), but
+      -- still wrong. A revision successor must carry the SAME department_id
+      -- (including both null, i.e. two facility-wide rows) as the
+      -- submission it revises.
+      if not exists (
+        select 1 from report_submissions
+        where id = new.revision_of and department_id is not distinct from new.department_id
+      ) then
+        raise exception 'report_submissions %: revision_of must reference a submission in the same department.', new.id
+          using errcode = 'check_violation';
+      end if;
     end if;
     return new;
   end if;
@@ -275,6 +325,33 @@ begin
   if new.revision_of is distinct from old.revision_of then
     raise exception 'report_submissions %: revision_of is immutable once set.', old.id
       using errcode = 'check_violation';
+  end if;
+
+  -- L-5 (security review): the "pdf-only update always passes" fast path
+  -- below (v_content_unchanged never inspects pdf_*, by design -- the async
+  -- PDF worker must be able to stamp these on a submitted/locked/revised
+  -- row regardless of the state machine) did not distinguish the
+  -- service-role writer from an ordinary end user, so an authenticated
+  -- reports.publish holder could set pdf_status/pdf_content_hash/
+  -- pdf_storage_path/pdf_attempts/pdf_error on their own facility's row
+  -- (proved: a forged pdf_content_hash/pdf_storage_path on a locked row).
+  -- These five columns may now be changed ONLY by a session with no acting
+  -- user at all (auth.uid() is null) -- exactly the service-role-
+  -- authenticated shape report-pdf-worker.mjs's drain runs under, and the
+  -- SAME "auth.uid() is null" test 0048's incident_reports deleted_at
+  -- exemption already uses for the identical service-role-vs-authenticated
+  -- distinction. Checked unconditionally, before any status-specific branch
+  -- below, so it holds regardless of whether the same UPDATE also legally
+  -- changes status.
+  v_pdf_changed :=
+    new.pdf_status is distinct from old.pdf_status
+    or new.pdf_storage_path is distinct from old.pdf_storage_path
+    or new.pdf_content_hash is distinct from old.pdf_content_hash
+    or new.pdf_attempts is distinct from old.pdf_attempts
+    or new.pdf_error is distinct from old.pdf_error;
+  if v_pdf_changed and auth.uid() is not null then
+    raise exception 'report_submissions %: pdf_* columns may only be changed by the service role.', old.id
+      using errcode = 'insufficient_privilege';
   end if;
 
   if old.status = 'draft' then
@@ -454,6 +531,10 @@ create policy "report template governors can read template publish change reques
     and internal.has_permission((select auth.uid()), facility_id, 'reports.publish')
   );
 
+-- M-1(b): requested_by = (select auth.uid()) closes the INSERT-side half of
+-- the self-approval bypass -- a request can never even be CREATED under
+-- someone else's identity (section (h) below closes the UPDATE-side half:
+-- requested_by can never be REASSIGNED after the fact either).
 drop policy if exists "report template governors can create template publish change requests" on admin_change_requests;
 create policy "report template governors can create template publish change requests" on admin_change_requests
   for insert
@@ -461,6 +542,7 @@ create policy "report template governors can create template publish change requ
     entity_table = 'report_template_versions'
     and internal.has_permission((select auth.uid()), facility_id, 'reports.template.manage')
     and internal.has_permission((select auth.uid()), facility_id, 'reports.publish')
+    and requested_by = (select auth.uid())
   );
 
 drop policy if exists "report template governors can advance template publish change requests" on admin_change_requests;
@@ -476,3 +558,187 @@ create policy "report template governors can advance template publish change req
     and internal.has_permission((select auth.uid()), facility_id, 'reports.template.manage')
     and internal.has_permission((select auth.uid()), facility_id, 'reports.publish')
   );
+
+-- ---------------------------------------------------------------------------
+-- (g) M-1(a): fn_report_template_version_publish_guard() -- BEFORE UPDATE
+-- trigger on report_template_versions. Enforces DR-26's governance rule AT
+-- THE DATABASE LAYER: when this version's facility has
+-- daily_reports.templatePublishRequiresApproval enabled, an is_published
+-- false -> true transition is only legal when an admin_change_requests row
+-- for this exact (entity_table='report_template_versions', entity_id=this
+-- version) exists with status 'approved' (the status the row carries the
+-- moment applyTemplatePublish flips is_published -- see
+-- report-templates-routes.mjs's publish/approve route: approve, THEN
+-- publish, THEN advance to 'published') or 'published', and a reviewer that
+-- differs from the requester (redundant with 0014's trigger + section (h)
+-- below, which both already prevent a mismatched reviewed_by/requested_by
+-- pair from ever reaching 'approved' -- kept here anyway as a self-
+-- contained, defense-in-depth predicate rather than trusting a upstream
+-- invariant to hold).
+--
+-- Setting resolution: `loadModuleConfig` (src/lib/http/module-config.mjs)
+-- resolves a facility's effective config as facility_module_overrides.
+-- config_patch_jsonb, falling back to organization_module_settings.
+-- config_jsonb, falling back to the registry default (settings-registry.mjs
+-- -- false for this key) -- both tables store a FLAT map keyed by the
+-- setting's own dotted string ("daily_reports.templatePublishRequiresApproval"),
+-- keyed by module_id (looked up once via modules.code = 'daily_reports').
+-- That flat-map shape is directly resolvable in SQL with no JS-only
+-- registry logic to duplicate or mirror onto another column, so this
+-- trigger reads the SAME two tables the BFF resolution reads, in the SAME
+-- facility-overrides-organization-overrides-default order -- there is
+-- exactly one source of truth for this setting, not two that could drift.
+-- SECURITY DEFINER (fixed search_path) since the actor set this trigger
+-- fires for (reports.template.manage + reports.publish) is not guaranteed
+-- to hold admin.manage, which is what gates SELECT on
+-- facility_module_overrides/organization_module_settings/
+-- admin_change_requests directly.
+-- ---------------------------------------------------------------------------
+create or replace function fn_report_template_version_publish_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_module_id uuid;
+  v_org_id uuid;
+  v_facility_layer jsonb;
+  v_org_layer jsonb;
+  v_requires_approval boolean := false;
+  v_approved boolean;
+begin
+  if tg_op = 'UPDATE' and old.is_published = false and new.is_published = true then
+    select id into v_module_id from modules where code = 'daily_reports';
+
+    if v_module_id is not null then
+      select config_patch_jsonb into v_facility_layer
+        from facility_module_overrides
+        where facility_id = new.facility_id and module_id = v_module_id;
+
+      if v_facility_layer is not null and v_facility_layer ? 'daily_reports.templatePublishRequiresApproval' then
+        v_requires_approval := coalesce((v_facility_layer ->> 'daily_reports.templatePublishRequiresApproval')::boolean, false);
+      else
+        select organization_id into v_org_id from facilities where id = new.facility_id;
+        if v_org_id is not null then
+          select config_jsonb into v_org_layer
+            from organization_module_settings
+            where organization_id = v_org_id and module_id = v_module_id;
+          if v_org_layer is not null and v_org_layer ? 'daily_reports.templatePublishRequiresApproval' then
+            v_requires_approval := coalesce((v_org_layer ->> 'daily_reports.templatePublishRequiresApproval')::boolean, false);
+          end if;
+        end if;
+      end if;
+    end if;
+
+    if v_requires_approval then
+      select exists (
+        select 1 from admin_change_requests
+        where entity_table = 'report_template_versions'
+          and entity_id = new.id
+          and status in ('approved', 'published')
+          and reviewed_by is not null
+          and reviewed_by is distinct from requested_by
+      ) into v_approved;
+
+      if not v_approved then
+        raise exception 'report_template_versions %: publishing this version requires an approved admin_change_requests row (daily_reports.templatePublishRequiresApproval is enabled for this facility).', new.id
+          using errcode = 'insufficient_privilege';
+      end if;
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists report_template_versions_publish_guard on report_template_versions;
+create trigger report_template_versions_publish_guard
+  before update on report_template_versions
+  for each row execute function fn_report_template_version_publish_guard();
+
+revoke execute on function fn_report_template_version_publish_guard() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_report_template_version_publish_guard() from anon;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (h) M-1(b): fn_enforce_change_request_transition (0014) -- recreated whole
+-- (CREATE OR REPLACE preserves the existing trigger binding/OID) to freeze
+-- requested_by. The prior body only ever inspected requested_by inside the
+-- `status = 'approved'` branch, and short-circuited entirely on
+-- `new.status = old.status` -- so a caller could UPDATE requested_by to a
+-- DIFFERENT user on a status-unchanged statement (a legal no-op as far as
+-- the early return was concerned), then separately approve the request
+-- under their own identity as reviewer, satisfying reviewed_by <>
+-- requested_by against the now-reassigned requested_by. Proved: `update ...
+-- set requested_by = <other user>` succeeded silently before this change.
+-- The freeze is checked FIRST, before the status-unchanged early return, so
+-- it applies to every UPDATE regardless of whether status also changes in
+-- the same statement. Every other branch is carried over byte-for-byte from
+-- 0014.
+-- ---------------------------------------------------------------------------
+create or replace function fn_enforce_change_request_transition()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.requested_by is distinct from old.requested_by then
+    raise exception 'admin_change_requests %: requested_by is immutable once set.', old.id
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if new.status = old.status then
+    return new;
+  end if;
+
+  if not (
+    (old.status = 'draft' and new.status = 'pending_review')
+    or (old.status = 'pending_review' and new.status in ('approved', 'rejected'))
+    or (old.status = 'approved' and new.status = 'published')
+  ) then
+    raise exception 'Illegal change request transition from % to %.', old.status, new.status
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if new.status in ('approved', 'rejected') then
+    if new.reviewed_by is null or new.reviewed_at is null then
+      raise exception 'reviewed_by and reviewed_at are required when moving a change request to %.', new.status
+        using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+
+  if new.status = 'approved' and new.reviewed_by = new.requested_by then
+    raise exception 'A change request cannot be self-approved (reviewed_by must differ from requested_by).'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if new.status = 'published' and new.published_at is null then
+    new.published_at := now();
+  end if;
+
+  return new;
+end;
+$$;
+
+-- Trigger/grants unchanged from 0014 (CREATE OR REPLACE above preserves the
+-- function's OID, so the existing trigger binding is untouched); re-asserted
+-- here only for idempotent re-runnability.
+drop trigger if exists admin_change_requests_enforce_transition on admin_change_requests;
+create trigger admin_change_requests_enforce_transition
+  before update on admin_change_requests
+  for each row execute function fn_enforce_change_request_transition();
+
+-- ---------------------------------------------------------------------------
+-- (i) M-1(b): admin_change_requests carries no dedicated table-level guard
+-- of its own beyond the trigger above -- the requested_by freeze in (h)
+-- covers every entity_table this table serves, not just
+-- report_template_versions, so nothing further is needed here.
+-- ---------------------------------------------------------------------------
+
+notify pgrst, 'reload schema';
