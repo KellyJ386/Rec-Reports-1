@@ -42,6 +42,7 @@ import {
   formatComplianceSummary
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
+import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 // S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
@@ -58,6 +59,12 @@ let currentFacility = null;
 let facilities = [];
 let platformAdmin = false;
 let reportTemplatesById = new Map();
+// Full published-template rows for the active facility (as opposed to
+// reportTemplatesById's id->name lookup, used by the inbox) -- kept so the
+// home dashboard's "Submit report" quick action can jump straight into
+// startNewReport when there is exactly one template to choose from, without
+// a second fetch.
+let publishedReportTemplates = [];
 
 // Permission gating: a user without the relevant write permission must never
 // see write controls (rule applies to every panel added this batch). Platform
@@ -350,8 +357,18 @@ async function loadAllModules() {
   schedulePanel.reset();
   commsPanel.reset();
 
+  // P-3: quick actions render synchronously (permission-driven, no fetch of
+  // their own) so they're on screen immediately -- above the fold on mobile
+  // -- rather than waiting on the Promise.all below. The dashboard's summary
+  // tiles are fetched first in that Promise.all (loadHomeDashboardTiles),
+  // ahead of every module panel's own load, per the "rendered first" plan
+  // requirement; each tile's fetch is still independent of the others (see
+  // loadHomeDashboardTiles) and of every panel's own load below.
+  renderQuickActions();
+
   try {
     await Promise.all([
+      loadHomeDashboardTiles(),
       loadReports(),
       loadReportInbox(),
       schedulePanel.load(),
@@ -364,6 +381,180 @@ async function loadAllModules() {
   } catch (error) {
     console.error("Error loading modules:", error);
   }
+}
+
+// --- Home dashboard (P-3) ---------------------------------------------------
+// Quick-action buttons + summary tiles rendered above every module panel.
+// Pure selection/shaping logic lives in home-dashboard.mjs (buildQuickActions,
+// buildTiles, computeTodayShiftsForMe); everything here is I/O (apiFetch) and
+// DOM (el()) glue.
+
+// Mirrors hasPerm()'s platform-admin bypass for the fixed set of permission
+// codes home-dashboard.mjs's quick actions/tiles ever check: a platform admin
+// has no membership row (hence no `permissions` array) for a facility they
+// don't belong to, so hasPerm() special-cases them to "always allowed"
+// instead of reading `permissions` at all -- this passes the pure functions
+// below the equivalent of "every code", rather than teaching them their own
+// platformAdmin bypass.
+function homeDashboardPermissions() {
+  if (platformAdmin) return HOME_DASHBOARD_PERMISSION_CODES;
+  const facility = currentFacilityRecord();
+  return (facility && facility.permissions) || [];
+}
+
+// Scrolls a module panel into view and, since every panel is a <details>
+// (collapsed by default under 640px, see collapsePanelsOnMobile), opens it
+// first so scrolling doesn't land on a collapsed, empty-looking section.
+function revealPanel(panelId) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  if (panel.tagName === "DETAILS") panel.open = true;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function handleQuickAction(action) {
+  revealPanel(action.panelId);
+  if (action.key === "log-incident") {
+    incidentsPanel.openCreate();
+  } else if (action.key === "new-work-order") {
+    workOrdersPanel.openCreate();
+  } else if (action.key === "submit-report" && publishedReportTemplates.length === 1) {
+    // Exactly one published template: skip the extra tap and open its draft
+    // directly. With more than one, there's no single right choice --
+    // revealPanel above has already scrolled the reports panel's template
+    // list into view for the caller to pick from.
+    startNewReport(publishedReportTemplates[0]);
+  }
+}
+
+function renderQuickActions() {
+  const container = document.getElementById("home-quick-actions");
+  if (!container || !currentFacility) return;
+  container.textContent = "";
+  const actions = buildQuickActions(homeDashboardPermissions());
+  for (const action of actions) {
+    const btn = el("button", { type: "button", class: "primary quick-action-btn" }, action.label);
+    btn.addEventListener("click", () => handleQuickAction(action));
+    container.append(btn);
+  }
+}
+
+// Resolves messages that still need the caller's own acknowledgement:
+// published, is_required_ack messages this facility has, minus whichever of
+// those the caller has already acked (checked per-message via the same
+// GET .../messages/:id/acknowledgements?employeeId=me route commsPanel's own
+// seedAckStateForVisibleMessages uses). A per-message ack-check failure is
+// treated as "already acked" (excluded) rather than "still needs it", so a
+// transient error on one message never inflates the tile's count -- the
+// worst case is silently under-counting one message, not over-alarming.
+async function loadUnackedMessages() {
+  const messages = (await apiFetch(`/facilities/${currentFacility}/messages?status=published`)) || [];
+  const requiredAck = messages.filter((message) => message.is_required_ack);
+  if (requiredAck.length === 0) return [];
+  const ackedFlags = await Promise.all(
+    requiredAck.map((message) =>
+      apiFetch(`/facilities/${currentFacility}/messages/${message.id}/acknowledgements?employeeId=me`)
+        .then((rows) => ackedMessageIdsFromRows(rows).size > 0)
+        .catch(() => true)
+    )
+  );
+  return requiredAck.filter((_, index) => !ackedFlags[index]);
+}
+
+// Resolves the caller's own shifts for `today`: the current Mon-Sun period
+// (same facility-wide, department_id-null period schedulePanel's own
+// reloadWeek() selects), its shifts, and its assignments, joined down to
+// "mine, today" by home-dashboard.mjs's computeTodayShiftsForMe. Returns []
+// (not an error) when the caller has no employee record in this facility --
+// there is nothing "mine" to show, same convention as the work-orders tile.
+async function loadTodayShifts(myEmployeeId, today) {
+  if (!myEmployeeId) return [];
+  const periods = (await apiFetch(`/facilities/${currentFacility}/schedule-periods`)) || [];
+  const { weekStartDate } = weekBoundsFor(today);
+  const period = periods.find((p) => p.week_start_date === weekStartDate && !p.department_id) || null;
+  if (!period) return [];
+  const [shifts, assignments] = await Promise.all([
+    apiFetch(`/facilities/${currentFacility}/shifts?period_id=${period.id}`),
+    apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${period.id}`)
+  ]);
+  return computeTodayShiftsForMe({ shifts: shifts || [], assignments: assignments || [], myEmployeeId, today });
+}
+
+// Fires all six of the dashboard's data fetches independently (a permission
+// the caller lacks skips its fetch entirely rather than requesting a 403;
+// one that's held but fails is caught to null, which buildTiles renders as
+// "Unavailable" for just that tile -- no fetch's failure blocks another's or
+// blanks the rest of the page), then renders whatever buildTiles returns.
+async function loadHomeDashboardTiles() {
+  const container = document.getElementById("home-tiles");
+  if (!container || !currentFacility) return;
+
+  const permissions = homeDashboardPermissions();
+  const permSet = new Set(permissions);
+  const myEmployeeId = (currentFacilityRecord() || {}).employeeId || null;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [compliance, workOrders, incidents, unackedMessages, certifications, todayShifts] = await Promise.all([
+    permSet.has("reports.read")
+      ? apiFetch(`/facilities/${currentFacility}/reports/compliance?from=${today}&to=${today}`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("work_orders.read")
+      ? myEmployeeId
+        ? apiFetch(
+            `/facilities/${currentFacility}/work-orders?assignee=${encodeURIComponent(myEmployeeId)}&status=open`
+          ).catch(() => null)
+        : Promise.resolve([])
+      : Promise.resolve(null),
+    permSet.has("incidents.read")
+      ? apiFetch(`/facilities/${currentFacility}/incidents?status=submitted`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("communications.read") ? loadUnackedMessages().catch(() => null) : Promise.resolve(null),
+    apiFetch(`/facilities/${currentFacility}/employee-certifications`).catch(() => null),
+    permSet.has("schedule.read") ? loadTodayShifts(myEmployeeId, today).catch(() => null) : Promise.resolve(null)
+  ]);
+
+  renderTiles(
+    container,
+    buildTiles({ permissions, compliance, workOrders, incidents, unackedMessages, certifications, todayShifts, now: new Date() })
+  );
+}
+
+function renderTiles(container, tiles) {
+  container.textContent = "";
+  if (tiles.length === 0) {
+    container.append(el("p", { class: "item-subtitle" }, "No summary tiles available for your role yet."));
+    return;
+  }
+  for (const tile of tiles) {
+    const isUnavailable = tile.value === "Unavailable";
+    const card = el(
+      "button",
+      {
+        type: "button",
+        class: "home-tile",
+        "aria-label": `${tile.title}: ${tile.value}${tile.hint ? ", " + tile.hint : ""}`
+      },
+      [
+        el("div", { class: "home-tile-title" }, tile.title),
+        el("div", { class: isUnavailable ? "home-tile-value is-unavailable" : "home-tile-value" }, tile.value),
+        el("div", { class: "home-tile-hint" }, tile.hint)
+      ]
+    );
+    card.addEventListener("click", () => revealPanel(tile.panelId));
+    container.append(card);
+  }
+}
+
+// P-3: panels are <details>/<summary> disclosures so they can start
+// collapsed on narrow viewports without hiding them from a caller with
+// JavaScript disabled -- called once at startup (DOMContentLoaded, below),
+// not re-run on resize, matching "start collapsed" rather than "stay in sync
+// with the viewport forever".
+function collapsePanelsOnMobile() {
+  if (!window.matchMedia || window.matchMedia("(min-width: 640px)").matches) return;
+  document.querySelectorAll("main > details.panel[open]").forEach((panel) => {
+    panel.open = false;
+  });
 }
 
 // Small DOM builder used by every schema-driven view added in this batch
@@ -627,6 +818,10 @@ async function loadReports() {
       apiFetch(`/facilities/${currentFacility}/reports`)
     ]);
 
+    // GET .../report-templates defaults to ?status=published (no ?status=all
+    // here), so `templates` is already published-only -- safe to hand
+    // straight to the home dashboard's quick action.
+    publishedReportTemplates = templates || [];
     renderReportsList(container, templates || [], reports || []);
   } catch (error) {
     setError(container, error.message);
@@ -2424,7 +2619,17 @@ const incidentsPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "Report new incident" capture form (P-3's "Log incident" quick
+  // action): same gate as the toggle button in render() above, so a caller
+  // without incidents.manage silently does nothing rather than a form
+  // magically appearing that submitCapture's own POST would 403 on anyway.
+  function openCreate() {
+    if (!hasPerm("incidents.manage")) return;
+    state.captureOpen = true;
+    render();
+  }
+
+  return { load, reset, openCreate };
 })();
 
 // --- Work orders module (WO-10) -----------------------------------------------
@@ -2829,7 +3034,15 @@ const workOrdersPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "New work order" create form (P-3's "New work order" quick
+  // action): same gate as the toggle button in render() above.
+  function openCreate() {
+    if (!hasPerm("work_orders.manage")) return;
+    state.createOpen = true;
+    render();
+  }
+
+  return { load, reset, openCreate };
 })();
 
 // --- Communications module (CM-08/CM-09/P-1) -----------------------------------
@@ -3336,5 +3549,6 @@ function setupSignOut() {
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
+  collapsePanelsOnMobile();
   migrateLegacyRefreshToken().finally(initialize);
 });
