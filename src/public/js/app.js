@@ -48,6 +48,7 @@ import {
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
 import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
+import { sanitizeQuery, groupResults, debounce } from "./search.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 // S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
@@ -2722,7 +2723,10 @@ const incidentsPanel = (function () {
   const INCIDENT_NEXT_STATUS_CHOICES = ["under_review", "escalated", "action_pending", "closed"];
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area incident-detail" });
+    // P-8: a static id, safe because only one incident detail is ever open
+    // at a time -- lets the global search box scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area incident-detail", id: "incident-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.incident_no : "Loading incident…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -2905,7 +2909,10 @@ const incidentsPanel = (function () {
     render();
   }
 
-  return { load, reset, openCreate };
+  // openDetail exposed for P-8 (global search): its own "View" button
+  // above already calls it internally; the search box's incidents leg
+  // calls the same function to deep-link into a matched incident.
+  return { load, reset, openCreate, openDetail };
 })();
 
 // --- Work orders module (WO-10) -----------------------------------------------
@@ -3167,7 +3174,10 @@ const workOrdersPanel = (function () {
   }
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area work-order-detail" });
+    // P-8: a static id (only one work order detail is ever open at a
+    // time) so the global search box can scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area work-order-detail", id: "work-order-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.title : "Loading work order…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -3318,7 +3328,9 @@ const workOrdersPanel = (function () {
     render();
   }
 
-  return { load, reset, openCreate };
+  // openDetail exposed for P-8 (global search): the search box's work
+  // orders leg calls the same function its own "View" button uses.
+  return { load, reset, openCreate, openDetail };
 })();
 
 // --- Communications module (CM-08/CM-09/P-1) -----------------------------------
@@ -3619,7 +3631,12 @@ const commsPanel = (function () {
   }
 
   function buildMessageCard(message) {
-    const card = el("div", { class: "message-card" });
+    // P-8: an id per card (messages have no dedicated detail view the way
+    // incidents/work orders do) so the global search box can scroll to and
+    // highlight the specific card when it's on the currently rendered
+    // page; when it isn't (client-side pagination, P-1), the search box
+    // falls back to scrolling to the panel itself.
+    const card = el("div", { class: "message-card", id: `message-card-${message.id}` });
     card.append(el("strong", {}, `${message.priority} · ${message.subject}`));
     card.append(el("div", { class: "item-subtitle" }, (message.body_text || "").slice(0, 140)));
 
@@ -3822,9 +3839,200 @@ function setupSignOut() {
   });
 }
 
+// --- Global search (P-8) ----------------------------------------------------
+// Header search box: debounced GET /api/v1/search?facilityId=&q=, grouped
+// results (incidents/work orders/employees/messages, only the legs the
+// server included -- see search.mjs's groupResults), each deep-linking into
+// its panel. Every DOM node is built with el() (never innerHTML with
+// interpolation -- see el()'s doc comment above), so a result's own text
+// (an incident summary, a message subject, ...) can never be parsed as
+// markup even though it is attacker-influenced content from another user
+// in the same facility.
+
+// Container each leg's results scroll to. Employees have no dedicated list
+// panel of their own (scheduling-routes.mjs's employees endpoint backs the
+// schedule board -- see search-routes.mjs's leg comment), so that leg
+// scrolls to the schedule panel; incidents/work orders additionally open
+// their own detail view (openDetail, exposed above) once scrolled to;
+// messages have no detail view, so the specific message card is
+// highlighted instead when it's on the currently rendered page.
+const SEARCH_LEG_CONTAINER_ID = {
+  incidents: "incidents-workspace",
+  workOrders: "work-orders-workspace",
+  employees: "schedule-workspace",
+  messages: "comms-workspace"
+};
+
+function scrollElementIntoView(elementId, options) {
+  const target = document.getElementById(elementId);
+  if (target) target.scrollIntoView({ behavior: "smooth", block: "start", ...options });
+  return target;
+}
+
+// Briefly outlines `target` so a deep-linked result is visually obvious
+// after the scroll lands, then removes the outline -- a transient cue, not
+// a persistent style change.
+function flashSearchHighlight(target) {
+  if (!target) return;
+  target.classList.add("search-result-highlight");
+  setTimeout(() => target.classList.remove("search-result-highlight"), 2000);
+}
+
+function searchResultPrimaryText(legKey, item) {
+  switch (legKey) {
+    case "incidents":
+      return `${item.incident_no || "Incident"} · ${item.summary || ""}`;
+    case "workOrders":
+      return item.title || "Work order";
+    case "employees":
+      return `${item.first_name || ""} ${item.last_name || ""}`.trim() || item.employee_no || "Employee";
+    case "messages":
+      return item.subject || "Message";
+    default:
+      return "";
+  }
+}
+
+function searchResultSecondaryText(legKey, item) {
+  switch (legKey) {
+    case "incidents":
+      return item.location_text || (item.status ? `Status: ${item.status}` : "");
+    case "workOrders":
+      return item.status ? `Status: ${item.status}` : item.description || "";
+    case "employees":
+      return item.employee_no ? `#${item.employee_no}` : item.status || "";
+    case "messages":
+      return (item.body_text || "").slice(0, 100);
+    default:
+      return "";
+  }
+}
+
+// Registers the header search box: reads/writes only #global-search's own
+// subtree plus the four panel containers it deep-links into, and the
+// module-level `currentFacility` every other panel already relies on --
+// no new global state of its own.
+function setupGlobalSearch() {
+  const wrapper = document.getElementById("global-search");
+  const input = document.getElementById("global-search-input");
+  const resultsEl = document.getElementById("global-search-results");
+  if (!wrapper || !input || !resultsEl) return;
+
+  function closeResults() {
+    resultsEl.hidden = true;
+    resultsEl.textContent = "";
+    input.setAttribute("aria-expanded", "false");
+  }
+
+  function renderStatus(text, { isError = false } = {}) {
+    resultsEl.textContent = "";
+    resultsEl.append(el("p", { class: isError ? "global-search-status rr-error" : "global-search-status" }, text));
+    resultsEl.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  async function openResult(legKey, item) {
+    closeResults();
+    const container = scrollElementIntoView(SEARCH_LEG_CONTAINER_ID[legKey]);
+    if (legKey === "incidents" && incidentsPanel.openDetail) {
+      await incidentsPanel.openDetail(item.id);
+      flashSearchHighlight(scrollElementIntoView("incident-detail-panel") || container);
+    } else if (legKey === "workOrders" && workOrdersPanel.openDetail) {
+      await workOrdersPanel.openDetail(item.id);
+      flashSearchHighlight(scrollElementIntoView("work-order-detail-panel") || container);
+    } else if (legKey === "messages") {
+      const card = document.getElementById(`message-card-${item.id}`);
+      if (card) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+        flashSearchHighlight(card);
+      } else {
+        flashSearchHighlight(container);
+      }
+    } else {
+      flashSearchHighlight(container);
+    }
+  }
+
+  function renderResults(groups) {
+    resultsEl.textContent = "";
+    if (groups.length === 0) {
+      renderStatus("No matches.");
+      return;
+    }
+    for (const group of groups) {
+      resultsEl.append(el("div", { class: "global-search-group-label" }, group.label));
+      for (const item of group.items) {
+        const row = el(
+          "button",
+          { type: "button", class: "global-search-result", role: "option" },
+          [
+            el("span", { class: "global-search-result-title" }, searchResultPrimaryText(group.key, item)),
+            el("span", { class: "global-search-result-subtitle" }, searchResultSecondaryText(group.key, item))
+          ]
+        );
+        row.addEventListener("click", () => openResult(group.key, item));
+        resultsEl.append(row);
+      }
+    }
+    resultsEl.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  // Guards against an in-flight response landing after the input has moved
+  // on to a different (or cleared) query -- sanitizeQuery is a pure,
+  // deterministic function of the input's CURRENT value, so re-deriving
+  // and comparing here is enough to detect that without any request-id
+  // bookkeeping.
+  async function runSearch(rawValue) {
+    const q = sanitizeQuery(rawValue);
+    if (!q || !currentFacility) {
+      closeResults();
+      return;
+    }
+    renderStatus("Searching…");
+    try {
+      const payload = await apiFetch(`/search?facilityId=${encodeURIComponent(currentFacility)}&q=${encodeURIComponent(q)}`);
+      if (sanitizeQuery(input.value) !== q) return; // stale response
+      renderResults(groupResults(payload));
+    } catch (error) {
+      if (sanitizeQuery(input.value) !== q) return; // stale response
+      renderStatus(error.message || "Search failed", { isError: true });
+    }
+  }
+
+  // P-8: >=300ms debounce, and only ever fires for a sanitized q of at
+  // least 2 characters (sanitizeQuery's own MIN_QUERY_LENGTH) -- a shorter
+  // or entirely-reserved-characters value closes the dropdown immediately
+  // instead of debouncing a search the server would just 400 anyway.
+  const debouncedSearch = debounce(runSearch, 300);
+
+  input.addEventListener("input", (event) => {
+    const value = event.target.value;
+    if (sanitizeQuery(value) === null) {
+      debouncedSearch.cancel();
+      closeResults();
+      return;
+    }
+    debouncedSearch(value);
+  });
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      debouncedSearch.cancel();
+      closeResults();
+      input.blur();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!wrapper.contains(event.target)) closeResults();
+  });
+}
+
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
   collapsePanelsOnMobile();
+  setupGlobalSearch();
   migrateLegacyRefreshToken().finally(initialize);
 });
