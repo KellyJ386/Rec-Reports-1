@@ -67,6 +67,70 @@ test("me returns the member's facilities with permissions", async (t) => {
   assert.equal(facilitiesCall.url.searchParams.get("id"), "in.(fac-1)");
 });
 
+test("me includes the caller's employeeId per facility when an employee row exists", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "facilities") return [{ id: "fac-1", name: "North Arena", organization_id: "org-1" }];
+    if (table === "employees") return [{ id: "emp-1", facility_id: "fac-1" }];
+    return [];
+  });
+  const { call } = mount({
+    claims: { sub: "user-1", email: "a@b.com" },
+    client,
+    platformAdmin: false,
+    memberships: [{ facilityId: "fac-1", permissions: ["reports.read"] }],
+    error: null
+  });
+  const result = await call();
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.facilities[0].employeeId, "emp-1");
+  const employeesCall = captured.find((c) => c.table === "employees");
+  assert.equal(employeesCall.url.searchParams.get("user_id"), "eq.user-1");
+  assert.equal(employeesCall.url.searchParams.get("facility_id"), "in.(fac-1)");
+});
+
+test("me returns null employeeId for a facility with no employee row for the caller", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "facilities") return [{ id: "fac-1", name: "North Arena", organization_id: "org-1" }];
+    if (table === "employees") return [];
+    return [];
+  });
+  const { call } = mount({
+    claims: { sub: "user-1", email: "a@b.com" },
+    client,
+    platformAdmin: false,
+    memberships: [{ facilityId: "fac-1", permissions: ["reports.read"] }],
+    error: null
+  });
+  const result = await call();
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.facilities[0].employeeId, null);
+});
+
+test("me maps a platform admin's employeeId only for facilities where an employee row exists", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "facilities") {
+      return [
+        { id: "fac-1", name: "North Arena", organization_id: "org-1" },
+        { id: "fac-2", name: "Riverfront Aquatics", organization_id: "org-1" }
+      ];
+    }
+    if (table === "employees") return [{ id: "emp-9", facility_id: "fac-2" }];
+    return [];
+  });
+  const { call } = mount({
+    claims: { sub: "admin-1", email: "admin@b.com" },
+    client,
+    platformAdmin: true,
+    memberships: [],
+    error: null
+  });
+  const result = await call();
+  assert.equal(result.status, 200);
+  const byId = Object.fromEntries(result.payload.facilities.map((f) => [f.id, f.employeeId]));
+  assert.equal(byId["fac-1"], null);
+  assert.equal(byId["fac-2"], "emp-9");
+});
+
 test("me lists every facility for a platform admin", async (t) => {
   const captured = stubFetch(t, (table) =>
     table === "facilities"
