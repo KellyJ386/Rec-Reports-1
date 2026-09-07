@@ -69,8 +69,14 @@ if (unknownMigrationCodes.length > 0) {
 // are BFF-only by design (documented in src/lib/permissions.mjs's own
 // comments): incidents.export.pdf has no DB write beyond an audit event
 // already covered by another code's policy; reports.workflow.manage and
-// reports.distribution.manage are reserved for DR-18/DR-21 with no route or
-// policy yet. Any other code that stops appearing in a migration (or a new
+// reports.distribution.manage stay BFF-only even after DR-18/19/20
+// (0053_report_workflow_events.sql) landed -- workflow evaluation is pure,
+// the submit-time enqueue RPC is gated on reports.submit, and execution runs
+// entirely under the service-role drain client, so no authenticated-role
+// route or policy predicate ever needs reports.workflow.manage; both codes
+// remain reserved for a future template-workflow/distribution-list
+// CONFIGURATION surface, not yet built. Any other code that stops appearing
+// in a migration (or a new
 // code that's added without one) is a real regression of the kind S-5 itself
 // fixed for incidents.escalate/tasks.create/legal_hold.manage/audit.view and
 // reports.publish.

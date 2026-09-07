@@ -702,3 +702,92 @@ test("GET reports/:id/signatures returns the recorded signatures", async (t) => 
   assert.equal(result.payload.length, 1);
   assert.equal(result.payload[0].signer_role, "manager");
 });
+
+// --- DR-18/DR-19: submit-time workflow enqueue ------------------------------
+
+const WORKFLOW_VERSION = {
+  id: "ver-wf",
+  template_id: "tpl-1",
+  version_number: 1,
+  schema_json: SCHEMA,
+  workflow_json: { on_submit: ["queue_pdf", "notify_managers"] },
+  is_published: true
+};
+
+test("POST submit enqueues workflow events via internal.enqueue_report_workflow", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          department_id: null,
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-wf",
+          payload_json: { supervisor: "Sam", attendance: 42 }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [WORKFLOW_VERSION];
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    if (table === "rpc/enqueue_report_workflow" && method === "POST") {
+      return { submission_id: "sub-1", event_ids: ["evt-1", "evt-2"] };
+    }
+    return [];
+  });
+  const { call } = mount({ userId: "user-7" });
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+
+  const rpcCall = captured.find((c) => c.table === "rpc/enqueue_report_workflow" && c.method === "POST");
+  assert.ok(rpcCall, "expected the submit route to call internal.enqueue_report_workflow");
+  assert.equal(rpcCall.body.p_submission_id, "sub-1");
+  assert.equal(rpcCall.body.p_actions.length, 2);
+  assert.equal(rpcCall.body.p_actions[0].type, "queue_pdf");
+  assert.equal(rpcCall.body.p_actions[1].type, "notify");
+});
+
+test("POST submit still returns 200 when the workflow enqueue RPC call itself rejects", async (t) => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "rpc/enqueue_report_workflow") {
+      return { ok: false, status: 500, text: async () => JSON.stringify({ message: "boom" }) };
+    }
+    const method = init.method;
+    if (table === "report_submissions" && method === "GET") {
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify([
+            {
+              id: "sub-1",
+              facility_id: "fac-1",
+              department_id: null,
+              status: "draft",
+              template_id: "tpl-1",
+              template_version_id: "ver-wf",
+              payload_json: { supervisor: "Sam", attendance: 42 }
+            }
+          ])
+      };
+    }
+    if (table === "report_template_versions") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([WORKFLOW_VERSION]) };
+    }
+    if (table === "report_submissions" && method === "PATCH") {
+      return { ok: true, status: 200, text: async () => JSON.stringify([{ id: "sub-1", status: "submitted" }]) };
+    }
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const { call } = mount({ userId: "user-7" });
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.status, "submitted");
+});

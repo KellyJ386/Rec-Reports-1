@@ -84,7 +84,8 @@ const requiredRlsTables = [
   "subscription_plans",
   "tenant_subscriptions",
   "usage_counters",
-  "auth_throttle"
+  "auth_throttle",
+  "report_workflow_events"
 ];
 
 for (const table of requiredRlsTables) {
@@ -112,7 +113,13 @@ for (const helper of [
   "fn_incident_witness_statement_guard",
   "fn_report_submission_signature_guard",
   "internal.apply_incident_amendment",
-  "public.apply_incident_amendment"
+  "public.apply_incident_amendment",
+  "internal.enqueue_report_workflow",
+  "public.enqueue_report_workflow",
+  "internal.mint_workflow_incident",
+  "public.mint_workflow_incident",
+  "internal.mint_workflow_work_order",
+  "public.mint_workflow_work_order"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
