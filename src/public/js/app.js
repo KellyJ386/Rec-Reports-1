@@ -29,7 +29,10 @@ import {
   buildComposePayload,
   validateAudienceRows,
   buildAudiencePayload,
-  deriveAckState
+  deriveAckState,
+  ackedMessageIdsFromRows,
+  shouldFetchCompliance,
+  formatComplianceSummary
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
 
@@ -2816,16 +2819,20 @@ const workOrdersPanel = (function () {
   return { load, reset };
 })();
 
-// --- Communications module (CM-08/CM-09) --------------------------------------
+// --- Communications module (CM-08/CM-09/P-1) -----------------------------------
 // Compose form (channel/audience/priority/required-ack) posting through the
 // draft-then-publish flow (CM-03), a paginated message list that auto-marks
-// delivered/read receipts as it renders, and a per-viewer ack-state badge.
+// delivered/read receipts as it renders, a per-viewer ack-state badge, and
+// (P-1) server-seeded ack state plus per-message compliance counts for
+// publishers/authors.
 //
-// Known API gap, worked around rather than papered over: there is no GET for
-// message_acknowledgements, so "has THIS viewer already acknowledged" can
-// only be known for an acknowledgement made during this session
-// (ackedMessageIds) -- a message acknowledged in an earlier session still
-// renders as pending/overdue rather than a guessed "complete".
+// ackedMessageIds is seeded from GET .../acknowledgements?employeeId=me for
+// every visible message (seedAckStateForVisibleMessages, mirroring how
+// markReceiptsForVisibleMessages already marks receipts) as it renders, so
+// an acknowledgement made in an earlier session still renders as complete --
+// it is no longer session-local, just checked lazily per page of messages
+// rather than fetched in one facility-wide call (there is no such bulk
+// endpoint; P-1 only added the per-message one).
 const commsPanel = (function () {
   const state = {
     channels: [],
@@ -2837,8 +2844,12 @@ const commsPanel = (function () {
     composeErrors: {},
     audienceRows: [{ audienceType: "", audienceRefId: "" }],
     audienceError: null,
+    myEmployeeId: null,
     ackedMessageIds: new Set(),
+    ackCheckedIds: new Set(),
     receiptSentIds: new Set(),
+    complianceByMessageId: {},
+    complianceCheckedIds: new Set(),
     formError: null
   };
 
@@ -2855,6 +2866,13 @@ const commsPanel = (function () {
     if (!host || !currentFacility) return;
     setLoading(host, true);
     try {
+      // GET /facilities/:id/employees is registered by the scheduling module
+      // (gated on schedule.read) but serves as the facility's employee
+      // directory app-wide -- reused here (same pattern as the work orders
+      // panel's "Mine" chip) only to resolve the caller's own employees.id,
+      // for deciding which messages' compliance counts to show.
+      const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
+      state.myEmployeeId = ((employees || []).find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
       state.channels = (await apiFetch(`/facilities/${currentFacility}/channels`).catch(() => [])) || [];
       await loadMessagesList();
     } catch (error) {
@@ -2883,8 +2901,12 @@ const commsPanel = (function () {
     state.audienceError = null;
     state.formError = null;
     state.page = 1;
+    state.myEmployeeId = null;
     state.ackedMessageIds = new Set();
+    state.ackCheckedIds = new Set();
     state.receiptSentIds = new Set();
+    state.complianceByMessageId = {};
+    state.complianceCheckedIds = new Set();
     const host = container();
     if (host) host.textContent = "";
   }
@@ -2901,6 +2923,57 @@ const commsPanel = (function () {
       state.receiptSentIds.add(message.id);
       apiFetch(`/messages/${message.id}/receipt`, { method: "POST", body: { deliveredAt: now, readAt: now } }).catch(() => {});
     }
+  }
+
+  // P-1: seeds state.ackedMessageIds from the server (GET .../acknowledgements
+  // ?employeeId=me) for every message about to render, once per message id
+  // per panel load (ackCheckedIds, same dedup shape as receiptSentIds). Unlike
+  // markReceiptsForVisibleMessages this re-renders once every check settles,
+  // since learning "the caller already acknowledged this" flips the message
+  // card's badge and hides its Acknowledge button -- ackCheckedIds already
+  // holds every id involved by then, so that re-render's own call back into
+  // this function is a same-tick no-op rather than a fetch loop.
+  async function seedAckStateForVisibleMessages(messages) {
+    const toCheck = messages.filter((message) => !state.ackCheckedIds.has(message.id));
+    if (toCheck.length === 0) return;
+    for (const message of toCheck) state.ackCheckedIds.add(message.id);
+    await Promise.all(
+      toCheck.map((message) =>
+        apiFetch(`/facilities/${currentFacility}/messages/${message.id}/acknowledgements?employeeId=me`)
+          .then((rows) => {
+            if (ackedMessageIdsFromRows(rows).size > 0) state.ackedMessageIds.add(message.id);
+          })
+          .catch(() => {})
+      )
+    );
+    render();
+  }
+
+  // P-1: fetches the compliance rollup (delivered/read/acknowledged/pending/
+  // overdue/total) for every visible message shouldFetchCompliance says this
+  // viewer should see counts for (their own sends, or any message at all when
+  // they hold communications.publish), once per message id per panel load
+  // (complianceCheckedIds, same dedup/re-render shape as
+  // seedAckStateForVisibleMessages above).
+  async function loadComplianceForVisibleMessages(messages) {
+    const canPublish = hasPerm("communications.publish");
+    const toFetch = messages.filter(
+      (message) =>
+        !state.complianceCheckedIds.has(message.id) &&
+        shouldFetchCompliance(message, { canPublish, myEmployeeId: state.myEmployeeId })
+    );
+    if (toFetch.length === 0) return;
+    for (const message of toFetch) state.complianceCheckedIds.add(message.id);
+    await Promise.all(
+      toFetch.map((message) =>
+        apiFetch(`/facilities/${currentFacility}/messages/${message.id}/compliance`)
+          .then((summary) => {
+            state.complianceByMessageId[message.id] = summary;
+          })
+          .catch(() => {})
+      )
+    );
+    render();
   }
 
   async function acknowledge(id) {
@@ -3060,6 +3133,14 @@ const commsPanel = (function () {
       ackBtn.addEventListener("click", () => acknowledge(message.id));
       card.append(ackBtn);
     }
+
+    // P-1: a compliance count (e.g. "2/5 acknowledged, 1 overdue") for
+    // whoever shouldFetchCompliance says gets to see it -- the message's own
+    // author, or anyone holding communications.publish. Absent until its
+    // background fetch (loadComplianceForVisibleMessages) settles.
+    const complianceText = formatComplianceSummary(state.complianceByMessageId[message.id]);
+    if (complianceText) card.append(el("div", { class: "item-subtitle" }, complianceText));
+
     return card;
   }
 
@@ -3090,6 +3171,8 @@ const commsPanel = (function () {
     } else {
       const { pageItems, ...pageInfo } = paginate(state.messages, state.page, state.pageSize);
       markReceiptsForVisibleMessages(pageItems);
+      seedAckStateForVisibleMessages(pageItems);
+      loadComplianceForVisibleMessages(pageItems);
       for (const message of pageItems) listWrap.append(buildMessageCard(message));
       const bar = buildPaginationBar(pageInfo, (p) => {
         state.page = p;
