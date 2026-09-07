@@ -18,6 +18,7 @@ import { registerNotificationRoutes } from "../src/lib/http/notification-routes.
 import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs";
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
 import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
+import { registerReportDistributionRoutes } from "../src/lib/http/report-distribution-routes.mjs";
 import { registerIncidentRoutes } from "../src/lib/http/incidents-routes.mjs";
 import { registerIncidentPeopleRoutes } from "../src/lib/http/incidents-people-routes.mjs";
 import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
@@ -292,6 +293,9 @@ registerMeRoute(userRouter, { authenticate, sendJson });
 
 // Daily Reports: template list/fetch, draft create/edit, and immutable submit.
 registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
+// Daily Reports: template -> distribution list bindings + delivery readback
+// (DR-21, reports.distribution.manage).
+registerReportDistributionRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: capture + escalation queue (incidents.read / incidents.manage).
 registerIncidentRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: people involved + witness statements (IN-12, incidents.read /

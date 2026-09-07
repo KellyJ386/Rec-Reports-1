@@ -78,8 +78,11 @@ function toHHMM(date) {
 // The next timestamp at which the quiet-hours window ends, so a deferred job
 // wakes up right as it becomes safe to deliver rather than being polled
 // arbitrarily. Falls back to a short retry if the configured end time is
-// malformed, so a bad config value can't wedge a job forever.
-function nextQuietWindowEnd(now, quietEndHHMM) {
+// malformed, so a bad config value can't wedge a job forever. Exported (DR-22):
+// src/lib/report-distribution.mjs's quiet-hours reschedule reuses this
+// verbatim rather than duplicating the "wake at window end, not by polling"
+// logic for its own outbox-event reschedule.
+export function nextQuietWindowEnd(now, quietEndHHMM) {
   const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(quietEndHHMM ?? "");
   if (!match) return new Date(now.getTime() + BASE_BACKOFF_MS);
   const [, hh, mm] = match;
@@ -480,18 +483,50 @@ export async function drainOnce({ client, now = new Date(), limit = 25, config =
 // processJob above can then deliver on a later drain pass.
 // ---------------------------------------------------------------------------
 
+// DR-22: outbox_events is a single shared table with a single pending ->
+// processing -> processed/failed state machine, and claimDueOutboxEvents
+// below used to claim EVERY pending row regardless of event_type. That is
+// fine as long as this file is the table's only consumer -- but DR-22 adds a
+// second one (src/lib/report-distribution.mjs processReportSubmittedEvents,
+// consuming 'report.submitted' rows into report_deliveries instead of
+// notification_jobs) that the plan explicitly wires to run in the SAME
+// drain invocation, right after this worker (src/lib/http/internal-
+// routes.mjs handleDrain). Without this reservation, drainOutboxOnce would
+// win the race every time: it claims 'report.submitted' rows just like any
+// other type, finds no notification_events catalog entry for them
+// (translateOutboxEvent), and marks them 'processed' with a
+// "skipped: ..." note -- silently swallowing every report-submission event
+// before the report-distribution consumer ever sees one.
+//
+// RESERVED_OUTBOX_EVENT_TYPES is the fix: event types with their own
+// dedicated consumer are excluded from THIS file's claim query, so they
+// stay 'pending' for that consumer's own claim (which filters TO the
+// reserved type) instead of being swept up generically here. Add a future
+// module's own event_type here when it grows a dedicated outbox consumer
+// the same way DR-22 does; this file's own claim is the only thing that
+// needs to know the exclusion list, since every dedicated consumer filters
+// FOR its own type already.
+export const RESERVED_OUTBOX_EVENT_TYPES = new Set(["report.submitted"]);
+
 // Selects due, pending outbox_events (available_at <= now, or a prior
 // failure's next_attempt_at <= now) and claims each with a conditional
 // pending -> processing update, mirroring claimDueJobs' race-safe claim
-// (the loser's UPDATE matches zero rows and is silently skipped).
+// (the loser's UPDATE matches zero rows and is silently skipped). Excludes
+// RESERVED_OUTBOX_EVENT_TYPES (see comment above) -- those event types are
+// claimed by their own dedicated consumer instead.
 export async function claimDueOutboxEvents({ client, now = new Date(), limit = 25 }) {
   const nowIso = toIso(now);
+  const reserved = [...RESERVED_OUTBOX_EVENT_TYPES];
+  const extra = { or: `(available_at.lte.${nowIso},next_attempt_at.lte.${nowIso})` };
+  if (reserved.length > 0) {
+    extra.event_type = `not.in.(${reserved.join(",")})`;
+  }
   const candidates = await pgSelect(client, "outbox_events", {
     filters: { status: "pending" },
     select: OUTBOX_COLUMNS,
     order: "available_at.asc",
     limit,
-    extra: { or: `(available_at.lte.${nowIso},next_attempt_at.lte.${nowIso})` }
+    extra
   });
 
   const claimed = [];
