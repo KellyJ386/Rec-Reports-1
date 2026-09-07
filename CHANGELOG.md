@@ -8,6 +8,37 @@ All notable changes to this project are documented in this file. The format is b
 
 Nothing yet.
 
+## [Wave 2] - 2026-09-07
+
+### Added
+- Role-based home: permission-gated quick actions and tiles for reports due, my open work orders, open
+  incidents, unacknowledged messages, expiring certifications and today's shifts; collapsible module panels.
+- Global search across incidents, work orders, employees and messages (per-module read permission), with
+  trigram indexes (migration 0051).
+- Incident people and witness statements: versioned, append-only, sign-once statements (migration 0050),
+  routes and UI.
+- Acknowledgement and receipt read paths, per-message compliance and a facility compliance rollup; the app
+  shows persisted acknowledgement state across sessions.
+- Shift assignments read path; the schedule board loads persisted assignments.
+- Email delivery through Resend and push delivery through FCM HTTP v1 behind `EMAIL_PROVIDER` and
+  `PUSH_PROVIDER`; test-send route accepts a channel; optional Firebase web config in public-config.
+- Smoke test in CI against the built app; `DEPLOYMENT.md` runbook; on-demand contrast and accessibility
+  checks; the caller's employee id in `/me`.
+
+### Changed
+- Route guards come from one `makeGuards()` factory; list pagination parsing is shared and consistent.
+- PostgREST errors are translated centrally to 409/400/401/403; query-shape errors stay reported 500s;
+  error detail is hidden in production unless `DEBUG_ERRORS` is set.
+- Lint now checks unused bindings, duplicate imports and interpolated `innerHTML`; typecheck validates
+  every permission literal passed to a guard.
+- Minimum 44px tap targets, visible focus, labelled form controls, live status regions, skip link.
+
+### Fixed
+- `PATCH /facilities/:id` accepted only bodies that included a name.
+- The certification gap report was readable by any facility member; it now requires `training.read`.
+- Soft-deleting an incident person failed the row-visibility check for every actor.
+- Search stripped accented and non-Latin characters from queries.
+
 ## [Wave 1] - 2026-09-06
 
 Security hardening wave. Full scope, findings, and proving tests are in
