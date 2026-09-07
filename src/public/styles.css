@@ -190,6 +190,37 @@ a.primary:focus-visible {
   background: #d6e4f7;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.enable-push-btn {
+  background: #eef4ff;
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+  border-radius: 8px;
+  padding: 8px 16px;
+  min-height: 44px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.enable-push-btn:hover {
+  background: #d6e4f7;
+}
+
+.enable-push-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.push-status {
+  font-size: 0.85em;
+  color: #666;
+}
+
 .module-list {
   display: grid;
   gap: 12px;
