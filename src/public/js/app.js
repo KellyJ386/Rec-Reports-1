@@ -47,8 +47,7 @@ import {
   formatComplianceSummary
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
-import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
-import { sanitizeQuery, groupResults, debounce } from "./search.mjs";
+import { shouldOfferPushEnrollment, buildDeviceTokenPayload, permissionGrants } from "./push-registration.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 // S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
@@ -3839,200 +3838,87 @@ function setupSignOut() {
   });
 }
 
-// --- Global search (P-8) ----------------------------------------------------
-// Header search box: debounced GET /api/v1/search?facilityId=&q=, grouped
-// results (incidents/work orders/employees/messages, only the legs the
-// server included -- see search.mjs's groupResults), each deep-linking into
-// its panel. Every DOM node is built with el() (never innerHTML with
-// interpolation -- see el()'s doc comment above), so a result's own text
-// (an incident summary, a message subject, ...) can never be parsed as
-// markup even though it is attacker-influenced content from another user
-// in the same facility.
+// --- Push enrollment (P-5) --------------------------------------------------
+// "Enable notifications" button: requests Notification permission and, once
+// a real device token is available, registers it via POST /me/device-tokens
+// (src/lib/http/communications-routes.mjs's existing CM-07 endpoint). The
+// button stays hidden entirely unless the server has an owner-configured
+// Firebase web config (GET /api/v1/public-config's optional
+// `firebaseWebConfig`, sourced from FIREBASE_WEB_CONFIG_JSON) AND this
+// browser supports both Notification and service workers -- see
+// push-registration.mjs's shouldOfferPushEnrollment for the exact rule.
 
-// Container each leg's results scroll to. Employees have no dedicated list
-// panel of their own (scheduling-routes.mjs's employees endpoint backs the
-// schedule board -- see search-routes.mjs's leg comment), so that leg
-// scrolls to the schedule panel; incidents/work orders additionally open
-// their own detail view (openDetail, exposed above) once scrolled to;
-// messages have no detail view, so the specific message card is
-// highlighted instead when it's on the currently rendered page.
-const SEARCH_LEG_CONTAINER_ID = {
-  incidents: "incidents-workspace",
-  workOrders: "work-orders-workspace",
-  employees: "schedule-workspace",
-  messages: "comms-workspace"
-};
-
-function scrollElementIntoView(elementId, options) {
-  const target = document.getElementById(elementId);
-  if (target) target.scrollIntoView({ behavior: "smooth", block: "start", ...options });
-  return target;
+function setPushStatus(message) {
+  const statusEl = document.getElementById("push-status");
+  if (statusEl) statusEl.textContent = message;
 }
 
-// Briefly outlines `target` so a deep-linked result is visually obvious
-// after the scroll lands, then removes the outline -- a transient cue, not
-// a persistent style change.
-function flashSearchHighlight(target) {
-  if (!target) return;
-  target.classList.add("search-result-highlight");
-  setTimeout(() => target.classList.remove("search-result-highlight"), 2000);
+// TODO(P-5 follow-up): mint a real FCM registration token via the Firebase
+// Messaging JS SDK's getToken({ vapidKey, serviceWorkerRegistration }).
+// That SDK cannot be loaded today under this app's `default-src 'self'` CSP
+// (scripts/server.mjs's securityHeaders) without either a same-origin
+// bundled copy -- this is a zero-dependency, no-bundler app -- or loosening
+// the CSP to allow an external script host, and neither is in scope for
+// this slice (see push-registration.mjs's file-header note). Returns null
+// until that SDK step lands, which is exactly what tells the click handler
+// below there is nothing to register yet.
+async function getFcmToken(_firebaseWebConfig) {
+  return null;
 }
 
-function searchResultPrimaryText(legKey, item) {
-  switch (legKey) {
-    case "incidents":
-      return `${item.incident_no || "Incident"} · ${item.summary || ""}`;
-    case "workOrders":
-      return item.title || "Work order";
-    case "employees":
-      return `${item.first_name || ""} ${item.last_name || ""}`.trim() || item.employee_no || "Employee";
-    case "messages":
-      return item.subject || "Message";
-    default:
-      return "";
-  }
-}
+async function setupPushEnrollment() {
+  const button = document.getElementById("enable-push-btn");
+  if (!button) return;
 
-function searchResultSecondaryText(legKey, item) {
-  switch (legKey) {
-    case "incidents":
-      return item.location_text || (item.status ? `Status: ${item.status}` : "");
-    case "workOrders":
-      return item.status ? `Status: ${item.status}` : item.description || "";
-    case "employees":
-      return item.employee_no ? `#${item.employee_no}` : item.status || "";
-    case "messages":
-      return (item.body_text || "").slice(0, 100);
-    default:
-      return "";
-  }
-}
-
-// Registers the header search box: reads/writes only #global-search's own
-// subtree plus the four panel containers it deep-links into, and the
-// module-level `currentFacility` every other panel already relies on --
-// no new global state of its own.
-function setupGlobalSearch() {
-  const wrapper = document.getElementById("global-search");
-  const input = document.getElementById("global-search-input");
-  const resultsEl = document.getElementById("global-search-results");
-  if (!wrapper || !input || !resultsEl) return;
-
-  function closeResults() {
-    resultsEl.hidden = true;
-    resultsEl.textContent = "";
-    input.setAttribute("aria-expanded", "false");
+  let firebaseWebConfig = null;
+  try {
+    const response = await fetch(`${API_BASE}/public-config`, { headers: { Accept: "application/json" } });
+    const data = response.ok ? await response.json() : null;
+    firebaseWebConfig = data?.firebaseWebConfig ?? null;
+  } catch {
+    firebaseWebConfig = null;
   }
 
-  function renderStatus(text, { isError = false } = {}) {
-    resultsEl.textContent = "";
-    resultsEl.append(el("p", { class: isError ? "global-search-status rr-error" : "global-search-status" }, text));
-    resultsEl.hidden = false;
-    input.setAttribute("aria-expanded", "true");
+  const notificationSupported = typeof Notification !== "undefined";
+  const serviceWorkerSupported = "serviceWorker" in navigator;
+  if (!shouldOfferPushEnrollment({ firebaseWebConfig, notificationSupported, serviceWorkerSupported })) {
+    return;
   }
+  button.hidden = false;
 
-  async function openResult(legKey, item) {
-    closeResults();
-    const container = scrollElementIntoView(SEARCH_LEG_CONTAINER_ID[legKey]);
-    if (legKey === "incidents" && incidentsPanel.openDetail) {
-      await incidentsPanel.openDetail(item.id);
-      flashSearchHighlight(scrollElementIntoView("incident-detail-panel") || container);
-    } else if (legKey === "workOrders" && workOrdersPanel.openDetail) {
-      await workOrdersPanel.openDetail(item.id);
-      flashSearchHighlight(scrollElementIntoView("work-order-detail-panel") || container);
-    } else if (legKey === "messages") {
-      const card = document.getElementById(`message-card-${item.id}`);
-      if (card) {
-        card.scrollIntoView({ behavior: "smooth", block: "center" });
-        flashSearchHighlight(card);
-      } else {
-        flashSearchHighlight(container);
-      }
-    } else {
-      flashSearchHighlight(container);
-    }
-  }
-
-  function renderResults(groups) {
-    resultsEl.textContent = "";
-    if (groups.length === 0) {
-      renderStatus("No matches.");
+  button.addEventListener("click", async () => {
+    if (!currentFacility) {
+      setPushStatus("Select a facility first.");
       return;
     }
-    for (const group of groups) {
-      resultsEl.append(el("div", { class: "global-search-group-label" }, group.label));
-      for (const item of group.items) {
-        const row = el(
-          "button",
-          { type: "button", class: "global-search-result", role: "option" },
-          [
-            el("span", { class: "global-search-result-title" }, searchResultPrimaryText(group.key, item)),
-            el("span", { class: "global-search-result-subtitle" }, searchResultSecondaryText(group.key, item))
-          ]
-        );
-        row.addEventListener("click", () => openResult(group.key, item));
-        resultsEl.append(row);
-      }
-    }
-    resultsEl.hidden = false;
-    input.setAttribute("aria-expanded", "true");
-  }
-
-  // Guards against an in-flight response landing after the input has moved
-  // on to a different (or cleared) query -- sanitizeQuery is a pure,
-  // deterministic function of the input's CURRENT value, so re-deriving
-  // and comparing here is enough to detect that without any request-id
-  // bookkeeping.
-  async function runSearch(rawValue) {
-    const q = sanitizeQuery(rawValue);
-    if (!q || !currentFacility) {
-      closeResults();
-      return;
-    }
-    renderStatus("Searching…");
+    button.disabled = true;
     try {
-      const payload = await apiFetch(`/search?facilityId=${encodeURIComponent(currentFacility)}&q=${encodeURIComponent(q)}`);
-      if (sanitizeQuery(input.value) !== q) return; // stale response
-      renderResults(groupResults(payload));
+      const permission = await Notification.requestPermission();
+      if (!permissionGrants(permission)) {
+        setPushStatus("Notifications permission was not granted.");
+        return;
+      }
+      const token = await getFcmToken(firebaseWebConfig);
+      if (!token) {
+        setPushStatus("Notifications permission granted. Device registration isn't fully wired up in this deployment yet.");
+        return;
+      }
+      await apiFetch("/me/device-tokens", {
+        method: "POST",
+        body: buildDeviceTokenPayload({ facilityId: currentFacility, token })
+      });
+      setPushStatus("Notifications enabled on this device.");
     } catch (error) {
-      if (sanitizeQuery(input.value) !== q) return; // stale response
-      renderStatus(error.message || "Search failed", { isError: true });
+      setPushStatus(`Could not enable notifications: ${error.message}`);
+    } finally {
+      button.disabled = false;
     }
-  }
-
-  // P-8: >=300ms debounce, and only ever fires for a sanitized q of at
-  // least 2 characters (sanitizeQuery's own MIN_QUERY_LENGTH) -- a shorter
-  // or entirely-reserved-characters value closes the dropdown immediately
-  // instead of debouncing a search the server would just 400 anyway.
-  const debouncedSearch = debounce(runSearch, 300);
-
-  input.addEventListener("input", (event) => {
-    const value = event.target.value;
-    if (sanitizeQuery(value) === null) {
-      debouncedSearch.cancel();
-      closeResults();
-      return;
-    }
-    debouncedSearch(value);
-  });
-
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      debouncedSearch.cancel();
-      closeResults();
-      input.blur();
-    }
-  });
-
-  document.addEventListener("click", (event) => {
-    if (!wrapper.contains(event.target)) closeResults();
   });
 }
 
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
-  collapsePanelsOnMobile();
-  setupGlobalSearch();
+  setupPushEnrollment();
   migrateLegacyRefreshToken().finally(initialize);
 });

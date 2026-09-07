@@ -13,22 +13,11 @@
   <body>
     <header class="app-header">
       <div class="user-info">Signed in as <span id="user-email">...</span></div>
-      <div class="global-search" id="global-search">
-        <label class="sr-only" for="global-search-input">Search incidents, work orders, people, messages</label>
-        <input
-          type="search"
-          id="global-search-input"
-          class="global-search-input"
-          placeholder="Search incidents, work orders, people, messages…"
-          autocomplete="off"
-          role="combobox"
-          aria-autocomplete="list"
-          aria-expanded="false"
-          aria-controls="global-search-results"
-        />
-        <div id="global-search-results" class="global-search-results" role="listbox" aria-live="polite" hidden></div>
+      <div class="header-actions">
+        <button type="button" id="enable-push-btn" class="enable-push-btn" hidden>Enable notifications</button>
+        <span id="push-status" class="push-status" aria-live="polite"></span>
+        <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
       </div>
-      <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
     </header>
     <main class="shell">
       <section id="home-dashboard" aria-labelledby="home-heading">

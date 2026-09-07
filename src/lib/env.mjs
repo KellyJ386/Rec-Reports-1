@@ -6,7 +6,13 @@ const optionalServerFields = [
   "DATABASE_URL",
   "OBSERVABILITY_DSN",
   "CRON_SECRET",
-  "DEBUG_ERRORS"
+  "DEBUG_ERRORS",
+  "EMAIL_PROVIDER",
+  "EMAIL_API_KEY",
+  "EMAIL_FROM",
+  "PUSH_PROVIDER",
+  "FCM_SERVICE_ACCOUNT_JSON",
+  "FIREBASE_WEB_CONFIG_JSON"
 ];
 
 // CRON_SECRET (OP-13, src/lib/http/internal-routes.mjs) gates the internal
@@ -23,6 +29,31 @@ const optionalServerFields = [
 // is also set (any non-empty value other than "false"/"0"). Every other
 // environment (VERCEL_ENV unset -- local/dev, or "preview") shows the detail
 // unconditionally, matching this app's behavior before DEBUG_ERRORS existed.
+//
+// EMAIL_PROVIDER/EMAIL_API_KEY/EMAIL_FROM (P-4, src/lib/notifications/
+// email.mjs + adapters.mjs) and PUSH_PROVIDER/FCM_SERVICE_ACCOUNT_JSON
+// (P-5, src/lib/notifications/fcm.mjs + adapters.mjs) configure the
+// worker's real delivery adapters (src/lib/notifications/worker.mjs's
+// config.emailAdapter/pushAdapter, built by
+// buildAdaptersFromEnv in adapters.mjs). EMAIL_PROVIDER/PUSH_PROVIDER unset
+// or "noop" -> the zero-network noop adapter (every delivery marked 'sent'
+// with no provider configured, same as before P-4/P-5 existed).
+// EMAIL_PROVIDER=resend requires EMAIL_API_KEY and EMAIL_FROM;
+// PUSH_PROVIDER=fcm requires FCM_SERVICE_ACCOUNT_JSON (base64-encoded
+// Google service-account JSON -- base64 because the raw JSON embeds a
+// multi-line PEM private key, which is not safe to carry as a literal env
+// var value); either missing credential throws at adapter-build time
+// (buildAdaptersFromEnv), never silently falling back to noop.
+//
+// FIREBASE_WEB_CONFIG_JSON (P-5, scripts/server.mjs's GET /public-config)
+// is the owner-supplied Firebase Web SDK config object (apiKey, authDomain,
+// projectId, messagingSenderId, appId, ...) as a raw JSON string -- unlike
+// FCM_SERVICE_ACCOUNT_JSON this is NOT base64 and carries no secret: it is
+// the same public client config Firebase's own web docs say is safe to ship
+// to the browser, handed back verbatim (as `firebaseWebConfig`) so the "Enable
+// notifications" button in src/public/js/app.js knows whether push
+// enrollment is available at all. Unset or malformed JSON -> the field is
+// simply omitted from the response, never a request failure.
 //
 // SUPABASE_STORAGE_BUCKET (OP-16, src/lib/storage.mjs) is optional like the
 // fields above, but unlike them it always ends up set on the returned env --

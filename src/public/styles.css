@@ -248,112 +248,35 @@ a.primary:focus-visible {
   background: #d6e4f7;
 }
 
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-/* P-8: global search box in the app header. */
-.global-search {
-  position: relative;
-  flex: 1 1 320px;
-  max-width: 420px;
-  margin: 0 16px;
-}
-
-.global-search-input {
-  width: 100%;
-  min-height: 44px;
-  box-sizing: border-box;
-  border: 1px solid #b9c7d9;
-  border-radius: 10px;
-  padding: 10px 14px;
-  font-size: 0.95em;
-}
-
-.global-search-input:focus-visible {
-  outline: 3px solid #0b57d0;
-  outline-offset: 2px;
-}
-
-.global-search-results {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
-  z-index: 20;
-  max-height: 60vh;
-  overflow-y: auto;
-  background: #ffffff;
-  border: 1px solid #dce5f2;
-  border-radius: 12px;
-  box-shadow: 0 18px 40px rgba(23, 32, 51, 0.16);
-  padding: 6px;
-}
-
-.global-search-status {
-  margin: 0;
-  padding: 10px 12px;
-  color: #666;
-  font-size: 0.9em;
-}
-
-.global-search-group-label {
-  padding: 8px 12px 2px;
-  font-size: 0.75em;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: #1c6dd0;
-}
-
-.global-search-result {
+.header-actions {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  width: 100%;
-  min-height: 44px;
-  box-sizing: border-box;
-  text-align: left;
-  background: none;
-  border: none;
-  border-radius: 8px;
-  padding: 8px 12px;
-  cursor: pointer;
-  font: inherit;
+  align-items: center;
+  gap: 12px;
 }
 
-.global-search-result:hover,
-.global-search-result:focus-visible {
+.enable-push-btn {
   background: #eef4ff;
-  outline: none;
-}
-
-.global-search-result-title {
+  color: #173b72;
+  border: 1px solid #b9c7d9;
+  border-radius: 8px;
+  padding: 8px 16px;
+  min-height: 44px;
+  cursor: pointer;
   font-weight: 700;
 }
 
-.global-search-result-subtitle {
+.enable-push-btn:hover {
+  background: #d6e4f7;
+}
+
+.enable-push-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.push-status {
   font-size: 0.85em;
   color: #666;
-}
-
-.search-result-highlight {
-  outline: 3px solid #f2a71b;
-  outline-offset: 2px;
-  transition: outline-color 0.3s ease;
-}
-
-@media (max-width: 720px) {
-  .app-header { flex-wrap: wrap; gap: 12px; }
-  .global-search { flex: 1 1 100%; max-width: none; margin: 0; order: 3; }
 }
 
 .module-list {
