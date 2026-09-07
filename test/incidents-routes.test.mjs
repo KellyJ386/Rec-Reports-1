@@ -158,6 +158,48 @@ test("GET incident by id returns the incident for a reader", async (t) => {
   assert.equal(result.payload.id, "inc-1");
 });
 
+// --- GET /incidents/:id: retention_eligible_at (IN-16b) ----------------------
+
+test("GET incident by id includes a computed retention_eligible_at using the registry default (no facility config)", async (t) => {
+  // "modules" resolves to [] here (no explicit stub), so loadModuleConfig
+  // returns {} early -- configValue falls back to the registry default,
+  // exactly the "unconfigured facility" case.
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  assert.equal(result.status, 200);
+  // INCIDENT: occurred_at 2026-07-18T10:00:00Z, severity high, no OSHA
+  // review, report_type incident -- "standard" class, default 2555 days.
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 2555 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
+});
+
+test("GET incident by id computes an OSHA-class retention date when requires_osha_review is true", async (t) => {
+  const oshaIncident = { ...INCIDENT, requires_osha_review: true };
+  stubFetch(t, (table) => (table === "incident_reports" ? [oshaIncident] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 1825 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
+});
+
+test("GET incident by id honors a facility-configured retention override", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "modules") return [{ id: "mod-incidents", code: "incidents" }];
+    if (table === "facilities") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings") return [];
+    if (table === "facility_module_overrides") {
+      return [{ config_patch_jsonb: { "incidents.retentionDaysStandard": 10 } }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 10 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
+});
+
 test("POST incidents validates shape before guarding (400, no fetch)", async (t) => {
   const captured = stubFetch(t, () => []);
   const { call } = mount({ memberships: READER });
@@ -698,6 +740,68 @@ test("PATCH legal-hold happy path flips legal_hold and writes an audit event", a
   const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
   assert.ok(auditInsert, "expected an incident_audit_events insert");
   assert.equal(auditInsert.body[0].event_type, "incident.legal_hold_changed");
+});
+
+// --- GET /incidents/:id/legal-hold (IN-16c: history) -------------------------
+
+test("GET legal-hold history 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("GET", "/incidents/nope/legal-hold");
+  assert.equal(result.status, 404);
+});
+
+test("GET legal-hold history denies a caller with none of audit.view/manage/review", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.legal_hold.manage"] }]
+  });
+  const result = await call("GET", "/incidents/inc-1/legal-hold");
+  assert.equal(result.status, 403);
+});
+
+test("GET legal-hold history returns the ordered toggle history for a manager", async (t) => {
+  const HISTORY_ROWS = [
+    {
+      id: 1,
+      actor_user_id: "user-3",
+      event_payload: { actor: "user-3", from: false, to: true },
+      created_at: "2026-07-19T00:00:00Z"
+    },
+    {
+      id: 2,
+      actor_user_id: "user-4",
+      event_payload: { actor: "user-4", from: true, to: false },
+      created_at: "2026-07-20T00:00:00Z"
+    }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports") return [{ ...INCIDENT, legal_hold: false }];
+    if (table === "incident_audit_events" && method === "GET") return HISTORY_ROWS;
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage
+  const result = await call("GET", "/incidents/inc-1/legal-hold");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.legalHold, false);
+  assert.equal(result.payload.history.length, 2);
+  assert.deepEqual(result.payload.history[0], {
+    id: 1,
+    actorUserId: "user-3",
+    from: false,
+    to: true,
+    changedAt: "2026-07-19T00:00:00Z"
+  });
+  assert.deepEqual(result.payload.history[1], {
+    id: 2,
+    actorUserId: "user-4",
+    from: true,
+    to: false,
+    changedAt: "2026-07-20T00:00:00Z"
+  });
+
+  const auditGet = captured.find((c) => c.table === "incident_audit_events" && c.method === "GET");
+  assert.match(auditGet.url.search, /event_type=eq\.incident\.legal_hold_changed/);
 });
 
 // --- POST /incidents/:id/submit: suggestedFollowUps (IN-05) -----------------
@@ -1317,6 +1421,172 @@ test("GET export.pdf marks an amended incident's audit event and lists amendment
   const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
   assert.match(bytes, /\[AMENDED\]/);
   assert.match(bytes, /\(Amendment 1 Reason: corrected the location\) Tj/);
+});
+
+// --- GET /incidents/:id/packet.pdf (IN-18) -----------------------------------
+
+function respondPacket(overrides = {}) {
+  return (table, method, parsed) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "facilities") return [{ id: "fac-1", name: "Riverside Rec Center" }];
+    if (table === "incident_people") return overrides.people ?? [];
+    if (table === "incident_witness_statements") return overrides.statements ?? [];
+    if (table === "incident_attachments") return overrides.attachments ?? [];
+    if (table === "incident_followup_actions") return overrides.followups ?? [FOLLOWUP];
+    if (table === "incident_escalations") return overrides.escalations ?? [ESCALATION];
+    if (table === "incident_amendments") return overrides.amendments ?? [];
+    if (table === "incident_signatures") return overrides.signatures ?? [];
+    if (table === "incident_compliance_checks") return overrides.complianceChecks ?? [];
+    if (table === "incident_audit_events" && method === "GET") {
+      // Two distinct queries hit this table: one filtered by incident_id
+      // (display), one by facility_id (chain verification) -- distinguish
+      // them by which filter the query actually carries.
+      if (parsed.searchParams.get("incident_id")) return overrides.auditEvents ?? [];
+      if (parsed.searchParams.get("facility_id")) return overrides.chainRows ?? [];
+    }
+    return [];
+  };
+}
+
+test("GET packet.pdf denies a reader without incidents.export.pdf with 403 and writes nothing", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("GET packet.pdf 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: EXPORTER });
+  const result = await call("GET", "/incidents/nope/packet.pdf");
+  assert.equal(result.status, 404);
+});
+
+test("GET packet.pdf 409s while the incident is a draft, before any child table is queried", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // INCIDENT is a draft
+  const { call } = mount({ memberships: EXPORTER });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /submitted-or-later/i);
+  assert.ok(!captured.some((c) => c.table === "incident_people"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("GET packet.pdf happy path returns a packet envelope containing every section", async (t) => {
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const PERSON = {
+    id: "person-1",
+    person_role: "injured_party",
+    full_name: "Jane Doe",
+    contact_json: {},
+    injury_json: {},
+    statement_text: null
+  };
+  stubFetch(
+    t,
+    respondPacket({
+      people: [PERSON],
+      statements: [
+        {
+          id: "stmt-1",
+          person_id: "person-1",
+          version_no: 1,
+          statement_text: "I saw it happen.",
+          submitted_by: "user-1",
+          submitted_at: "2026-07-18T11:00:00Z",
+          signed_at: "2026-07-18T11:30:00Z",
+          deleted_at: null
+        }
+      ],
+      attachments: [
+        {
+          id: "att-1",
+          attachment_type: "photo",
+          storage_path: "facilities/fac-1/incidents/inc-1/x.jpg",
+          checksum_sha256: null,
+          metadata: {},
+          captured_at: null,
+          captured_by: null
+        }
+      ]
+    })
+  );
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.contentType, "application/pdf");
+  assert.match(result.payload.filename, /^incident-INC-2026-001-packet-.+\.pdf$/);
+  assert.match(result.payload.contentDisposition, /^attachment; filename="incident-INC-2026-001-packet-.+\.pdf"$/);
+  assert.equal(result.payload.documentHash, undefined); // internal only, not part of the wire envelope
+
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.ok(bytes.startsWith("%PDF-1.4\n"));
+  assert.match(bytes, /== Involved People ==/);
+  assert.match(bytes, /== Witness Statements ==/);
+  assert.match(bytes, /\(Statement 1 Version: 1\) Tj/);
+  assert.match(bytes, /== Evidence Index ==/);
+  assert.match(bytes, /== Audit Timeline ==/);
+  assert.match(bytes, /== Audit Chain Verification ==/);
+  assert.match(bytes, /== Packet Integrity ==/);
+  assert.match(bytes, /\(Packet Hash: sha256:[0-9a-f]{64}\) Tj/);
+});
+
+test("GET packet.pdf writes an incident.packet_exported audit event carrying the packet hash and chain result", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert on packet export");
+  const event = auditInsert.body[0];
+  assert.equal(event.facility_id, "fac-1");
+  assert.equal(event.incident_id, "inc-1");
+  assert.equal(event.actor_user_id, "user-8");
+  assert.equal(event.event_type, "incident.packet_exported");
+  assert.match(event.event_payload.documentHash, /^[0-9a-f]{64}$/);
+  // An empty chainRows fixture (no rows fetched) verifies as valid: true,
+  // brokenAt: null (verifyIncidentAuditChain's vacuous-chain case).
+  assert.equal(event.event_payload.chainValid, true);
+  assert.equal(event.event_payload.chainBrokenAt, null);
+});
+
+test("GET packet.pdf omits the Signatures/Compliance Checks sections when those tables don't exist in this tree (defensive absence)", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_signatures" || table === "incident_compliance_checks") {
+      // Simulates PostgREST's "relation does not exist" response for a
+      // sibling migration's table this tree doesn't carry yet.
+      return { ok: false, status: 404, text: async () => JSON.stringify({ message: "relation not found" }) };
+    }
+    const data = respondPacket()(table, init.method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.doesNotMatch(bytes, /== Signatures ==/);
+  assert.doesNotMatch(bytes, /== Compliance Checks ==/);
+  // The rest of the packet still renders fine.
+  assert.match(bytes, /== Evidence Index ==/);
+  assert.match(bytes, /== Packet Integrity ==/);
+});
+
+test("GET packet.pdf: a failing audit write returns 500 instead of the packet envelope", async (t) => {
+  const captured = stubFetchAuditFailure(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
+  assert.equal(result.payload.body, undefined);
+  const auditAttempt = captured.postgrest.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditAttempt, "expected the (failed) audit insert to have been attempted");
 });
 
 // --- Audit write failure handling (IN-22 interim, see writeAuditEvent) ------
