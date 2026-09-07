@@ -119,11 +119,18 @@ test("claimDueJobs claims due pending jobs via a conditional pending->processing
   assert.match(or, /next_attempt_at\.lte\./);
 });
 
+// Both employees resolve a deliverable email address via the employees +
+// app_users(email) embed (P-4) -- shared by the "drainOnce happy path" test
+// below and every email-channel test further down.
+const EMPLOYEE_WITH_EMAIL_1 = { id: "emp-1", user_id: "user-1", app_users: { email: "emp1@example.com" } };
+const EMPLOYEE_WITH_EMAIL_2 = { id: "emp-2", user_id: "user-2", app_users: { email: "emp2@example.com" } };
+
 test("drainOnce happy path: writes one delivery per recipient per channel and marks the job sent", async (t) => {
   const job = baseJob();
   const captured = stubFetch(t, (table, method) => {
     if (table === "notification_jobs" && method === "GET") return [job];
     if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "processing" }];
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1, EMPLOYEE_WITH_EMAIL_2];
     if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
     return [];
   });
@@ -142,9 +149,13 @@ test("drainOnce happy path: writes one delivery per recipient per channel and ma
     assert.equal(row.job_id, "job-1");
     assert.equal(row.facility_id, "fac-1");
   }
+  // The default (no-op) email adapter marks every resolved recipient sent,
+  // same as push's default -- see the dedicated email-channel tests below
+  // for opted_out/no_email/provider-id-persisted coverage.
   for (const row of byChannel("email")) {
-    assert.equal(row.status, "queued");
-    assert.equal(row.sent_at, null);
+    assert.equal(row.status, "sent");
+    assert.ok(row.sent_at);
+    assert.equal(row.provider_message_id, null);
   }
   assert.deepEqual(
     insert.body.map((row) => row.employee_id).sort(),
@@ -584,7 +595,7 @@ test("a recipient's personal quiet-hours override suppresses their push even out
   assert.equal(byEmployee["emp-2"].status, "sent");
 });
 
-test("a job whose resolved channels do not include push never queries device tokens or preferences", async (t) => {
+test("a job whose resolved channels do not include push never queries device tokens (email's own preferences/employees queries still run)", async (t) => {
   const job = baseJob(); // channels: ["in_app", "email"]
   const captured = stubFetch(t, (table, method) => {
     if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
@@ -594,6 +605,214 @@ test("a job whose resolved channels do not include push never queries device tok
 
   await processJob({ client: client(), job, now: NOON });
 
+  // employee_device_tokens is push-only -- never queried when 'push' is not
+  // among the job's resolved channels. employee_notification_preferences IS
+  // shared with the email path (email_enabled lives on the same row as
+  // push_enabled), so it's expected here precisely because this job's
+  // channels include 'email'.
   assert.ok(!captured.some((c) => c.table === "employee_device_tokens"));
-  assert.ok(!captured.some((c) => c.table === "employee_notification_preferences"));
+  assert.ok(captured.some((c) => c.table === "employee_notification_preferences"));
+});
+
+// --- P-4: email channel ------------------------------------------------
+
+function baseEmailJob(overrides = {}) {
+  return baseJob({
+    event_type: "message.published",
+    payload_jsonb: { recipients: ["emp-1"], channels: ["email"], title: "Subject line", body: "Body text" },
+    ...overrides
+  });
+}
+
+test("processJob delivers email via the default (no-op) adapter, marks the delivery sent, and queries employees exactly once", async (t) => {
+  const job = baseEmailJob();
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  assert.equal(insert.body.length, 1);
+  assert.equal(insert.body[0].employee_id, "emp-1");
+  assert.equal(insert.body[0].channel, "email");
+  assert.equal(insert.body[0].status, "sent");
+  assert.ok(insert.body[0].sent_at);
+  assert.equal(insert.body[0].provider_message_id, null);
+
+  const employeesLookups = captured.filter((c) => c.table === "employees" && c.method === "GET");
+  assert.equal(employeesLookups.length, 1, "expected exactly one employees select per job, not one per recipient");
+  assert.equal(employeesLookups[0].url.searchParams.get("select"), "id,user_id,app_users(email)");
+  assert.equal(employeesLookups[0].url.searchParams.get("id"), "in.(emp-1)");
+});
+
+test("email subject/text are derived from the job payload's title/body, exactly like push derives title/body", async (t) => {
+  const job = baseEmailJob({
+    payload_jsonb: { recipients: ["emp-1"], channels: ["email"], title: "Subject line", body: "Body text" }
+  });
+  let seen = null;
+  const fakeAdapter = {
+    send: async (message) => {
+      seen = message;
+      return { code: "ok" };
+    }
+  };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  await processJob({ client: client(), job, now: NOON, config: { emailAdapter: fakeAdapter } });
+
+  assert.equal(seen.to, "emp1@example.com");
+  assert.equal(seen.subject, "Subject line");
+  assert.equal(seen.text, "Body text");
+  assert.ok(captured.some((c) => c.table === "notification_deliveries" && c.method === "POST"));
+});
+
+test("email subject falls back to the job's event_type, and text to '', when the payload carries neither (mirrors push)", async (t) => {
+  const job = baseEmailJob({ payload_jsonb: { recipients: ["emp-1"], channels: ["email"] } });
+  let seen = null;
+  const fakeAdapter = {
+    send: async (message) => {
+      seen = message;
+      return { code: "ok" };
+    }
+  };
+  stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  await processJob({ client: client(), job, now: NOON, config: { emailAdapter: fakeAdapter } });
+
+  assert.equal(seen.subject, job.event_type);
+  assert.equal(seen.text, "");
+});
+
+test("an email recipient's email_enabled=false preference is recorded failed without ever contacting the adapter", async (t) => {
+  const job = baseEmailJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["email"] } });
+  let adapterCalled = false;
+  const fakeAdapter = { send: async () => { adapterCalled = true; return { code: "ok" }; } };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1, EMPLOYEE_WITH_EMAIL_2];
+    if (table === "employee_notification_preferences" && method === "GET") {
+      return [{ facility_id: "fac-1", employee_id: "emp-1", email_enabled: false }];
+    }
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON, config: { emailAdapter: fakeAdapter } });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "failed"); // opted out, never contacted
+  assert.equal(byEmployee["emp-1"].sent_at, null);
+  assert.equal(byEmployee["emp-2"].status, "sent");
+  assert.equal(adapterCalled, true, "expected emp-2's send to still reach the adapter");
+});
+
+test("a recipient with no linked app_users email is marked failed (no_email), never failing the whole job", async (t) => {
+  const job = baseEmailJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["email"] } });
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") {
+      // emp-1 has a user_id but no linked app_users row (embed comes back
+      // null); emp-2 has an app_users row whose email is empty. Both are
+      // "nobody to email".
+      return [
+        { id: "emp-1", user_id: "user-1", app_users: null },
+        { id: "emp-2", user_id: "user-2", app_users: { email: "" } }
+      ];
+    }
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent", "a ruled-out email recipient must never dead-letter/fail the whole job");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "failed");
+  assert.equal(byEmployee["emp-1"].sent_at, null);
+  assert.equal(byEmployee["emp-2"].status, "failed");
+});
+
+test("a recipient whose employees row is missing entirely from the select (deleted employee) is marked failed, never throwing the job into handleFailure", async (t) => {
+  const job = baseEmailJob({ payload_jsonb: { recipients: ["emp-1", "emp-ghost"], channels: ["email"] } });
+  const captured = stubFetch(t, (table, method) => {
+    // Only emp-1 comes back -- emp-ghost has no employees row at all (e.g.
+    // deleted between enqueue and drain).
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "sent");
+  assert.equal(byEmployee["emp-ghost"].status, "failed");
+  assert.ok(!captured.some((c) => c.table === "notification_jobs" && c.method === "PATCH" && c.body.status === "dead_letter"));
+});
+
+test("a permanently rejected email address is recorded bounced, and the provider's message id is persisted on a sent delivery", async (t) => {
+  const job = baseEmailJob({ payload_jsonb: { recipients: ["emp-1", "emp-2"], channels: ["email"] } });
+  const fakeAdapter = {
+    send: async ({ to }) =>
+      to === "emp1@example.com" ? { code: "ok", providerMessageId: "resend-msg-42" } : { code: "invalid_recipient" }
+  };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employees" && method === "GET") return [EMPLOYEE_WITH_EMAIL_1, EMPLOYEE_WITH_EMAIL_2];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }, { id: "delivery-2" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  const result = await processJob({ client: client(), job, now: NOON, config: { emailAdapter: fakeAdapter } });
+
+  assert.equal(result.outcome, "sent");
+  const insert = captured.find((c) => c.table === "notification_deliveries" && c.method === "POST");
+  const byEmployee = Object.fromEntries(insert.body.map((row) => [row.employee_id, row]));
+  assert.equal(byEmployee["emp-1"].status, "sent");
+  assert.equal(byEmployee["emp-1"].provider_message_id, "resend-msg-42");
+  assert.equal(byEmployee["emp-2"].status, "bounced");
+  assert.equal(byEmployee["emp-2"].sent_at, null);
+  assert.equal(byEmployee["emp-2"].provider_message_id, null);
+});
+
+test("a job whose resolved channels do not include email never queries employees for email resolution", async (t) => {
+  const job = basePushJob(); // channels: ["push"]
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "employee_device_tokens" && method === "GET") return [DEVICE_TOKEN_1];
+    if (table === "employee_notification_preferences" && method === "GET") return [];
+    if (table === "notification_deliveries" && method === "POST") return [{ id: "delivery-1" }];
+    if (table === "notification_jobs" && method === "PATCH") return [{ ...job, status: "sent" }];
+    return [];
+  });
+
+  await processJob({ client: client(), job, now: NOON });
+
+  assert.ok(!captured.some((c) => c.table === "employees"));
 });

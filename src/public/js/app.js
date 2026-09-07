@@ -32,6 +32,7 @@ import {
   deriveAckState
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
+import { shouldOfferPushEnrollment, buildDeviceTokenPayload, permissionGrants } from "./push-registration.mjs";
 
 const TOKEN_KEY = "rr_admin_token";
 // S-11: the refresh token itself lives only in the HttpOnly `rr_refresh`
@@ -3237,8 +3238,87 @@ function setupSignOut() {
   });
 }
 
+// --- Push enrollment (P-5) --------------------------------------------------
+// "Enable notifications" button: requests Notification permission and, once
+// a real device token is available, registers it via POST /me/device-tokens
+// (src/lib/http/communications-routes.mjs's existing CM-07 endpoint). The
+// button stays hidden entirely unless the server has an owner-configured
+// Firebase web config (GET /api/v1/public-config's optional
+// `firebaseWebConfig`, sourced from FIREBASE_WEB_CONFIG_JSON) AND this
+// browser supports both Notification and service workers -- see
+// push-registration.mjs's shouldOfferPushEnrollment for the exact rule.
+
+function setPushStatus(message) {
+  const statusEl = document.getElementById("push-status");
+  if (statusEl) statusEl.textContent = message;
+}
+
+// TODO(P-5 follow-up): mint a real FCM registration token via the Firebase
+// Messaging JS SDK's getToken({ vapidKey, serviceWorkerRegistration }).
+// That SDK cannot be loaded today under this app's `default-src 'self'` CSP
+// (scripts/server.mjs's securityHeaders) without either a same-origin
+// bundled copy -- this is a zero-dependency, no-bundler app -- or loosening
+// the CSP to allow an external script host, and neither is in scope for
+// this slice (see push-registration.mjs's file-header note). Returns null
+// until that SDK step lands, which is exactly what tells the click handler
+// below there is nothing to register yet.
+async function getFcmToken(_firebaseWebConfig) {
+  return null;
+}
+
+async function setupPushEnrollment() {
+  const button = document.getElementById("enable-push-btn");
+  if (!button) return;
+
+  let firebaseWebConfig = null;
+  try {
+    const response = await fetch(`${API_BASE}/public-config`, { headers: { Accept: "application/json" } });
+    const data = response.ok ? await response.json() : null;
+    firebaseWebConfig = data?.firebaseWebConfig ?? null;
+  } catch {
+    firebaseWebConfig = null;
+  }
+
+  const notificationSupported = typeof Notification !== "undefined";
+  const serviceWorkerSupported = "serviceWorker" in navigator;
+  if (!shouldOfferPushEnrollment({ firebaseWebConfig, notificationSupported, serviceWorkerSupported })) {
+    return;
+  }
+  button.hidden = false;
+
+  button.addEventListener("click", async () => {
+    if (!currentFacility) {
+      setPushStatus("Select a facility first.");
+      return;
+    }
+    button.disabled = true;
+    try {
+      const permission = await Notification.requestPermission();
+      if (!permissionGrants(permission)) {
+        setPushStatus("Notifications permission was not granted.");
+        return;
+      }
+      const token = await getFcmToken(firebaseWebConfig);
+      if (!token) {
+        setPushStatus("Notifications permission granted. Device registration isn't fully wired up in this deployment yet.");
+        return;
+      }
+      await apiFetch("/me/device-tokens", {
+        method: "POST",
+        body: buildDeviceTokenPayload({ facilityId: currentFacility, token })
+      });
+      setPushStatus("Notifications enabled on this device.");
+    } catch (error) {
+      setPushStatus(`Could not enable notifications: ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
 // Start app on load
 document.addEventListener("DOMContentLoaded", () => {
   setupSignOut();
+  setupPushEnrollment();
   migrateLegacyRefreshToken().finally(initialize);
 });
