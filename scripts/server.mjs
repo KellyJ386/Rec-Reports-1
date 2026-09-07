@@ -252,15 +252,37 @@ registerMeRoute(router, { authenticate, sendJson });
 // /api/v1 prefix. Logic lives in the already-tested domain libs under src/lib/.
 export const userRouter = createRouter();
 
+// P-5: parses the owner-supplied FIREBASE_WEB_CONFIG_JSON env var (a raw
+// JSON string -- see src/lib/env.mjs's comment on why this one is NOT
+// base64, unlike FCM_SERVICE_ACCOUNT_JSON). Returns null on anything short
+// of "a JSON object" (unset, malformed JSON, a JSON array/primitive) so a
+// bad value degrades to "push enrollment unavailable" rather than a 500 on
+// every call to this unauthenticated, publicly-reachable route.
+function parseFirebaseWebConfig(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 // Unauthenticated: hands the browser the public Supabase config (project URL and
 // anon key) so the login page can drive the same-origin auth proxy below. The
-// anon key is public by design.
-userRouter.register("GET", "/public-config", (request, response, { env }) =>
-  sendJson(response, 200, {
+// anon key is public by design. `firebaseWebConfig` (P-5) is included only when
+// FIREBASE_WEB_CONFIG_JSON is set to valid JSON -- its absence is how
+// src/public/js/app.js decides whether to show the "Enable notifications"
+// button at all.
+userRouter.register("GET", "/public-config", (request, response, { env }) => {
+  const payload = {
     supabaseUrl: env.SUPABASE_URL,
     supabaseAnonKey: env.SUPABASE_ANON_KEY
-  })
-);
+  };
+  const firebaseWebConfig = parseFirebaseWebConfig(env.FIREBASE_WEB_CONFIG_JSON);
+  if (firebaseWebConfig) payload.firebaseWebConfig = firebaseWebConfig;
+  return sendJson(response, 200, payload);
+});
 
 // Email + password sign-in / refresh, proxied server-side to Supabase Auth so
 // the client stays same-origin under the strict CSP. Logic in auth-routes.mjs.

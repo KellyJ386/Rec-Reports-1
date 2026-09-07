@@ -169,8 +169,8 @@ test("POST notification-routes happy path inserts the shaped row", async (t) => 
   assert.deepEqual(insert.body[0].route_jsonb, { channels: ["in_app", "email"] });
 });
 
-test("POST route test inserts a notification_jobs row with a test marker", async (t) => {
-  const captured = stubFetch(
+function stubTestRoute(t) {
+  return stubFetch(
     t,
     withEntitlement((table, method) => {
       if (table === "notification_routes" && method === "GET") {
@@ -188,6 +188,10 @@ test("POST route test inserts a notification_jobs row with a test marker", async
       return [];
     })
   );
+}
+
+test("POST route test inserts a notification_jobs row with a test marker, defaulting to the push channel", async (t) => {
+  const captured = stubTestRoute(t);
   const { call } = mount();
   const result = await call("POST", "/facilities/fac-1/notification-routes/route-1/test");
   assert.equal(result.status, 201);
@@ -195,7 +199,26 @@ test("POST route test inserts a notification_jobs row with a test marker", async
   assert.equal(insert.body[0].facility_id, "fac-1");
   assert.equal(insert.body[0].event_type, "incident.escalated");
   assert.equal(insert.body[0].payload_jsonb.test, true);
-  assert.deepEqual(insert.body[0].payload_jsonb.channels, ["in_app"]);
+  // P-4/P-5: the test-send route always overrides the route's own channel
+  // list with the single requested channel (default "push") so it exercises
+  // exactly one adapter, not whatever the route happens to be configured for.
+  assert.deepEqual(insert.body[0].payload_jsonb.channels, ["push"]);
+});
+
+test("POST route test honours an explicit channel:'email' body field", async (t) => {
+  const captured = stubTestRoute(t);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/notification-routes/route-1/test", { channel: "email" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.deepEqual(insert.body[0].payload_jsonb.channels, ["email"]);
+});
+
+test("POST route test rejects an unrecognized channel with 400", async (t) => {
+  stubTestRoute(t);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/notification-routes/route-1/test", { channel: "sms" });
+  assert.equal(result.status, 400);
 });
 
 test("POST route test 404s for an unknown route", async (t) => {
