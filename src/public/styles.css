@@ -883,6 +883,30 @@ a.primary:focus-visible {
   margin: 8px 0;
 }
 
+/* WO-20: preventive-maintenance upcoming-occurrences strip. */
+.pm-occurrence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.pm-occurrence-chip {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--rr-border-strong);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--rr-surface-alt);
+  min-width: 72px;
+  text-align: center;
+}
+
+.pm-occurrence-chip.preview {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
 .filter-chips {
   display: flex;
   flex-wrap: wrap;

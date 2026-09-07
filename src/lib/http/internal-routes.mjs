@@ -30,6 +30,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
 import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
+import { generatePmWorkOrders } from "../pm-generation.mjs";
 import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { processReportPdfJobs } from "../report-pdf-worker.mjs";
@@ -172,12 +173,27 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
+  // WO-19: PM work-order generation, same cadence/service-role client as
+  // every other drain step above. `config` is deliberately the flat,
+  // registry-default-only shape drainAll's own `config` argument already
+  // uses for reports.quietHoursStart/End (src/lib/notifications/worker.mjs)
+  // rather than a per-facility resolved config -- resolving
+  // workOrders.pmHorizonDays per facility inside a cross-tenant batch pass
+  // would need a query per distinct facility_id among the scanned plans
+  // (module-config.mjs's makeConfigLoader exists for exactly that shape but
+  // is not wired in here); until a facility actually needs a non-default
+  // horizon this keeps the drain to the single pm_plans query
+  // generatePmWorkOrders already issues. Revisit by threading a
+  // makeConfigLoader(client) through if/when that's needed.
+  const pmGeneration = await generatePmWorkOrders(client, { now, limit, config: {} });
+
   sendJson(response, 200, {
     ...summary,
     reportWorkflow,
     reportDistribution: reportDistributionSummary,
     reportPdf,
-    authThrottleSwept: authThrottleSwept.deleted
+    authThrottleSwept: authThrottleSwept.deleted,
+    pmGeneration
   });
 }
 

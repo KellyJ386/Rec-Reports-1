@@ -89,7 +89,8 @@ test("loadModuleConfig: with neither layer set, config reproduces registry defau
   assert.deepEqual(config, {
     "workOrders.defaultPriority": "medium",
     "workOrders.slaHoursUrgent": 24,
-    "workOrders.slaHoursRoutine": 72
+    "workOrders.slaHoursRoutine": 72,
+    "workOrders.pmHorizonDays": 30
   });
 });
 

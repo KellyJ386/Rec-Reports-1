@@ -395,3 +395,64 @@ test("drain: processes a queued report_submissions row and folds the summary int
   assert.deepEqual(result.payload.reportPdf, { claimed: 1, generated: 1, reused: 0, retried: 0, failed: 0 });
   assert.equal(uploadCalls, 1);
 });
+
+// ---------------------------------------------------------------------------
+// WO-19: the drain also runs PM work-order generation and folds its summary
+// into the response under `pmGeneration`.
+// ---------------------------------------------------------------------------
+test("drain: generates a due PM work order and folds the summary into the response as pmGeneration", async (t) => {
+  const original = globalThis.fetch;
+  // Anchored far in the past with a huge interval so there is exactly ONE
+  // occurrence ever (the anchor itself), always due by the time this test
+  // runs, regardless of the machine's real wall-clock date -- the drain
+  // route always uses `new Date()` for `now`, so the fixture must stay
+  // correct at any real run time rather than depending on a fixed "today".
+  const plan = {
+    id: "plan-1",
+    facility_id: "fac-1",
+    asset_id: null,
+    title: "Pool pump service",
+    description: "Quarterly service",
+    cadence_type: "interval",
+    interval_days: 3650000,
+    anchor_date: "2020-01-01",
+    season_months: null,
+    lead_time_days: 0,
+    priority: "medium",
+    default_assignee_employee_id: null,
+    active: true,
+    last_generated_at: null,
+    created_at: "2020-01-01T00:00:00.000Z"
+  };
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const respond = {
+      pm_plans: method === "GET" ? [plan] : [{ id: "plan-1" }],
+      pm_plan_occurrences: method === "POST" ? [{ id: "occ-1" }] : [{ id: "occ-1", work_order_id: "wo-1" }],
+      work_orders: [{ id: "wo-1" }],
+      facilities: [],
+      auth_throttle: [],
+      outbox_events: [],
+      notification_jobs: [],
+      report_workflow_events: [],
+      report_submissions: []
+    }[table];
+    return { ok: true, status: 200, text: async () => JSON.stringify(respond ?? []) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.pmGeneration.plansScanned, 1);
+  assert.equal(result.payload.pmGeneration.created, 1);
+  assert.deepEqual(result.payload.pmGeneration.errors, []);
+});
