@@ -4,6 +4,12 @@ import { configValue } from "./settings-registry.mjs";
 export const WORK_ORDER_STATUSES = ["open", "in_progress", "on_hold", "resolved", "closed", "cancelled"];
 export const WORK_ORDER_PRIORITIES = ["low", "medium", "high", "urgent"];
 export const OPEN_STATUSES = ["open", "in_progress", "on_hold"];
+
+// WO-11/0059: assets' own check-constraint enums, same single-source-of-truth
+// convention as the work order ones above. `status` was already on `assets`
+// since 0005; `criticality` is new in 0059_assets_registry.sql.
+export const ASSET_STATUSES = ["active", "inactive", "retired"];
+export const ASSET_CRITICALITY_LEVELS = ["low", "medium", "high", "critical"];
 // Manual-create-only enum (0005_work_orders.sql's source_type check
 // constraint); the incident/report routes stamp their own source_type
 // server-side and never accept it from a request body.

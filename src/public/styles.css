@@ -349,6 +349,19 @@ button.primary {
 .admin-card span {
   color: var(--rr-warning-text);
 }
+/* WO-13: assets sub-panel. Every other module card claims one of the five
+   semantic tint tones (danger/success/info/teal/warning) above; assets are
+   a registry, not a workflow state, so this deliberately stays neutral
+   (--rr-surface-alt/--rr-border-strong) rather than reusing another
+   module's tone. */
+.asset-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--rr-border-strong);
+  border-radius: 14px;
+  background: var(--rr-surface-alt);
+  padding: 16px;
+}
 a.primary {
   display: inline-block;
   border: 1px solid var(--rr-border-strong);
