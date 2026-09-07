@@ -85,7 +85,9 @@ const requiredRlsTables = [
   "tenant_subscriptions",
   "usage_counters",
   "auth_throttle",
-  "report_workflow_events"
+  "report_workflow_events",
+  "report_distribution_lists",
+  "report_deliveries"
 ];
 
 for (const table of requiredRlsTables) {

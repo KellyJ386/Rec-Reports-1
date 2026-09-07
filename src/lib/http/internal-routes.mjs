@@ -1,4 +1,5 @@
-// Internal, CRON_SECRET-guarded routes (OP-13/OP-14/OP-21) -- machine-to-
+// Internal, CRON_SECRET-guarded routes (OP-13/OP-14/OP-21, plus DR-22's
+// report-distribution fan-out riding the same drain invocation) -- machine-to-
 // machine endpoints that Vercel Cron (or the local dev worker loop, or an
 // operator with curl) hits directly. These are deliberately NOT reachable
 // through the normal facility-token/JWT `authenticate()` pipeline every
@@ -30,6 +31,7 @@ import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
 import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
 import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
+import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -133,6 +135,20 @@ async function handleDrain(request, response, { env }, sendJson) {
   // workflow event can dead-letter itself, but can never fail this route.
   const reportWorkflow = await executeReportWorkflowEvents(client, { now, limit, adapters: { emailAdapter, pushAdapter } });
 
+  // DR-22: report-submission fan-out runs in the SAME drain invocation,
+  // right after the generic notification worker -- see
+  // src/lib/notifications/worker.mjs's RESERVED_OUTBOX_EVENT_TYPES for why
+  // ordering relative to drainAll above is safe (that claim already
+  // excludes 'report.submitted', so there is no race to lose either way).
+  // config.appUrl builds the report link in every distribution email body.
+  const reportDistributionSummary = await processReportSubmittedEvents({
+    client,
+    now,
+    limit,
+    adapters: { email: emailAdapter },
+    config: { dsn: env.OBSERVABILITY_DSN, appUrl: env.APP_URL }
+  });
+
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
   // cadence as the drain -- the durable throttle store's equivalent of the
   // in-memory limiter's own periodic sweep (rate-limit.mjs), so a table
@@ -141,7 +157,12 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
-  sendJson(response, 200, { ...summary, reportWorkflow, authThrottleSwept: authThrottleSwept.deleted });
+  sendJson(response, 200, {
+    ...summary,
+    reportWorkflow,
+    reportDistribution: reportDistributionSummary,
+    authThrottleSwept: authThrottleSwept.deleted
+  });
 }
 
 // GET /internal/audit/verify-all's chain fetch for one facility. Fetches
