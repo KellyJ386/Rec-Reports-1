@@ -32,6 +32,8 @@ import { drainAll } from "../notifications/worker.mjs";
 import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
 import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
+import { processReportPdfJobs } from "../report-pdf-worker.mjs";
+import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -149,6 +151,19 @@ async function handleDrain(request, response, { env }, sendJson) {
     config: { dsn: env.OBSERVABILITY_DSN, appUrl: env.APP_URL }
   });
 
+  // DR-23: drain report_submissions.pdf_status = 'queued' rows on the same
+  // cadence as the notifications drain, using the same service-role client
+  // (RLS bypass is required here too -- the drain must see every facility's
+  // queued snapshots, not just one caller's) and a Storage client built from
+  // the same server env the attachment routes already use
+  // (createStorageClientFromEnv, src/lib/storage.mjs). See
+  // report-pdf-worker.mjs for the render -> upload -> record pipeline.
+  const reportPdf = await processReportPdfJobs(client, createStorageClientFromEnv(env), {
+    now: new Date(),
+    limit,
+    config: { dsn: env.OBSERVABILITY_DSN }
+  });
+
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
   // cadence as the drain -- the durable throttle store's equivalent of the
   // in-memory limiter's own periodic sweep (rate-limit.mjs), so a table
@@ -161,6 +176,7 @@ async function handleDrain(request, response, { env }, sendJson) {
     ...summary,
     reportWorkflow,
     reportDistribution: reportDistributionSummary,
+    reportPdf,
     authThrottleSwept: authThrottleSwept.deleted
   });
 }

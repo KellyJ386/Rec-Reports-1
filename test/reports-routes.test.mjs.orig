@@ -50,26 +50,6 @@ function stubFetch(t, respond) {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     const parsed = new URL(url);
-    // DR-23: the pdf-snapshot signed-URL route calls Storage's
-    // POST /storage/v1/object/sign/<bucket>/<path> -- distinct from every
-    // other call this file stubs (PostgREST's /rest/v1/<table>), so it is
-    // intercepted first and answered with a fixed signed-URL fragment,
-    // matching createSignedUrl's expected {signedURL} response shape
-    // (src/lib/storage.mjs). Recorded under the synthetic table name
-    // "__storage_sign__" so a test can still inspect which path was signed.
-    if (parsed.pathname.includes("/storage/v1/object/sign/")) {
-      captured.push({
-        table: "__storage_sign__",
-        method: init.method,
-        url: parsed,
-        body: init.body ? JSON.parse(init.body) : null
-      });
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify({ signedURL: "/object/sign/attachments/mock-token" })
-      };
-    }
     const table = parsed.pathname.replace("/rest/v1/", "");
     const method = init.method;
     captured.push({ table, method, url: parsed, body: init.body ? JSON.parse(init.body) : null });
@@ -82,12 +62,6 @@ function stubFetch(t, respond) {
   return captured;
 }
 
-const BASE_ENV = {
-  SUPABASE_URL: "https://example.supabase.co",
-  SUPABASE_SERVICE_ROLE_KEY: "service-key",
-  SUPABASE_STORAGE_BUCKET: "attachments"
-};
-
 function mount({ memberships = CREATOR, userId = "user-1" } = {}) {
   const router = createRouter();
   const sent = [];
@@ -96,11 +70,11 @@ function mount({ memberships = CREATOR, userId = "user-1" } = {}) {
   const sendJson = (response, status, payload) => sent.push({ status, payload });
   const readBody = async (request) => request.__body ?? "{}";
   registerReportRoutes(router, { authenticate, sendJson, readBody });
-  async function call(method, path, body, envOverrides = {}) {
+  async function call(method, path, body) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
     const request = { url: path, __body: body === undefined ? undefined : JSON.stringify(body) };
-    await handler(request, {}, { env: { ...BASE_ENV, ...envOverrides }, params });
+    await handler(request, {}, { env: {}, params });
     return sent[sent.length - 1];
   }
   return { call };
@@ -774,32 +748,6 @@ test("POST submit enqueues workflow events via internal.enqueue_report_workflow"
   assert.equal(rpcCall.body.p_actions[1].type, "notify");
 });
 
-test("POST submit on a sandbox template (DR-26) enqueues nothing: no workflow RPC, no outbox event", async (t) => {
-  const captured = stubFetch(t, (table, method) => {
-    if (table === "report_submissions" && method === "GET") {
-      return [
-        {
-          id: "sub-1",
-          facility_id: "fac-1",
-          department_id: null,
-          status: "draft",
-          template_id: "tpl-1",
-          template_version_id: "ver-wf",
-          payload_json: { supervisor: "Sam", attendance: 42 }
-        }
-      ];
-    }
-    if (table === "report_template_versions") return [WORKFLOW_VERSION];
-    if (table === "report_templates") return [{ id: "tpl-1", sandbox: true }];
-    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
-    return [];
-  });
-  const { call } = mount();
-  const result = await call("POST", "/reports/sub-1/submit");
-  assert.equal(result.status, 200);
-  assert.ok(!captured.some((c) => c.table === "rpc/enqueue_report_workflow"), "sandbox must not enqueue");
-});
-
 test("POST submit still returns 200 when the workflow enqueue RPC call itself rejects", async (t) => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -842,224 +790,4 @@ test("POST submit still returns 200 when the workflow enqueue RPC call itself re
   const result = await call("POST", "/reports/sub-1/submit");
   assert.equal(result.status, 200);
   assert.equal(result.payload.status, "submitted");
-});
-
-// --- GET reports/:id/detail: DR-24 successorId -------------------------------
-
-test("GET reports/:id/detail resolves successorId by looking up revision_of", async (t) => {
-  // Two different GETs against report_submissions happen in this route:
-  // loadSubmission (filters on id) and the successor lookup (filters on
-  // revision_of) -- distinguished by query param, so this test builds its
-  // own url-aware stub directly rather than the generic table-keyed one.
-  const original = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    const parsed = new URL(url);
-    const table = parsed.pathname.replace("/rest/v1/", "");
-    if (table === "report_submissions") {
-      if (parsed.searchParams.get("id") === "eq.sub-1") {
-        return { ok: true, status: 200, text: async () => JSON.stringify([{ ...SUBMITTED_REPORT, status: "revised" }]) };
-      }
-      if (parsed.searchParams.get("revision_of") === "eq.sub-1") {
-        return { ok: true, status: 200, text: async () => JSON.stringify([{ id: "sub-2" }]) };
-      }
-      return { ok: true, status: 200, text: async () => "[]" };
-    }
-    if (table === "report_template_versions") return { ok: true, status: 200, text: async () => JSON.stringify([VERSION]) };
-    if (table === "report_templates") return { ok: true, status: 200, text: async () => JSON.stringify([PUBLISHED_TEMPLATE]) };
-    return { ok: true, status: 200, text: async () => "[]" };
-  };
-  t.after(() => {
-    globalThis.fetch = original;
-  });
-
-  const { call } = mount({ memberships: READER });
-  const result = await call("GET", "/reports/sub-1/detail");
-  assert.equal(result.status, 200);
-  assert.equal(result.payload.successorId, "sub-2");
-});
-
-test("GET reports/:id/detail leaves successorId null for a non-revised row", async (t) => {
-  const captured = stubFetch(t, (table, method) => {
-    if (table === "report_submissions" && method === "GET") return [SUBMITTED_REPORT];
-    if (table === "report_template_versions" && method === "GET") return [VERSION];
-    if (table === "report_templates" && method === "GET") return [PUBLISHED_TEMPLATE];
-    if (table === "report_submission_attachments" && method === "GET") return [];
-    return [];
-  });
-  const { call } = mount({ memberships: READER });
-  const result = await call("GET", "/reports/sub-1/detail");
-  assert.equal(result.status, 200);
-  assert.equal(result.payload.successorId, null);
-  assert.ok(!captured.some((c) => c.table === "report_submissions" && c.url.searchParams.has("revision_of")));
-});
-
-// --- DR-24: lock / revise ----------------------------------------------------
-
-const PUBLISHER = [{ facilityId: "fac-1", status: "active", permissions: ["reports.read", "reports.publish"] }];
-
-function lockRouteStub(t, { submission, patched } = {}) {
-  return stubFetch(t, (table, method) => {
-    if (table === "report_submissions" && method === "GET") return [submission];
-    if (table === "report_submissions" && method === "PATCH") return [patched ?? { ...submission, status: "locked" }];
-    return [];
-  });
-}
-
-test("POST reports/:id/lock 404s when the report belongs to a different facility", async (t) => {
-  lockRouteStub(t, { submission: { ...SUBMITTED_REPORT, facility_id: "fac-2" } });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/lock");
-  assert.equal(result.status, 404);
-});
-
-test("POST reports/:id/lock denies a caller without reports.publish", async (t) => {
-  lockRouteStub(t, { submission: SUBMITTED_REPORT });
-  const { call } = mount({ memberships: READER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/lock");
-  assert.equal(result.status, 403);
-});
-
-test("POST reports/:id/lock 409s a draft report", async (t) => {
-  lockRouteStub(t, { submission: { ...SUBMITTED_REPORT, status: "draft" } });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/lock");
-  assert.equal(result.status, 409);
-});
-
-test("POST reports/:id/lock 409s an already-locked report", async (t) => {
-  lockRouteStub(t, { submission: { ...SUBMITTED_REPORT, status: "locked" } });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/lock");
-  assert.equal(result.status, 409);
-});
-
-test("POST reports/:id/lock happy path flips a submitted report to locked", async (t) => {
-  const captured = lockRouteStub(t, { submission: SUBMITTED_REPORT });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/lock");
-  assert.equal(result.status, 200);
-  assert.equal(result.payload.status, "locked");
-  const patch = captured.find((c) => c.table === "report_submissions" && c.method === "PATCH");
-  assert.equal(patch.body.status, "locked");
-  assert.equal(patch.url.searchParams.get("id"), "eq.sub-1");
-});
-
-function reviseRouteStub(t, { submission } = {}) {
-  return stubFetch(t, (table, method) => {
-    if (table === "report_submissions" && method === "GET") return [submission];
-    if (table === "report_submissions" && method === "POST") {
-      return [{ ...submission, id: "sub-2", status: "draft", revision_of: submission.id }];
-    }
-    if (table === "report_submissions" && method === "PATCH") return [{ ...submission, status: "revised" }];
-    return [];
-  });
-}
-
-test("POST reports/:id/revise denies a caller without reports.publish", async (t) => {
-  reviseRouteStub(t, { submission: SUBMITTED_REPORT });
-  const { call } = mount({ memberships: READER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/revise");
-  assert.equal(result.status, 403);
-});
-
-test("POST reports/:id/revise 409s a draft report", async (t) => {
-  reviseRouteStub(t, { submission: { ...SUBMITTED_REPORT, status: "draft" } });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/revise");
-  assert.equal(result.status, 409);
-});
-
-test("POST reports/:id/revise allows a locked report and mints a draft successor", async (t) => {
-  const captured = reviseRouteStub(t, { submission: { ...SUBMITTED_REPORT, status: "locked" } });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/revise");
-  assert.equal(result.status, 200);
-  assert.equal(result.payload.original.status, "revised");
-  assert.equal(result.payload.successor.revision_of, "sub-1");
-  assert.equal(result.payload.successor.status, "draft");
-
-  const insert = captured.find((c) => c.table === "report_submissions" && c.method === "POST");
-  assert.equal(insert.body[0].revision_of, "sub-1");
-  assert.equal(insert.body[0].status, "draft");
-  assert.equal(insert.body[0].payload_json.supervisor, "Sam");
-
-  const patch = captured.find((c) => c.table === "report_submissions" && c.method === "PATCH");
-  assert.equal(patch.body.status, "revised");
-
-  // Insert happens before the original's UPDATE (safer failure ordering --
-  // see the route's own comment).
-  assert.ok(captured.indexOf(insert) < captured.indexOf(patch));
-});
-
-test("POST reports/:id/revise allows a submitted report", async (t) => {
-  reviseRouteStub(t, { submission: SUBMITTED_REPORT });
-  const { call } = mount({ memberships: PUBLISHER });
-  const result = await call("POST", "/facilities/fac-1/reports/sub-1/revise");
-  assert.equal(result.status, 200);
-});
-
-// --- DR-23: PDF snapshot signed URL ------------------------------------------
-
-function snapshotStub(t, { submission } = {}) {
-  return stubFetch(t, (table, method) => {
-    if (table === "report_submissions" && method === "GET") return [submission];
-    return [];
-  });
-}
-
-// assertPathInFacility (src/lib/storage.mjs) requires a real UUID-shaped
-// facility id -- every other fixture in this file uses the plain "fac-1"
-// shorthand, which is fine for routes that never touch Storage, but this
-// route does, so these tests get their own UUID facility id (same
-// convention as test/attachments-routes.test.mjs's FAC_1/FAC_2).
-const SNAPSHOT_FACILITY_ID = "33333333-3333-3333-3333-333333333333";
-const SNAPSHOT_MEMBER = [{ facilityId: SNAPSHOT_FACILITY_ID, status: "active", permissions: ["reports.export"] }];
-const SNAPSHOT_READER = [{ facilityId: SNAPSHOT_FACILITY_ID, status: "active", permissions: ["reports.read"] }];
-
-const GENERATED_REPORT = {
-  ...SUBMITTED_REPORT,
-  facility_id: SNAPSHOT_FACILITY_ID,
-  pdf_status: "generated",
-  pdf_storage_path: `facilities/${SNAPSHOT_FACILITY_ID}/reports/sub-1/snapshot-abcdef12.pdf`,
-  pdf_content_hash: "a".repeat(64)
-};
-
-test("GET facilities/:facilityId/reports/:id/pdf denies a caller without reports.export", async (t) => {
-  snapshotStub(t, { submission: GENERATED_REPORT });
-  const { call } = mount({ memberships: SNAPSHOT_READER });
-  const result = await call("GET", `/facilities/${SNAPSHOT_FACILITY_ID}/reports/sub-1/pdf`);
-  assert.equal(result.status, 403);
-});
-
-test("GET facilities/:facilityId/reports/:id/pdf 404s while the snapshot is still queued", async (t) => {
-  snapshotStub(t, { submission: { ...GENERATED_REPORT, pdf_status: "queued", pdf_storage_path: null } });
-  const { call } = mount({ memberships: SNAPSHOT_MEMBER });
-  const result = await call("GET", `/facilities/${SNAPSHOT_FACILITY_ID}/reports/sub-1/pdf`);
-  assert.equal(result.status, 404);
-});
-
-test("GET facilities/:facilityId/reports/:id/pdf 404s when the report belongs to a different facility", async (t) => {
-  snapshotStub(t, { submission: { ...GENERATED_REPORT, facility_id: "44444444-4444-4444-4444-444444444444" } });
-  const { call } = mount({ memberships: SNAPSHOT_MEMBER });
-  const result = await call("GET", `/facilities/${SNAPSHOT_FACILITY_ID}/reports/sub-1/pdf`);
-  assert.equal(result.status, 404);
-});
-
-test("GET facilities/:facilityId/reports/:id/pdf returns a signed url once generated", async (t) => {
-  const captured = snapshotStub(t, { submission: GENERATED_REPORT });
-  const { call } = mount({ memberships: SNAPSHOT_MEMBER });
-  const result = await call("GET", `/facilities/${SNAPSHOT_FACILITY_ID}/reports/sub-1/pdf`);
-  assert.equal(result.status, 200);
-  assert.ok(result.payload.url.includes("/storage/v1/object/sign/attachments/mock-token"));
-  assert.equal(result.payload.expiresInSeconds, 300);
-  const sign = captured.find((c) => c.table === "__storage_sign__");
-  // The path is percent-encoded segment-by-segment (storage.mjs's
-  // encodeObjectPath); decode it back and confirm it's exactly this row's
-  // own pdf_storage_path.
-  const decodedPath = sign.url.pathname
-    .split("/storage/v1/object/sign/attachments/")[1]
-    .split("/")
-    .map(decodeURIComponent)
-    .join("/");
-  assert.equal(decodedPath, GENERATED_REPORT.pdf_storage_path);
 });

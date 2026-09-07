@@ -1679,6 +1679,52 @@ function renderInboxExtras(host, state) {
   // ever happens from the fill-in form (reportFormController above), not
   // this read-only review pane.
   renderSignaturesSection(host, state, { allowSigning: false });
+  // DR-24: Lock/Revise. Both buttons are shown to every viewer of this pane
+  // (there is no client-side permission introspection to gate on) -- a
+  // caller who lacks reports.publish simply sees the route's own 403
+  // surfaced through runLifecycleAction's error handling, same posture as
+  // the PDF download button above. A locked row only offers Revise (it can
+  // no longer be locked again); a revised row offers neither, since it is
+  // permanently immutable, and instead shows a link to its successor.
+  if (submission.status === "submitted" || submission.status === "locked") {
+    const lifecycleSection = el("div", { class: "report-inbox-lifecycle" });
+    const lifecycleStatus = el("span", { class: "item-subtitle", role: "status", "aria-live": "polite" });
+    if (submission.status === "submitted") {
+      const lockBtn = el("button", { type: "button" }, "Lock");
+      lockBtn.addEventListener("click", () => runLifecycleAction(submission, "lock", lockBtn, lifecycleStatus));
+      lifecycleSection.append(lockBtn);
+    }
+    const reviseBtn = el("button", { type: "button" }, "Revise");
+    reviseBtn.addEventListener("click", () => runLifecycleAction(submission, "revise", reviseBtn, lifecycleStatus));
+    lifecycleSection.append(reviseBtn, lifecycleStatus);
+    host.append(lifecycleSection);
+  } else if (submission.status === "revised" && detail.successorId) {
+    const lifecycleSection = el("div", { class: "report-inbox-lifecycle" });
+    lifecycleSection.append(el("p", { class: "item-subtitle" }, "This report has been revised."));
+    const successorBtn = el("button", { type: "button" }, "View revised version");
+    successorBtn.addEventListener("click", () => inboxDetailController.open(detail.successorId, { forceReadOnly: true }));
+    lifecycleSection.append(successorBtn);
+    host.append(lifecycleSection);
+  }
+}
+
+// POST /facilities/:facilityId/reports/:id/lock or /revise (DR-24), then
+// reload this same submission's detail pane so the new status (and, for a
+// revise, the freshly-created successor's link) render immediately without
+// a page refresh. Errors (403 missing reports.publish, 409 illegal
+// transition) surface inline exactly like downloadReportPdf's pattern above.
+async function runLifecycleAction(submission, action, button, statusEl) {
+  button.disabled = true;
+  statusEl.classList.remove("rr-error");
+  statusEl.textContent = action === "lock" ? "Locking…" : "Creating revision…";
+  try {
+    await apiFetch(`/facilities/${submission.facility_id}/reports/${submission.id}/${action}`, { method: "POST" });
+    await inboxDetailController.open(submission.id, { forceReadOnly: true });
+  } catch (error) {
+    statusEl.classList.add("rr-error");
+    statusEl.textContent = `${action === "lock" ? "Lock" : "Revise"} failed: ${error.message}`;
+    button.disabled = false;
+  }
 }
 
 // GET /reports/:id/pdf (DR-15, landing this batch from a sibling agent) hands

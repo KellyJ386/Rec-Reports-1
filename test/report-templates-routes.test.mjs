@@ -341,10 +341,26 @@ test("PATCH /report-template-versions/:id happy path updates the schema in place
 
 // --- POST /report-template-versions/:id/publish -----------------------------
 
+const CHANGE_SUMMARY = { changeSummary: "Publishing the revised opening checklist." };
+
+test("POST /report-template-versions/:id/publish 400s without a changeSummary (no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/report-template-versions/v-1/publish", { changeSummary: "  " });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST /report-template-versions/:id/publish 400s when changeSummary exceeds 500 characters", async (t) => {
+  const { call } = mount();
+  const result = await call("POST", "/report-template-versions/v-1/publish", { changeSummary: "x".repeat(501) });
+  assert.equal(result.status, 400);
+});
+
 test("POST /report-template-versions/:id/publish 404s when the version is missing", async (t) => {
   stubFetch(t, () => []);
   const { call } = mount();
-  const result = await call("POST", "/report-template-versions/missing/publish");
+  const result = await call("POST", "/report-template-versions/missing/publish", CHANGE_SUMMARY);
   assert.equal(result.status, 404);
 });
 
@@ -356,7 +372,7 @@ test("POST /report-template-versions/:id/publish denies a member without reports
     return [];
   });
   const { call } = mount({ memberships: MEMBER });
-  const result = await call("POST", "/report-template-versions/v-1/publish");
+  const result = await call("POST", "/report-template-versions/v-1/publish", CHANGE_SUMMARY);
   assert.equal(result.status, 403);
   assert.ok(!captured.some((c) => c.table === "report_template_versions" && c.method === "PATCH"));
 });
@@ -369,7 +385,7 @@ test("POST /report-template-versions/:id/publish denies a template manager who l
     return [];
   });
   const { call } = mount({ memberships: MANAGER_NO_PUBLISH });
-  const result = await call("POST", "/report-template-versions/v-1/publish");
+  const result = await call("POST", "/report-template-versions/v-1/publish", CHANGE_SUMMARY);
   assert.equal(result.status, 403);
   assert.ok(!captured.some((c) => c.table === "report_template_versions" && c.method === "PATCH"));
 });
@@ -383,7 +399,7 @@ test("POST /report-template-versions/:id/publish rejects an already-published ve
     return [];
   });
   const { call } = mount();
-  const result = await call("POST", "/report-template-versions/v-1/publish");
+  const result = await call("POST", "/report-template-versions/v-1/publish", CHANGE_SUMMARY);
   assert.equal(result.status, 409);
   assert.ok(!captured.some((c) => c.table === "report_template_versions" && c.method === "PATCH"));
 });
@@ -403,7 +419,7 @@ test("POST /report-template-versions/:id/publish happy path flips is_published a
     return [];
   });
   const { call } = mount();
-  const result = await call("POST", "/report-template-versions/v-2/publish");
+  const result = await call("POST", "/report-template-versions/v-2/publish", CHANGE_SUMMARY);
   assert.equal(result.status, 200);
   const versionPatch = captured.find((c) => c.table === "report_template_versions" && c.method === "PATCH");
   const templatePatch = captured.find((c) => c.table === "report_templates" && c.method === "PATCH");
@@ -414,4 +430,143 @@ test("POST /report-template-versions/:id/publish happy path flips is_published a
   assert.equal(templatePatch.body.status, "published");
   assert.equal(result.payload.version.id, "v-2");
   assert.equal(result.payload.template.id, "t-1");
+});
+
+// --- DR-26: governance (templatePublishRequiresApproval) --------------------
+// modules/organization_module_settings/facility_module_overrides are stubbed
+// so loadModuleConfig resolves daily_reports.templatePublishRequiresApproval
+// = true from a facility override, matching how the real registry layers
+// resolve (src/lib/http/module-config.mjs).
+function stubGovernanceOn(t, extra) {
+  return stubFetch(t, (table, method, url) => {
+    if (table === "modules" && method === "GET") return [{ id: "mod-daily-reports", code: "daily_reports" }];
+    if (table === "facilities" && method === "GET") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings" && method === "GET") return [];
+    if (table === "facility_module_overrides" && method === "GET") {
+      return [{ config_patch_jsonb: { "daily_reports.templatePublishRequiresApproval": true } }];
+    }
+    return extra ? extra(table, method, url) : [];
+  });
+}
+
+test("POST /report-template-versions/:id/publish stages a change request instead of publishing when governance is on", async (t) => {
+  const captured = stubGovernanceOn(t, (table, method) => {
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "v-2", facility_id: "fac-1", template_id: "t-1", version_number: 2, is_published: false }];
+    }
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1", active_version: 1, status: "published" }];
+    if (table === "admin_change_requests" && method === "POST") {
+      return [
+        {
+          id: "cr-1",
+          facility_id: "fac-1",
+          entity_table: "report_template_versions",
+          entity_id: "v-2",
+          status: "draft",
+          requested_by: "user-1",
+          change_summary: "Publishing the revised opening checklist."
+        }
+      ];
+    }
+    if (table === "admin_change_requests" && method === "PATCH") {
+      return [{ id: "cr-1", status: "pending_review", requested_by: "user-1" }];
+    }
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/report-template-versions/v-2/publish", CHANGE_SUMMARY);
+  assert.equal(result.status, 202);
+  assert.equal(result.payload.changeRequest.status, "pending_review");
+  // Never actually published under governance.
+  assert.ok(!captured.some((c) => c.table === "report_template_versions" && c.method === "PATCH"));
+  assert.ok(!captured.some((c) => c.table === "report_templates" && c.method === "PATCH"));
+  const inserted = captured.find((c) => c.table === "admin_change_requests" && c.method === "POST");
+  assert.equal(inserted.body[0].entity_table, "report_template_versions");
+  assert.equal(inserted.body[0].entity_id, "v-2");
+  assert.equal(inserted.body[0].change_summary, "Publishing the revised opening checklist.");
+});
+
+test("POST /report-template-versions/:id/publish/approve rejects self-approval with 409", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "v-2", facility_id: "fac-1", template_id: "t-1", version_number: 2, is_published: false }];
+    }
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    if (table === "admin_change_requests" && method === "GET") {
+      return [{ id: "cr-1", facility_id: "fac-1", status: "pending_review", requested_by: "user-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ userId: "user-1" });
+  const result = await call("POST", "/report-template-versions/v-2/publish/approve");
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /self-approved/);
+});
+
+test("POST /report-template-versions/:id/publish/approve 404s when there is no pending request", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "v-2", facility_id: "fac-1", template_id: "t-1", version_number: 2, is_published: false }];
+    }
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    if (table === "admin_change_requests" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ userId: "user-2" });
+  const result = await call("POST", "/report-template-versions/v-2/publish/approve");
+  assert.equal(result.status, 404);
+});
+
+test("POST /report-template-versions/:id/publish/approve by a different actor publishes and marks the request published", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "v-2", facility_id: "fac-1", template_id: "t-1", version_number: 2, is_published: false }];
+    }
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    if (table === "admin_change_requests" && method === "GET") {
+      return [{ id: "cr-1", facility_id: "fac-1", status: "pending_review", requested_by: "user-1" }];
+    }
+    if (table === "admin_change_requests" && method === "PATCH") {
+      return [{ id: "cr-1", status: "approved", requested_by: "user-1", reviewed_by: "user-2" }];
+    }
+    if (table === "report_template_versions" && method === "PATCH") return [{ id: "v-2", is_published: true }];
+    if (table === "report_templates" && method === "PATCH") return [{ id: "t-1", active_version: 2, status: "published" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-2" });
+  const result = await call("POST", "/report-template-versions/v-2/publish/approve");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.version.id, "v-2");
+  assert.equal(result.payload.template.id, "t-1");
+  assert.ok(captured.some((c) => c.table === "report_template_versions" && c.method === "PATCH"));
+  assert.ok(captured.some((c) => c.table === "report_templates" && c.method === "PATCH"));
+  const patches = captured.filter((c) => c.table === "admin_change_requests" && c.method === "PATCH");
+  assert.equal(patches.length, 2);
+  assert.equal(patches[0].body.status, "approved");
+  assert.equal(patches[1].body.status, "published");
+});
+
+// --- DR-26: sandbox flag -----------------------------------------------------
+
+test("PATCH /report-templates/:id updates sandbox", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    if (table === "report_templates" && method === "PATCH") return [{ id: "t-1", sandbox: true }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/report-templates/t-1", { sandbox: true });
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "report_templates" && c.method === "PATCH");
+  assert.equal(patch.body.sandbox, true);
+});
+
+test("PATCH /report-templates/:id rejects a non-boolean sandbox", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("PATCH", "/report-templates/t-1", { sandbox: "yes" });
+  assert.equal(result.status, 400);
 });
