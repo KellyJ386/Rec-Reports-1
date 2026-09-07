@@ -93,7 +93,8 @@ test("loadModuleConfig: with neither layer set, config reproduces registry defau
     // WO-21: off by default -- a facility that has configured nothing sees
     // this key resolve to the registry default alongside the pre-existing
     // three, same as every other unset key here.
-    "workOrders.autoCreateFromReportDefects": false
+    "workOrders.autoCreateFromReportDefects": false,
+    "workOrders.pmHorizonDays": 30
   });
 });
 

@@ -49,6 +49,16 @@ import {
   findAssetName
 } from "./assets.mjs";
 import {
+  PM_CADENCE_TYPES,
+  PM_PRIORITIES,
+  formatSeasonMonths,
+  validatePmPlanCreate,
+  buildPmPlanPayload,
+  occurrenceStatusLabel,
+  formatOccurrenceDate,
+  upcomingOccurrences
+} from "./pm-plan-filters.mjs";
+import {
   weekBoundsFor,
   bucketShiftsByDay,
   deriveShiftBadges,
@@ -397,6 +407,7 @@ async function loadAllModules() {
   // see workOrdersPanel.reset()'s own comment for why that call lives there
   // rather than a separate line here.
   workOrdersPanel.reset();
+  pmPlansPanel.reset();
   schedulePanel.reset();
   commsPanel.reset();
 
@@ -417,6 +428,7 @@ async function loadAllModules() {
       schedulePanel.load(),
       incidentsPanel.load(),
       workOrdersPanel.load(),
+      pmPlansPanel.load(),
       commsPanel.load(),
       loadTraining(),
       loadCertifications()
@@ -4626,6 +4638,355 @@ const assetsPanel = (function () {
   }
 
   return { load, reset, hasLoaded, render };
+})();
+
+// --- Preventive maintenance sub-panel (WO-20) -------------------------------
+// Lives inside the work-orders panel's <details> but renders into its own
+// container (#pm-plans-workspace, a sibling of #work-orders-workspace) --
+// NOT nested inside workOrdersPanel's own container, since that panel's
+// render() clears its host's full contents (host.textContent = "") on every
+// state change, which would wipe out a nested PM sub-tree on every work-order
+// list refresh. Plan list, create/edit form, and (once a plan is selected)
+// an upcoming-occurrences strip built from GET .../pm-plans/:id/occurrences'
+// merged stored+preview response via upcomingOccurrences/occurrenceStatusLabel/
+// formatOccurrenceDate (pm-plan-filters.mjs).
+const pmPlansPanel = (function () {
+  const state = {
+    plans: [],
+    formError: null,
+    createOpen: false,
+    createFields: emptyPlanFields(),
+    createErrors: {},
+    editingId: null,
+    editFields: null,
+    editErrors: {},
+    selectedId: null,
+    occurrences: [],
+    occurrencesError: null
+  };
+
+  function emptyPlanFields() {
+    return {
+      title: "",
+      description: "",
+      cadenceType: "interval",
+      intervalDays: "",
+      seasonMonthsText: "",
+      anchorDate: "",
+      leadTimeDays: "",
+      priority: "",
+      assetId: ""
+    };
+  }
+
+  function container() {
+    return document.getElementById("pm-plans-workspace");
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    try {
+      state.plans = (await apiFetch(`/facilities/${currentFacility}/pm-plans`)) || [];
+      state.formError = null;
+    } catch (error) {
+      state.plans = [];
+      state.formError = error.message;
+    }
+    render();
+  }
+
+  function reset() {
+    state.plans = [];
+    state.formError = null;
+    state.createOpen = false;
+    state.createFields = emptyPlanFields();
+    state.createErrors = {};
+    state.editingId = null;
+    state.editFields = null;
+    state.editErrors = {};
+    state.selectedId = null;
+    state.occurrences = [];
+    state.occurrencesError = null;
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  async function createPlan() {
+    const validation = validatePmPlanCreate(state.createFields);
+    state.createErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      await apiFetch(`/facilities/${currentFacility}/pm-plans`, {
+        method: "POST",
+        body: buildPmPlanPayload(state.createFields)
+      });
+      state.createOpen = false;
+      state.createFields = emptyPlanFields();
+      state.createErrors = {};
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function fieldsFromPlan(plan) {
+    return {
+      title: plan.title || "",
+      description: plan.description || "",
+      cadenceType: plan.cadence_type,
+      intervalDays: plan.interval_days != null ? String(plan.interval_days) : "",
+      seasonMonthsText: formatSeasonMonths(plan.season_months),
+      anchorDate: plan.anchor_date || "",
+      leadTimeDays: plan.lead_time_days != null ? String(plan.lead_time_days) : "",
+      priority: plan.priority || "",
+      assetId: plan.asset_id || ""
+    };
+  }
+
+  function openEdit(plan) {
+    state.editingId = plan.id;
+    state.editFields = fieldsFromPlan(plan);
+    state.editErrors = {};
+    render();
+  }
+
+  function closeEdit() {
+    state.editingId = null;
+    state.editFields = null;
+    state.editErrors = {};
+    render();
+  }
+
+  async function savePlan(planId) {
+    const validation = validatePmPlanCreate(state.editFields);
+    state.editErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      await apiFetch(`/pm-plans/${planId}`, { method: "PATCH", body: buildPmPlanPayload(state.editFields) });
+      state.editingId = null;
+      state.editFields = null;
+      state.editErrors = {};
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function deactivatePlan(planId) {
+    try {
+      await apiFetch(`/pm-plans/${planId}/deactivate`, { method: "POST" });
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function selectPlan(planId) {
+    state.selectedId = state.selectedId === planId ? null : planId;
+    state.occurrences = [];
+    state.occurrencesError = null;
+    render();
+    if (!state.selectedId) return;
+    try {
+      state.occurrences = (await apiFetch(`/pm-plans/${state.selectedId}/occurrences`)) || [];
+    } catch (error) {
+      state.occurrencesError = error.message;
+    }
+    render();
+  }
+
+  function buildCadenceFields(fields, onChange) {
+    const wrap = el("div", { class: "pm-plan-cadence-fields" });
+    if (fields.cadenceType === "interval") {
+      const intervalInput = el("input", { type: "number", min: "1", value: fields.intervalDays });
+      intervalInput.addEventListener("input", () => onChange({ intervalDays: intervalInput.value }));
+      wrap.append(el("label", {}, ["Interval (days)", intervalInput]));
+    } else if (fields.cadenceType === "seasonal") {
+      const monthsInput = el("input", { type: "text", placeholder: "e.g. 3, 9", value: fields.seasonMonthsText });
+      monthsInput.addEventListener("input", () => onChange({ seasonMonthsText: monthsInput.value }));
+      wrap.append(el("label", {}, ["Months (1-12, comma-separated)", monthsInput]));
+    }
+    return wrap;
+  }
+
+  function buildPlanForm(fields, errors, onChange, onSubmit, submitLabel) {
+    const wrap = el("div", { class: "inline-form pm-plan-form" });
+    const titleInput = el("input", { type: "text", value: fields.title, placeholder: "Title" });
+    titleInput.addEventListener("input", () => onChange({ title: titleInput.value }));
+    const descInput = document.createElement("textarea");
+    descInput.placeholder = "Description (optional)";
+    descInput.value = fields.description;
+    descInput.addEventListener("input", () => onChange({ description: descInput.value }));
+
+    const cadenceSelect = document.createElement("select");
+    for (const cadence of PM_CADENCE_TYPES) cadenceSelect.append(el("option", { value: cadence }, cadence));
+    cadenceSelect.value = fields.cadenceType;
+    cadenceSelect.addEventListener("change", () => onChange({ cadenceType: cadenceSelect.value }));
+
+    const anchorInput = el("input", { type: "date", value: fields.anchorDate });
+    anchorInput.addEventListener("input", () => onChange({ anchorDate: anchorInput.value }));
+
+    const leadInput = el("input", { type: "number", min: "0", value: fields.leadTimeDays, placeholder: "0" });
+    leadInput.addEventListener("input", () => onChange({ leadTimeDays: leadInput.value }));
+
+    const prioritySelect = document.createElement("select");
+    prioritySelect.append(el("option", { value: "" }, "Default priority"));
+    for (const priority of PM_PRIORITIES) prioritySelect.append(el("option", { value: priority }, priority));
+    prioritySelect.value = fields.priority;
+    prioritySelect.addEventListener("change", () => onChange({ priority: prioritySelect.value }));
+
+    const assetInput = el("input", { type: "text", placeholder: "Asset ID (optional)", value: fields.assetId });
+    assetInput.addEventListener("input", () => onChange({ assetId: assetInput.value }));
+
+    const submitBtn = el("button", { type: "button", class: "primary" }, submitLabel);
+    submitBtn.addEventListener("click", onSubmit);
+
+    const errorText = Object.values(errors).join(" ");
+    wrap.append(
+      el("label", {}, ["Title", titleInput]),
+      el("label", {}, ["Description", descInput]),
+      el("label", {}, ["Cadence", cadenceSelect]),
+      buildCadenceFields(fields, onChange),
+      el("label", {}, ["Anchor date", anchorInput]),
+      el("label", {}, ["Lead time (days)", leadInput]),
+      el("label", {}, ["Priority", prioritySelect]),
+      el("label", {}, ["Asset", assetInput]),
+      submitBtn
+    );
+    if (errorText) wrap.append(el("p", { class: "rr-error", role: "alert" }, errorText));
+    return wrap;
+  }
+
+  function buildOccurrenceStrip() {
+    const strip = el("div", { class: "pm-occurrence-strip" });
+    if (state.occurrencesError) {
+      strip.append(el("p", { class: "rr-error", role: "alert" }, state.occurrencesError));
+      return strip;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const upcoming = upcomingOccurrences(state.occurrences, today, 16);
+    if (upcoming.length === 0) {
+      strip.append(el("p", { class: "item-subtitle" }, "No occurrences in the next 8 weeks."));
+      return strip;
+    }
+    for (const occurrence of upcoming) {
+      const chip = el("div", { class: occurrence.preview ? "pm-occurrence-chip preview" : "pm-occurrence-chip" });
+      chip.append(el("strong", {}, formatOccurrenceDate(occurrence.scheduledFor)));
+      chip.append(el("div", { class: "item-subtitle" }, occurrenceStatusLabel(occurrence)));
+      strip.append(chip);
+    }
+    return strip;
+  }
+
+  function buildPlanCard(plan) {
+    const card = el("div", { class: "work-order-card" });
+    card.append(el("strong", {}, plan.title));
+    const cadenceLabel =
+      plan.cadence_type === "interval"
+        ? `Every ${plan.interval_days} day(s)`
+        : `Months: ${formatSeasonMonths(plan.season_months)}`;
+    card.append(el("div", { class: "item-subtitle" }, cadenceLabel));
+    card.append(el("div", { class: "item-subtitle" }, `Anchor: ${plan.anchor_date} · ${plan.active ? "Active" : "Inactive"}`));
+    if (plan.description) card.append(el("div", { class: "item-subtitle" }, plan.description));
+
+    const actionsRow = el("div", { class: "detail-actions" });
+    const viewBtn = el("button", { type: "button" }, state.selectedId === plan.id ? "Hide occurrences" : "Upcoming occurrences");
+    viewBtn.addEventListener("click", () => selectPlan(plan.id));
+    actionsRow.append(viewBtn);
+
+    if (hasPerm("work_orders.manage")) {
+      const editBtn = el("button", { type: "button" }, "Edit");
+      editBtn.addEventListener("click", () => openEdit(plan));
+      actionsRow.append(editBtn);
+      if (plan.active) {
+        const deactivateBtn = el("button", { type: "button" }, "Deactivate");
+        deactivateBtn.addEventListener("click", () => deactivatePlan(plan.id));
+        actionsRow.append(deactivateBtn);
+      }
+    }
+    card.append(actionsRow);
+
+    if (state.editingId === plan.id) {
+      card.append(
+        buildPlanForm(
+          state.editFields,
+          state.editErrors,
+          (patch) => {
+            Object.assign(state.editFields, patch);
+            render();
+          },
+          () => savePlan(plan.id),
+          "Save changes"
+        )
+      );
+      const cancelBtn = el("button", { type: "button" }, "Cancel edit");
+      cancelBtn.addEventListener("click", () => closeEdit());
+      card.append(cancelBtn);
+    }
+
+    if (state.selectedId === plan.id) card.append(buildOccurrenceStrip());
+    return card;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+    host.setAttribute("aria-busy", "false");
+
+    if (hasPerm("work_orders.manage")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.createOpen ? "Cancel new plan" : "New PM plan"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.createOpen = !state.createOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.createOpen) {
+        host.append(
+          buildPlanForm(
+            state.createFields,
+            state.createErrors,
+            (patch) => {
+              Object.assign(state.createFields, patch);
+              render();
+            },
+            () => createPlan(),
+            "Create plan"
+          )
+        );
+      }
+    }
+
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.plans.length === 0) {
+      listWrap.append(el("p", {}, "No preventive maintenance plans yet."));
+    } else {
+      for (const plan of state.plans) listWrap.append(buildPlanCard(plan));
+    }
+    host.append(listWrap);
+  }
+
+  return { load, reset };
 })();
 
 // --- Communications module (CM-08/CM-09/P-1) -----------------------------------

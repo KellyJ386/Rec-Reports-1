@@ -233,6 +233,16 @@ export const settingsRegistry = Object.freeze(
       validation: {},
       permission: "admin.manage"
     },
+    {
+      key: "workOrders.pmHorizonDays",
+      module: "work_orders",
+      label: "Preventive maintenance generation horizon (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 30, // WO-19: how far ahead pm-generation.mjs mints PM work orders
+      validation: { min: 1, max: 365 },
+      permission: "admin.manage"
+    },
 
     // --- Daily reports (module code: daily_reports) ------------------------
     {

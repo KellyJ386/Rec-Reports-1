@@ -152,11 +152,12 @@ function buildWorkOrderParams(rawParams, { config, now }) {
 // no severity signal of its own beyond "this fired".
 //
 // `eventType` is set to `create_work_order:<fieldKey>` rather than the
-// default `<type>:<index>` composition: 0060's create-or-replace of
-// internal.enqueue_report_workflow (0053) honors an action's own eventType
-// when present (falling back to type:index otherwise), so each defect's
-// report_workflow_events ledger row is labeled by the field that produced
-// it -- and, since report_workflow_events' own uniqueness is
+// default `<type>:<index>` composition: actionEventType (used by
+// report-workflow-executor.mjs when it inserts each derived action's ledger
+// row -- the RPC itself only ever inserts one 'evaluate' event, see H-1)
+// honors an action's own eventType when present (falling back to type:index
+// otherwise), so each defect's report_workflow_events ledger row is labeled
+// by the field that produced it -- and, since that table's uniqueness is
 // (submission_id, event_type), this is also what keeps two DIFFERENT
 // defects on the same submission from colliding into a single ledger row.
 // `params.sourceDefectKey` carries the same field key through to
