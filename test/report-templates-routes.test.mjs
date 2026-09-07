@@ -239,6 +239,40 @@ test("POST /report-templates/:id/versions creates a draft at version = max(exist
   assert.equal(insert.body[0].facility_id, "fac-1");
 });
 
+// --- DR-17: signature_requirements validated on validationJson at version
+// creation time (report-schema.mjs's validateSignatureRequirements) --------
+
+test("POST /report-templates/:id/versions accepts a well-formed signature_requirements", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_templates" && method === "GET") return [{ id: "t-1", facility_id: "fac-1" }];
+    if (table === "report_template_versions" && method === "GET") return [];
+    if (table === "report_template_versions" && method === "POST") return [{ id: "v-1", version_number: 1 }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/report-templates/t-1/versions", {
+    schema: VALID_SCHEMA,
+    validationJson: { signature_requirements: { required: true, roles: ["manager"] } }
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "report_template_versions" && c.method === "POST");
+  assert.deepEqual(insert.body[0].validation_json, {
+    signature_requirements: { required: true, roles: ["manager"] }
+  });
+});
+
+test("POST /report-templates/:id/versions rejects a malformed signature_requirements with 400 before any fetch", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MEMBER });
+  const result = await call("POST", "/report-templates/t-1/versions", {
+    schema: VALID_SCHEMA,
+    validationJson: { signature_requirements: { required: "yes" } }
+  });
+  assert.equal(result.status, 400);
+  assert.ok(result.payload.errors.some((e) => /signature_requirements: .*required must be a boolean/.test(e)));
+  assert.equal(captured.length, 0);
+});
+
 // --- PATCH /report-template-versions/:id ------------------------------------
 
 test("PATCH /report-template-versions/:id 404s when the version is missing", async (t) => {

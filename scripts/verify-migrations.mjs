@@ -21,6 +21,7 @@ const requiredRlsTables = [
   "report_template_versions",
   "report_submissions",
   "report_submission_attachments",
+  "report_submission_signatures",
   "audit_events",
   "outbox_events",
   "employees",
@@ -109,6 +110,7 @@ for (const helper of [
   "fn_incident_report_audit",
   "fn_incident_report_transition_guard",
   "fn_incident_witness_statement_guard",
+  "fn_report_submission_signature_guard",
   "internal.apply_incident_amendment",
   "public.apply_incident_amendment"
 ]) {

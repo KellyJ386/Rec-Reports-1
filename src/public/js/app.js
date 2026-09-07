@@ -996,6 +996,27 @@ async function startNewReport(template) {
 
 const AUTOSAVE_DELAY_MS = 2000;
 
+// DR-16: maps a report-schema field `type` to the <input type="..."> that
+// renders it. Every type not listed here (text/textarea/select/multiselect/
+// checkbox/photo/signature) has its own dedicated branch in buildFieldInput
+// above this map's only use, so this only needs to cover the single-<input>
+// types. Kept in one place so a fifth "renders as <input type=X>" field type
+// never has to touch buildFieldInput's own branching again.
+const INPUT_TYPE_BY_FIELD_TYPE = {
+  number: "number",
+  date: "date",
+  time: "time",
+  datetime: "datetime-local",
+  counter: "number",
+  rating: "number"
+};
+
+// Mirrors report-schema.mjs's DEFAULT_RATING_SCALE -- used only to size the
+// rating <input>'s max when a template somehow omits `scale` (schema
+// validation requires it, so this is a display-only fallback, never reached
+// through the normal authoring path).
+const DEFAULT_RATING_SCALE = 5;
+
 // Shared engine behind both the fill-in-a-draft form (DR-13, `editable:
 // true`, mounted in the Daily reports panel) and the manager review inbox's
 // read-only detail pane (DR-14, `editable: false`, mounted in the inbox
@@ -1288,12 +1309,20 @@ function createReportFormController({ areaId, editable, extra }) {
       return textarea;
     }
 
-    // text, number, date, time all render as a single <input> differing only
-    // in `type`.
+    // text, number, date, time, datetime, counter, rating all render as a
+    // single <input> differing only in `type` (and, for counter/rating,
+    // step/min/max) -- DR-16's three new field types slot straight into this
+    // shared control the same way number/date/time already do.
     const input = document.createElement("input");
-    input.type = descriptor.type === "number" || descriptor.type === "date" || descriptor.type === "time"
-      ? descriptor.type
-      : "text";
+    input.type = INPUT_TYPE_BY_FIELD_TYPE[descriptor.type] || "text";
+    if (descriptor.type === "counter") {
+      input.step = typeof descriptor.step === "number" && descriptor.step > 0 ? descriptor.step : 1;
+    }
+    if (descriptor.type === "rating") {
+      input.min = "1";
+      input.max = String(typeof descriptor.scale === "number" ? descriptor.scale : DEFAULT_RATING_SCALE);
+      input.step = "1";
+    }
     input.id = inputId;
     input.value = value ?? "";
     input.disabled = disabled;
@@ -1493,8 +1522,91 @@ function createReportFormController({ areaId, editable, extra }) {
   return { open, close };
 }
 
-// DR-13's fill-a-draft form, mounted in the Daily reports panel.
-const reportFormController = createReportFormController({ areaId: "report-form-area", editable: true });
+// DR-17: renders the signature section shared by the fill-in form and the
+// review inbox's detail pane -- one row per role the pinned version's
+// signature_requirements lists (nothing rendered when there is no such
+// policy, or it lists no roles). A role already carrying a
+// report_submission_signatures row shows when it was signed; an unsigned
+// role gets a "Sign as <role>" button only when `allowSigning` is true AND
+// the submission is still a draft (POST .../signatures is rejected
+// otherwise, 409 -- see reports-routes.mjs), otherwise it just reads "not
+// yet signed". `host` is the same DOM node createReportFormController's
+// render() hands every `extra` callback.
+async function renderSignaturesSection(host, state, { allowSigning }) {
+  const detail = state.detail;
+  if (!detail) return;
+  const submission = detail.submission || {};
+  const roles = Array.isArray(detail.signature_requirements?.roles) ? detail.signature_requirements.roles : [];
+  if (roles.length === 0) return;
+
+  const section = el("div", { class: "report-signatures" });
+  section.append(el("strong", {}, "Signatures"));
+  const listHost = el("div", {});
+  section.append(listHost);
+  host.append(section);
+
+  async function refresh() {
+    listHost.textContent = "";
+    listHost.append(
+      el("p", { class: "item-subtitle", role: "status", "aria-live": "polite" }, "Loading signatures…")
+    );
+    let signatures;
+    try {
+      signatures = await apiFetch(`/facilities/${submission.facility_id}/reports/${submission.id}/signatures`);
+    } catch (error) {
+      listHost.textContent = "";
+      listHost.append(el("p", { class: "rr-error", role: "alert" }, `Could not load signatures: ${error.message}`));
+      return;
+    }
+    const signedByRole = new Map((signatures || []).map((signature) => [signature.signer_role, signature]));
+
+    listHost.textContent = "";
+    const list = el("ul", { class: "report-signature-list" });
+    for (const role of roles) {
+      const existing = signedByRole.get(role);
+      const item = el("li", { class: "report-signature-item" });
+      if (existing) {
+        item.append(el("span", {}, `${role}: signed ${new Date(existing.signed_at).toLocaleString()}`));
+      } else if (allowSigning && submission.status === "draft") {
+        const signBtn = el("button", { type: "button" }, `Sign as ${role}`);
+        const signStatus = el("span", { class: "item-subtitle", role: "status", "aria-live": "polite" });
+        signBtn.addEventListener("click", async () => {
+          signBtn.disabled = true;
+          signStatus.textContent = "Signing…";
+          signStatus.classList.remove("rr-error");
+          try {
+            await apiFetch(`/facilities/${submission.facility_id}/reports/${submission.id}/signatures`, {
+              method: "POST",
+              body: { role }
+            });
+            await refresh();
+          } catch (error) {
+            signStatus.textContent = `Error: ${error.message}`;
+            signStatus.classList.add("rr-error");
+            signBtn.disabled = false;
+          }
+        });
+        item.append(el("span", {}, `${role}: `), signBtn, signStatus);
+      } else {
+        item.append(el("span", {}, `${role}: not yet signed`));
+      }
+      list.append(item);
+    }
+    listHost.append(list);
+  }
+
+  await refresh();
+}
+
+// DR-13's fill-a-draft form, mounted in the Daily reports panel. Signatures
+// are interactive here (allowSigning: true) -- this is the only place a
+// "Sign as <role>" button is offered, matching the submission still being a
+// draft while this controller has it open.
+const reportFormController = createReportFormController({
+  areaId: "report-form-area",
+  editable: true,
+  extra: (host, state) => renderSignaturesSection(host, state, { allowSigning: true })
+});
 
 // DR-14's manager review inbox detail pane: always read-only, and renders
 // attachments/validation results/PDF export after the shared field-answer
@@ -1561,6 +1673,12 @@ function renderInboxExtras(host, state) {
   pdfBtn.addEventListener("click", () => downloadReportPdf(submission.id, pdfBtn, pdfStatus));
   pdfSection.append(pdfBtn, pdfStatus);
   host.append(pdfSection);
+
+  // DR-17: read-only list of who has signed off, per the DR-17 acceptance
+  // ("the list of signatures on the detail view") -- signing itself only
+  // ever happens from the fill-in form (reportFormController above), not
+  // this read-only review pane.
+  renderSignaturesSection(host, state, { allowSigning: false });
 }
 
 // GET /reports/:id/pdf (DR-15, landing this batch from a sibling agent) hands

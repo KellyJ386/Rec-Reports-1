@@ -480,3 +480,225 @@ test("GET reports/:id/pdf returns the export envelope for a submitted report", a
   const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
   assert.ok(bytes.startsWith("%PDF-1.4\n"));
 });
+
+// --- DR-16: hidden_fields recorded on validation_results at submit ----------
+
+const VISIBILITY_SCHEMA = {
+  sections: [
+    {
+      title: "Opening",
+      fields: [
+        { key: "supervisor", label: "Supervisor", type: "text", required: true },
+        {
+          key: "pool_temp",
+          label: "Pool temperature",
+          type: "number",
+          required: true,
+          visibility_rules: [{ field: "supervisor", op: "eq", value: "nobody" }]
+        }
+      ]
+    }
+  ]
+};
+const VISIBILITY_VERSION = { ...VERSION, schema_json: VISIBILITY_SCHEMA };
+
+test("POST submit records hidden_fields on validation_results even with no other warnings", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          payload_json: { supervisor: "Sam" }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [VISIBILITY_VERSION];
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "report_submissions" && c.method === "PATCH");
+  assert.deepEqual(patch.body.validation_results, { hidden_fields: ["pool_temp"] });
+});
+
+// --- DR-17: signatures -------------------------------------------------------
+
+const SIG_REQUIRED_VERSION = {
+  ...VERSION,
+  validation_json: { signature_requirements: { required: true, roles: ["manager"] } }
+};
+
+test("POST submit is blocked (400) with the missing roles when a required signature is absent", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          payload_json: { supervisor: "Sam", attendance: 42 }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures") return [];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 400);
+  assert.deepEqual(result.payload.missingRoles, ["manager"]);
+  assert.ok(!captured.some((c) => c.table === "report_submissions" && c.method === "PATCH"));
+});
+
+test("POST submit succeeds once every required role has signed", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_id: "tpl-1",
+          template_version_id: "ver-3",
+          payload_json: { supervisor: "Sam", attendance: 42 }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures") return [{ signer_role: "manager" }];
+    if (table === "report_submissions" && method === "PATCH") return [{ id: "sub-1", status: "submitted" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/reports/sub-1/submit");
+  assert.equal(result.status, 200);
+  assert.ok(captured.some((c) => c.table === "report_submissions" && c.method === "PATCH"));
+});
+
+// POST /facilities/:facilityId/reports/:id/signatures
+
+test("POST reports/:id/signatures rejects a missing role before any fetch (400)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", {});
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST reports/:id/signatures 404s when the submission belongs to a different facility", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET"
+      ? [{ id: "sub-1", facility_id: "fac-2", status: "draft", template_version_id: "ver-3" }]
+      : []
+  );
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "manager" });
+  assert.equal(result.status, 404);
+});
+
+test("POST reports/:id/signatures denies a caller without reports.submit (403)", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET"
+      ? [{ id: "sub-1", facility_id: "fac-1", status: "draft", template_version_id: "ver-3" }]
+      : []
+  );
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "manager" });
+  assert.equal(result.status, 403);
+});
+
+test("POST reports/:id/signatures refuses a non-draft submission (409)", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET"
+      ? [{ id: "sub-1", facility_id: "fac-1", status: "submitted", template_version_id: "ver-3" }]
+      : []
+  );
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "manager" });
+  assert.equal(result.status, 409);
+});
+
+test("POST reports/:id/signatures rejects a role not on the template's signature_requirements list (400)", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [{ id: "sub-1", facility_id: "fac-1", status: "draft", template_version_id: "ver-3" }];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "janitor" });
+  assert.equal(result.status, 400);
+});
+
+test("POST reports/:id/signatures happy path inserts a signature attributed to the caller", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") {
+      return [
+        {
+          id: "sub-1",
+          facility_id: "fac-1",
+          status: "draft",
+          template_version_id: "ver-3",
+          payload_json: { supervisor: "Sam" }
+        }
+      ];
+    }
+    if (table === "report_template_versions") return [SIG_REQUIRED_VERSION];
+    if (table === "report_submission_signatures" && method === "POST") return [{ id: "sig-1" }];
+    return [];
+  });
+  const { call } = mount({ userId: "user-9" });
+  const result = await call("POST", "/facilities/fac-1/reports/sub-1/signatures", { role: "manager" });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "report_submission_signatures" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].submission_id, "sub-1");
+  assert.equal(insert.body[0].signer_user_id, "user-9");
+  assert.equal(insert.body[0].signer_role, "manager");
+  assert.match(insert.body[0].signature_hash, /^[0-9a-f]{64}$/);
+});
+
+// GET /facilities/:facilityId/reports/:id/signatures
+
+test("GET reports/:id/signatures 404s when the submission belongs to a different facility", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET" ? [{ id: "sub-1", facility_id: "fac-2" }] : []
+  );
+  const { call } = mount();
+  const result = await call("GET", "/facilities/fac-1/reports/sub-1/signatures");
+  assert.equal(result.status, 404);
+});
+
+test("GET reports/:id/signatures denies a caller without reports.read on that facility (403)", async (t) => {
+  stubFetch(t, (table, method) =>
+    table === "report_submissions" && method === "GET" ? [{ id: "sub-1", facility_id: "fac-1" }] : []
+  );
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/reports/sub-1/signatures");
+  assert.equal(result.status, 403);
+});
+
+test("GET reports/:id/signatures returns the recorded signatures", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") return [{ id: "sub-1", facility_id: "fac-1" }];
+    if (table === "report_submission_signatures") {
+      return [{ id: "sig-1", submission_id: "sub-1", signer_role: "manager" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/reports/sub-1/signatures");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  assert.equal(result.payload[0].signer_role, "manager");
+});
