@@ -19,10 +19,12 @@ import { registerCertPolicyRoutes } from "../src/lib/http/cert-policy-routes.mjs
 import { registerBillingRoutes } from "../src/lib/http/billing-routes.mjs";
 import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
 import { registerIncidentRoutes } from "../src/lib/http/incidents-routes.mjs";
+import { registerIncidentPeopleRoutes } from "../src/lib/http/incidents-people-routes.mjs";
 import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
+import { registerSearchRoutes } from "../src/lib/http/search-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
 import { registerAttachmentRoutes } from "../src/lib/http/attachments-routes.mjs";
@@ -314,6 +316,9 @@ registerMeRoute(userRouter, { authenticate, sendJson });
 registerReportRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: capture + escalation queue (incidents.read / incidents.manage).
 registerIncidentRoutes(userRouter, { authenticate, sendJson, readBody });
+// Incidents: people involved + witness statements (IN-12, incidents.read /
+// incidents.manage or incidents.review).
+registerIncidentPeopleRoutes(userRouter, { authenticate, sendJson, readBody });
 // Work orders: dashboard list, create (incl. from incidents), status updates.
 registerWorkOrderRoutes(userRouter, { authenticate, sendJson, readBody });
 // Scheduling: periods, shifts, and publish-readiness/conflict validation.
@@ -322,6 +327,10 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Global search (P-8): GET /api/v1/search?facilityId=&q= fans out over
+// incidents/work orders/employees/messages, each leg gated on that
+// module's own read permission.
+registerSearchRoutes(userRouter, { authenticate, sendJson, readBody });
 // Attachments (OP-17): upload/list/signed-url for reports, incidents, and
 // work orders. No readBody -- uploads are raw binary read directly off the
 // request stream, never JSON.

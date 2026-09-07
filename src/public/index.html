@@ -20,53 +20,45 @@
       </div>
     </header>
     <main class="shell">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">Production readiness sprint 1</p>
-          <h1>Rec Reports operations command center</h1>
-          <p>
-            A protected, tenant-scoped dashboard foundation for recreation teams to manage daily
-            reports, schedules, incidents, work orders, communications, and training.
-          </p>
+      <section id="home-dashboard" aria-labelledby="home-heading">
+        <div class="home-dashboard-header">
+          <div>
+            <p class="eyebrow">Home</p>
+            <h1 id="home-heading">Today at a glance</h1>
+          </div>
+          <label class="facility-switcher">
+            <span>Facility context</span>
+            <select id="facility-select" aria-label="Active facility"></select>
+          </label>
         </div>
-        <label class="facility-switcher">
-          <span>Facility context</span>
-          <select id="facility-select" aria-label="Active facility"></select>
-        </label>
+        <div id="home-quick-actions" class="quick-actions" aria-label="Quick actions"></div>
+        <div id="home-tiles" class="home-tiles" aria-label="Today's summary"></div>
       </section>
-      <section class="grid" aria-label="MVP workflow modules">
-        <article class="card"><h2>Daily reports</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-        <article class="card"><h2>Scheduling</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-        <article class="card"><h2>Incidents</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-        <article class="card"><h2>Work orders</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-        <article class="card"><h2>Communications</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-        <article class="card"><h2>Training</h2><p>Tenant-aware workflow space ready for authenticated Supabase data integration.</p></article>
-      </section>
-      <section class="panel" aria-labelledby="daily-report-heading">
-        <div>
+      <details class="panel" id="panel-daily-reports" open>
+        <summary>
           <p class="eyebrow">Daily report workflow</p>
           <h2 id="daily-report-heading">Report templates and submissions</h2>
-          <p>
-            This first production slice models configurable report templates, required answers,
-            immutable submitted snapshots, attachments, audit events, and outbox notifications.
-            Expand a submission's "Attachments" toggle to upload evidence (draft submissions only)
-            or download anything already on file.
-          </p>
-        </div>
+        </summary>
+        <p>
+          This first production slice models configurable report templates, required answers,
+          immutable submitted snapshots, attachments, audit events, and outbox notifications.
+          Expand a submission's "Attachments" toggle to upload evidence (draft submissions only)
+          or download anything already on file.
+        </p>
         <div id="reports-list" class="module-list"></div>
         <div id="report-form-area" class="report-form-area" hidden></div>
-      </section>
-      <section class="panel" aria-labelledby="report-inbox-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-report-inbox" open>
+        <summary>
           <p class="eyebrow">Manager review</p>
           <h2 id="report-inbox-heading">Report review inbox</h2>
-          <p>
-            Filter submissions by status, date range, department, and template. Opening a
-            submission renders its answers from the exact schema version it was filled against
-            (never the current template, even if it's since been re-published), plus its
-            attachments, any validation warnings it was submitted with, and a PDF export.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Filter submissions by status, date range, department, and template. Opening a
+          submission renders its answers from the exact schema version it was filled against
+          (never the current template, even if it's since been re-published), plus its
+          attachments, any validation warnings it was submitted with, and a PDF export.
+        </p>
         <div class="report-inbox">
           <form id="report-inbox-filters" class="report-inbox-filters">
             <label>
@@ -100,92 +92,92 @@
           <div id="report-inbox-list" class="module-list"></div>
           <div id="report-inbox-detail" class="report-form-area" hidden></div>
         </div>
-      </section>
-      <section class="panel" aria-labelledby="schedule-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-schedule" open>
+        <summary>
           <p class="eyebrow">Scheduling workflow</p>
           <h2 id="schedule-heading">Weekly schedule board</h2>
-          <p>
-            Pick a week to see its shifts grouped by day, assign or unassign staff on a shift
-            card, generate shifts from templates, and validate or publish once coverage is
-            ready. Conflict and certification badges call out anything blocking publish.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Pick a week to see its shifts grouped by day, assign or unassign staff on a shift
+          card, generate shifts from templates, and validate or publish once coverage is
+          ready. Conflict and certification badges call out anything blocking publish.
+        </p>
         <div id="schedule-workspace" class="module-workspace" aria-label="Weekly schedule board"></div>
-      </section>
-      <section class="panel" aria-labelledby="incident-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-incidents" open>
+        <summary>
           <p class="eyebrow">Incident workflow</p>
           <h2 id="incident-heading">Incident reports</h2>
-          <p>
-            Report a new incident, then track it from draft through submission: follow-up
-            actions, escalation acknowledgement/resolution, an immutable amendment history, and
-            evidence attachments. High/critical severity requires an immediate-actions note
-            before a report can be created.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Report a new incident, then track it from draft through submission: follow-up
+          actions, escalation acknowledgement/resolution, an immutable amendment history, and
+          evidence attachments. High/critical severity requires an immediate-actions note
+          before a report can be created.
+        </p>
         <div id="incidents-workspace" class="module-workspace"></div>
-      </section>
-      <section class="panel" aria-labelledby="work-order-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-work-orders" open>
+        <summary>
           <p class="eyebrow">Maintenance workflow</p>
           <h2 id="work-order-heading">Work orders</h2>
-          <p>
-            Filter by open/mine/overdue/priority, create a work order, and open one to see its
-            comment thread and change its status or assignee. Expand a work order's
-            "Attachments" toggle to upload a photo or document, or download evidence already on
-            file.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Filter by open/mine/overdue/priority, create a work order, and open one to see its
+          comment thread and change its status or assignee. Expand a work order's
+          "Attachments" toggle to upload a photo or document, or download evidence already on
+          file.
+        </p>
         <div id="work-orders-workspace" class="module-workspace"></div>
-      </section>
-      <section class="panel" aria-labelledby="communications-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-communications" open>
+        <summary>
           <p class="eyebrow">Communications workflow</p>
           <h2 id="communications-heading">Messages</h2>
-          <p>
-            Publishers can compose a message with a channel, priority, audience, and optional
-            required acknowledgement. Opening this panel marks each visible message delivered
-            and read; required-acknowledgement messages show their acknowledgement state.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Publishers can compose a message with a channel, priority, audience, and optional
+          required acknowledgement. Opening this panel marks each visible message delivered
+          and read; required-acknowledgement messages show their acknowledgement state.
+        </p>
         <div id="comms-workspace" class="module-workspace"></div>
-      </section>
-      <section class="panel" aria-labelledby="training-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-training" open>
+        <summary>
           <p class="eyebrow">Training workflow</p>
           <h2 id="training-heading">Training assignments</h2>
-          <p>
-            Training connects courses, modules, assignments, progress, completions, and
-            certification events back to scheduling and incident follow-up requirements.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Training connects courses, modules, assignments, progress, completions, and
+          certification events back to scheduling and incident follow-up requirements.
+        </p>
         <div id="training-list"></div>
-      </section>
-      <section class="panel" aria-labelledby="certifications-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-certifications" open>
+        <summary>
           <p class="eyebrow">Certification wallet</p>
           <h2 id="certifications-heading">My certifications</h2>
-          <p>
-            Every certification on file for the current facility, with a live status derived
-            from its expiry and renewal window, plus whether evidence has been uploaded.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Every certification on file for the current facility, with a live status derived
+          from its expiry and renewal window, plus whether evidence has been uploaded.
+        </p>
         <div id="certifications-list"></div>
-      </section>
-      <section class="panel" aria-labelledby="admin-heading">
-        <div>
+      </details>
+      <details class="panel" id="panel-admin" open>
+        <summary>
           <p class="eyebrow">Admin control center</p>
           <h2 id="admin-heading">Facility configuration governance</h2>
-          <p>
-            Admin controls manage module toggles, inherited settings, branding profiles,
-            reviewed change requests, and audit-ready configuration events.
-          </p>
-        </div>
+        </summary>
+        <p>
+          Admin controls manage module toggles, inherited settings, branding profiles,
+          reviewed change requests, and audit-ready configuration events.
+        </p>
         <div class="admin-card">
           <a href="/admin/" class="primary">Open admin control center</a>
         </div>
-      </section>
+      </details>
     </main>
     <script type="module" src="/js/app.js"></script>
   </body>

@@ -969,3 +969,256 @@ test("POST /facilities/:facilityId/messages publishes immediately with legacy pu
   const insert = captured.find((c) => c.table === "messages" && c.method === "POST");
   assert.ok(insert.body[0].published_at, "expected published_at to be stamped");
 });
+
+// --- Ack/read state + compliance (P-1: CM-09/CM-11) -------------------------
+
+const REQUIRED_MESSAGE = {
+  ...MESSAGE,
+  id: "msg-req",
+  is_required_ack: true,
+  published_at: "2026-07-18T08:00:00Z"
+};
+
+const AUDIENCE_ROW = { id: "aud-1", message_id: "msg-req", audience_type: "employee", audience_ref_id: "emp-1" };
+
+for (const resource of ["acknowledgements", "receipts"]) {
+  const table = resource === "acknowledgements" ? "message_acknowledgements" : "message_receipts";
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource} denies a non-member with 403`, async (t) => {
+    stubFetch(t, (t2) => (t2 === "messages" ? [MESSAGE] : []));
+    const { call } = mount({ memberships: OUTSIDER });
+    const result = await call("GET", `/facilities/fac-1/messages/msg-1/${resource}`);
+    assert.equal(result.status, 403);
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource} 404s when the message is missing`, async (t) => {
+    stubFetch(t, () => []);
+    const { call } = mount({ memberships: READER });
+    const result = await call("GET", `/facilities/fac-1/messages/nope/${resource}`);
+    assert.equal(result.status, 404);
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource} 404s when the message belongs to a different facility`, async (t) => {
+    stubFetch(t, (t2) => (t2 === "messages" ? [MESSAGE] : []));
+    const { call } = mount({ memberships: READER });
+    const result = await call("GET", `/facilities/fac-2/messages/msg-1/${resource}`);
+    assert.equal(result.status, 404);
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource} returns a paginated, facility+message-scoped list`, async (t) => {
+    const captured = stubFetch(t, (t2) => {
+      if (t2 === "messages") return [MESSAGE];
+      if (t2 === table) return [{ id: "row-1" }, { id: "row-2" }];
+      return [];
+    });
+    const { call } = mount({ memberships: READER });
+    const result = await call("GET", `/facilities/fac-1/messages/msg-1/${resource}?limit=2&offset=1`);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.payload, [{ id: "row-1" }, { id: "row-2" }]);
+
+    const list = captured.find((c) => c.table === table && c.method === "GET");
+    assert.ok(list, `expected a ${table} GET`);
+    assert.equal(list.url.searchParams.get("facility_id"), "eq.fac-1");
+    assert.equal(list.url.searchParams.get("message_id"), "eq.msg-1");
+    assert.equal(list.url.searchParams.get("limit"), "2");
+    assert.equal(list.url.searchParams.get("offset"), "1");
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource} rejects a bad limit with 400 before any list query`, async (t) => {
+    const captured = stubFetch(t, (t2) => (t2 === "messages" ? [MESSAGE] : []));
+    const { call } = mount({ memberships: READER });
+    const result = await call("GET", `/facilities/fac-1/messages/msg-1/${resource}?limit=0`);
+    assert.equal(result.status, 400);
+    assert.ok(!captured.some((c) => c.table === table));
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource}?employeeId=me resolves the caller's own employee row`, async (t) => {
+    const captured = stubFetch(t, (t2) => {
+      if (t2 === "messages") return [MESSAGE];
+      if (t2 === "employees") return [{ id: "emp-own-row" }];
+      if (t2 === table) return [{ id: "row-1", employee_id: "emp-own-row" }];
+      return [];
+    });
+    const { call } = mount({ memberships: READER, userId: "user-42" });
+    const result = await call("GET", `/facilities/fac-1/messages/msg-1/${resource}?employeeId=me`);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.payload, [{ id: "row-1", employee_id: "emp-own-row" }]);
+
+    const list = captured.find((c) => c.table === table && c.method === "GET");
+    assert.equal(list.url.searchParams.get("employee_id"), "eq.emp-own-row");
+  });
+
+  test(`GET /facilities/:facilityId/messages/:messageId/${resource}?employeeId=me returns an empty list (not 500) when the caller has no employee row`, async (t) => {
+    const captured = stubFetch(t, (t2) => {
+      if (t2 === "messages") return [MESSAGE];
+      if (t2 === "employees") return [];
+      return [];
+    });
+    const { call } = mount({ memberships: READER, userId: "user-no-employee" });
+    const result = await call("GET", `/facilities/fac-1/messages/msg-1/${resource}?employeeId=me`);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.payload, []);
+    assert.ok(!captured.some((c) => c.table === table));
+  });
+}
+
+// --- Per-message compliance (CM-11) -----------------------------------------
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance denies a non-member with 403", async (t) => {
+  stubFetch(t, (table) => (table === "messages" ? [REQUIRED_MESSAGE] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/messages/msg-req/compliance");
+  assert.equal(result.status, 403);
+});
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance 404s when the message is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/messages/nope/compliance");
+  assert.equal(result.status, 404);
+});
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance 404s when the message belongs to a different facility", async (t) => {
+  stubFetch(t, (table) => (table === "messages" ? [REQUIRED_MESSAGE] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-2/messages/msg-req/compliance");
+  assert.equal(result.status, 404);
+});
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance resolves the message's own audience and rolls receipts/acks up against it", async (t) => {
+  // published_at is "now" (not the fixed 2026-07-18 REQUIRED_MESSAGE), so this
+  // is safely inside the default ack window regardless of when the suite runs
+  // -- overdue is asserted separately below.
+  const freshRequiredMessage = { ...REQUIRED_MESSAGE, published_at: new Date().toISOString() };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [freshRequiredMessage];
+    if (table === "message_audiences") return [AUDIENCE_ROW];
+    if (table === "message_receipts") return [{ employee_id: "emp-1", delivered_at: "2026-07-18T08:01:00Z" }];
+    if (table === "message_acknowledgements") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/messages/msg-req/compliance", undefined);
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { delivered: 1, read: 0, acknowledged: 0, pending: 1, overdue: 0, total: 1 });
+
+  const audienceLookup = captured.find((c) => c.table === "message_audiences");
+  assert.equal(audienceLookup.url.searchParams.get("message_id"), "eq.msg-req");
+});
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance is overdue once now is past published_at + the default ack window", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "messages") return [REQUIRED_MESSAGE];
+    if (table === "message_audiences") return [AUDIENCE_ROW];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  // The route computes "now" as the real wall clock (new Date()), so this
+  // relies on REQUIRED_MESSAGE.published_at (2026-07-18) being safely more
+  // than DEFAULT_ACK_DUE_HOURS (48h) in the past relative to whenever this
+  // suite actually runs -- true for any run date after mid-2026.
+  const result = await call("GET", "/facilities/fac-1/messages/msg-req/compliance");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.overdue, 1);
+  assert.equal(result.payload.pending, 1);
+});
+
+test("GET /facilities/:facilityId/messages/:messageId/compliance is never overdue for a message that does not require acknowledgement", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "messages") return [MESSAGE]; // is_required_ack: false
+    if (table === "message_audiences") return [{ ...AUDIENCE_ROW, message_id: "msg-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/messages/msg-1/compliance");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.overdue, 0);
+  assert.equal(result.payload.pending, 0);
+});
+
+// --- Facility-wide compliance rollup (CM-11) --------------------------------
+
+test("GET /facilities/:facilityId/communications/compliance-summary denies a non-member with 403", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/facilities/fac-1/communications/compliance-summary");
+  assert.equal(result.status, 403);
+});
+
+test("GET /facilities/:facilityId/communications/compliance-summary rejects an invalid ?from with 400", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/communications/compliance-summary?from=not-a-date");
+  assert.equal(result.status, 400);
+});
+
+test("GET /facilities/:facilityId/communications/compliance-summary rejects an invalid ?to with 400", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/communications/compliance-summary?to=nope");
+  assert.equal(result.status, 400);
+});
+
+test("GET /facilities/:facilityId/communications/compliance-summary defaults to the last 30 days and filters messages by published_at", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "messages" ? [] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/facilities/fac-1/communications/compliance-summary");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { messages: 0, requiredAck: 0, acknowledged: 0, pending: 0, overdue: 0 });
+
+  const list = captured.find((c) => c.table === "messages");
+  assert.equal(list.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.ok(list.url.searchParams.getAll("published_at").some((v) => v.startsWith("gte.")));
+  assert.ok(list.url.searchParams.getAll("published_at").some((v) => v.startsWith("lte.")));
+});
+
+test("GET /facilities/:facilityId/communications/compliance-summary skips audience/receipt/ack queries when nothing in range requires ack", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "messages") return [{ ...MESSAGE, is_required_ack: false }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call(
+    "GET",
+    "/facilities/fac-1/communications/compliance-summary?from=2026-07-01&to=2026-07-31"
+  );
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { messages: 1, requiredAck: 0, acknowledged: 0, pending: 0, overdue: 0 });
+  assert.ok(!captured.some((c) => c.table === "message_audiences"));
+  assert.ok(!captured.some((c) => c.table === "message_receipts"));
+  assert.ok(!captured.some((c) => c.table === "message_acknowledgements"));
+});
+
+test("GET /facilities/:facilityId/communications/compliance-summary aggregates acknowledged/pending/overdue across every required-ack message in range", async (t) => {
+  const messageA = { ...REQUIRED_MESSAGE, id: "msg-a", published_at: "2026-07-05T00:00:00Z" };
+  const messageB = { ...REQUIRED_MESSAGE, id: "msg-b", published_at: "2026-07-10T00:00:00Z" };
+  const audiences = [
+    { id: "aud-a", message_id: "msg-a", audience_type: "employee", audience_ref_id: "emp-1" },
+    { id: "aud-b1", message_id: "msg-b", audience_type: "employee", audience_ref_id: "emp-2" },
+    { id: "aud-b2", message_id: "msg-b", audience_type: "employee", audience_ref_id: "emp-3" }
+  ];
+  const acks = [{ message_id: "msg-a", employee_id: "emp-1", acknowledged_at: "2026-07-05T01:00:00Z" }];
+  const captured = stubFetch(t, (table) => {
+    if (table === "messages") return [messageA, messageB];
+    if (table === "message_audiences") return audiences;
+    if (table === "message_acknowledgements") return acks;
+    if (table === "message_receipts") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call(
+    "GET",
+    "/facilities/fac-1/communications/compliance-summary?from=2026-07-01&to=2026-07-31"
+  );
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.messages, 2);
+  assert.equal(result.payload.requiredAck, 2);
+  // msg-a: emp-1 acknowledged (1/1). msg-b: emp-2 and emp-3 both pending (0/2).
+  assert.equal(result.payload.acknowledged, 1);
+  assert.equal(result.payload.pending, 2);
+
+  const audiencesLookup = captured.find((c) => c.table === "message_audiences");
+  assert.equal(audiencesLookup.url.searchParams.get("message_id"), "in.(msg-a,msg-b)");
+  const acksLookup = captured.find((c) => c.table === "message_acknowledgements");
+  assert.equal(acksLookup.url.searchParams.get("message_id"), "in.(msg-a,msg-b)");
+});

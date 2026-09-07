@@ -11,7 +11,12 @@ import {
   INCIDENT_REPORT_TYPES,
   INCIDENT_SEVERITIES,
   FOLLOWUP_ACTION_TYPES,
-  AMENDABLE_INCIDENT_FIELDS
+  AMENDABLE_INCIDENT_FIELDS,
+  INCIDENT_PERSON_ROLES,
+  validatePersonInput,
+  buildPersonPayload,
+  validateStatementInput,
+  buildStatementPayload
 } from "./incident-form.mjs";
 import { paginate } from "./list-pagination.mjs";
 import {
@@ -21,7 +26,14 @@ import {
   validateWorkOrderCreate,
   buildWorkOrderCreatePayload
 } from "./work-order-filters.mjs";
-import { weekBoundsFor, bucketShiftsByDay, deriveShiftBadges, validateShiftCreate, buildShiftCreatePayload } from "./schedule-board.mjs";
+import {
+  weekBoundsFor,
+  bucketShiftsByDay,
+  deriveShiftBadges,
+  validateShiftCreate,
+  buildShiftCreatePayload,
+  indexAssignmentsByShift
+} from "./schedule-board.mjs";
 import {
   MESSAGE_PRIORITIES,
   AUDIENCE_TYPES,
@@ -29,7 +41,10 @@ import {
   buildComposePayload,
   validateAudienceRows,
   buildAudiencePayload,
-  deriveAckState
+  deriveAckState,
+  ackedMessageIdsFromRows,
+  shouldFetchCompliance,
+  formatComplianceSummary
 } from "./comms-compose.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
 import { shouldOfferPushEnrollment, buildDeviceTokenPayload, permissionGrants } from "./push-registration.mjs";
@@ -49,6 +64,12 @@ let currentFacility = null;
 let facilities = [];
 let platformAdmin = false;
 let reportTemplatesById = new Map();
+// Full published-template rows for the active facility (as opposed to
+// reportTemplatesById's id->name lookup, used by the inbox) -- kept so the
+// home dashboard's "Submit report" quick action can jump straight into
+// startNewReport when there is exactly one template to choose from, without
+// a second fetch.
+let publishedReportTemplates = [];
 
 // Permission gating: a user without the relevant write permission must never
 // see write controls (rule applies to every panel added this batch). Platform
@@ -341,8 +362,18 @@ async function loadAllModules() {
   schedulePanel.reset();
   commsPanel.reset();
 
+  // P-3: quick actions render synchronously (permission-driven, no fetch of
+  // their own) so they're on screen immediately -- above the fold on mobile
+  // -- rather than waiting on the Promise.all below. The dashboard's summary
+  // tiles are fetched first in that Promise.all (loadHomeDashboardTiles),
+  // ahead of every module panel's own load, per the "rendered first" plan
+  // requirement; each tile's fetch is still independent of the others (see
+  // loadHomeDashboardTiles) and of every panel's own load below.
+  renderQuickActions();
+
   try {
     await Promise.all([
+      loadHomeDashboardTiles(),
       loadReports(),
       loadReportInbox(),
       schedulePanel.load(),
@@ -355,6 +386,180 @@ async function loadAllModules() {
   } catch (error) {
     console.error("Error loading modules:", error);
   }
+}
+
+// --- Home dashboard (P-3) ---------------------------------------------------
+// Quick-action buttons + summary tiles rendered above every module panel.
+// Pure selection/shaping logic lives in home-dashboard.mjs (buildQuickActions,
+// buildTiles, computeTodayShiftsForMe); everything here is I/O (apiFetch) and
+// DOM (el()) glue.
+
+// Mirrors hasPerm()'s platform-admin bypass for the fixed set of permission
+// codes home-dashboard.mjs's quick actions/tiles ever check: a platform admin
+// has no membership row (hence no `permissions` array) for a facility they
+// don't belong to, so hasPerm() special-cases them to "always allowed"
+// instead of reading `permissions` at all -- this passes the pure functions
+// below the equivalent of "every code", rather than teaching them their own
+// platformAdmin bypass.
+function homeDashboardPermissions() {
+  if (platformAdmin) return HOME_DASHBOARD_PERMISSION_CODES;
+  const facility = currentFacilityRecord();
+  return (facility && facility.permissions) || [];
+}
+
+// Scrolls a module panel into view and, since every panel is a <details>
+// (collapsed by default under 640px, see collapsePanelsOnMobile), opens it
+// first so scrolling doesn't land on a collapsed, empty-looking section.
+function revealPanel(panelId) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  if (panel.tagName === "DETAILS") panel.open = true;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function handleQuickAction(action) {
+  revealPanel(action.panelId);
+  if (action.key === "log-incident") {
+    incidentsPanel.openCreate();
+  } else if (action.key === "new-work-order") {
+    workOrdersPanel.openCreate();
+  } else if (action.key === "submit-report" && publishedReportTemplates.length === 1) {
+    // Exactly one published template: skip the extra tap and open its draft
+    // directly. With more than one, there's no single right choice --
+    // revealPanel above has already scrolled the reports panel's template
+    // list into view for the caller to pick from.
+    startNewReport(publishedReportTemplates[0]);
+  }
+}
+
+function renderQuickActions() {
+  const container = document.getElementById("home-quick-actions");
+  if (!container || !currentFacility) return;
+  container.textContent = "";
+  const actions = buildQuickActions(homeDashboardPermissions());
+  for (const action of actions) {
+    const btn = el("button", { type: "button", class: "primary quick-action-btn" }, action.label);
+    btn.addEventListener("click", () => handleQuickAction(action));
+    container.append(btn);
+  }
+}
+
+// Resolves messages that still need the caller's own acknowledgement:
+// published, is_required_ack messages this facility has, minus whichever of
+// those the caller has already acked (checked per-message via the same
+// GET .../messages/:id/acknowledgements?employeeId=me route commsPanel's own
+// seedAckStateForVisibleMessages uses). A per-message ack-check failure is
+// treated as "already acked" (excluded) rather than "still needs it", so a
+// transient error on one message never inflates the tile's count -- the
+// worst case is silently under-counting one message, not over-alarming.
+async function loadUnackedMessages() {
+  const messages = (await apiFetch(`/facilities/${currentFacility}/messages?status=published`)) || [];
+  const requiredAck = messages.filter((message) => message.is_required_ack);
+  if (requiredAck.length === 0) return [];
+  const ackedFlags = await Promise.all(
+    requiredAck.map((message) =>
+      apiFetch(`/facilities/${currentFacility}/messages/${message.id}/acknowledgements?employeeId=me`)
+        .then((rows) => ackedMessageIdsFromRows(rows).size > 0)
+        .catch(() => true)
+    )
+  );
+  return requiredAck.filter((_, index) => !ackedFlags[index]);
+}
+
+// Resolves the caller's own shifts for `today`: the current Mon-Sun period
+// (same facility-wide, department_id-null period schedulePanel's own
+// reloadWeek() selects), its shifts, and its assignments, joined down to
+// "mine, today" by home-dashboard.mjs's computeTodayShiftsForMe. Returns []
+// (not an error) when the caller has no employee record in this facility --
+// there is nothing "mine" to show, same convention as the work-orders tile.
+async function loadTodayShifts(myEmployeeId, today) {
+  if (!myEmployeeId) return [];
+  const periods = (await apiFetch(`/facilities/${currentFacility}/schedule-periods`)) || [];
+  const { weekStartDate } = weekBoundsFor(today);
+  const period = periods.find((p) => p.week_start_date === weekStartDate && !p.department_id) || null;
+  if (!period) return [];
+  const [shifts, assignments] = await Promise.all([
+    apiFetch(`/facilities/${currentFacility}/shifts?period_id=${period.id}`),
+    apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${period.id}`)
+  ]);
+  return computeTodayShiftsForMe({ shifts: shifts || [], assignments: assignments || [], myEmployeeId, today });
+}
+
+// Fires all six of the dashboard's data fetches independently (a permission
+// the caller lacks skips its fetch entirely rather than requesting a 403;
+// one that's held but fails is caught to null, which buildTiles renders as
+// "Unavailable" for just that tile -- no fetch's failure blocks another's or
+// blanks the rest of the page), then renders whatever buildTiles returns.
+async function loadHomeDashboardTiles() {
+  const container = document.getElementById("home-tiles");
+  if (!container || !currentFacility) return;
+
+  const permissions = homeDashboardPermissions();
+  const permSet = new Set(permissions);
+  const myEmployeeId = (currentFacilityRecord() || {}).employeeId || null;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [compliance, workOrders, incidents, unackedMessages, certifications, todayShifts] = await Promise.all([
+    permSet.has("reports.read")
+      ? apiFetch(`/facilities/${currentFacility}/reports/compliance?from=${today}&to=${today}`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("work_orders.read")
+      ? myEmployeeId
+        ? apiFetch(
+            `/facilities/${currentFacility}/work-orders?assignee=${encodeURIComponent(myEmployeeId)}&status=open`
+          ).catch(() => null)
+        : Promise.resolve([])
+      : Promise.resolve(null),
+    permSet.has("incidents.read")
+      ? apiFetch(`/facilities/${currentFacility}/incidents?status=submitted`).catch(() => null)
+      : Promise.resolve(null),
+    permSet.has("communications.read") ? loadUnackedMessages().catch(() => null) : Promise.resolve(null),
+    apiFetch(`/facilities/${currentFacility}/employee-certifications`).catch(() => null),
+    permSet.has("schedule.read") ? loadTodayShifts(myEmployeeId, today).catch(() => null) : Promise.resolve(null)
+  ]);
+
+  renderTiles(
+    container,
+    buildTiles({ permissions, compliance, workOrders, incidents, unackedMessages, certifications, todayShifts, now: new Date() })
+  );
+}
+
+function renderTiles(container, tiles) {
+  container.textContent = "";
+  if (tiles.length === 0) {
+    container.append(el("p", { class: "item-subtitle" }, "No summary tiles available for your role yet."));
+    return;
+  }
+  for (const tile of tiles) {
+    const isUnavailable = tile.value === "Unavailable";
+    const card = el(
+      "button",
+      {
+        type: "button",
+        class: "home-tile",
+        "aria-label": `${tile.title}: ${tile.value}${tile.hint ? ", " + tile.hint : ""}`
+      },
+      [
+        el("div", { class: "home-tile-title" }, tile.title),
+        el("div", { class: isUnavailable ? "home-tile-value is-unavailable" : "home-tile-value" }, tile.value),
+        el("div", { class: "home-tile-hint" }, tile.hint)
+      ]
+    );
+    card.addEventListener("click", () => revealPanel(tile.panelId));
+    container.append(card);
+  }
+}
+
+// P-3: panels are <details>/<summary> disclosures so they can start
+// collapsed on narrow viewports without hiding them from a caller with
+// JavaScript disabled -- called once at startup (DOMContentLoaded, below),
+// not re-run on resize, matching "start collapsed" rather than "stay in sync
+// with the viewport forever".
+function collapsePanelsOnMobile() {
+  if (!window.matchMedia || window.matchMedia("(min-width: 640px)").matches) return;
+  document.querySelectorAll("main > details.panel[open]").forEach((panel) => {
+    panel.open = false;
+  });
 }
 
 // Small DOM builder used by every schema-driven view added in this batch
@@ -618,6 +823,10 @@ async function loadReports() {
       apiFetch(`/facilities/${currentFacility}/reports`)
     ]);
 
+    // GET .../report-templates defaults to ?status=published (no ?status=all
+    // here), so `templates` is already published-only -- safe to hand
+    // straight to the home dashboard's quick action.
+    publishedReportTemplates = templates || [];
     renderReportsList(container, templates || [], reports || []);
   } catch (error) {
     setError(container, error.message);
@@ -1422,13 +1631,11 @@ async function loadReportInbox() {
 // Week picker, day-column shift grid, assign/unassign, create-shift form,
 // generate-from-templates, and Validate/Publish with readiness badges.
 //
-// Known API gap, worked around rather than papered over: nothing in
-// src/lib/http/scheduling-routes.mjs lists existing shift_assignments (only
-// POST to create one and PATCH to change its status exist) -- so the board
-// can only ever know about an assignment IT created or changed this session.
-// assignmentsByShiftId is that session-local cache; a shift assigned in
-// another tab/session, or before this page loaded, renders as "Unassigned"
-// with an honest caption rather than a guess.
+// assignmentsByShiftId is seeded from the server on every reloadWeek() via
+// GET .../shift-assignments?period_id= + indexAssignmentsByShift (P-2), so it
+// reflects assignments made in another tab/session, not just this one.
+// assignEmployee/unassign additionally update it optimistically so the card
+// reflects the change immediately, without waiting on a full reload.
 const schedulePanel = (function () {
   const state = {
     weekStartDate: null,
@@ -1478,7 +1685,12 @@ const schedulePanel = (function () {
     state.assignmentsByShiftId = new Map();
     if (state.period) {
       try {
-        state.shifts = (await apiFetch(`/facilities/${currentFacility}/shifts?period_id=${state.period.id}`)) || [];
+        const [shifts, assignments] = await Promise.all([
+          apiFetch(`/facilities/${currentFacility}/shifts?period_id=${state.period.id}`),
+          apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${state.period.id}`)
+        ]);
+        state.shifts = shifts || [];
+        state.assignmentsByShiftId = indexAssignmentsByShift(assignments || []);
         state.formError = null;
       } catch (error) {
         state.shifts = [];
@@ -1586,11 +1798,11 @@ const schedulePanel = (function () {
         method: "POST",
         body: { employeeId }
       });
-      state.assignmentsByShiftId.set(shiftId, {
-        id: assignment.id,
-        employeeId: assignment.employee_id,
-        label: employeeLabel(assignment.employee_id)
-      });
+      // Optimistic add: append the new row (same snake_case shape the GET
+      // .../shift-assignments route returns) rather than waiting for a full
+      // reloadWeek() round-trip.
+      const existing = state.assignmentsByShiftId.get(shiftId) || [];
+      state.assignmentsByShiftId.set(shiftId, [...existing, assignment]);
       state.formError = null;
       render();
     } catch (error) {
@@ -1599,15 +1811,15 @@ const schedulePanel = (function () {
     }
   }
 
-  async function unassign(shiftId) {
-    const assignment = state.assignmentsByShiftId.get(shiftId);
-    if (!assignment) return;
+  async function unassign(shiftId, assignmentId) {
     try {
-      await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments/${assignment.id}`, {
+      await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments/${assignmentId}`, {
         method: "PATCH",
         body: { status: "cancelled" }
       });
-      state.assignmentsByShiftId.delete(shiftId);
+      const remaining = (state.assignmentsByShiftId.get(shiftId) || []).filter((a) => a.id !== assignmentId);
+      if (remaining.length > 0) state.assignmentsByShiftId.set(shiftId, remaining);
+      else state.assignmentsByShiftId.delete(shiftId);
       render();
     } catch (error) {
       state.formError = error.message;
@@ -1674,16 +1886,19 @@ const schedulePanel = (function () {
     if (badges.certWarning) badgeRow.append(badge("Cert warning", "warning"));
     if (badgeRow.childNodes.length > 0) card.append(badgeRow);
 
-    const assignment = state.assignmentsByShiftId.get(shift.id);
-    if (assignment) {
-      card.append(el("span", { class: "item-subtitle" }, `Assigned: ${assignment.label}`));
-      if (hasPerm("schedule.manage")) {
-        const unassignBtn = el("button", { type: "button" }, "Unassign");
-        unassignBtn.addEventListener("click", () => unassign(shift.id));
-        card.append(unassignBtn);
+    const assignments = state.assignmentsByShiftId.get(shift.id) || [];
+    if (assignments.length > 0) {
+      for (const assignment of assignments) {
+        const row = el("div", { class: "item-subtitle" }, `Assigned: ${employeeLabel(assignment.employee_id)}`);
+        if (hasPerm("schedule.manage")) {
+          const unassignBtn = el("button", { type: "button" }, "Unassign");
+          unassignBtn.addEventListener("click", () => unassign(shift.id, assignment.id));
+          row.append(unassignBtn);
+        }
+        card.append(row);
       }
     } else {
-      card.append(el("span", { class: "item-subtitle" }, "Unassigned (or assigned outside this session)"));
+      card.append(el("span", { class: "item-subtitle" }, "Unassigned"));
       if (hasPerm("schedule.manage") && state.employees.length > 0) {
         const select = document.createElement("select");
         select.append(el("option", { value: "" }, "Assign to…"));
@@ -1804,10 +2019,8 @@ const schedulePanel = (function () {
 // --- Incidents module (IN-10) -------------------------------------------------
 // Capture form (draft -> submit), paginated list, and a detail view: status +
 // submit/status actions, follow-ups (create/complete), escalation history
-// (acknowledge/resolve), amendment history (clearly labeled immutable), and
-// attachments. A "People involved" section is intentionally a placeholder --
-// no incident_people/witness API exists anywhere in this codebase yet
-// (IN-12 is unbuilt), so nothing is fabricated for it.
+// (acknowledge/resolve), amendment history (clearly labeled immutable),
+// people involved + witness statement history (IN-12), and attachments.
 const incidentsPanel = (function () {
   const state = {
     items: [],
@@ -1832,7 +2045,20 @@ const incidentsPanel = (function () {
     amendmentsError: null,
     amendOpen: false,
     amendFields: { reason: "", patch: {} },
-    amendErrors: {}
+    amendErrors: {},
+    // IN-12: people involved + their witness statement history.
+    people: [],
+    peopleError: null,
+    personOpen: false,
+    personFields: { personRole: "", fullName: "" },
+    personErrors: {},
+    // Statement history/composer state, keyed by person id, so multiple
+    // people's histories can be loaded/expanded independently.
+    statementsByPersonId: {},
+    statementErrorsByPersonId: {},
+    openPersonId: null,
+    statementFieldByPersonId: {},
+    statementFieldErrorsByPersonId: {}
   };
 
   function emptyCaptureFields() {
@@ -1881,6 +2107,16 @@ const incidentsPanel = (function () {
     state.followups = [];
     state.escalations = [];
     state.amendments = [];
+    state.people = [];
+    state.peopleError = null;
+    state.personOpen = false;
+    state.personFields = { personRole: "", fullName: "" };
+    state.personErrors = {};
+    state.statementsByPersonId = {};
+    state.statementErrorsByPersonId = {};
+    state.openPersonId = null;
+    state.statementFieldByPersonId = {};
+    state.statementFieldErrorsByPersonId = {};
     const host = container();
     if (host) host.textContent = "";
   }
@@ -1921,6 +2157,16 @@ const incidentsPanel = (function () {
     state.escalationsError = null;
     state.amendments = [];
     state.amendmentsError = null;
+    state.people = [];
+    state.peopleError = null;
+    state.personOpen = false;
+    state.personFields = { personRole: "", fullName: "" };
+    state.personErrors = {};
+    state.statementsByPersonId = {};
+    state.statementErrorsByPersonId = {};
+    state.openPersonId = null;
+    state.statementFieldByPersonId = {};
+    state.statementFieldErrorsByPersonId = {};
     render();
     try {
       state.detail = await apiFetch(`/incidents/${id}`);
@@ -1949,6 +2195,7 @@ const incidentsPanel = (function () {
     } catch (error) {
       state.escalationsError = error.message;
     }
+    await loadPeople();
     render();
   }
 
@@ -1956,6 +2203,121 @@ const incidentsPanel = (function () {
     state.detailId = null;
     state.detail = null;
     render();
+  }
+
+  // --- People / witness statements (IN-12) ----------------------------------
+  async function loadPeople() {
+    if (!currentFacility || !state.detailId) return;
+    try {
+      state.people = (await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people`)) || [];
+      state.peopleError = null;
+    } catch (error) {
+      state.peopleError = error.message;
+    }
+  }
+
+  async function submitPerson() {
+    const validation = validatePersonInput(state.personFields);
+    state.personErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people`, {
+        method: "POST",
+        body: buildPersonPayload(state.personFields)
+      });
+      state.people.push(created);
+      state.personOpen = false;
+      state.personFields = { personRole: "", fullName: "" };
+      state.personErrors = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function removePerson(personId) {
+    try {
+      await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}`, {
+        method: "DELETE"
+      });
+      state.people = state.people.filter((p) => p.id !== personId);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function togglePersonStatements(personId) {
+    if (state.openPersonId === personId) {
+      state.openPersonId = null;
+      render();
+      return;
+    }
+    state.openPersonId = personId;
+    if (!state.statementFieldByPersonId[personId]) {
+      state.statementFieldByPersonId[personId] = { statementText: "" };
+    }
+    render();
+    if (!state.statementsByPersonId[personId]) {
+      try {
+        state.statementsByPersonId[personId] =
+          (await apiFetch(
+            `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements`
+          )) || [];
+        delete state.statementErrorsByPersonId[personId];
+      } catch (error) {
+        state.statementErrorsByPersonId[personId] = error.message;
+      }
+      render();
+    }
+  }
+
+  async function submitStatement(personId) {
+    const fields = state.statementFieldByPersonId[personId] || { statementText: "" };
+    const validation = validateStatementInput(fields);
+    state.statementFieldErrorsByPersonId[personId] = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(
+        `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements`,
+        { method: "POST", body: buildStatementPayload(fields) }
+      );
+      const existing = state.statementsByPersonId[personId] || [];
+      state.statementsByPersonId[personId] = [...existing, created];
+      state.statementFieldByPersonId[personId] = { statementText: "" };
+      state.statementFieldErrorsByPersonId[personId] = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function signStatement(personId, statementId) {
+    try {
+      const updated = await apiFetch(
+        `/facilities/${currentFacility}/incidents/${state.detailId}/people/${personId}/statements/${statementId}/sign`,
+        { method: "POST" }
+      );
+      const existing = state.statementsByPersonId[personId] || [];
+      state.statementsByPersonId[personId] = existing.map((s) => (s.id === statementId ? updated : s));
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
   }
 
   async function submitIncident() {
@@ -2233,10 +2595,137 @@ const incidentsPanel = (function () {
     return wrap;
   }
 
+  // --- People / witness statements (IN-12) ----------------------------------
+  function buildPersonForm() {
+    const wrap = el("div", { class: "inline-form" });
+    const roleSelect = document.createElement("select");
+    roleSelect.append(el("option", { value: "" }, "Role"));
+    for (const role of INCIDENT_PERSON_ROLES) {
+      const opt = el("option", { value: role }, role.replace(/_/g, " "));
+      if (state.personFields.personRole === role) opt.selected = true;
+      roleSelect.append(opt);
+    }
+    roleSelect.addEventListener("change", () => (state.personFields.personRole = roleSelect.value));
+    const nameInput = el("input", { type: "text", placeholder: "Full name", value: state.personFields.fullName });
+    nameInput.addEventListener("input", () => (state.personFields.fullName = nameInput.value));
+    const errorText = [state.personErrors.personRole, state.personErrors.fullName].filter(Boolean).join(" ");
+    const errorEl = el("p", { class: "rr-error" }, errorText);
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Add person");
+    submitBtn.addEventListener("click", () => submitPerson());
+    wrap.append(roleSelect, nameInput, submitBtn, errorEl);
+    return wrap;
+  }
+
+  // contact_json is an open, free-form object -- rendered as
+  // "key: value" pairs joined by commas rather than assuming any particular
+  // shape, since nothing in the schema constrains its keys.
+  function formatContact(contactJson) {
+    const entries = Object.entries(contactJson || {});
+    if (entries.length === 0) return "No contact info on file.";
+    return entries.map(([key, value]) => `${key}: ${value}`).join(", ");
+  }
+
+  function buildStatementComposer(personId) {
+    const fields = state.statementFieldByPersonId[personId] || { statementText: "" };
+    const errors = state.statementFieldErrorsByPersonId[personId] || {};
+    const wrap = el("div", { class: "inline-form" });
+    const textarea = document.createElement("textarea");
+    textarea.placeholder = "Statement text";
+    textarea.value = fields.statementText;
+    textarea.addEventListener("input", () => (fields.statementText = textarea.value));
+    state.statementFieldByPersonId[personId] = fields;
+    if (errors.statementText) wrap.append(el("p", { class: "rr-error" }, errors.statementText));
+    const submitBtn = el("button", { type: "button" }, "Add statement");
+    submitBtn.addEventListener("click", () => submitStatement(personId));
+    wrap.append(textarea, submitBtn);
+    return wrap;
+  }
+
+  function buildStatementHistory(person) {
+    const wrap = el("div", { class: "module-section" });
+    const statementError = state.statementErrorsByPersonId[person.id];
+    if (statementError) wrap.append(el("p", { class: "rr-error" }, statementError));
+    const statements = state.statementsByPersonId[person.id];
+    if (!statements) {
+      wrap.append(el("p", { class: "item-subtitle" }, "Loading statements…"));
+      return wrap;
+    }
+    if (statements.length === 0) {
+      wrap.append(el("p", { class: "item-subtitle" }, "No statements recorded yet."));
+    }
+    const anySigned = statements.some((s) => s.signed_at);
+    for (const statement of statements) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `Version ${statement.version_no}`));
+      row.append(el("div", { class: "item-subtitle" }, statement.statement_text));
+      row.append(
+        el(
+          "div",
+          { class: "item-subtitle" },
+          statement.signed_at
+            ? `Signed ${new Date(statement.signed_at).toLocaleString()}`
+            : `Submitted ${new Date(statement.submitted_at).toLocaleString()}`
+        )
+      );
+      if (!statement.signed_at && (hasPerm("incidents.manage") || hasPerm("incidents.review"))) {
+        const signBtn = el("button", { type: "button" }, "Sign");
+        signBtn.addEventListener("click", () => signStatement(person.id, statement.id));
+        row.append(signBtn);
+      }
+      wrap.append(row);
+    }
+    if (!anySigned && (hasPerm("incidents.manage") || hasPerm("incidents.review"))) {
+      wrap.append(buildStatementComposer(person.id));
+    } else if (anySigned) {
+      wrap.append(el("p", { class: "item-subtitle" }, "A signed statement exists; no further versions may be added."));
+    }
+    return wrap;
+  }
+
+  function buildPeopleSection() {
+    const wrap = el("div", {});
+    if (state.peopleError) wrap.append(el("p", { class: "rr-error" }, state.peopleError));
+    if (state.people.length === 0) wrap.append(el("p", { class: "item-subtitle" }, "No people recorded for this incident."));
+    for (const person of state.people) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${person.full_name} · ${person.person_role.replace(/_/g, " ")}`));
+      row.append(el("div", { class: "item-subtitle" }, formatContact(person.contact_json)));
+      const rowActions = el("div", { class: "detail-actions" });
+      const historyBtn = el(
+        "button",
+        { type: "button" },
+        state.openPersonId === person.id ? "Hide statements" : "Statements"
+      );
+      historyBtn.addEventListener("click", () => togglePersonStatements(person.id));
+      rowActions.append(historyBtn);
+      if (hasPerm("incidents.manage") || hasPerm("incidents.review")) {
+        const removeBtn = el("button", { type: "button" }, "Remove");
+        removeBtn.addEventListener("click", () => removePerson(person.id));
+        rowActions.append(removeBtn);
+      }
+      row.append(rowActions);
+      if (state.openPersonId === person.id) row.append(buildStatementHistory(person));
+      wrap.append(row);
+    }
+    if (hasPerm("incidents.manage") || hasPerm("incidents.review")) {
+      const toggleBtn = el("button", { type: "button" }, state.personOpen ? "Cancel" : "Add person");
+      toggleBtn.addEventListener("click", () => {
+        state.personOpen = !state.personOpen;
+        render();
+      });
+      wrap.append(toggleBtn);
+      if (state.personOpen) wrap.append(buildPersonForm());
+    }
+    return wrap;
+  }
+
   const INCIDENT_NEXT_STATUS_CHOICES = ["under_review", "escalated", "action_pending", "closed"];
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area incident-detail" });
+    // P-8: a static id, safe because only one incident detail is ever open
+    // at a time -- lets the global search box scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area incident-detail", id: "incident-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.incident_no : "Loading incident…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -2283,7 +2772,7 @@ const incidentsPanel = (function () {
     if (actionsRow.childNodes.length > 0) panel.append(actionsRow);
 
     panel.append(el("h4", {}, "People involved"));
-    panel.append(el("p", { class: "item-subtitle" }, "Person/witness tracking isn't available in this release yet."));
+    panel.append(buildPeopleSection());
 
     panel.append(el("h4", {}, "Follow-up actions"));
     if (state.followupsError) panel.append(el("p", { class: "rr-error" }, state.followupsError));
@@ -2409,7 +2898,20 @@ const incidentsPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "Report new incident" capture form (P-3's "Log incident" quick
+  // action): same gate as the toggle button in render() above, so a caller
+  // without incidents.manage silently does nothing rather than a form
+  // magically appearing that submitCapture's own POST would 403 on anyway.
+  function openCreate() {
+    if (!hasPerm("incidents.manage")) return;
+    state.captureOpen = true;
+    render();
+  }
+
+  // openDetail exposed for P-8 (global search): its own "View" button
+  // above already calls it internally; the search box's incidents leg
+  // calls the same function to deep-link into a matched incident.
+  return { load, reset, openCreate, openDetail };
 })();
 
 // --- Work orders module (WO-10) -----------------------------------------------
@@ -2671,7 +3173,10 @@ const workOrdersPanel = (function () {
   }
 
   function renderDetail() {
-    const panel = el("div", { class: "report-form-area work-order-detail" });
+    // P-8: a static id (only one work order detail is ever open at a
+    // time) so the global search box can scroll straight to it after
+    // calling openDetail() below.
+    const panel = el("div", { class: "report-form-area work-order-detail", id: "work-order-detail-panel" });
     const header = el("div", { class: "report-form-header" });
     header.append(el("h3", {}, state.detail ? state.detail.title : "Loading work order…"));
     const closeBtn = el("button", { type: "button" }, "Close");
@@ -2814,19 +3319,33 @@ const workOrdersPanel = (function () {
     if (state.detailId) host.append(renderDetail());
   }
 
-  return { load, reset };
+  // Opens the "New work order" create form (P-3's "New work order" quick
+  // action): same gate as the toggle button in render() above.
+  function openCreate() {
+    if (!hasPerm("work_orders.manage")) return;
+    state.createOpen = true;
+    render();
+  }
+
+  // openDetail exposed for P-8 (global search): the search box's work
+  // orders leg calls the same function its own "View" button uses.
+  return { load, reset, openCreate, openDetail };
 })();
 
-// --- Communications module (CM-08/CM-09) --------------------------------------
+// --- Communications module (CM-08/CM-09/P-1) -----------------------------------
 // Compose form (channel/audience/priority/required-ack) posting through the
 // draft-then-publish flow (CM-03), a paginated message list that auto-marks
-// delivered/read receipts as it renders, and a per-viewer ack-state badge.
+// delivered/read receipts as it renders, a per-viewer ack-state badge, and
+// (P-1) server-seeded ack state plus per-message compliance counts for
+// publishers/authors.
 //
-// Known API gap, worked around rather than papered over: there is no GET for
-// message_acknowledgements, so "has THIS viewer already acknowledged" can
-// only be known for an acknowledgement made during this session
-// (ackedMessageIds) -- a message acknowledged in an earlier session still
-// renders as pending/overdue rather than a guessed "complete".
+// ackedMessageIds is seeded from GET .../acknowledgements?employeeId=me for
+// every visible message (seedAckStateForVisibleMessages, mirroring how
+// markReceiptsForVisibleMessages already marks receipts) as it renders, so
+// an acknowledgement made in an earlier session still renders as complete --
+// it is no longer session-local, just checked lazily per page of messages
+// rather than fetched in one facility-wide call (there is no such bulk
+// endpoint; P-1 only added the per-message one).
 const commsPanel = (function () {
   const state = {
     channels: [],
@@ -2838,8 +3357,12 @@ const commsPanel = (function () {
     composeErrors: {},
     audienceRows: [{ audienceType: "", audienceRefId: "" }],
     audienceError: null,
+    myEmployeeId: null,
     ackedMessageIds: new Set(),
+    ackCheckedIds: new Set(),
     receiptSentIds: new Set(),
+    complianceByMessageId: {},
+    complianceCheckedIds: new Set(),
     formError: null
   };
 
@@ -2856,6 +3379,13 @@ const commsPanel = (function () {
     if (!host || !currentFacility) return;
     setLoading(host, true);
     try {
+      // GET /facilities/:id/employees is registered by the scheduling module
+      // (gated on schedule.read) but serves as the facility's employee
+      // directory app-wide -- reused here (same pattern as the work orders
+      // panel's "Mine" chip) only to resolve the caller's own employees.id,
+      // for deciding which messages' compliance counts to show.
+      const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
+      state.myEmployeeId = ((employees || []).find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
       state.channels = (await apiFetch(`/facilities/${currentFacility}/channels`).catch(() => [])) || [];
       await loadMessagesList();
     } catch (error) {
@@ -2884,8 +3414,12 @@ const commsPanel = (function () {
     state.audienceError = null;
     state.formError = null;
     state.page = 1;
+    state.myEmployeeId = null;
     state.ackedMessageIds = new Set();
+    state.ackCheckedIds = new Set();
     state.receiptSentIds = new Set();
+    state.complianceByMessageId = {};
+    state.complianceCheckedIds = new Set();
     const host = container();
     if (host) host.textContent = "";
   }
@@ -2902,6 +3436,57 @@ const commsPanel = (function () {
       state.receiptSentIds.add(message.id);
       apiFetch(`/messages/${message.id}/receipt`, { method: "POST", body: { deliveredAt: now, readAt: now } }).catch(() => {});
     }
+  }
+
+  // P-1: seeds state.ackedMessageIds from the server (GET .../acknowledgements
+  // ?employeeId=me) for every message about to render, once per message id
+  // per panel load (ackCheckedIds, same dedup shape as receiptSentIds). Unlike
+  // markReceiptsForVisibleMessages this re-renders once every check settles,
+  // since learning "the caller already acknowledged this" flips the message
+  // card's badge and hides its Acknowledge button -- ackCheckedIds already
+  // holds every id involved by then, so that re-render's own call back into
+  // this function is a same-tick no-op rather than a fetch loop.
+  async function seedAckStateForVisibleMessages(messages) {
+    const toCheck = messages.filter((message) => !state.ackCheckedIds.has(message.id));
+    if (toCheck.length === 0) return;
+    for (const message of toCheck) state.ackCheckedIds.add(message.id);
+    await Promise.all(
+      toCheck.map((message) =>
+        apiFetch(`/facilities/${currentFacility}/messages/${message.id}/acknowledgements?employeeId=me`)
+          .then((rows) => {
+            if (ackedMessageIdsFromRows(rows).size > 0) state.ackedMessageIds.add(message.id);
+          })
+          .catch(() => {})
+      )
+    );
+    render();
+  }
+
+  // P-1: fetches the compliance rollup (delivered/read/acknowledged/pending/
+  // overdue/total) for every visible message shouldFetchCompliance says this
+  // viewer should see counts for (their own sends, or any message at all when
+  // they hold communications.publish), once per message id per panel load
+  // (complianceCheckedIds, same dedup/re-render shape as
+  // seedAckStateForVisibleMessages above).
+  async function loadComplianceForVisibleMessages(messages) {
+    const canPublish = hasPerm("communications.publish");
+    const toFetch = messages.filter(
+      (message) =>
+        !state.complianceCheckedIds.has(message.id) &&
+        shouldFetchCompliance(message, { canPublish, myEmployeeId: state.myEmployeeId })
+    );
+    if (toFetch.length === 0) return;
+    for (const message of toFetch) state.complianceCheckedIds.add(message.id);
+    await Promise.all(
+      toFetch.map((message) =>
+        apiFetch(`/facilities/${currentFacility}/messages/${message.id}/compliance`)
+          .then((summary) => {
+            state.complianceByMessageId[message.id] = summary;
+          })
+          .catch(() => {})
+      )
+    );
+    render();
   }
 
   async function acknowledge(id) {
@@ -3045,7 +3630,12 @@ const commsPanel = (function () {
   }
 
   function buildMessageCard(message) {
-    const card = el("div", { class: "message-card" });
+    // P-8: an id per card (messages have no dedicated detail view the way
+    // incidents/work orders do) so the global search box can scroll to and
+    // highlight the specific card when it's on the currently rendered
+    // page; when it isn't (client-side pagination, P-1), the search box
+    // falls back to scrolling to the panel itself.
+    const card = el("div", { class: "message-card", id: `message-card-${message.id}` });
     card.append(el("strong", {}, `${message.priority} · ${message.subject}`));
     card.append(el("div", { class: "item-subtitle" }, (message.body_text || "").slice(0, 140)));
 
@@ -3061,6 +3651,14 @@ const commsPanel = (function () {
       ackBtn.addEventListener("click", () => acknowledge(message.id));
       card.append(ackBtn);
     }
+
+    // P-1: a compliance count (e.g. "2/5 acknowledged, 1 overdue") for
+    // whoever shouldFetchCompliance says gets to see it -- the message's own
+    // author, or anyone holding communications.publish. Absent until its
+    // background fetch (loadComplianceForVisibleMessages) settles.
+    const complianceText = formatComplianceSummary(state.complianceByMessageId[message.id]);
+    if (complianceText) card.append(el("div", { class: "item-subtitle" }, complianceText));
+
     return card;
   }
 
@@ -3091,6 +3689,8 @@ const commsPanel = (function () {
     } else {
       const { pageItems, ...pageInfo } = paginate(state.messages, state.page, state.pageSize);
       markReceiptsForVisibleMessages(pageItems);
+      seedAckStateForVisibleMessages(pageItems);
+      loadComplianceForVisibleMessages(pageItems);
       for (const message of pageItems) listWrap.append(buildMessageCard(message));
       const bar = buildPaginationBar(pageInfo, (p) => {
         state.page = p;

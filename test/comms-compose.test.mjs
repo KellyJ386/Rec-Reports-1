@@ -5,7 +5,10 @@ import {
   buildComposePayload,
   validateAudienceRows,
   buildAudiencePayload,
-  deriveAckState
+  deriveAckState,
+  ackedMessageIdsFromRows,
+  shouldFetchCompliance,
+  formatComplianceSummary
 } from "../src/public/js/comms-compose.mjs";
 
 test("validateComposeInput requires channel, subject, body", () => {
@@ -144,4 +147,89 @@ test("deriveAckState returns pending when required, unacknowledged, and not yet 
 
 test("deriveAckState returns pending when required with no ackDueAt at all", () => {
   assert.equal(deriveAckState({ isRequiredAck: true, ackedByMe: false }), "pending");
+});
+
+// --- ackedMessageIdsFromRows (P-1) -------------------------------------------
+
+test("ackedMessageIdsFromRows builds a Set of message ids from live snake_case rows", () => {
+  const rows = [{ id: "ack-1", message_id: "msg-1" }, { id: "ack-2", message_id: "msg-2" }];
+  assert.deepEqual(ackedMessageIdsFromRows(rows), new Set(["msg-1", "msg-2"]));
+});
+
+test("ackedMessageIdsFromRows also accepts camelCase rows", () => {
+  assert.deepEqual(ackedMessageIdsFromRows([{ messageId: "msg-1" }]), new Set(["msg-1"]));
+});
+
+test("ackedMessageIdsFromRows returns an empty Set for an empty/undefined response", () => {
+  assert.deepEqual(ackedMessageIdsFromRows([]), new Set());
+  assert.deepEqual(ackedMessageIdsFromRows(undefined), new Set());
+});
+
+// --- shouldFetchCompliance (P-1) ---------------------------------------------
+
+test("shouldFetchCompliance is true for any message when the viewer holds communications.publish", () => {
+  assert.equal(
+    shouldFetchCompliance({ id: "msg-1", author_employee_id: "emp-other" }, { canPublish: true, myEmployeeId: "emp-me" }),
+    true
+  );
+});
+
+test("shouldFetchCompliance is true when the viewer is the message's own author, even without publish", () => {
+  assert.equal(
+    shouldFetchCompliance(
+      { id: "msg-1", author_employee_id: "emp-me" },
+      { canPublish: false, myEmployeeId: "emp-me" }
+    ),
+    true
+  );
+});
+
+test("shouldFetchCompliance is false for someone else's message when the viewer can't publish", () => {
+  assert.equal(
+    shouldFetchCompliance(
+      { id: "msg-1", author_employee_id: "emp-other" },
+      { canPublish: false, myEmployeeId: "emp-me" }
+    ),
+    false
+  );
+});
+
+test("shouldFetchCompliance is false with no resolved employee id and no publish permission", () => {
+  assert.equal(
+    shouldFetchCompliance({ id: "msg-1", author_employee_id: "emp-other" }, { canPublish: false, myEmployeeId: null }),
+    false
+  );
+});
+
+test("shouldFetchCompliance accepts the camelCase authorEmployeeId shape too", () => {
+  assert.equal(
+    shouldFetchCompliance({ id: "msg-1", authorEmployeeId: "emp-me" }, { canPublish: false, myEmployeeId: "emp-me" }),
+    true
+  );
+});
+
+test("shouldFetchCompliance is false for a missing message", () => {
+  assert.equal(shouldFetchCompliance(null, { canPublish: true }), false);
+});
+
+// --- formatComplianceSummary (P-1) -------------------------------------------
+
+test("formatComplianceSummary reports acknowledged/total with no overdue clause when overdue is zero", () => {
+  assert.equal(
+    formatComplianceSummary({ delivered: 3, read: 3, acknowledged: 2, pending: 1, overdue: 0, total: 3 }),
+    "2/3 acknowledged"
+  );
+});
+
+test("formatComplianceSummary appends the overdue count when nonzero", () => {
+  assert.equal(
+    formatComplianceSummary({ delivered: 3, read: 3, acknowledged: 1, pending: 2, overdue: 1, total: 3 }),
+    "1/3 acknowledged, 1 overdue"
+  );
+});
+
+test("formatComplianceSummary returns an empty string for a missing or malformed rollup", () => {
+  assert.equal(formatComplianceSummary(null), "");
+  assert.equal(formatComplianceSummary(undefined), "");
+  assert.equal(formatComplianceSummary({}), "");
 });
