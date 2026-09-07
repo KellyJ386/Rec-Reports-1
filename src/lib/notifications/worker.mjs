@@ -46,6 +46,7 @@ import {
 } from "../admin/notifications.mjs";
 import { configValue } from "../settings-registry.mjs";
 import { sendPush } from "./push.mjs";
+import { sendEmail } from "./email.mjs";
 import { reportError } from "../observability.mjs";
 
 const JOB_COLUMNS =
@@ -379,6 +380,118 @@ async function buildPushDeliveryStatuses({ client, job, recipients, channels, no
   return statuses;
 }
 
+// Resolves, for every recipient of a channel='email' delivery, whether they
+// are eligible to receive it right now and (if so) which address to send to.
+// Two ways a recipient can be ruled out before a provider is ever contacted
+// (mirrors resolvePushPlan's "reason" bookkeeping -- see buildPushDeliveryStatuses'
+// comment for why the notification_deliveries row itself can only ever
+// record 'failed' for either):
+//   - "opted_out" -- employee_notification_preferences.email_enabled = false.
+//   - "no_email"  -- the recipient's employees row has no user_id, or its
+//     user_id points at no app_users row, or that row's email is empty. The
+//     "employees has no email column; app_users.email is app-written and
+//     not-null-unique" resolution the plan calls out: `employees.user_id`
+//     is nullable, so a recipient with no linked user_id (or a linked user
+//     whose account was hard-deleted, leaving nothing for the embed to
+//     return) is exactly the same "nobody to email" case as an active user
+//     with an unset email would be, were that ever possible under the
+//     not-null constraint.
+// ONE service-role select resolves every recipient's email in this job (the
+// plan's "one select per job, never one per recipient" requirement): the
+// `app_users(email)` embed already proven at admin-routes.mjs's membership
+// listing, filtered to this job's recipient ids.
+async function resolveEmailPlan({ client, job, recipients }) {
+  const [employeeRows, prefRows] = await Promise.all([
+    pgSelect(client, "employees", {
+      filters: { facility_id: job.facility_id, id: { in: recipients } },
+      select: "id,user_id,app_users(email)"
+    }),
+    pgSelect(client, "employee_notification_preferences", {
+      filters: { facility_id: job.facility_id, employee_id: { in: recipients } },
+      select: PREFERENCE_COLUMNS
+    })
+  ]);
+
+  const emailByEmployee = new Map();
+  for (const row of employeeRows ?? []) {
+    if (!row?.id) continue;
+    emailByEmployee.set(row.id, row.app_users?.email ?? null);
+  }
+  const prefsByEmployee = new Map((prefRows ?? []).map((row) => [row.employee_id, row]));
+
+  const plan = new Map();
+  for (const employeeId of recipients) {
+    const pref = prefsByEmployee.get(employeeId) ?? null;
+    if (pref?.email_enabled === false) {
+      plan.set(employeeId, { eligible: false, reason: "opted_out", email: null });
+      continue;
+    }
+    // A recipient this job's `employees` select simply didn't return a row
+    // for (id not found -- e.g. the employee record itself was deleted
+    // between enqueue and drain) resolves the same as a found row with no
+    // email: emailByEmployee.get returns undefined either way, and `?? null`
+    // below treats both identically. This is the "a recipient with no
+    // app_users row must record failed, never throw the whole job" case.
+    const email = emailByEmployee.get(employeeId) ?? null;
+    if (!email) {
+      plan.set(employeeId, { eligible: false, reason: "no_email", email: null });
+      continue;
+    }
+    plan.set(employeeId, { eligible: true, reason: null, email });
+  }
+  return plan;
+}
+
+// Builds { employeeId -> { status, sent_at, provider_message_id } } for
+// every recipient's email delivery row, sending through the adapter (bounded
+// concurrency inside sendEmail -- one POST per recipient, never a batch
+// endpoint, per CM-14/OP-12) and never throwing the job into handleFailure
+// over a single recipient's bad address. Only called when the job's resolved
+// channel list actually includes 'email', so a job with no email recipients
+// never issues the extra employees/preferences queries. Subject/text are
+// derived from the job payload exactly like buildPushDeliveryStatuses
+// derives title/body -- see that function for why (a route-produced job
+// carries no per-recipient content today, only a shared title/body for the
+// whole notification).
+async function buildEmailDeliveryStatuses({ client, job, recipients, channels, now, config }) {
+  const statuses = new Map();
+  if (!channels.includes("email") || recipients.length === 0) return statuses;
+
+  const nowIso = toIso(now);
+  const plan = await resolveEmailPlan({ client, job, recipients });
+  const eligibleEntries = [...plan.entries()].filter(([, entry]) => entry.eligible);
+
+  let results = [];
+  if (eligibleEntries.length > 0) {
+    const sendOptions = config.emailAdapter ? { adapter: config.emailAdapter } : {};
+    const subject = job.payload_jsonb?.title ?? job.event_type;
+    const text = job.payload_jsonb?.body ?? "";
+    const html = job.payload_jsonb?.html;
+    const messages = eligibleEntries.map(([, entry]) => ({ to: entry.email, subject, text, html }));
+    results = await sendEmail({ messages }, sendOptions);
+  }
+
+  eligibleEntries.forEach(([employeeId], index) => {
+    const result = results[index] ?? { outcome: "retryable", providerMessageId: null };
+    let status;
+    if (result.outcome === "sent") status = "sent";
+    else if (result.outcome === "retryable") status = "failed";
+    else status = "bounced"; // provider permanently rejected this address
+    statuses.set(employeeId, {
+      status,
+      sent_at: status === "sent" ? nowIso : null,
+      provider_message_id: status === "sent" ? result.providerMessageId ?? null : null
+    });
+  });
+
+  for (const [employeeId, entry] of plan.entries()) {
+    if (!entry.eligible) {
+      statuses.set(employeeId, { status: "failed", sent_at: null, provider_message_id: null });
+    }
+  }
+  return statuses;
+}
+
 // Processes one already-claimed (status='processing') job: quiet-hours jobs
 // are rescheduled (status back to 'pending', next_attempt_at = next window
 // end) rather than dropped or failed -- UNLESS the job carries
@@ -419,6 +532,7 @@ export async function processJob({ client, job, now = new Date(), config = {} })
     }
 
     const pushStatuses = await buildPushDeliveryStatuses({ client, job, recipients, channels, now, config });
+    const emailStatuses = await buildEmailDeliveryStatuses({ client, job, recipients, channels, now, config });
 
     const deliveryRows = [];
     for (const employeeId of recipients) {
@@ -432,6 +546,19 @@ export async function processJob({ client, job, now = new Date(), config = {} })
             channel,
             status: resolved.status,
             sent_at: resolved.sent_at
+          });
+          continue;
+        }
+        if (channel === "email") {
+          const resolved = emailStatuses.get(employeeId) ?? { status: "failed", sent_at: null, provider_message_id: null };
+          deliveryRows.push({
+            facility_id: job.facility_id,
+            job_id: job.id,
+            employee_id: employeeId,
+            channel,
+            status: resolved.status,
+            sent_at: resolved.sent_at,
+            provider_message_id: resolved.provider_message_id ?? null
           });
           continue;
         }

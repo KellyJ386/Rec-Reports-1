@@ -29,7 +29,11 @@
         />
         <div id="global-search-results" class="global-search-results" role="listbox" aria-live="polite" hidden></div>
       </div>
-      <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
+      <div class="header-actions">
+        <button type="button" id="enable-push-btn" class="enable-push-btn" hidden>Enable notifications</button>
+        <span id="push-status" class="push-status" aria-live="polite"></span>
+        <button type="button" id="sign-out-btn" class="sign-out-btn">Sign out</button>
+      </div>
     </header>
     <main class="shell" id="main-content" tabindex="-1">
       <section id="home-dashboard" aria-labelledby="home-heading">

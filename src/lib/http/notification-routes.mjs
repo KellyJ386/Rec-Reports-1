@@ -279,6 +279,14 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
   // Builds a notification_job for the route via buildNotificationJob and inserts
   // it into the existing notification_jobs table with a {test:true} payload
   // marker, so a route can be exercised end-to-end without a real trigger.
+  //
+  // P-4/P-5: an optional `channel` body field ("email" | "push", default
+  // "push") overrides the route's own configured channel list with exactly
+  // that one channel, so an admin can target which real adapter
+  // (config.emailAdapter / config.pushAdapter, wired in
+  // src/lib/http/internal-routes.mjs + scripts/notifications-worker.mjs)
+  // the next drain pass exercises for this route, without also firing every
+  // other channel the route happens to be configured for.
   router.register(
     "POST",
     "/facilities/:facilityId/notification-routes/:id/test",
@@ -286,6 +294,13 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
       withAuth(request, response, env, async (auth) => {
         if (!requirePublish(auth, params.facilityId, response)) return;
         if (!(await requireEntitled(auth, params.facilityId, response))) return;
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const rawChannel = body.payload.channel;
+        if (rawChannel !== undefined && rawChannel !== "email" && rawChannel !== "push") {
+          return sendJson(response, 400, { errors: ["channel must be 'email' or 'push'"] });
+        }
+        const channel = rawChannel ?? "push";
         const route = (
           await pgSelect(auth.client, "notification_routes", {
             filters: { id: params.id, facility_id: params.facilityId },
@@ -295,7 +310,7 @@ export function registerNotificationRoutes(router, { authenticate, sendJson, rea
         )?.[0];
         if (!route) return sendJson(response, 404, { error: "notification route not found" });
         const job = buildNotificationJob(route.event_code, route, []);
-        job.payload_jsonb = { ...job.payload_jsonb, test: true };
+        job.payload_jsonb = { ...job.payload_jsonb, channels: [channel], test: true };
         const rows = await pgInsert(auth.client, "notification_jobs", [job], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
       })
