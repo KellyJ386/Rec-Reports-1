@@ -28,6 +28,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
+import { processReportPdfJobs } from "../report-pdf-worker.mjs";
+import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -108,6 +110,19 @@ async function handleDrain(request, response, { env }, sendJson) {
   // site in this codebase.
   const summary = await drainAll({ client, now: new Date(), limit, config: { dsn: env.OBSERVABILITY_DSN } });
 
+  // DR-23: drain report_submissions.pdf_status = 'queued' rows on the same
+  // cadence as the notifications drain, using the same service-role client
+  // (RLS bypass is required here too -- the drain must see every facility's
+  // queued snapshots, not just one caller's) and a Storage client built from
+  // the same server env the attachment routes already use
+  // (createStorageClientFromEnv, src/lib/storage.mjs). See
+  // report-pdf-worker.mjs for the render -> upload -> record pipeline.
+  const reportPdf = await processReportPdfJobs(client, createStorageClientFromEnv(env), {
+    now: new Date(),
+    limit,
+    config: { dsn: env.OBSERVABILITY_DSN }
+  });
+
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
   // cadence as the drain -- the durable throttle store's equivalent of the
   // in-memory limiter's own periodic sweep (rate-limit.mjs), so a table
@@ -116,7 +131,7 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
-  sendJson(response, 200, { ...summary, authThrottleSwept: authThrottleSwept.deleted });
+  sendJson(response, 200, { ...summary, reportPdf, authThrottleSwept: authThrottleSwept.deleted });
 }
 
 // GET /internal/audit/verify-all's chain fetch for one facility. Fetches

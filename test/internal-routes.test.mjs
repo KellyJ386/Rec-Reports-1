@@ -271,3 +271,67 @@ test("when OBSERVABILITY_DSN is unset, a broken chain is still reported in the r
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(captured.observability.length, 0, "DSN unset must stay a silent no-op even for a broken chain");
 });
+
+// --- DR-23: report_submissions.pdf_status = 'queued' drain wiring -----------
+// The shared stubFetch above only handles facilities/audit_events/
+// outbox_events/notification_jobs/auth_throttle, so this test builds its own
+// inline stub (same style as the "sweep failure fails open" test above) to
+// answer the extra tables report-pdf-worker.mjs's processReportPdfJobs
+// queries, plus the Storage upload call, and proves the drain route's
+// response actually carries processReportPdfJobs' own summary shape.
+test("drain: processes a queued report_submissions row and folds the summary into the response as reportPdf", async (t) => {
+  const original = globalThis.fetch;
+  const submission = {
+    id: "sub-1",
+    facility_id: "fac-1",
+    department_id: null,
+    template_id: "tpl-1",
+    template_version_id: "ver-1",
+    report_date: "2026-07-18",
+    shift_ref: "AM",
+    status: "submitted",
+    submitted_by: "user-1",
+    submitted_at: "2026-07-18T20:00:00.000Z",
+    payload_json: { supervisor: "Sam" },
+    revision_of: null,
+    source: "web",
+    pdf_status: "queued",
+    pdf_storage_path: null,
+    pdf_content_hash: null,
+    pdf_attempts: 0
+  };
+  let uploadCalls = 0;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.startsWith("/storage/v1/object/")) {
+      uploadCalls += 1;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ Key: "attachments/mock" }) };
+    }
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const respond = {
+      report_submissions: method === "GET" ? [submission] : [{ ...submission, pdf_status: "generated" }],
+      report_templates: [{ id: "tpl-1", name: "Daily Pool Opening", code: "pool_open" }],
+      report_template_versions: [
+        { id: "ver-1", template_id: "tpl-1", version_number: 1, schema_json: { sections: [] } }
+      ],
+      facilities: [{ id: "fac-1", name: "Riverside Rec Center" }],
+      report_submission_attachments: [],
+      auth_throttle: []
+    }[table];
+    return { ok: true, status: 200, text: async () => JSON.stringify(respond ?? []) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.reportPdf, { claimed: 1, generated: 1, reused: 0, retried: 0, failed: 0 });
+  assert.equal(uploadCalls, 1);
+});

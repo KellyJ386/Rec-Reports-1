@@ -10,20 +10,36 @@ import { computeCompliance, dateRange } from "../reports-compliance.mjs";
 import { buildReportPdfPackage } from "../admin/report-pdf.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import { flagState } from "../admin/entitlements.mjs";
+import {
+  createStorageClientFromEnv,
+  assertPathInFacility,
+  createSignedUrl,
+  StorageValidationError
+} from "../storage.mjs";
 
 const READ = "reports.read";
 const CREATE = "reports.create";
 const SUBMIT = "reports.submit";
 const EXPORT = "reports.export";
+// DR-24: lock/revise reuse reports.publish rather than a new reports.lock
+// code -- see 0055_report_lifecycle.sql's header for the full justification
+// (same "makes this record official and hard to undo" governance tier as
+// publishing a template version).
+const PUBLISH = "reports.publish";
 const PDF_EXPORT_FLAG = "reports.pdf_export";
+// DR-23: TTL for a signed URL onto the immutable PDF snapshot -- same 300s
+// used by attachments-routes.mjs/training-routes.mjs for every other
+// short-lived Storage read.
+const SNAPSHOT_SIGNED_URL_TTL_SECONDS = 300;
 
 const TEMPLATE_COLUMNS =
-  "id,facility_id,department_id,code,name,description,status,active_version,created_at,updated_at";
+  "id,facility_id,department_id,code,name,description,status,active_version,sandbox,created_at,updated_at";
 const VERSION_COLUMNS =
   "id,facility_id,template_id,version_number,schema_json,validation_json,is_published,created_at";
 const SUBMISSION_COLUMNS =
   "id,facility_id,department_id,template_id,template_version_id,report_date,shift_ref,status," +
-  "submitted_by,submitted_at,payload_json,validation_results,source,created_at,updated_at";
+  "submitted_by,submitted_at,payload_json,validation_results,source,revision_of," +
+  "pdf_status,pdf_storage_path,pdf_content_hash,pdf_attempts,pdf_error,created_at,updated_at";
 const ATTACHMENT_COLUMNS =
   "id,facility_id,submission_id,field_key,storage_path,mime_type,checksum,metadata,created_at";
 
@@ -288,11 +304,28 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
           order: "created_at.asc"
         });
 
+        // DR-24: when this row has ITSELF been revised, look up its
+        // successor (revision_of = this row's id) so the UI can render "see
+        // the revised version" without a second round trip. Only ever
+        // queried for a 'revised' row -- every other status has no
+        // successor by construction (revision_of is set exactly once, at
+        // the moment revise mints the successor).
+        let successorId = null;
+        if (submission.status === "revised") {
+          const successorRows = await pgSelect(auth.client, "report_submissions", {
+            filters: { revision_of: submission.id },
+            select: "id",
+            limit: 1
+          });
+          successorId = (successorRows ?? [])[0]?.id ?? null;
+        }
+
         return sendJson(response, 200, {
           submission,
           schema_json: version?.schema_json ?? null,
           template_name: template?.name ?? null,
-          attachments: attachments ?? []
+          attachments: attachments ?? [],
+          successorId
         });
       })
   );
@@ -466,6 +499,131 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
     })
   );
 
+  // --- Lock / Revise (DR-24) ---------------------------------------------
+  // POST /facilities/:facilityId/reports/:id/lock : submitted -> locked.
+  // Gated on reports.publish (department-scoped, same shape as every other
+  // row guard here) -- see the PUBLISH constant's comment above for why this
+  // reuses that code instead of a new one. 0055's RLS policy + transition
+  // trigger enforce the identical rule at the DB layer independent of this
+  // check, so a direct PostgREST call cannot bypass it either.
+  router.register("POST", "/facilities/:facilityId/reports/:id/lock", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const submission = await loadSubmission(auth.client, params.id);
+      if (!submission || submission.facility_id !== params.facilityId) {
+        return sendJson(response, 404, { error: "report not found" });
+      }
+      if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, PUBLISH, response)) {
+        return;
+      }
+      if (submission.status !== "submitted") {
+        return sendJson(response, 409, { error: "only a submitted report can be locked" });
+      }
+      const patch = { status: "locked", updated_at: new Date().toISOString() };
+      const rows = await pgUpdate(auth.client, "report_submissions", { id: params.id }, patch, { returning: true });
+      return sendJson(response, 200, (rows ?? [])[0] ?? null);
+    })
+  );
+
+  // POST /facilities/:facilityId/reports/:id/revise : submitted|locked ->
+  // revised. The original row becomes immutable (0055's transition trigger
+  // rejects any further change to a 'revised' row); a NEW draft successor is
+  // minted with revision_of pointing back at the original, copying
+  // payload_json and template_version_id (and department_id/report_date/
+  // shift_ref) forward as the starting point for the correction. Same
+  // reports.publish guard as lock, for the same reason.
+  //
+  // Ordering: the successor is inserted BEFORE the original is flipped to
+  // 'revised'. These are two separate, non-transactional PostgREST calls (no
+  // multi-statement RPC exists for this, matching every other multi-write
+  // route in this file, e.g. the template-publish route's sequential version
+  // + template PATCHes) -- inserting first means a failure on the second
+  // write leaves an orphaned draft rather than an original stuck 'revised'
+  // with no successor to continue from, which is the safer failure mode of
+  // the two.
+  router.register("POST", "/facilities/:facilityId/reports/:id/revise", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const submission = await loadSubmission(auth.client, params.id);
+      if (!submission || submission.facility_id !== params.facilityId) {
+        return sendJson(response, 404, { error: "report not found" });
+      }
+      if (!requireRowDeptPermission(auth, submission.facility_id, submission.department_id, PUBLISH, response)) {
+        return;
+      }
+      if (submission.status !== "submitted" && submission.status !== "locked") {
+        return sendJson(response, 409, { error: "only a submitted or locked report can be revised" });
+      }
+
+      const successorRow = {
+        facility_id: submission.facility_id,
+        department_id: submission.department_id ?? null,
+        template_id: submission.template_id,
+        template_version_id: submission.template_version_id,
+        report_date: submission.report_date,
+        shift_ref: submission.shift_ref,
+        status: "draft",
+        payload_json: submission.payload_json ?? {},
+        revision_of: submission.id,
+        source: "web"
+      };
+      const successorRows = await pgInsert(auth.client, "report_submissions", [successorRow], { returning: true });
+      const successor = (successorRows ?? [])[0] ?? null;
+      if (!successor) return sendJson(response, 500, { error: "failed to create revision successor" });
+
+      const patch = { status: "revised", updated_at: new Date().toISOString() };
+      const revisedRows = await pgUpdate(auth.client, "report_submissions", { id: params.id }, patch, {
+        returning: true
+      });
+      return sendJson(response, 200, { original: (revisedRows ?? [])[0] ?? null, successor });
+    })
+  );
+
+  // --- PDF snapshot (DR-23) -----------------------------------------------
+  // GET /facilities/:facilityId/reports/:id/pdf : signed URL onto the
+  // immutable snapshot the async drain (report-pdf-worker.mjs) already
+  // rendered and uploaded -- distinct from GET /reports/:id/pdf above
+  // (DR-15), which re-renders a fresh, non-archival PDF from whatever is
+  // live right now. Gated on reports.export, matching DR-15's existing
+  // "PDF access" permission convention on this same surface (not a new
+  // reports.read-only surface: pulling a signed URL onto a document is the
+  // same class of action as generating one on demand). 404 while the
+  // snapshot has not been generated yet -- not 409 -- so a caller polling
+  // for it can't distinguish "still queued" from "will never exist" any
+  // more precisely than the pdf_status field on the submission itself
+  // already tells them.
+  router.register("GET", "/facilities/:facilityId/reports/:id/pdf", (request, response, { env, params }) =>
+    withAuth(request, response, env, async (auth) => {
+      const submission = await loadSubmission(auth.client, params.id);
+      if (!submission || submission.facility_id !== params.facilityId) {
+        return sendJson(response, 404, { error: "report not found" });
+      }
+      if (!requirePerm(auth, params.facilityId, EXPORT, response)) return;
+      if (submission.pdf_status !== "generated" || !submission.pdf_storage_path) {
+        return sendJson(response, 404, { error: "pdf snapshot not yet generated" });
+      }
+
+      // Defense-in-depth twin of 0055's pdf_storage_path shape CHECK: never
+      // mint a signed URL for a path that disagrees with this row's own
+      // facility -- same posture as attachments-routes.mjs/
+      // training-routes.mjs's identical guard.
+      try {
+        assertPathInFacility(submission.pdf_storage_path, params.facilityId, "reports");
+      } catch (error) {
+        if (error instanceof StorageValidationError) {
+          return sendJson(response, 404, { error: "report not found" });
+        }
+        throw error;
+      }
+
+      const storageClient = createStorageClientFromEnv(env);
+      try {
+        const url = await createSignedUrl(storageClient, submission.pdf_storage_path, SNAPSHOT_SIGNED_URL_TTL_SECONDS);
+        return sendJson(response, 200, { url, expiresInSeconds: SNAPSHOT_SIGNED_URL_TTL_SECONDS });
+      } catch {
+        return sendJson(response, 502, { error: "failed to create signed url" });
+      }
+    })
+  );
+
   // --- Compliance (DR-12) -----------------------------------------------
   // GET /facilities/:facilityId/reports/compliance?from=&to= : per published
   // template per date in [from, to], {expected, submitted, missing,
@@ -610,10 +768,12 @@ export function registerReportRoutes(router, { authenticate, sendJson, readBody 
         payload: submission.payload_json ?? {},
         submitterName,
         submittedAt: submission.submitted_at,
-        // DR-24 (lock/revise) has not landed yet -- there is no revision_of
-        // chain to inspect, so this only distinguishes a 'revised' status
-        // row from everything else, and always reads "Original" until then.
-        revisionMarker: submission.status === "revised" ? "Revised" : "Original"
+        // DR-24 landed report_submissions.revision_of: a row born as a
+        // revision successor shows which original it continues from; a row
+        // that has ITSELF since been revised (status = 'revised') still
+        // reads "Revised" -- distinguishing the two matters more than
+        // reusing one label for both.
+        revisionMarker: submission.status === "revised" ? "Revised" : submission.revision_of ? `Revision of ${submission.revision_of}` : "Original"
       });
 
       return sendJson(response, 200, {
