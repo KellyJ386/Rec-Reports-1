@@ -21,7 +21,14 @@ import {
   validateWorkOrderCreate,
   buildWorkOrderCreatePayload
 } from "./work-order-filters.mjs";
-import { weekBoundsFor, bucketShiftsByDay, deriveShiftBadges, validateShiftCreate, buildShiftCreatePayload } from "./schedule-board.mjs";
+import {
+  weekBoundsFor,
+  bucketShiftsByDay,
+  deriveShiftBadges,
+  validateShiftCreate,
+  buildShiftCreatePayload,
+  indexAssignmentsByShift
+} from "./schedule-board.mjs";
 import {
   MESSAGE_PRIORITIES,
   AUDIENCE_TYPES,
@@ -1421,13 +1428,11 @@ async function loadReportInbox() {
 // Week picker, day-column shift grid, assign/unassign, create-shift form,
 // generate-from-templates, and Validate/Publish with readiness badges.
 //
-// Known API gap, worked around rather than papered over: nothing in
-// src/lib/http/scheduling-routes.mjs lists existing shift_assignments (only
-// POST to create one and PATCH to change its status exist) -- so the board
-// can only ever know about an assignment IT created or changed this session.
-// assignmentsByShiftId is that session-local cache; a shift assigned in
-// another tab/session, or before this page loaded, renders as "Unassigned"
-// with an honest caption rather than a guess.
+// assignmentsByShiftId is seeded from the server on every reloadWeek() via
+// GET .../shift-assignments?period_id= + indexAssignmentsByShift (P-2), so it
+// reflects assignments made in another tab/session, not just this one.
+// assignEmployee/unassign additionally update it optimistically so the card
+// reflects the change immediately, without waiting on a full reload.
 const schedulePanel = (function () {
   const state = {
     weekStartDate: null,
@@ -1477,7 +1482,12 @@ const schedulePanel = (function () {
     state.assignmentsByShiftId = new Map();
     if (state.period) {
       try {
-        state.shifts = (await apiFetch(`/facilities/${currentFacility}/shifts?period_id=${state.period.id}`)) || [];
+        const [shifts, assignments] = await Promise.all([
+          apiFetch(`/facilities/${currentFacility}/shifts?period_id=${state.period.id}`),
+          apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${state.period.id}`)
+        ]);
+        state.shifts = shifts || [];
+        state.assignmentsByShiftId = indexAssignmentsByShift(assignments || []);
         state.formError = null;
       } catch (error) {
         state.shifts = [];
@@ -1585,11 +1595,11 @@ const schedulePanel = (function () {
         method: "POST",
         body: { employeeId }
       });
-      state.assignmentsByShiftId.set(shiftId, {
-        id: assignment.id,
-        employeeId: assignment.employee_id,
-        label: employeeLabel(assignment.employee_id)
-      });
+      // Optimistic add: append the new row (same snake_case shape the GET
+      // .../shift-assignments route returns) rather than waiting for a full
+      // reloadWeek() round-trip.
+      const existing = state.assignmentsByShiftId.get(shiftId) || [];
+      state.assignmentsByShiftId.set(shiftId, [...existing, assignment]);
       state.formError = null;
       render();
     } catch (error) {
@@ -1598,15 +1608,15 @@ const schedulePanel = (function () {
     }
   }
 
-  async function unassign(shiftId) {
-    const assignment = state.assignmentsByShiftId.get(shiftId);
-    if (!assignment) return;
+  async function unassign(shiftId, assignmentId) {
     try {
-      await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments/${assignment.id}`, {
+      await apiFetch(`/facilities/${currentFacility}/shifts/${shiftId}/assignments/${assignmentId}`, {
         method: "PATCH",
         body: { status: "cancelled" }
       });
-      state.assignmentsByShiftId.delete(shiftId);
+      const remaining = (state.assignmentsByShiftId.get(shiftId) || []).filter((a) => a.id !== assignmentId);
+      if (remaining.length > 0) state.assignmentsByShiftId.set(shiftId, remaining);
+      else state.assignmentsByShiftId.delete(shiftId);
       render();
     } catch (error) {
       state.formError = error.message;
@@ -1673,16 +1683,19 @@ const schedulePanel = (function () {
     if (badges.certWarning) badgeRow.append(badge("Cert warning", "warning"));
     if (badgeRow.childNodes.length > 0) card.append(badgeRow);
 
-    const assignment = state.assignmentsByShiftId.get(shift.id);
-    if (assignment) {
-      card.append(el("span", { class: "item-subtitle" }, `Assigned: ${assignment.label}`));
-      if (hasPerm("schedule.manage")) {
-        const unassignBtn = el("button", { type: "button" }, "Unassign");
-        unassignBtn.addEventListener("click", () => unassign(shift.id));
-        card.append(unassignBtn);
+    const assignments = state.assignmentsByShiftId.get(shift.id) || [];
+    if (assignments.length > 0) {
+      for (const assignment of assignments) {
+        const row = el("div", { class: "item-subtitle" }, `Assigned: ${employeeLabel(assignment.employee_id)}`);
+        if (hasPerm("schedule.manage")) {
+          const unassignBtn = el("button", { type: "button" }, "Unassign");
+          unassignBtn.addEventListener("click", () => unassign(shift.id, assignment.id));
+          row.append(unassignBtn);
+        }
+        card.append(row);
       }
     } else {
-      card.append(el("span", { class: "item-subtitle" }, "Unassigned (or assigned outside this session)"));
+      card.append(el("span", { class: "item-subtitle" }, "Unassigned"));
       if (hasPerm("schedule.manage") && state.employees.length > 0) {
         const select = document.createElement("select");
         select.append(el("option", { value: "" }, "Assign to…"));

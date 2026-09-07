@@ -77,6 +77,39 @@ export function deriveShiftBadges(shiftId, readiness = {}) {
   };
 }
 
+// Assignment statuses that still occupy the shift's calendar slot -- mirrors
+// scheduling-routes.mjs's server-side ACTIVE_ASSIGNMENT_STATUSES
+// (0003_scheduling.sql shift_assignments.status: pending/approved/declined/
+// cancelled). Duplicated here rather than imported: src/public/js is a
+// separate, unbundled static tree that never imports from src/lib
+// (server-only) -- see this file's header comment.
+const ACTIVE_ASSIGNMENT_STATUSES = new Set(["pending", "approved"]);
+
+// Indexes a flat shift_assignments row list (the shape
+// GET /facilities/:facilityId/shift-assignments?period_id=|shift_id=
+// returns, P-2) by shift_id, so the board can look up every assignment for a
+// given shift in O(1) instead of scanning the full list per card. Within
+// each shift's array, active assignments (pending/approved) sort before
+// inactive ones (declined/cancelled); ties broken by created_at ascending --
+// this does not rely on the input already being sorted.
+export function indexAssignmentsByShift(assignments) {
+  const byShift = new Map();
+  for (const assignment of assignments ?? []) {
+    const list = byShift.get(assignment.shift_id) ?? [];
+    list.push(assignment);
+    byShift.set(assignment.shift_id, list);
+  }
+  for (const list of byShift.values()) {
+    list.sort((a, b) => {
+      const aActive = ACTIVE_ASSIGNMENT_STATUSES.has(a.status) ? 0 : 1;
+      const bActive = ACTIVE_ASSIGNMENT_STATUSES.has(b.status) ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      return new Date(a.created_at) - new Date(b.created_at);
+    });
+  }
+  return byShift;
+}
+
 export function validateShiftCreate(fields = {}) {
   const errors = {};
   if (!fields.roleCode || !fields.roleCode.trim()) errors.roleCode = "Role is required.";

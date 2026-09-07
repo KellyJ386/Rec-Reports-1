@@ -43,6 +43,10 @@ const ACTIVE_ASSIGNMENT_STATUSES = ["pending", "approved"];
 // Periods a generate-from-templates run may target; published/archived
 // periods are already locked (SC-03).
 const GENERATABLE_PERIOD_STATUSES = ["draft", "review"];
+// GET /shift-assignments pagination (P-2, SC-08): matches the
+// reports-routes.mjs/work-orders-routes.mjs default/max convention.
+const ASSIGNMENT_LIST_DEFAULT_LIMIT = 50;
+const ASSIGNMENT_LIST_MAX_LIMIT = 200;
 const SCHEDULING_MODULE_CODE = "scheduling";
 const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE);
 
@@ -56,7 +60,7 @@ const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE)
 // operate within the authenticated user's facility scope.
 export function registerSchedulingRoutes(router, { authenticate, sendJson, readBody }) {
   const guards = makeGuards({ authenticate, sendJson, readBody });
-  const { withAuth, requirePerm, parseJsonBody, queryParams } = guards;
+  const { withAuth, requirePerm, parseJsonBody, queryParams, parseListLimitOffset } = guards;
   const requireRead = guards.requireRead(READ);
 
   async function loadPeriod(client, periodId) {
@@ -757,6 +761,71 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           { returning: true }
         );
         return sendJson(response, 200, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Shift Assignments: list (SC-08 P-2) -------------------------------------
+  // GET /shift-assignments?period_id=<uuid>|shift_id=<uuid> -- exactly one of
+  // the two filters is required (400 otherwise). shift_assignments carries no
+  // schedule_period_id of its own (see computeScheduleReadiness's comment
+  // above), so a period_id filter first resolves that period's
+  // schedule_shifts ids (facility-scoped), then filters assignments by
+  // shift_id IN (...); a period with no shifts short-circuits to [] without a
+  // second query. By default only "live" assignments are returned
+  // (ACTIVE_ASSIGNMENT_STATUSES -- pending/approved, the same set the SC-05
+  // conflict check above treats as still occupying the employee's calendar);
+  // ?include_cancelled=true also returns declined/cancelled rows. A
+  // non-uuid period_id/shift_id is never validated here -- it reaches
+  // PostgREST as-is and comes back 22P02 invalid_text_representation, which
+  // withAuth's translatePostgrestError already maps to a clean 400 (see
+  // errors.mjs), so no separate uuid-shape check is needed. Paginated via the
+  // shared parseListLimitOffset.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/shift-assignments",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        if (!requireRead(auth, params.facilityId, response)) return;
+
+        const qp = queryParams(request);
+        const periodId = qp.get("period_id");
+        const shiftId = qp.get("shift_id");
+        if ((periodId && shiftId) || (!periodId && !shiftId)) {
+          return sendJson(response, 400, {
+            error: "exactly one of period_id or shift_id query params is required"
+          });
+        }
+
+        const paging = parseListLimitOffset(qp, {
+          defaultLimit: ASSIGNMENT_LIST_DEFAULT_LIMIT,
+          maxLimit: ASSIGNMENT_LIST_MAX_LIMIT
+        });
+        if (!paging.ok) return sendJson(response, 400, { error: paging.error });
+
+        const includeCancelled = qp.get("include_cancelled") === "true";
+        const filters = { facility_id: params.facilityId };
+        if (!includeCancelled) filters.status = { in: ACTIVE_ASSIGNMENT_STATUSES };
+
+        if (periodId) {
+          const shiftRows = await pgSelect(auth.client, "schedule_shifts", {
+            filters: { facility_id: params.facilityId, schedule_period_id: periodId },
+            select: "id"
+          });
+          const shiftIds = (shiftRows ?? []).map((row) => row.id);
+          if (shiftIds.length === 0) return sendJson(response, 200, []);
+          filters.shift_id = { in: shiftIds };
+        } else {
+          filters.shift_id = shiftId;
+        }
+
+        const rows = await pgSelect(auth.client, "shift_assignments", {
+          filters,
+          select: ASSIGNMENT_COLUMNS,
+          order: "created_at.asc",
+          limit: paging.limit,
+          offset: paging.offset
+        });
+        return sendJson(response, 200, rows ?? []);
       })
   );
 

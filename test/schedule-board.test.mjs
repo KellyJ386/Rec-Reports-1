@@ -5,7 +5,8 @@ import {
   bucketShiftsByDay,
   deriveShiftBadges,
   validateShiftCreate,
-  buildShiftCreatePayload
+  buildShiftCreatePayload,
+  indexAssignmentsByShift
 } from "../src/public/js/schedule-board.mjs";
 
 // 2024-01-01 is a real-world Monday, used as a pinned anchor for every case
@@ -135,4 +136,54 @@ test("buildShiftCreatePayload trims roleCode and passes ISO instants through", (
     startsAt: "2024-01-02T09:00:00.000Z",
     endsAt: "2024-01-02T18:00:00.000Z"
   });
+});
+
+test("indexAssignmentsByShift groups assignments by shift_id", () => {
+  const assignments = [
+    { id: "a1", shift_id: "shift-1", employee_id: "emp-1", status: "approved", created_at: "2024-01-01T00:00:00Z" },
+    { id: "a2", shift_id: "shift-2", employee_id: "emp-2", status: "pending", created_at: "2024-01-01T00:00:00Z" },
+    { id: "a3", shift_id: "shift-1", employee_id: "emp-3", status: "pending", created_at: "2024-01-02T00:00:00Z" }
+  ];
+  const byShift = indexAssignmentsByShift(assignments);
+  assert.equal(byShift.size, 2);
+  assert.deepEqual(
+    byShift.get("shift-1").map((a) => a.id),
+    ["a1", "a3"]
+  );
+  assert.deepEqual(
+    byShift.get("shift-2").map((a) => a.id),
+    ["a2"]
+  );
+  assert.equal(byShift.get("shift-9"), undefined);
+});
+
+test("indexAssignmentsByShift sorts active (pending/approved) assignments before declined/cancelled", () => {
+  const assignments = [
+    { id: "cancelled-1", shift_id: "shift-1", status: "cancelled", created_at: "2024-01-01T00:00:00Z" },
+    { id: "approved-1", shift_id: "shift-1", status: "approved", created_at: "2024-01-02T00:00:00Z" },
+    { id: "declined-1", shift_id: "shift-1", status: "declined", created_at: "2024-01-03T00:00:00Z" },
+    { id: "pending-1", shift_id: "shift-1", status: "pending", created_at: "2024-01-04T00:00:00Z" }
+  ];
+  const byShift = indexAssignmentsByShift(assignments);
+  assert.deepEqual(
+    byShift.get("shift-1").map((a) => a.id),
+    ["approved-1", "pending-1", "cancelled-1", "declined-1"]
+  );
+});
+
+test("indexAssignmentsByShift orders same-activeness assignments by created_at ascending, independent of input order", () => {
+  const assignments = [
+    { id: "later", shift_id: "shift-1", status: "pending", created_at: "2024-01-05T00:00:00Z" },
+    { id: "earlier", shift_id: "shift-1", status: "approved", created_at: "2024-01-01T00:00:00Z" }
+  ];
+  const byShift = indexAssignmentsByShift(assignments);
+  assert.deepEqual(
+    byShift.get("shift-1").map((a) => a.id),
+    ["earlier", "later"]
+  );
+});
+
+test("indexAssignmentsByShift tolerates an empty/missing list", () => {
+  assert.equal(indexAssignmentsByShift([]).size, 0);
+  assert.equal(indexAssignmentsByShift(undefined).size, 0);
 });
