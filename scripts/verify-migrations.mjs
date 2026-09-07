@@ -38,6 +38,7 @@ const requiredRlsTables = [
   "incident_followup_actions",
   "incident_audit_events",
   "incident_amendments",
+  "incident_witness_statements",
   "assets",
   "work_orders",
   "work_order_updates",
@@ -107,6 +108,7 @@ for (const helper of [
   "fn_message_audience_ref_facility",
   "fn_incident_report_audit",
   "fn_incident_report_transition_guard",
+  "fn_incident_witness_statement_guard",
   "internal.apply_incident_amendment",
   "public.apply_incident_amendment"
 ]) {

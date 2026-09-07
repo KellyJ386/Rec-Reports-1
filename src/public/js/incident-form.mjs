@@ -131,6 +131,59 @@ export function buildAmendmentPayload(fields = {}) {
 // decide which of the acknowledge/resolve actions applies to a given row.
 export const ESCALATION_STATUSES = ["pending", "acknowledged", "resolved", "expired"];
 
+// --- People / witness statements (IN-12) ------------------------------------
+// person_role vocabulary, verbatim from incident_people's check constraint
+// (0004_incidents.sql), used by the "add person" form.
+export const INCIDENT_PERSON_ROLES = ["injured_party", "witness", "staff", "contractor", "visitor"];
+
+// Validates the "add person" form's field state before
+// POST /facilities/:facilityId/incidents/:incidentId/people, mirroring that
+// route's own shape check: personRole must be one of the check-constraint
+// values, fullName is a required non-blank string. contact/injury are
+// optional free-form objects (contact_json/injury_json columns default to
+// {} server-side, so the form never needs to send an empty object either).
+export function validatePersonInput(fields = {}) {
+  const errors = {};
+  if (!fields.personRole || !INCIDENT_PERSON_ROLES.includes(fields.personRole)) {
+    errors.personRole = `Select one of: ${INCIDENT_PERSON_ROLES.join(", ")}.`;
+  }
+  if (!fields.fullName || !fields.fullName.trim()) {
+    errors.fullName = "Full name is required.";
+  }
+  return { valid: Object.keys(errors).length === 0, errors };
+}
+
+// Shapes validated "add person" field state into the JSON body
+// POST .../people expects. contact/injury are only included when they carry
+// at least one key, matching buildIncidentCreatePayload's "omit rather than
+// send an empty default" convention above.
+export function buildPersonPayload(fields = {}) {
+  const payload = {
+    personRole: fields.personRole,
+    fullName: (fields.fullName || "").trim()
+  };
+  const contact = fields.contact && typeof fields.contact === "object" ? fields.contact : {};
+  if (Object.keys(contact).length > 0) payload.contact = contact;
+  const injury = fields.injury && typeof fields.injury === "object" ? fields.injury : {};
+  if (Object.keys(injury).length > 0) payload.injury = injury;
+  return payload;
+}
+
+// Validates the "add statement" form's field state before
+// POST .../people/:personId/statements, mirroring that route's own shape
+// check: statementText is a required non-blank string.
+export function validateStatementInput(fields = {}) {
+  const errors = {};
+  if (!fields.statementText || !fields.statementText.trim()) {
+    errors.statementText = "Statement text is required.";
+  }
+  return { valid: Object.keys(errors).length === 0, errors };
+}
+
+export function buildStatementPayload(fields = {}) {
+  return { statementText: (fields.statementText || "").trim() };
+}
+
 // Which single action (if any) is legal next for an escalation row, per the
 // incidents-routes.mjs guarded transitions (pending -> acknowledged ->
 // resolved only). Returns null when neither action applies (resolved/
