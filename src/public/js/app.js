@@ -1153,8 +1153,10 @@ function createReportFormController({ areaId, editable, extra }) {
       state.needsReason = false;
       state.fieldErrors = {};
       state.formErrors = [];
-      setSaveStatus("Submitted");
+      // render() rebuilds the form, including an empty status span, so the
+      // confirmation must be written after it or it is wiped instantly.
       render();
+      setSaveStatus("Submitted");
       await loadReports();
     } catch (error) {
       const messages = parseApiErrorDetails(error);
