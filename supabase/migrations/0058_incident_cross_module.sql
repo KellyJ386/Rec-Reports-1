@@ -192,6 +192,25 @@ create policy "incident actors can insert incident notification jobs" on notific
       or internal.has_permission((select auth.uid()), facility_id, 'incidents.escalate')
     )
     and event_type in ('incident.submitted', 'incident.escalated', 'incident.sla_breached')
+    -- NEW-1 (security re-verification): the dedupe key for
+    -- incident.submitted is computed from client-supplied values only
+    -- (facility, event, incident id, no escalation id, first recipient), so
+    -- a row inserted BEFORE the incident is submitted would occupy the key
+    -- the genuine emission later computes and silently suppress it. A
+    -- submitted-event job may therefore only be written once the referenced
+    -- incident has actually left draft -- at which point the genuine row
+    -- already exists and a late duplicate is the harmless no-op the unique
+    -- index was designed for. escalated/sla_breached carry a server-minted
+    -- escalation id in the key (M3) and need no such gate.
+    and (
+      event_type <> 'incident.submitted'
+      or exists (
+        select 1 from incident_reports r
+        where r.id::text = payload_jsonb ->> 'incidentId'
+          and r.facility_id = notification_jobs.facility_id
+          and r.status <> 'draft'
+      )
+    )
     and (
       coalesce(payload_jsonb ->> 'quietHoursBypass', 'false') <> 'true'
       or exists (

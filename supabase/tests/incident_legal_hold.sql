@@ -670,6 +670,87 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 10. NEW-2 (security re-verification): a held incident's child rows cannot
+-- be DETACHED by re-pointing incident_id at another incident -- in either
+-- direction (out of a held parent, or into one). A move between two
+-- unheld incidents stays legal.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if not exists (select 1 from incident_reports where id = '57e00000-0000-0000-0000-000000000e01' and legal_hold = true) then
+    raise exception 'ILH FIXTURE: e01 is expected to still be under legal hold at section 10';
+  end if;
+  if exists (select 1 from incident_reports where id in ('57e00000-0000-0000-0000-000000000e02', '57e00000-0000-0000-0000-000000000e03') and legal_hold = true) then
+    raise exception 'ILH FIXTURE: e02/e03 are expected to be unheld at section 10';
+  end if;
+end;
+$$;
+
+-- The earlier sections consume the shared child fixtures (hard-deleted by the
+-- service-role exemption test, soft-deleted, or deleted on the closed
+-- parent), so section 10 gets its own rows: a person and an attachment on
+-- the HELD e01, and a person on the unheld e02. Inserted as the superuser:
+-- auth.uid() is null, so the guards are exempt.
+insert into incident_people (id, facility_id, incident_id, person_role, full_name) values
+  ('57f10000-0000-0000-0000-000000000f06', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e01', 'witness', 'Section 10 Held Witness'),
+  ('57f10000-0000-0000-0000-000000000f07', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e02', 'witness', 'Section 10 Released Witness')
+on conflict (id) do nothing;
+insert into incident_attachments (id, facility_id, incident_id, attachment_type, storage_path) values
+  ('57f20000-0000-0000-0000-000000000f06', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e01', 'photo', 'facilities/57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/incidents/57e00000-0000-0000-0000-000000000e01/section10.jpg')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"57000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  begin
+    update incident_people set incident_id = '57e00000-0000-0000-0000-000000000e02'
+      where id = '57f10000-0000-0000-0000-000000000f06';
+    raise exception 'ILH FAIL (NEW-2): incident_people row was moved OFF a held incident';
+  exception
+    when check_violation then null; -- expected
+  end;
+
+  begin
+    update incident_attachments set incident_id = '57e00000-0000-0000-0000-000000000e02'
+      where id = '57f20000-0000-0000-0000-000000000f06';
+    raise exception 'ILH FAIL (NEW-2): incident_attachments row was moved OFF a held incident';
+  exception
+    when check_violation then null; -- expected
+  end;
+
+  begin
+    update incident_people set incident_id = '57e00000-0000-0000-0000-000000000e01'
+      where id = '57f10000-0000-0000-0000-000000000f07';
+    raise exception 'ILH FAIL (NEW-2): incident_people row was moved INTO a held incident';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+-- A move between two unheld incidents (e02 -> e03) is still allowed: the
+-- guard is about legal hold, not about freezing incident_id in general.
+do $$
+declare
+  v_rows int;
+begin
+  update incident_people set incident_id = '57e00000-0000-0000-0000-000000000e03'
+    where id = '57f10000-0000-0000-0000-000000000f07';
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then
+    raise exception 'ILH FAIL (NEW-2): moving a child between two unheld incidents affected % rows (expected 1; check the update policy)', v_rows;
+  end if;
+exception
+  when check_violation then
+    raise exception 'ILH FAIL (NEW-2): moving a child between two UNHELD incidents was rejected';
+end;
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
 -- 8. H1 continued: fn_incident_child_legal_hold_guard's fail-closed
 -- fallback. Guard 4 (the incident_reports-level BEFORE DELETE guard) is
 -- temporarily disabled here specifically so the CHILD guard's own
