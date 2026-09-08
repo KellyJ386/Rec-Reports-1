@@ -23,9 +23,10 @@ IN-21, and IN-11 flips from PARTIAL to DONE now that signatures and compliance c
 Work Orders assets/SLA/PM slice (WO-11, WO-12, WO-13, WO-15, WO-16, WO-17, WO-18, WO-19, WO-20, WO-21) are
 DONE. Each row is evidenced against migrations 0052–0061 on `claude/wave3-slice-3c` @ `dfa9570` (3A: PR
 #25, migrations 0052–0055; 3B: PR #26, migrations 0056–0058; 3C: PR #27, migrations 0059–0061). 3C's
-security review is one round in (2 High / 4 Medium / 3 Low, all fixed at `f58dafb`) with re-verification
-pending, so its rows are marked accordingly rather than carrying a final sign-off the way 3A's and 3B's do.
-Gate on this head: 2444 unit tests, 41 RLS suites, 61-migration replay. Rollups below are updated in place.
+security review ran three rounds (2 High / 4 Medium / 3 Low in round one, one High regression and three
+smaller items in round two, all closed) and is signed off at `9f3959c`; all three slices carry a final
+sign-off in `plans/SECURITY_REVIEW_2026-09_WAVE3.md`. Gate on `9f3959c`: 2447 unit tests, 41 RLS suites,
+61-migration replay. Rollups below are updated in place.
 
 **Method notes**
 
@@ -169,8 +170,8 @@ done; 2026-09-06: IN-24 partial)*
 **WO rollup:** DONE 22 (WO-14 counted as delivered via the platform primitive), PARTIAL 0, NOT STARTED 5,
 OWNER-ONLY 0 (of 27). *(updated 2026-09-08: WO-11, WO-12, WO-13, WO-15, WO-16, WO-17, WO-18, WO-19, WO-20,
 WO-21 done via Wave 3 Slice 3C — code-complete and unit/RLS-tested on `f58dafb`; the slice's security
-review found 2 High/4 Medium/3 Low in round 1, all fixed at `f58dafb`, and re-verification is still
-pending, so treat these rows as done-pending-re-verification rather than fully closed; 2026-09-06: WO-27
+review found 2 High/4 Medium/3 Low in round 1 and one High regression plus three smaller items in round
+2, all closed and signed off at `9f3959c` (`plans/SECURITY_REVIEW_2026-09_WAVE3.md`); 2026-09-06: WO-27
 done)*
 
 ---
@@ -400,8 +401,8 @@ both Slice 3B) — the first M3 tasks any module's own plan has completed.**
    (IN-12) + Wave 3 Slice 3B (IN-11, IN-13, IN-14, IN-15), 2026-09-08 — one round of security review closed,
    part of Slice 3B's sign-off.**
 8. ~~**WO-15/16 (SLA tracking + overdue notifications).**~~ **DONE, Wave 3 Slice 3C (2026-09-08) —
-   `supabase/migrations/0060_work_order_sla.sql`, `scripts/work-order-sla-scan.mjs`; security-review
-   re-verification for the whole slice is still pending.**
+   `supabase/migrations/0060_work_order_sla.sql`, `scripts/work-order-sla-scan.mjs`; security review
+   signed off for the whole slice at `9f3959c`.**
 9. **TR-11 (certification expiry evaluator).** `certificationStatus()` is a pure function sitting unused by any scheduled process — certifications silently go stale with no alert to anyone, undermining the module's core "certification record storage" promise (roadmap §1.2.F) the moment a cert actually expires.
 10. ~~**DR-16 (field-type/validation-rule expansion).**~~ **DONE, Wave 3 Slice 3A (2026-09-08) —
     `src/lib/report-schema.mjs` now supports 13 field types plus validation/visibility rules.**

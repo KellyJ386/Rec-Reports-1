@@ -32,9 +32,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Security
 
-- One independent review round for the work-order slice (assets, SLA, preventive maintenance) found and
-  closed 2 High, 4 Medium and 3 Low findings; re-verification of the fixes is in progress. The reports and
-  incidents slices each passed independent review and were judged safe to merge.
+- Independent security reviews of all three slices, each re-verified on the fixed head until every
+  finding was closed (reports: four rounds; incidents: three; work orders: three). Sign-off recorded in
+  `plans/SECURITY_REVIEW_2026-09_WAVE3.md` with a post-deploy verification checklist.
 
 ## [Wave 2] - 2026-09-07
 

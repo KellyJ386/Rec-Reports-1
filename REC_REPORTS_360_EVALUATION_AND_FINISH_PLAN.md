@@ -386,9 +386,9 @@ SLA, PM: WO-11, 12, 13, 15, 16, 17, 18, 19, 20, 21; migrations 0059–0061; WO-1
 delivered in Wave 1). #25 and #26 are each merged into #27's branch, so #27's head
 (`claude/wave3-slice-3c` @ `dfa9570`) carries all three. Gate on that head: 2444 unit tests, 41 RLS
 suites, 61-migration replay. Reviews: #25 safe-to-merge after one round that examined DR-20's
-server-side workflow execution; #26 safe-to-merge after two rounds; #27's first review round found 2 High
-/ 4 Medium / 3 Low, all fixed, with re-verification still in progress — treat it as done-pending-
-re-verification, not signed off. One process lesson carried forward: a builder worktree cut before a
+server-side workflow execution; #26 safe-to-merge after two rounds; #27 safe-to-merge after three rounds (2 High / 4 Medium /
+3 Low in round one; a dropped policy guard and three recovery-path items in round two; everything closed
+in round three). All three are signed off in `plans/SECURITY_REVIEW_2026-09_WAVE3.md`. One process lesson carried forward: a builder worktree cut before a
 review fix landed re-created a definer RPC signature the fix had removed, caught only at merge time —
 builder worktrees now cut from the post-review head, with every new migration grepped for
 `create or replace function internal.` against the review's closures first. Known, recorded follow-ups
@@ -397,8 +397,7 @@ lookup to migration 0058's dedicated `dedupe_key` column; `test/seed-integrity.t
 verify-migrations fixture under `DATABASE_URL` (test-harness only); two informational notes each from
 #25 and #26 (template active-version repointing, a broad communications policy clause, guard-message
 wording). Still open: Slices 3D–3G (scheduling self-service, communications escalation, training content
-and automation, the platform realtime spike), migrations from 0062, once #27's re-verification closes and
-the chain merges.
+and automation, the platform realtime spike), migrations from 0062, once the #25 → #26 → #27 chain merges.
 
 ### 5.6 Wave 4 — Polish and scale (M3, 31 tasks)
 

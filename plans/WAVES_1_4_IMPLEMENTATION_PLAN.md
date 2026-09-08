@@ -282,10 +282,11 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
   (server-side workflow evaluation, a bounded-backtracking regex grammar for the new validation rules, and
   DB-enforced template-publish governance) and re-proved; final verdict safe to merge. 3B — two review
   rounds; findings closed at `f111a52` (re-pointing held child rows, pre-seeding submitted-event jobs);
-  final verdict safe to merge. 3C — one review round found 2 High / 4 Medium / 3 Low; all fixed at
+  final verdict safe to merge. 3C — three review rounds: round one found 2 High / 4 Medium / 3 Low, fixed at
   `f58dafb` (SLA-field write path, defect-work-order idempotency, preventive-maintenance review findings);
-  **re-verification is in progress, not yet closed** — treat 3C as done-pending-re-verification rather
-  than signed off.
+  round two found that the re-created work_orders policy had dropped 0058's follow-up guard (High) plus
+  three recovery-path items, fixed at `9f3959c`; round three closed everything — final verdict safe to
+  merge. All three slices are signed off in `plans/SECURITY_REVIEW_2026-09_WAVE3.md`.
 - **Lesson:** a builder worktree cut before a review fix landed re-created a definer RPC signature
   (`internal.enqueue_report_workflow(uuid, jsonb)`) that the fix had already dropped in favor of
   `internal.enqueue_report_workflow(uuid)`; caught only at merge time, not by CI. Rule for every future
@@ -299,5 +300,5 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
   incident-scoped clause, and two guard error messages could be worded more precisely; from 3A,
   re-pointing `report_templates.active_version` needs only `template.manage`.
 - **Next:** Wave 3 Slices 3D–3G (scheduling self-service, communications escalation, training content and
-  automation, the platform realtime spike), migrations starting at 0062, once 3C's re-verification closes
-  and the chain merges; then Wave 4.
+  automation, the platform realtime spike), migrations starting at 0062, once the #25 → #26 → #27 chain
+  merges; then Wave 4.
