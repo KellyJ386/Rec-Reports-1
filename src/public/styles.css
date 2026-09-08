@@ -349,6 +349,19 @@ button.primary {
 .admin-card span {
   color: var(--rr-warning-text);
 }
+/* WO-13: assets sub-panel. Every other module card claims one of the five
+   semantic tint tones (danger/success/info/teal/warning) above; assets are
+   a registry, not a workflow state, so this deliberately stays neutral
+   (--rr-surface-alt/--rr-border-strong) rather than reusing another
+   module's tone. */
+.asset-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--rr-border-strong);
+  border-radius: 14px;
+  background: var(--rr-surface-alt);
+  padding: 16px;
+}
 a.primary {
   display: inline-block;
   border: 1px solid var(--rr-border-strong);
@@ -881,6 +894,30 @@ a.primary:focus-visible {
   align-items: center;
   gap: 8px;
   margin: 8px 0;
+}
+
+/* WO-20: preventive-maintenance upcoming-occurrences strip. */
+.pm-occurrence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.pm-occurrence-chip {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--rr-border-strong);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--rr-surface-alt);
+  min-width: 72px;
+  text-align: center;
+}
+
+.pm-occurrence-chip.preview {
+  border-style: dashed;
+  opacity: 0.85;
 }
 
 .filter-chips {

@@ -9,6 +9,8 @@ import {
   workOrderDueAt,
   canTransition,
   applyStatusChange,
+  isResolvingStatus,
+  slaState,
   WORK_ORDER_STATUSES
 } from "../src/lib/work-orders.mjs";
 
@@ -142,4 +144,80 @@ test("applyStatusChange clears completed_at when reopening", () => {
   const now = new Date("2026-07-08T12:00:00Z");
   const patch = applyStatusChange({ status: "resolved", completed_at: "2026-07-01T00:00:00Z" }, "in_progress", now);
   assert.deepEqual(patch, { status: "in_progress", completed_at: null });
+});
+
+// --- WO-15: isResolvingStatus ------------------------------------------
+
+test("isResolvingStatus is true only for resolved/closed", () => {
+  assert.equal(isResolvingStatus("resolved"), true);
+  assert.equal(isResolvingStatus("closed"), true);
+  assert.equal(isResolvingStatus("cancelled"), false);
+  assert.equal(isResolvingStatus("open"), false);
+  assert.equal(isResolvingStatus("in_progress"), false);
+  assert.equal(isResolvingStatus("on_hold"), false);
+});
+
+// --- WO-15: slaState -----------------------------------------------------
+
+test("slaState reports on_track with no sla_due_at at all", () => {
+  const state = slaState({}, {}, new Date("2026-07-08T12:00:00Z"));
+  assert.deepEqual(state, { state: "on_track", dueAt: null, remainingHours: null });
+});
+
+test("slaState reports breached once sla_breached_at is stamped, regardless of remaining time", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const state = slaState(
+    { slaDueAt: "2026-07-09T12:00:00Z", slaBreachedAt: "2026-07-08T11:00:00Z" },
+    {},
+    now
+  );
+  assert.equal(state.state, "breached");
+});
+
+test("slaState reports breached as soon as now reaches sla_due_at, even without a stamp", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const atDeadline = slaState({ slaDueAt: "2026-07-08T12:00:00Z" }, {}, now);
+  assert.equal(atDeadline.state, "breached");
+  assert.equal(atDeadline.remainingHours, 0);
+
+  const pastDeadline = slaState({ slaDueAt: "2026-07-08T11:00:00Z" }, {}, now);
+  assert.equal(pastDeadline.state, "breached");
+  assert.ok(pastDeadline.remainingHours < 0);
+});
+
+test("slaState uses the 4h floor as the at_risk threshold when the window is short (< 20h)", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const workOrder = { createdAt: "2026-07-08T09:00:00Z", slaDueAt: "2026-07-08T19:00:00Z" }; // 10h window, 20% = 2h -> floor 4h wins
+  // Exactly at the 4h boundary (15:00): at_risk (inclusive).
+  assert.equal(slaState(workOrder, {}, new Date("2026-07-08T15:00:00Z")).state, "at_risk");
+  // Just outside the 4h boundary: on_track.
+  assert.equal(slaState(workOrder, {}, new Date("2026-07-08T14:59:00Z")).state, "on_track");
+});
+
+test("slaState uses 20% of the window as the at_risk threshold when it exceeds 4h", () => {
+  const workOrder = { createdAt: "2026-07-01T00:00:00Z", slaDueAt: "2026-07-11T00:00:00Z" }; // 240h window, 20% = 48h
+  // 48h remaining: at_risk (inclusive boundary).
+  assert.equal(slaState(workOrder, {}, new Date("2026-07-09T00:00:00Z")).state, "at_risk");
+  // 49h remaining: on_track.
+  assert.equal(slaState(workOrder, {}, new Date("2026-07-08T23:00:00Z")).state, "on_track");
+});
+
+test("slaState falls back to the 4h floor when createdAt is unknown or the window is non-positive", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const noCreatedAt = slaState({ slaDueAt: "2026-07-08T15:00:00Z" }, {}, now);
+  assert.equal(noCreatedAt.state, "at_risk"); // 3h remaining <= 4h floor
+
+  const invertedWindow = slaState(
+    { createdAt: "2026-07-08T20:00:00Z", slaDueAt: "2026-07-08T15:00:00Z" },
+    {},
+    now
+  );
+  assert.equal(invertedWindow.state, "at_risk"); // 3h remaining <= 4h floor
+});
+
+test("slaState reports remainingHours and an ISO dueAt alongside the state", () => {
+  const now = new Date("2026-07-08T12:00:00Z");
+  const state = slaState({ slaDueAt: "2026-07-09T00:00:00Z" }, {}, now);
+  assert.equal(state.dueAt, "2026-07-09T00:00:00.000Z");
+  assert.equal(state.remainingHours, 12);
 });

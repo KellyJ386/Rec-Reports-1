@@ -211,8 +211,12 @@ insert into incident_followup_actions (id, facility_id, incident_id, action_type
 on conflict (id) do nothing;
 
 
-insert into assets (id, facility_id, department_id, asset_tag, name, location_text) values
-  ('00000000-0000-0000-0000-000000001601', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'POOL-DECK-01', 'Pool deck safety mats', 'North pool deck')
+insert into assets (id, facility_id, department_id, asset_tag, name, location_text, category, criticality) values
+  ('00000000-0000-0000-0000-000000001601', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'POOL-DECK-01', 'Pool deck safety mats', 'North pool deck', 'safety_equipment', 'high')
+on conflict (id) do nothing;
+
+insert into assets (id, facility_id, department_id, asset_tag, name, location_text, status, category, criticality) values
+  ('00000000-0000-0000-0000-000000001602', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'PUMP-FILT-02', 'Pool filtration pump', 'Mechanical room', 'active', 'mechanical', 'critical')
 on conflict (id) do nothing;
 
 insert into work_orders (id, facility_id, department_id, asset_id, source_type, source_id, title, description, priority, status, assigned_to_employee_id, due_at) values
