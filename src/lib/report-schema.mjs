@@ -1,5 +1,18 @@
 import { permissions as PERMISSION_CODES } from "./permissions.mjs";
 
+// L-1 (security review, wave3-slice-3c): every field key seen across the
+// fixtures/seed data in this tree is already lowercase letters/digits/
+// underscores starting with a letter (e.g. "attendance", "pool_ready",
+// "gate_broken", down to single letters like "a"/"n"/"p" in tests) -- this
+// pattern accepts every one of those verbatim while rejecting the shape
+// that actually mattered for L-1: a bare-integer key ("0", "1", ...) that
+// could otherwise collide with actionEventType's default `${type}:${index}`
+// composition once report-workflow.mjs namespaces a defect's own eventType
+// as `create_work_order:defect:<fieldKey>` (see that module's own comment).
+// Requiring a LEADING letter closes that collision at the source, on top of
+// (not instead of) the `defect:` namespace segment.
+const FIELD_KEY_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+
 const allowedFieldTypes = new Set([
   "text",
   "textarea",
@@ -535,6 +548,9 @@ export function validateReportTemplateSchema(schema) {
     for (const [fieldIndex, field] of section.fields.entries()) {
       const prefix = `sections[${sectionIndex}].fields[${fieldIndex}]`;
       if (!field.key) errors.push(`${prefix}.key is required`);
+      if (field.key && !FIELD_KEY_PATTERN.test(field.key)) {
+        errors.push(`${prefix}.key must match ${FIELD_KEY_PATTERN}`);
+      }
       if (field.key && fieldKeys.has(field.key)) errors.push(`${prefix}.key must be unique`);
       if (field.key) fieldKeys.add(field.key);
       if (!field.label) errors.push(`${prefix}.label is required`);

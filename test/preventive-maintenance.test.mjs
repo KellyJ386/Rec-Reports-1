@@ -138,6 +138,33 @@ test("zero lead time (default) makes generationDate equal scheduledFor", () => {
   assert.equal(occurrence.generationDate, occurrence.scheduledFor);
 });
 
+// --- H-2 (security review, wave3-slice-3c): hard cap on materialized dates -
+
+test("interval: an unbounded window against a daily cadence is capped at MAX_OCCURRENCES, not materialized in full", () => {
+  // Same shape as the review's probe (probes-3c/p6_occurrence_dos.mjs):
+  // interval_days=1, anchored years in the past, window open out to
+  // 9999-12-31 -- pre-fix this produced 2.9M+ entries.
+  const plan = intervalPlan({ anchorDate: "2020-01-01", intervalDays: 1 });
+  const dates = occurrencesInWindow(plan, "2026-09-07", "9999-12-31").map((o) => o.scheduledFor);
+  assert.equal(dates.length, 1000);
+  // Still correct within the cap: starts at the first on/after-`from` date
+  // and each entry is exactly one day after the last.
+  assert.equal(dates[0], "2026-09-07");
+  assert.equal(dates[1], "2026-09-08");
+});
+
+test("seasonal: an unbounded window is capped at MAX_OCCURRENCES across years", () => {
+  const plan = seasonalPlan({ anchorDate: "1900-01-01", seasonMonths: [1, 4, 7, 10] });
+  const dates = occurrencesInWindow(plan, "2026-01-01", "9999-12-31").map((o) => o.scheduledFor);
+  assert.equal(dates.length, 1000);
+});
+
+test("a window that legitimately yields fewer than MAX_OCCURRENCES is unaffected by the cap", () => {
+  const plan = intervalPlan();
+  const dates = occurrencesInWindow(plan, "2026-01-01", "2026-04-01").map((o) => o.scheduledFor);
+  assert.deepEqual(dates, ["2026-01-01", "2026-01-31", "2026-03-02", "2026-04-01"]);
+});
+
 // --- inactive plans ----------------------------------------------------
 
 test("inactive plan: nextOccurrence returns null", () => {

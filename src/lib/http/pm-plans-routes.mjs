@@ -21,6 +21,20 @@ const CADENCE_TYPES = new Set(["interval", "seasonal"]);
 const PRIORITY_SET = new Set(WORK_ORDER_PRIORITIES);
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_OCCURRENCE_WINDOW_DAYS = 56; // 8 weeks -- WO-20's "upcoming-occurrences strip"
+// H-2 (security review, wave3-slice-3c): ?from=/?to= previously had no
+// maximum span -- a work_orders.read holder could request e.g.
+// 2026-09-07..9999-12-31 against a daily (interval_days=1) plan and force
+// occurrencesInWindow to materialize millions of dates in-process (2.9M
+// dates, ~335MB heap, ~5.3s blocking CPU measured against a single such
+// request -- the DoS this bound closes), then have the route sort and
+// JSON-serialize that. 400 comfortably covers WO-20's own 8-week default
+// plus any reasonable manual widening (a year-plus of daily occurrences
+// still exceeds any UI's practical use) while keeping a single request's
+// work bounded. preventive-maintenance.mjs's own MAX_OCCURRENCES is the
+// second, independent line of defense -- see that module's comment -- so a
+// future caller of occurrencesInWindow that bypasses this route-level check
+// entirely still cannot force unbounded materialization.
+const MAX_OCCURRENCE_WINDOW_DAYS = 400;
 
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
@@ -340,6 +354,18 @@ export function registerPmPlanRoutes(router, { authenticate, sendJson, readBody 
         const from = fromParam ?? today;
         const to = toParam ?? addDaysToDateStr(from, DEFAULT_OCCURRENCE_WINDOW_DAYS);
         if (to < from) return sendJson(response, 400, { error: "to must not be before from" });
+        // H-2: reject an over-wide window before occurrencesInWindow ever
+        // runs (see MAX_OCCURRENCE_WINDOW_DAYS above). Both from/to are
+        // already known to be valid YYYY-MM-DD strings at this point, so
+        // millisecond arithmetic on `new Date(...)` is exact/DST-safe here.
+        const spanDays = Math.round(
+          (new Date(`${to}T00:00:00.000Z`).getTime() - new Date(`${from}T00:00:00.000Z`).getTime()) / 86400000
+        );
+        if (spanDays > MAX_OCCURRENCE_WINDOW_DAYS) {
+          return sendJson(response, 400, {
+            error: `window (from..to) must not exceed ${MAX_OCCURRENCE_WINDOW_DAYS} days`
+          });
+        }
 
         const storedRows = await pgSelect(auth.client, "pm_plan_occurrences", {
           filters: { pm_plan_id: plan.id, scheduled_for: { gte: from, lte: to } },

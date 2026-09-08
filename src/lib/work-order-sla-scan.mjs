@@ -40,6 +40,22 @@
 //      processJob already knows how to honor -- mirrors
 //      shouldBypassQuietHours's urgent/emergency rule in
 //      src/lib/communications.mjs).
+//
+// M-3 (security review, wave3-slice-3c): per-candidate failure isolation.
+// Each candidate's claim + notify body runs inside its own try/catch (see
+// scanWorkOrderSla below) -- a failure claiming a row aborts only that
+// candidate; a failure AFTER a successful claim (route/recipient
+// resolution, the dedupe lookup, the notification_jobs insert) reverts the
+// sla_breached_at stamp (revertBreachClaim, CAS-guarded on the exact value
+// this call set) and records the failure in summary.errors, rather than
+// permanently stamping the row with nothing ever enqueued and aborting
+// every remaining candidate in the pass. "The next pass retries it" is true
+// again as of this fix -- pre-fix, a post-claim failure propagated straight
+// out of scanWorkOrderSla, which left the claimed row's alert lost for
+// good (selectBreachCandidates's `sla_breached_at is.null` filter would
+// never surface it again) and also aborted every later candidate plus
+// generatePmWorkOrders, which runs after this scan in the same drain
+// invocation (see internal-routes.mjs's handleDrain).
 import { pgSelect, pgInsert, pgUpdate } from "./supabase-rest.mjs";
 import { resolveRoute, expandDistributionList, isWithinQuietHours, buildNotificationJob } from "./admin/notifications.mjs";
 import { nextQuietWindowEnd } from "./notifications/worker.mjs";
@@ -143,6 +159,26 @@ async function alreadyEnqueued(client, facilityId, dedupeKey) {
   return (rows ?? []).length > 0;
 }
 
+// M-3 (security review, wave3-slice-3c): CAS the claim stamp back off on a
+// post-claim failure, only where it still equals the exact value THIS call
+// set (an `eq.<iso>` filter, the same CAS discipline claimBreach's own
+// `is.null` claim uses) -- so a concurrent claimBreach that (implausibly,
+// but not impossible if the clock or a retry ever produced the same
+// timestamp) claimed the row again in between is never clobbered, and a
+// claim that has already moved on (a later successful pass re-claimed it,
+// or nothing else touched it -- either way the row no longer carries THIS
+// call's exact stamp) is left alone. Zero rows back means "nothing to
+// revert" and is not itself a failure.
+async function revertBreachClaim(client, workOrderId, stampedIso) {
+  await pgUpdate(
+    client,
+    "work_orders",
+    { id: workOrderId },
+    { sla_breached_at: null },
+    { extra: { sla_breached_at: `eq.${stampedIso}` } }
+  );
+}
+
 // scanWorkOrderSla(client, { now, config, limit }) -> summary.
 //
 // `config` carries the same optional quiet-hours overrides every other scan/
@@ -150,11 +186,26 @@ async function alreadyEnqueued(client, facilityId, dedupeKey) {
 // reports.quietHoursStart/End registry defaults) plus `config.dsn`/
 // `config.observabilityFetch` are accepted for shape-compatibility with the
 // drain's shared config object but are not used here (no partial-failure
-// path in this scan needs a fire-and-forget report -- a per-row failure
-// simply is not counted as breached/enqueued and the next pass retries it,
-// since sla_breached_at is only ever stamped on a successful claim).
+// path in this scan needs a fire-and-forget report -- see the per-candidate
+// try/catch below for how a partial failure is actually handled).
+//
+// M-3: `claimBreach` durably stamps sla_breached_at BEFORE recipient
+// resolution/enqueue -- a failure anywhere after the claim (a bad
+// notification_routes row, a transient PostgREST error, ...) used to
+// propagate straight out of this function: the claimed row stayed
+// permanently stamped (selectBreachCandidates's `sla_breached_at is.null`
+// filter would never surface it again -- the overdue alert silently lost
+// forever) AND every remaining candidate in this pass, plus
+// generatePmWorkOrders which runs after this in the drain (see
+// internal-routes.mjs's handleDrain), never ran at all. Every candidate's
+// body below now runs inside its own try/catch: a failure after a
+// successful claim reverts the stamp (revertBreachClaim, CAS-guarded so it
+// can never clobber a different writer) and is recorded in
+// `summary.errors` instead of thrown, so one bad candidate can never abort
+// the rest of the pass -- the next pass retries a reverted row exactly like
+// selectBreachCandidates already expects.
 export async function scanWorkOrderSla(client, { now = new Date(), config = {}, limit = 25 } = {}) {
-  const summary = { scanned: 0, breached: 0, enqueued: 0, deduped: 0, noRoute: 0 };
+  const summary = { scanned: 0, breached: 0, enqueued: 0, deduped: 0, noRoute: 0, errors: [] };
 
   const candidates = await selectBreachCandidates(client, now, limit);
   summary.scanned = candidates.length;
@@ -172,45 +223,65 @@ export async function scanWorkOrderSla(client, { now = new Date(), config = {}, 
   }
 
   for (const candidate of candidates) {
-    const claimed = await claimBreach(client, candidate, now);
+    // M-3: claim outside the try -- a failed CLAIM itself (not yet stamped,
+    // nothing to revert) still aborts only this candidate, via the outer
+    // catch below, never the rest of the pass.
+    let claimed;
+    try {
+      claimed = await claimBreach(client, candidate, now);
+    } catch (error) {
+      summary.errors.push({ workOrderId: candidate.id, stage: "claim", error: error.message });
+      continue;
+    }
     if (!claimed) continue; // lost the race to a concurrent scan -- skip.
     summary.breached += 1;
 
-    const { route, recipients } = await recipientsFor(claimed.facility_id);
-    if (!route || recipients.length === 0) {
-      summary.noRoute += 1;
-      continue;
-    }
-
-    // Urgent work orders bypass quiet hours entirely -- same rule
-    // src/lib/communications.mjs's shouldBypassQuietHours already applies
-    // for urgent/emergency messages.
-    const bypass = claimed.priority === "urgent";
-    const deferred = !bypass && isWithinQuietHours(nowHHMM, quietStart, quietEnd);
-    const scheduledFor = deferred ? toIso(nextQuietWindowEnd(now, quietEnd)) : nowIso;
-
-    for (const recipientId of recipients) {
-      const dedupeKey = dedupeKeyFor(claimed, recipientId);
-      if (await alreadyEnqueued(client, claimed.facility_id, dedupeKey)) {
-        summary.deduped += 1;
+    try {
+      const { route, recipients } = await recipientsFor(claimed.facility_id);
+      if (!route || recipients.length === 0) {
+        summary.noRoute += 1;
         continue;
       }
 
-      const base = buildNotificationJob(EVENT_CODE, route, [recipientId]);
-      const job = {
-        ...base,
-        scheduled_for: scheduledFor,
-        payload_jsonb: {
-          ...base.payload_jsonb,
-          quietHoursBypass: bypass,
-          dedupeKey,
-          title: `Work order overdue: ${claimed.title}`,
-          body: `Work order "${claimed.title}" passed its SLA deadline (${claimed.sla_due_at}).`,
-          work_order_id: claimed.id
+      // Urgent work orders bypass quiet hours entirely -- same rule
+      // src/lib/communications.mjs's shouldBypassQuietHours already applies
+      // for urgent/emergency messages.
+      const bypass = claimed.priority === "urgent";
+      const deferred = !bypass && isWithinQuietHours(nowHHMM, quietStart, quietEnd);
+      const scheduledFor = deferred ? toIso(nextQuietWindowEnd(now, quietEnd)) : nowIso;
+
+      for (const recipientId of recipients) {
+        const dedupeKey = dedupeKeyFor(claimed, recipientId);
+        if (await alreadyEnqueued(client, claimed.facility_id, dedupeKey)) {
+          summary.deduped += 1;
+          continue;
         }
-      };
-      await pgInsert(client, "notification_jobs", [job], { returning: true });
-      summary.enqueued += 1;
+
+        const base = buildNotificationJob(EVENT_CODE, route, [recipientId]);
+        const job = {
+          ...base,
+          scheduled_for: scheduledFor,
+          payload_jsonb: {
+            ...base.payload_jsonb,
+            quietHoursBypass: bypass,
+            dedupeKey,
+            title: `Work order overdue: ${claimed.title}`,
+            body: `Work order "${claimed.title}" passed its SLA deadline (${claimed.sla_due_at}).`,
+            work_order_id: claimed.id
+          }
+        };
+        await pgInsert(client, "notification_jobs", [job], { returning: true });
+        summary.enqueued += 1;
+      }
+    } catch (error) {
+      // M-3: a failure anywhere after a successful claim (route/recipient
+      // resolution, dedupe lookup, the notification_jobs insert, ...) must
+      // never leave this row permanently stamped breached with nothing
+      // enqueued -- revert the claim so the next pass retries it, and
+      // record the failure instead of throwing it out of the loop.
+      summary.breached -= 1;
+      await revertBreachClaim(client, claimed.id, nowIso);
+      summary.errors.push({ workOrderId: claimed.id, stage: "notify", error: error.message });
     }
   }
 

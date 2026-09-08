@@ -345,10 +345,14 @@ test("evaluateWorkflow emits one create_work_order action per extracted defect w
   });
   assert.equal(result.actions.length, 2);
   assert.equal(result.actions[0].type, "create_work_order");
-  assert.equal(result.actions[0].eventType, "create_work_order:gate_broken");
+  // L-1 (security review, wave3-slice-3c): namespaced create_work_order:defect:<fieldKey>
+  // -- distinguishable from the default `${type}:${index}` composition
+  // (e.g. "create_work_order:0"), which is the point (see
+  // report-workflow.mjs's own comment on buildDefectWorkOrderAction).
+  assert.equal(result.actions[0].eventType, "create_work_order:defect:gate_broken");
   assert.equal(result.actions[0].params.sourceDefectKey, "gate_broken");
   assert.equal(result.actions[0].params.title, "Defect: Gate broken");
-  assert.equal(result.actions[1].eventType, "create_work_order:chemical_level");
+  assert.equal(result.actions[1].eventType, "create_work_order:defect:chemical_level");
   assert.equal(result.actions[1].params.sourceDefectKey, "chemical_level");
   assert.equal(result.actions[1].params.title, "Defect: Chemical level");
 });

@@ -10,6 +10,15 @@ const MANAGER = [
 const READER = [{ facilityId: "fac-1", status: "active", permissions: ["work_orders.read"] }];
 const OUTSIDER = [{ facilityId: "fac-2", status: "active", permissions: ["work_orders.read", "work_orders.manage"] }];
 
+// M-1 (security review, wave3-slice-3c): sla_due_at/first_response_at/
+// resolved_at are now stamped through a service-role RPC
+// (rpc/set_work_order_sla_fields, POST /rest/v1/rpc/set_work_order_sla_fields)
+// rather than a direct work_orders write. A test whose own `respond` doesn't
+// recognize that table gets a sensible default here -- echo the requested id
+// + fields back as the "row" -- so every test that doesn't care about the
+// stamp's exact response shape (most of them) needs no changes; a test that
+// DOES care finds the call via `captured` and inspects `body.p_fields`
+// directly (see e.g. the "derives sla_due_at" tests below).
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -17,8 +26,13 @@ function stubFetch(t, respond) {
     const parsed = new URL(url);
     const table = parsed.pathname.replace("/rest/v1/", "");
     const method = init.method;
-    captured.push({ table, method, url: parsed, body: init.body ? JSON.parse(init.body) : null });
-    const data = respond(table, method, parsed) ?? [];
+    const body = init.body ? JSON.parse(init.body) : null;
+    captured.push({ table, method, url: parsed, body });
+    let data = respond(table, method, parsed, body);
+    if (data === undefined && table === "rpc/set_work_order_sla_fields") {
+      data = { id: body?.p_work_order_id, ...(body?.p_fields ?? {}) };
+    }
+    data = data ?? [];
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   t.after(() => {
@@ -26,6 +40,13 @@ function stubFetch(t, respond) {
   });
   return captured;
 }
+
+// M-1: every route that can reach a service-role SLA stamp now needs
+// env.SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY -- default them here so every
+// existing test keeps exercising the real (non-503) path; pass
+// `env: { SUPABASE_SERVICE_ROLE_KEY: undefined }` (or omit SUPABASE_URL) to
+// a specific `call` to exercise the "service role not configured" case.
+const SERVICE_ENV = { SUPABASE_URL: "https://example.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "service-role-key" };
 
 function mount({ memberships = MANAGER, userId = "user-1" } = {}) {
   const router = createRouter();
@@ -35,14 +56,18 @@ function mount({ memberships = MANAGER, userId = "user-1" } = {}) {
   const sendJson = (response, status, payload) => sent.push({ status, payload });
   const readBody = async (request) => request.__body ?? "{}";
   registerWorkOrderRoutes(router, { authenticate, sendJson, readBody });
-  async function call(method, path, body) {
+  async function call(method, path, body, { env = SERVICE_ENV } = {}) {
     const { handler, params } = router.match({ method, url: path });
     assert.ok(handler, `no route matched ${method} ${path}`);
     const request = { url: path, __body: body === undefined ? undefined : JSON.stringify(body) };
-    await handler(request, {}, { env: {}, params });
+    await handler(request, {}, { env, params });
     return sent[sent.length - 1];
   }
   return { call };
+}
+
+function findSlaRpc(captured) {
+  return captured.find((c) => c.table === "rpc/set_work_order_sla_fields" && c.method === "POST");
 }
 
 test("GET work-orders denies a non-member of the facility with 403", async (t) => {
@@ -115,6 +140,22 @@ test("POST work-orders happy path inserts a shaped row", async (t) => {
   assert.equal(insert.body[0].created_by, "user-9");
 });
 
+// M-1 (security review, wave3-slice-3c): with no service-role client
+// available, work order creation must 503 BEFORE any write -- never insert
+// the row and then discover the SLA stamp can't be applied.
+test("POST work-orders 503s and inserts nothing when SUPABASE_SERVICE_ROLE_KEY is not configured", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/facilities/fac-1/work-orders",
+    { title: "Fix leak", description: "Water leak in basement", priority: "high" },
+    { env: { SUPABASE_URL: "https://example.supabase.co" } } // no SUPABASE_SERVICE_ROLE_KEY
+  );
+  assert.equal(result.status, 503);
+  assert.ok(!captured.some((c) => c.table === "work_orders"), "must not attempt the insert");
+});
+
 test("GET work-order by id returns a single work order", async (t) => {
   stubFetch(t, (table) =>
     table === "work_orders" ? [{ id: "wo-1", facility_id: "fac-1", title: "Fix leak" }] : []
@@ -146,6 +187,43 @@ test("PATCH work-order updates status", async (t) => {
   const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
   assert.equal(patch.body.status, "in_progress");
   assert.ok(patch.body.updated_at);
+});
+
+// M-1: a status-changing PATCH always touches resolved_at, so it 503s
+// (before any write) with no service-role client available; a
+// priority/assignee-only PATCH never touches an SLA-guarded column and is
+// completely unaffected.
+test("PATCH work-order status change 503s and writes nothing when SUPABASE_SERVICE_ROLE_KEY is not configured", async (t) => {
+  const captured = stubFetch(t, (table, method) =>
+    table === "work_orders" && method === "GET" ? [{ id: "wo-1", facility_id: "fac-1", status: "open" }] : []
+  );
+  const { call } = mount();
+  const result = await call(
+    "PATCH",
+    "/work-orders/wo-1",
+    { status: "in_progress" },
+    { env: { SUPABASE_URL: "https://example.supabase.co" } }
+  );
+  assert.equal(result.status, 503);
+  assert.ok(!captured.some((c) => c.method === "PATCH" || (c.table === "work_order_updates" && c.method === "POST")));
+});
+
+test("PATCH work-order priority-only change succeeds even with no service-role client configured", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") return [{ id: "wo-1", facility_id: "fac-1", priority: "medium" }];
+    if (table === "work_orders" && method === "PATCH") return [{ id: "wo-1", priority: "urgent" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call(
+    "PATCH",
+    "/work-orders/wo-1",
+    { priority: "urgent" },
+    { env: { SUPABASE_URL: "https://example.supabase.co" } }
+  );
+  assert.equal(result.status, 200);
+  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
+  assert.equal(patch.body.priority, "urgent");
 });
 
 test("PATCH work-order updates assignment", async (t) => {
@@ -866,8 +944,15 @@ test("POST work-orders derives sla_due_at from the resolved workOrders SLA confi
   assert.equal(result.status, 201);
   const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
   assert.equal(insert.body[0].due_at, "2099-01-01T00:00:00Z"); // client's human target, untouched
-  assert.ok(insert.body[0].sla_due_at, "sla_due_at should be set");
-  const slaDueAtMs = new Date(insert.body[0].sla_due_at).getTime();
+  // M-1: sla_due_at is no longer part of the INSERT body -- 0060's DB
+  // trigger rejects an authenticated write to it. It is stamped via the
+  // service-role RPC right after the insert instead.
+  assert.equal(insert.body[0].sla_due_at, undefined);
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call stamping sla_due_at");
+  assert.equal(rpc.body.p_work_order_id, "wo-1");
+  assert.ok(rpc.body.p_fields.sla_due_at, "sla_due_at should be set");
+  const slaDueAtMs = new Date(rpc.body.p_fields.sla_due_at).getTime();
   assert.ok(slaDueAtMs >= before + 6 * 60 * 60 * 1000);
   assert.ok(slaDueAtMs <= after + 6 * 60 * 60 * 1000);
 });
@@ -916,8 +1001,12 @@ test("POST incidents/:id/work-orders derives sla_due_at from config even when du
   assert.equal(result.status, 201);
   const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
   assert.equal(insert.body[0].due_at, "2099-06-01T00:00:00Z");
-  assert.notEqual(insert.body[0].sla_due_at, "2099-06-01T00:00:00Z");
-  assert.ok(insert.body[0].sla_due_at, "sla_due_at should still be set from config");
+  // M-1: sla_due_at is stamped via the service-role RPC, not the INSERT.
+  assert.equal(insert.body[0].sla_due_at, undefined);
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call");
+  assert.notEqual(rpc.body.p_fields.sla_due_at, "2099-06-01T00:00:00Z");
+  assert.ok(rpc.body.p_fields.sla_due_at, "sla_due_at should still be set from config");
 });
 
 test("POST incidents/:id/work-orders rejects a client-supplied sla_due_at with 400 before any fetch", async (t) => {
@@ -956,8 +1045,14 @@ test("PATCH work-order stamps first_response_at on the first status change off o
   const { call } = mount();
   const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
   assert.equal(result.status, 200);
+  // M-1: first_response_at/resolved_at are stamped via the service-role RPC,
+  // not the primary work_orders PATCH.
   const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
-  assert.ok(patch.body.first_response_at, "first_response_at should be stamped");
+  assert.equal(patch.body.first_response_at, undefined);
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call");
+  assert.equal(rpc.body.p_work_order_id, "wo-1");
+  assert.ok(rpc.body.p_fields.first_response_at, "first_response_at should be stamped");
 });
 
 test("PATCH work-order does not re-stamp first_response_at once already set", async (t) => {
@@ -980,6 +1075,12 @@ test("PATCH work-order does not re-stamp first_response_at once already set", as
   assert.equal(result.status, 200);
   const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
   assert.equal(patch.body.first_response_at, undefined);
+  // M-1: the RPC call still fires (resolved_at is always part of a status
+  // change's slaPatch), but must NOT carry a first_response_at key since it
+  // was already set.
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call for resolved_at");
+  assert.equal(rpc.body.p_fields.first_response_at, undefined);
 });
 
 test("PATCH work-order stamps resolved_at on entering resolved and preserves it through resolved -> closed", async (t) => {
@@ -994,7 +1095,10 @@ test("PATCH work-order stamps resolved_at on entering resolved and preserves it 
   const result = await call("PATCH", "/work-orders/wo-1", { status: "resolved" });
   assert.equal(result.status, 200);
   const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
-  assert.ok(patch.body.resolved_at, "resolved_at should be stamped on resolve");
+  assert.equal(patch.body.resolved_at, undefined);
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call");
+  assert.ok(rpc.body.p_fields.resolved_at, "resolved_at should be stamped on resolve");
 });
 
 test("PATCH work-order clears resolved_at when reopening", async (t) => {
@@ -1011,7 +1115,10 @@ test("PATCH work-order clears resolved_at when reopening", async (t) => {
   const result = await call("PATCH", "/work-orders/wo-1", { status: "in_progress" });
   assert.equal(result.status, 200);
   const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
-  assert.equal(patch.body.resolved_at, null);
+  assert.equal(patch.body.resolved_at, undefined);
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call");
+  assert.equal(rpc.body.p_fields.resolved_at, null, "resolved_at should be explicitly cleared, not merely omitted");
 });
 
 test("POST work-order updates stamps first_response_at on the first comment", async (t) => {
@@ -1027,9 +1134,50 @@ test("POST work-order updates stamps first_response_at on the first comment", as
   const { call } = mount();
   const result = await call("POST", "/work-orders/wo-1/updates", { body: "hi" });
   assert.equal(result.status, 201);
-  const patch = captured.find((c) => c.table === "work_orders" && c.method === "PATCH");
-  assert.ok(patch, "expected a work_orders PATCH stamping first_response_at");
-  assert.ok(patch.body.first_response_at);
+  // M-1: the stamp now goes through the service-role RPC, not a direct
+  // work_orders PATCH under the caller's own client.
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "PATCH"));
+  const rpc = findSlaRpc(captured);
+  assert.ok(rpc, "expected a set_work_order_sla_fields RPC call stamping first_response_at");
+  assert.equal(rpc.body.p_work_order_id, "wo-1");
+  assert.ok(rpc.body.p_fields.first_response_at);
+});
+
+// M-1: 503s BEFORE posting the comment when a first_response_at stamp will
+// be needed and no service-role client is available -- never post the
+// comment and then discover the stamp can't be applied.
+test("POST work-order updates 503s and posts nothing when a stamp is needed but SUPABASE_SERVICE_ROLE_KEY is not configured", async (t) => {
+  const captured = stubFetch(t, (table, method) =>
+    table === "work_orders" && method === "GET" ? [{ id: "wo-1", facility_id: "fac-1", first_response_at: null }] : []
+  );
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/work-orders/wo-1/updates",
+    { body: "hi" },
+    { env: { SUPABASE_URL: "https://example.supabase.co" } }
+  );
+  assert.equal(result.status, 503);
+  assert.ok(!captured.some((c) => c.table === "work_order_updates" && c.method === "POST"));
+});
+
+test("POST work-order updates succeeds with no service-role client when first_response_at is already set", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "work_orders" && method === "GET") {
+      return [{ id: "wo-1", facility_id: "fac-1", first_response_at: "2026-01-01T00:00:00Z" }];
+    }
+    if (table === "work_order_updates" && method === "POST") return [{ id: "u-1", update_type: "comment", body: "hi" }];
+    return [];
+  });
+  const { call } = mount();
+  const result = await call(
+    "POST",
+    "/work-orders/wo-1/updates",
+    { body: "hi" },
+    { env: { SUPABASE_URL: "https://example.supabase.co" } }
+  );
+  assert.equal(result.status, 201);
+  assert.ok(captured.some((c) => c.table === "work_order_updates" && c.method === "POST"));
 });
 
 test("POST work-order updates does not re-stamp first_response_at once already set", async (t) => {
