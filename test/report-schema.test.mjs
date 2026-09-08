@@ -396,6 +396,24 @@ test("unsafeRegexPatternReason rejects overlapping unbounded quantifiers on ordi
   assert.match(unsafeRegexPatternReason("^[0-9]+[0-9]+[0-9]+x$"), /backtracking potential/);
 });
 
+// Second re-verification: `[]` / `[^]` are COMPLETE classes in JavaScript, so
+// a scanner that treated the leading `]` as a literal member ran on to the
+// next `]` and let a repeated alternation group (`^[^](a|a)*[^]x$`, 873 ms at
+// 28 characters) or a run of `.*` slip past every rule.
+test("unsafeRegexPatternReason cannot be desynchronised by the empty-class forms [] and [^]", () => {
+  assert.match(unsafeRegexPatternReason("^[^](a|a)*[^]x$"), /repeat a group/);
+  assert.match(unsafeRegexPatternReason("^[^].*.*.*.*.*.*.*.*[^]x$"), /backtracking potential|more than 8/);
+  assert.match(unsafeRegexPatternReason("^[^]*[^]*[^]*[^]*[^]*x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^[]a|b$"), /wrap alternation/);
+  assert.match(unsafeRegexPatternReason("^[](a+)+$"), /repeat a group/);
+  // Still-legal uses of the same forms.
+  assert.equal(unsafeRegexPatternReason("^[^]$"), null);
+  assert.equal(unsafeRegexPatternReason("^[^]{1,64}$"), null);
+  assert.equal(unsafeRegexPatternReason("^[]]$"), null); // empty class then a literal ]
+  assert.equal(unsafeRegexPatternReason("^[\\]+]+$"), null); // escaped ] inside a class
+  assert.equal(unsafeRegexPatternReason("^[[]$"), null); // literal [ inside a class
+});
+
 test("unsafeRegexPatternReason rejects bounded ranges whose combinations still explode", () => {
   assert.match(
     unsafeRegexPatternReason("^\\d{1,64}\\d{1,64}\\d{1,64}\\d{1,64}x$"),

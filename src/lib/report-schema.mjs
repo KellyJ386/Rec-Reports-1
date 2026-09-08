@@ -164,13 +164,17 @@ function unsafeRegexStructureReason(pattern) {
 
     if (ch === "[") {
       // Character class: everything up to the matching unescaped `]` is
-      // literal (a leading `]` or `^]` is itself a literal `]`, standard
-      // regex-class syntax) -- `+`, `*`, `(`, `)`, `|` inside a class are
-      // ordinary characters, never quantifier/group/alternation syntax, so
-      // skip the whole class verbatim without touching depth/quantifiers.
+      // literal -- `+`, `*`, `(`, `)`, `|` inside a class are ordinary
+      // characters, never quantifier/group/alternation syntax, so skip the
+      // whole class verbatim without touching depth/quantifiers. JavaScript
+      // (unlike POSIX/Perl) does NOT treat a leading `]` as a literal: `[]`
+      // is the empty class and `[^]` matches any character, both complete
+      // at that first `]`. Treating that `]` as a member would make this
+      // scanner run on to the NEXT `]` and hide everything in between
+      // (quantifiers, a repeated group, a top-level `|`) from every rule --
+      // `^[^](a|a)*[^]x$` measured exponential under exactly that bug.
       i += 1;
       if (pattern[i] === "^") i += 1;
-      if (pattern[i] === "]") i += 1;
       while (i < n && pattern[i] !== "]") {
         i += pattern[i] === "\\" ? 2 : 1;
       }
