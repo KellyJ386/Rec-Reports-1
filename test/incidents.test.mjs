@@ -56,13 +56,45 @@ test("buildIncidentNotificationJobs shapes one row per recipient with a per-reci
     severity: "medium"
   });
   assert.equal(jobs.length, 2);
-  assert.equal(jobs[0].dedupe_key, "inc-1:incident.escalated:emp-1");
-  assert.equal(jobs[1].dedupe_key, "inc-1:incident.escalated:emp-2");
+  // No escalationId argument given -- the discriminator segment defaults to
+  // the literal "n/a" (M3).
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.escalated:n/a:emp-1");
+  assert.equal(jobs[1].dedupe_key, "inc-1:incident.escalated:n/a:emp-2");
   assert.equal(jobs[0].facility_id, "fac-1");
   assert.equal(jobs[0].event_type, "incident.escalated");
   assert.deepEqual(jobs[0].payload_jsonb.recipients, ["emp-1"]);
   assert.deepEqual(jobs[0].payload_jsonb.channels, ["in_app", "email"]);
   assert.equal(jobs[0].payload_jsonb.incidentId, "inc-1");
+  assert.equal(jobs[0].payload_jsonb.escalationId, null);
+});
+
+// M3 (security review): the second/third/... SLA breach or manual
+// re-escalation of the SAME incident must not reuse the first breach's
+// dedupe_key -- folding the escalation's own id into the key is what
+// distinguishes them, while a genuine RETRY of the identical breach (same
+// escalation id) still collapses onto the same key.
+test("buildIncidentNotificationJobs folds escalationId into dedupe_key so a second escalation does not collide with the first", () => {
+  const first = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-1");
+  const second = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-2");
+  assert.equal(first[0].dedupe_key, "inc-1:incident.sla_breached:esc-1:emp-1");
+  assert.equal(second[0].dedupe_key, "inc-1:incident.sla_breached:esc-2:emp-1");
+  assert.notEqual(first[0].dedupe_key, second[0].dedupe_key);
+  assert.equal(first[0].payload_jsonb.escalationId, "esc-1");
+  assert.equal(second[0].payload_jsonb.escalationId, "esc-2");
+
+  // A genuine retry of the SAME breach (identical escalationId) still
+  // dedupes as intended.
+  const retry = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-1");
+  assert.equal(retry[0].dedupe_key, first[0].dedupe_key);
 });
 
 test("buildIncidentNotificationJobs sets quietHoursBypass true for high/critical severity, false otherwise", () => {
@@ -97,7 +129,7 @@ test("buildIncidentNotificationJobs drops falsy recipient ids and returns [] for
     id: "inc-1"
   });
   assert.equal(jobs.length, 1);
-  assert.equal(jobs[0].dedupe_key, "inc-1:incident.submitted:emp-1");
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.submitted:n/a:emp-1");
 });
 
 test("shouldEscalateIncident escalates high severity, legal hold, or OSHA review", () => {

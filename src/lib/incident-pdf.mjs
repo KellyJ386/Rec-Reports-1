@@ -563,7 +563,14 @@ export function computeIncidentPacketHash({
     })),
     signatures: (signatures ?? []).map((s) => ({ ...s })),
     complianceChecks: (complianceChecks ?? []).map((c) => ({ ...c })),
-    chainVerification: chainVerification ? { valid: chainVerification.valid, brokenAt: chainVerification.brokenAt } : null,
+    chainVerification: chainVerification
+      ? {
+          valid: chainVerification.valid,
+          brokenAt: chainVerification.brokenAt,
+          truncated: chainVerification.truncated === true,
+          noRows: chainVerification.noRows === true
+        }
+      : null,
     generatedAt: generatedAt ?? null
   });
 }
@@ -701,11 +708,34 @@ export function renderIncidentPacket({
         : [["Audit Timeline", "None recorded"]]
   });
 
+  // M1 (security review): "Chain Valid: true" must never be printed over a
+  // chain the packet could not actually verify. verifyIncidentAuditChain
+  // (audit.mjs) reports an EMPTY input as vacuously valid -- correct for
+  // that function in isolation, wrong to surface verbatim here, since
+  // "empty" can mean "this facility genuinely has zero audit events" (fine)
+  // or "this caller's own permissions filtered the read to zero rows"
+  // (a false attestation over nothing) -- the route layer cannot always
+  // distinguish those either, so `verified: false` is required alongside
+  // `valid` whenever the route marks the read as not-authoritative
+  // (chainVerification.truncated or chainVerification.noRows, both set by
+  // incidents-routes.mjs, never by this pure renderer). "Chain Valid" prints
+  // that combined verified-and-valid state; "Chain Verification Note" names
+  // WHY when it does not, so the printed document itself carries the
+  // caveat rather than only the API envelope.
+  const chainNotVerified = chainVerification?.truncated === true || chainVerification?.noRows === true;
   sections.push({
     title: "Audit Chain Verification",
     fields: [
-      ["Chain Valid", chainVerification?.valid === true],
-      ["Chain Broken At", chainVerification?.brokenAt]
+      ["Chain Valid", !chainNotVerified && chainVerification?.valid === true],
+      ["Chain Broken At", chainVerification?.brokenAt],
+      [
+        "Chain Verification Note",
+        chainVerification?.truncated === true
+          ? "NOT FULLY VERIFIED -- the facility's audit chain exceeds the 10,000-row verification window; only a prefix was checked."
+          : chainVerification?.noRows === true
+            ? "NOT VERIFIED -- no audit rows were readable for this facility."
+            : null
+      ]
     ]
   });
 

@@ -158,7 +158,11 @@ export function registerIncidentComplianceRoutes(router, { authenticate, sendJso
 
         if (signatureImagePath !== undefined && signatureImagePath !== null) {
           try {
-            assertPathInFacility(signatureImagePath, params.facilityId, "incidents");
+            // L1 (security review): bind the path to THIS signature's own
+            // incident, not just the "incidents" module -- without the
+            // fourth argument here, a signature on incident A could name a
+            // path under incident B (same facility, same module) and pass.
+            assertPathInFacility(signatureImagePath, params.facilityId, "incidents", incident.id);
           } catch (error) {
             if (error instanceof StorageValidationError) {
               return sendJson(response, 400, { error: error.message });
@@ -242,8 +246,13 @@ export function registerIncidentComplianceRoutes(router, { authenticate, sendJso
         if (!requireRead(auth, params.facilityId, response)) return;
         const incident = await resolveIncident(auth, params, response);
         if (!incident) return;
+        // L5 (security review): a soft-deleted check is superseded/retired,
+        // not a live determination -- omit it here to match the closure
+        // gate's own `and deleted_at is null` (0056/0057 guard 2.5) rather
+        // than showing a caller a check the gate itself already ignores.
         const rows = await pgSelect(auth.client, "incident_compliance_checks", {
           filters: { incident_id: incident.id, facility_id: params.facilityId },
+          extra: { deleted_at: "is.null" },
           select: COMPLIANCE_CHECK_COLUMNS,
           order: "checked_at.desc"
         });

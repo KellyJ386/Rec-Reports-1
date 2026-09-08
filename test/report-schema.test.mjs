@@ -299,6 +299,21 @@ test("validation_rules minLength/maxLength/regex are enforced on a string field"
   ]);
 });
 
+test("a value longer than 512 characters is rejected before the regex ever runs", () => {
+  const schema = {
+    sections: [
+      {
+        title: "s",
+        fields: [{ key: "code", label: "Code", type: "text", validation_rules: { regex: "^[a-z]+$" } }]
+      }
+    ]
+  };
+  assert.deepEqual(validateReportSubmission(schema, { code: "a".repeat(512) }), []);
+  assert.deepEqual(validateReportSubmission(schema, { code: "a".repeat(513) }), [
+    "Code is too long to match the required pattern"
+  ]);
+});
+
 test("schema validation rejects an unknown validation_rules key and an inverted min/max", () => {
   const unknownKey = {
     sections: [
@@ -344,7 +359,7 @@ test("unsafeRegexPatternReason rejects nested-quantifier (catastrophic backtrack
 // `[^()]*` scan couldn't see into, ambiguity from a bare `?` inside a
 // repeated group, and a bounded-but-still-explosive `{n,m}`.
 test("unsafeRegexPatternReason rejects every ReDoS shape the security review measured", () => {
-  assert.match(unsafeRegexPatternReason("^(a|a)*$"), /alternation/);
+  assert.match(unsafeRegexPatternReason("^(a|a)*$"), /repeat a group/);
   assert.match(unsafeRegexPatternReason("^((a+))+$"), /nest groups/);
   assert.match(unsafeRegexPatternReason("^(\\d\\d?)*$"), /repeat a group/);
   assert.match(unsafeRegexPatternReason("^(a{1,2})*$"), /repeat a group/);
@@ -357,9 +372,82 @@ test("unsafeRegexPatternReason rejects lookaround assertions", () => {
   assert.match(unsafeRegexPatternReason("^(?<!foo)bar$"), /lookaround/);
 });
 
-test("unsafeRegexPatternReason rejects alternation nested inside a group (top-level alternation only)", () => {
-  assert.match(unsafeRegexPatternReason("^(foo|bar)$"), /alternation/);
-  assert.equal(unsafeRegexPatternReason("^foo$|^bar$"), null);
+// N-3 (security re-verification): a top-level `|` binds looser than the `^`/`$`
+// anchors, so `^AM|PM$` has an unanchored second branch (`PM$` matches
+// "xxPM"). Alternation is therefore only legal inside a group, where both
+// anchors still apply to every branch.
+test("unsafeRegexPatternReason accepts alternation inside a group and rejects a top-level |", () => {
+  assert.equal(unsafeRegexPatternReason("^(AM|PM)$"), null);
+  assert.equal(unsafeRegexPatternReason("^(foo|bar)$"), null);
+  assert.equal(unsafeRegexPatternReason("^(foo|bar)?-\\d{2}$"), null);
+  assert.match(unsafeRegexPatternReason("^AM|PM$"), /wrap alternation in a group/);
+  assert.match(unsafeRegexPatternReason("^foo$|^bar$"), /wrap alternation in a group/);
+});
+
+// H-2 (security re-verification): the previous grammar only restricted
+// quantifiers on GROUPS, so several unbounded quantifiers on adjacent
+// ordinary atoms that can match the same characters were still accepted --
+// `^\d+\d+\d+\d+x$` measured ~9 s on a 400-character value. Rule (f)
+// bounds the product of every quantifier's split count instead.
+test("unsafeRegexPatternReason rejects overlapping unbounded quantifiers on ordinary atoms", () => {
+  assert.match(unsafeRegexPatternReason("^\\d+\\d+\\d+\\d+x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^\\d+\\d+\\d+x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^\\d*\\d*\\d*x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^\\d{1,}\\d{1,}\\d{1,}x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^[0-9]+[0-9]+[0-9]+x$"), /backtracking potential/);
+});
+
+// Second re-verification: `[]` / `[^]` are COMPLETE classes in JavaScript, so
+// a scanner that treated the leading `]` as a literal member ran on to the
+// next `]` and let a repeated alternation group (`^[^](a|a)*[^]x$`, 873 ms at
+// 28 characters) or a run of `.*` slip past every rule.
+test("unsafeRegexPatternReason cannot be desynchronised by the empty-class forms [] and [^]", () => {
+  assert.match(unsafeRegexPatternReason("^[^](a|a)*[^]x$"), /repeat a group/);
+  assert.match(unsafeRegexPatternReason("^[^].*.*.*.*.*.*.*.*[^]x$"), /backtracking potential|more than 8/);
+  assert.match(unsafeRegexPatternReason("^[^]*[^]*[^]*[^]*[^]*x$"), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^[]a|b$"), /wrap alternation/);
+  assert.match(unsafeRegexPatternReason("^[](a+)+$"), /repeat a group/);
+  // Still-legal uses of the same forms.
+  assert.equal(unsafeRegexPatternReason("^[^]$"), null);
+  assert.equal(unsafeRegexPatternReason("^[^]{1,64}$"), null);
+  assert.equal(unsafeRegexPatternReason("^[]]$"), null); // empty class then a literal ]
+  assert.equal(unsafeRegexPatternReason("^[\\]+]+$"), null); // escaped ] inside a class
+  assert.equal(unsafeRegexPatternReason("^[[]$"), null); // literal [ inside a class
+});
+
+test("unsafeRegexPatternReason rejects bounded ranges whose combinations still explode", () => {
+  assert.match(
+    unsafeRegexPatternReason("^\\d{1,64}\\d{1,64}\\d{1,64}\\d{1,64}x$"),
+    /backtracking potential/
+  );
+  assert.match(unsafeRegexPatternReason("^\\d+\\d{1,64}\\d{1,64}\\d{1,8}x$"), /backtracking potential/);
+  // A huge upper bound is capped at the input cap, not taken literally.
+  assert.match(unsafeRegexPatternReason("^\\d+\\d{1,9999}\\d{1,9999}x$"), /backtracking potential/);
+});
+
+test("unsafeRegexPatternReason keeps two unbounded quantifiers and realistic bounded mixes", () => {
+  assert.equal(unsafeRegexPatternReason("^\\d+\\d+x$"), null);
+  assert.equal(unsafeRegexPatternReason("^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$"), null);
+  assert.equal(unsafeRegexPatternReason("^\\d+\\d{1,64}\\d{1,64}x$"), null);
+  assert.equal(unsafeRegexPatternReason("^\\d{3}-\\d{3}-\\d{4}$"), null);
+  assert.equal(unsafeRegexPatternReason("^[A-Z]{1,3}\\d{1,6}[A-Z]?$"), null);
+});
+
+test("every pattern the allow-list accepts in these tests matches a 512-character value quickly", () => {
+  const accepted = [
+    "^\\d+\\d+x$",
+    "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$",
+    "^\\d+\\d{1,64}\\d{1,64}x$",
+    "^\\d+(\\.\\d+)?$",
+    "^(a|a)?(a|a)?\\d+\\d+y$"
+  ];
+  for (const pattern of accepted) {
+    assert.equal(unsafeRegexPatternReason(pattern), null, pattern);
+    const started = performance.now();
+    new RegExp(pattern).test("1".repeat(512));
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 250, `${pattern} took ${elapsed.toFixed(1)}ms on a 512-character non-matching value`);
+  }
 });
 
 test("unsafeRegexPatternReason rejects groups nested more than one level deep", () => {

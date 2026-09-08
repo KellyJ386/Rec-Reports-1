@@ -36,6 +36,30 @@
 --   6. incident_amendments: a quick sanity probe that DELETE stays rejected
 --      unconditionally (fn_block_audit_mutation, 0032 -- untouched by this
 --      migration, already strictly stronger than "no delete while held").
+--   7. H1 (security review): a hard DELETE of the incident_reports row
+--      ITSELF is rejected outright while under legal hold (Guard 4) -- the
+--      review's H1 reproduction (a `for all`/incidents.manage policy with
+--      no BEFORE DELETE guard at all, admitting a real SQL DELETE that took
+--      every child row with it via ON DELETE CASCADE). Hard delete IS
+--      allowed once released and still draft (matching Guard 4's posture,
+--      mirroring guard 3's own "no longer a draft" freeze).
+--   8. H1 continued: fn_incident_child_legal_hold_guard's fail-closed
+--      fallback -- when the parent row cannot be found at all (the exact
+--      cascade-ordering gap the review's reproduction exploited: the
+--      system-generated ON DELETE CASCADE trigger removes the parent row
+--      BEFORE cascading to children, so a child's own lookup of its parent
+--      already finds nothing regardless of whether the parent was ever
+--      held), the child guard now REJECTS rather than reading a NULL
+--      lookup as "not held". Exercised directly (bypassing Guard 4 itself,
+--      via a temporarily disabled trigger) to prove this is a real,
+--      independent second layer, not merely inferred from Guard 4 blocking
+--      the path first.
+--   9. H2 (security review): the same legal-hold child guard, previously
+--      attached only to incident_people/incident_attachments/incident_
+--      witness_statements, now also covers incident_followup_actions and
+--      incident_escalations -- both hard DELETE and the soft-delete UPDATE
+--      -- while the parent is held, and both remain deletable once the
+--      hold is released.
 -- Runs against a migrated database inside a rolled-back transaction, so no
 -- fixture persists.
 begin;
@@ -102,10 +126,32 @@ insert into incident_attachments (id, facility_id, incident_id, attachment_type,
   ('57f20000-0000-0000-0000-000000000f03', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e03', 'photo', 'facilities/57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/incidents/57e00000-0000-0000-0000-000000000e03/closed.jpg')
 on conflict (id) do nothing;
 
+-- e04: a dedicated draft incident for the H1/H2 hard-delete tests (#7/#9
+-- below) -- kept separate from e01/e02/e03 so those sections' own fixtures
+-- and later assertions are never disturbed by an actual DELETE.
+-- e05: a dedicated draft incident for the H1 fail-closed test (#8) --
+-- separate again, since that test temporarily disables Guard 4 itself.
+insert into incident_reports (id, facility_id, incident_no, report_type, status, severity, occurred_at, location_text, summary) values
+  ('57e00000-0000-0000-0000-000000000e04', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ILH4', 'incident', 'draft', 'medium', '2026-07-01T00:00:00Z', 'Dock 4', 'H1/H2 hard-delete fixture'),
+  ('57e00000-0000-0000-0000-000000000e05', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ILH5', 'incident', 'draft', 'medium', '2026-07-01T00:00:00Z', 'Dock 5', 'H1 fail-closed fixture')
+on conflict (id) do nothing;
+
 insert into incident_witness_statements (id, facility_id, incident_id, person_id, version_no, statement_text) values
   ('57f30000-0000-0000-0000-000000000f01', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e01', '57f10000-0000-0000-0000-000000000f01', 1, 'Held statement'),
   ('57f30000-0000-0000-0000-000000000f02', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e02', '57f10000-0000-0000-0000-000000000f02', 1, 'Released statement'),
   ('57f30000-0000-0000-0000-000000000f03', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e03', '57f10000-0000-0000-0000-000000000f03', 1, 'Closed statement')
+on conflict (id) do nothing;
+
+-- H2: incident_followup_actions/incident_escalations rows, one per H1/H2
+-- fixture incident (e04, e05).
+insert into incident_followup_actions (id, facility_id, incident_id, action_type, status, description) values
+  ('57f50000-0000-0000-0000-000000000f04', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e04', 'corrective_action', 'open', 'e04 follow-up'),
+  ('57f50000-0000-0000-0000-000000000f05', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e05', 'corrective_action', 'open', 'e05 follow-up')
+on conflict (id) do nothing;
+
+insert into incident_escalations (id, facility_id, incident_id, escalation_level, reason_code, target_role, status, due_at) values
+  ('57f60000-0000-0000-0000-000000000f04', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e04', 1, 'ilh_test', 'manager', 'pending', '2026-07-02T00:00:00Z'),
+  ('57f60000-0000-0000-0000-000000000f05', '57aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '57e00000-0000-0000-0000-000000000e05', 1, 'ilh_test', 'manager', 'pending', '2026-07-02T00:00:00Z')
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------------
@@ -490,6 +536,205 @@ begin
   exception
     when insufficient_privilege then null; -- expected (fn_block_audit_mutation)
   end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 7. H1 (security review): place a hold on e04, then confirm a hard DELETE
+-- of the incident_reports row itself is rejected (Guard 4) -- the review's
+-- exact reproduction. Then release the hold and confirm the hard DELETE
+-- (cascading its children) succeeds once unheld and still draft.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '{"sub":"57000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  update incident_reports set legal_hold = true where id = '57e00000-0000-0000-0000-000000000e04';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL: the manager was denied placing the hold on e04';
+end;
+$$;
+
+do $$
+begin
+  delete from incident_reports where id = '57e00000-0000-0000-0000-000000000e04';
+  raise exception 'ILH FAIL (H1): hard DELETE of a legal-HELD incident_reports row succeeded for an incidents.manage holder';
+exception
+  when check_violation then null; -- expected (Guard 4)
+end;
+$$;
+
+reset role;
+
+do $$
+begin
+  if not exists (select 1 from incident_reports where id = '57e00000-0000-0000-0000-000000000e04') then
+    raise exception 'ILH FAIL (H1): e04 no longer exists after its hard DELETE was supposedly rejected';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 9. H2 (security review): while e04 is STILL held, both hard DELETE and
+-- the soft-delete UPDATE of its incident_followup_actions/
+-- incident_escalations rows are rejected -- previously outside the legal-
+-- hold matrix entirely (0057's original table list omitted both).
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '{"sub":"57000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  begin
+    delete from incident_followup_actions where id = '57f50000-0000-0000-0000-000000000f04';
+    raise exception 'ILH FAIL (H2): hard DELETE of incident_followup_actions succeeded while the parent incident is under legal hold';
+  exception
+    when check_violation then null; -- expected
+  end;
+
+  begin
+    update incident_followup_actions set deleted_at = now() where id = '57f50000-0000-0000-0000-000000000f04';
+    raise exception 'ILH FAIL (H2): soft-delete (UPDATE deleted_at) of incident_followup_actions succeeded while the parent incident is under legal hold';
+  exception
+    when check_violation then null; -- expected
+  end;
+
+  begin
+    delete from incident_escalations where id = '57f60000-0000-0000-0000-000000000f04';
+    raise exception 'ILH FAIL (H2): hard DELETE of incident_escalations succeeded while the parent incident is under legal hold';
+  exception
+    when check_violation then null; -- expected
+  end;
+
+  begin
+    update incident_escalations set deleted_at = now() where id = '57f60000-0000-0000-0000-000000000f04';
+    raise exception 'ILH FAIL (H2): soft-delete (UPDATE deleted_at) of incident_escalations succeeded while the parent incident is under legal hold';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 7/9 continued: release the hold, then confirm the children AND the
+-- parent are all deletable again -- proving the guards are genuinely
+-- conditional on the CURRENT hold state, matching section 4's own
+-- released-hold proof for the original three child tables.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  update incident_reports set legal_hold = false where id = '57e00000-0000-0000-0000-000000000e04';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL: the manager was denied releasing the hold on e04';
+end;
+$$;
+
+do $$
+begin
+  delete from incident_followup_actions where id = '57f50000-0000-0000-0000-000000000f04';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL (H2): hard DELETE of incident_followup_actions was rejected on a released-hold parent (should be allowed)';
+end;
+$$;
+
+do $$
+begin
+  delete from incident_escalations where id = '57f60000-0000-0000-0000-000000000f04';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL (H2): hard DELETE of incident_escalations was rejected on a released-hold parent (should be allowed)';
+end;
+$$;
+
+do $$
+begin
+  delete from incident_reports where id = '57e00000-0000-0000-0000-000000000e04';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL (H1): hard DELETE of a released-hold, still-draft incident_reports row was rejected (should be allowed)';
+end;
+$$;
+
+reset role;
+
+do $$
+begin
+  if exists (select 1 from incident_reports where id = '57e00000-0000-0000-0000-000000000e04') then
+    raise exception 'ILH FAIL (H1): e04 still exists after a hard DELETE that should have succeeded once released';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8. H1 continued: fn_incident_child_legal_hold_guard's fail-closed
+-- fallback. Guard 4 (the incident_reports-level BEFORE DELETE guard) is
+-- temporarily disabled here specifically so the CHILD guard's own
+-- independent fail-closed behavior can be exercised directly, reproducing
+-- the exact cascade-ordering gap the review's H1 finding describes: e05 is
+-- held, so the top-level DELETE below only reaches incident_followup_
+-- actions' trigger because Guard 4 itself is bypassed for this one
+-- statement. auth.uid() is NOT null here (request.jwt.claims is still set
+-- to the manager) -- this deliberately exercises the fail-closed branch,
+-- not the separate auth.uid()-is-null service-role exemption section 5
+-- already covers.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '{"sub":"57000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  update incident_reports set legal_hold = true where id = '57e00000-0000-0000-0000-000000000e05';
+exception
+  when check_violation then
+    raise exception 'ILH FAIL: the manager was denied placing the hold on e05';
+end;
+$$;
+
+reset role;
+
+-- DISABLE TRIGGER requires table ownership/superuser -- run as the
+-- connecting (table-owner) role, matching every other RLS-bypass step in
+-- this file set. request.jwt.claims stays set to the manager throughout
+-- (only the ROLE resets below, never the claims), so auth.uid() inside the
+-- trigger still resolves to a real, non-null actor once role authenticated
+-- is resumed for the DELETE itself.
+alter table incident_reports disable trigger incident_reports_transition_guard;
+
+select set_config('request.jwt.claims', '{"sub":"57000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  begin
+    -- Guard 4 is disabled above, so RLS alone (the FOR ALL incidents.manage
+    -- policy) admits this DELETE and it reaches the RI cascade; the CHILD
+    -- guard on incident_followup_actions is still enabled and must reject
+    -- it via the fail-closed fallback (the parent row is already gone by
+    -- the time that trigger's own SELECT runs).
+    delete from incident_reports where id = '57e00000-0000-0000-0000-000000000e05';
+    raise exception 'ILH FAIL (H1 fail-closed): a cascade-driven child DELETE succeeded even though the parent was held and Guard 4 was bypassed -- fn_incident_child_legal_hold_guard did not fail closed on the missing-parent case';
+  exception
+    when check_violation then null; -- expected: the child guard's fail-closed fallback fired
+  end;
+end;
+$$;
+
+reset role;
+
+alter table incident_reports enable trigger incident_reports_transition_guard;
+
+do $$
+begin
+  if not exists (select 1 from incident_reports where id = '57e00000-0000-0000-0000-000000000e05') then
+    raise exception 'ILH FAIL (H1 fail-closed): e05 no longer exists -- the child guard''s rejection should have aborted the WHOLE cascading DELETE statement, including the parent row removal';
+  end if;
+  if not exists (select 1 from incident_followup_actions where id = '57f50000-0000-0000-0000-000000000f05') then
+    raise exception 'ILH FAIL (H1 fail-closed): e05''s follow-up child no longer exists -- the cascade should have been rolled back along with the parent';
+  end if;
 end;
 $$;
 

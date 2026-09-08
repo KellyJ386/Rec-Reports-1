@@ -261,14 +261,33 @@ begin
     attachment_path := new.storage_path;
   end if;
 
-  if attachment_path is not null
-    and attachment_path !~ (
+  if attachment_path is not null then
+    -- L1 (security review, Wave 3 Slice 3B): incident_signatures gets its
+    -- OWN regex anchored on new.incident_id rather than reusing the shared
+    -- four-module alternation below. The shared regex only pins
+    -- facility_id + module ("incidents") + ANY single record-id segment --
+    -- it happily accepted a signature on incident A naming a path under
+    -- incident B (same facility, same module), and even a path under a
+    -- completely different module (reports/work_orders/certifications), so
+    -- long as the facility segment matched. This branch instead requires
+    -- the path to literally be
+    -- facilities/<facility_id>/incidents/<this row's own incident_id>/<filename>.
+    if TG_TABLE_NAME = 'incident_signatures' then
+      if attachment_path !~ (
+        '^facilities/' || new.facility_id::text ||
+        '/incidents/' || new.incident_id::text ||
+        '/(?!\.\.?$)[^/]+$'
+      ) then
+        raise exception 'attachment path % does not match facilities/%/incidents/%/<filename>', attachment_path, new.facility_id, new.incident_id
+          using errcode = 'check_violation';
+      end if;
+    elsif attachment_path !~ (
       '^facilities/' || new.facility_id::text ||
       '/(reports|incidents|work_orders|certifications)/(?!\.\.?/)[^/]+/(?!\.\.?$)[^/]+$'
-    )
-  then
-    raise exception 'attachment path % does not match facilities/%/<module>/<recordId>/<filename>', attachment_path, new.facility_id
-      using errcode = 'check_violation';
+    ) then
+      raise exception 'attachment path % does not match facilities/%/<module>/<recordId>/<filename>', attachment_path, new.facility_id
+        using errcode = 'check_violation';
+    end if;
   end if;
 
   return new;
@@ -349,12 +368,39 @@ create policy "incident managers can record compliance checks" on incident_compl
     and checked_by = (select auth.uid())
   );
 
+-- L2 (security review, Wave 3 Slice 3B): a manage-only actor's USING clause
+-- used to admit ANY existing row (no restriction on the row's OWN prior
+-- status), so a manage-without-review holder could overwrite a reviewer's
+-- 'waived' determination with their own 'pass' -- the same record-integrity
+-- guarantee "waive requires incidents.review" is supposed to protect, just
+-- approached from the update-away-from-waived direction instead of the
+-- mint-a-waiver direction. `and (status <> 'waived' or ... incidents.review)`
+-- (USING is evaluated against the EXISTING/pre-update row, matching every
+-- other UPDATE policy's own bare-column convention in this file set -- no
+-- `old.`/`new.` qualifier is legal inside a policy expression) closes that:
+-- a manage-only actor may still record/update a pass/fail check, but may no
+-- longer touch a row a reviewer has already waived; a reviewer (with or
+-- without manage) still can, via this same policy, matching G8's existing
+-- "reviewer waive" capability and letting a reviewer supersede their own or
+-- another reviewer's waiver without a second dedicated policy. The matching
+-- `and (deleted_at is null or ... incidents.review)` on the WITH CHECK
+-- (soft-delete was previously unconstrained here for EITHER code) closes
+-- the sibling gap the same way: a manage-only actor could otherwise set
+-- deleted_at on any check, making it invisible to the closure gate and to
+-- GET .../compliance-checks, without holding incidents.review; a reviewer
+-- still can.
 drop policy if exists "incident managers can update compliance checks" on incident_compliance_checks;
 create policy "incident managers can update compliance checks" on incident_compliance_checks
   for update
   using (
-    internal.has_permission((select auth.uid()), facility_id, 'incidents.manage')
-    or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+    (
+      internal.has_permission((select auth.uid()), facility_id, 'incidents.manage')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+    )
+    and (
+      status <> 'waived'
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+    )
   )
   with check (
     (
@@ -362,6 +408,10 @@ create policy "incident managers can update compliance checks" on incident_compl
       or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
     )
     and status in ('pass', 'fail')
+    and (
+      deleted_at is null
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+    )
     and internal.fn_assert_same_facility(facility_id, 'incident_reports', incident_id)
     and checked_by = (select auth.uid())
   );

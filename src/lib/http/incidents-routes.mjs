@@ -3,6 +3,7 @@ import { reportError } from "../observability.mjs";
 import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { verifyIncidentAuditChain } from "../audit.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
+import { isMissingRelationError } from "./errors.mjs";
 import {
   escalationDueAt,
   isEscalationOverdue,
@@ -44,20 +45,36 @@ const WORK_ORDER_MIN_COLUMNS =
 const AUDIT_VIEW = "incidents.audit.view";
 const INCIDENTS_MODULE_CODE = "incidents";
 
+// M1 (security review): the legal packet's facility-wide chain-verification
+// fetch is capped at this many rows -- past it, only a PREFIX of the real
+// chain was checked (see the packet route's own comment), so the route
+// marks the result truncated instead of reporting it as verified.
+const CHAIN_VERIFICATION_LIMIT = 10000;
+
 // IN-18: incident_signatures/incident_compliance_checks (design doc §2.2)
 // belong to a sibling Wave 3 migration (0056) that may not exist in every
 // tree this route runs against. Reads them the same way every other child
-// table here is read, but a missing-relation (or any other) PostgrestError
-// degrades to "no rows" instead of failing the whole packet -- the packet is
-// still a complete, correct legal document without a section this facility's
-// schema doesn't carry yet; renderIncidentPacket already treats an empty
-// array as "omit the section" (see that function's own doc comment).
+// table here is read, but a missing-relation PostgrestError (42P01/PGRST205
+// -- the table genuinely doesn't exist in this schema yet) degrades to "no
+// rows" instead of failing the whole packet -- the packet is still a
+// complete, correct legal document without a section this facility's schema
+// doesn't carry yet; renderIncidentPacket already treats an empty array as
+// "omit the section" (see that function's own doc comment).
+//
+// L4 (security review): every OTHER PostgrestError -- a 403 (RLS denied this
+// caller these rows), a 500, a malformed query -- is rethrown rather than
+// also degrading to []. The original `if (error instanceof PostgrestError)
+// return []` swallowed those too, so a legal packet could silently omit its
+// Signatures/Compliance Checks sections with no indication anywhere in the
+// document that the omission was an authorization/server failure rather
+// than "this incident genuinely has none" -- exactly the false-negative
+// shape M1 flags for the audit chain, just on a different pair of sections.
 async function tryOptionalSelect(client, table, options) {
   try {
     const rows = await pgSelect(client, table, options);
     return rows ?? [];
   } catch (error) {
-    if (error instanceof PostgrestError) return [];
+    if (isMissingRelationError(error)) return [];
     throw error;
   }
 }
@@ -189,17 +206,25 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
   // successful incident submit/escalate into a failed request. Errors are
   // caught, logged, and fire-and-forget reported (OP-20's reportError
   // contract), never re-thrown.
-  async function emitIncidentNotifications(auth, env, eventCode, incident, extraRecipientIds = []) {
+  // M3: `escalationId` (the just-created/relevant escalation's own id, when
+  // this event carries one -- e.g. the escalate route's own createdEscalation)
+  // is threaded through to buildIncidentNotificationJobs so its dedupe_key
+  // distinguishes this escalation from any other on the same incident. See
+  // that function's own doc comment for the full rationale.
+  async function emitIncidentNotifications(auth, env, eventCode, incident, extraRecipientIds = [], escalationId = null) {
     try {
       const route = await loadActiveRoute({ client: auth.client, facilityId: incident.facility_id, eventCode });
       if (!route) return;
       const expanded = await expandRouteRecipients({ client: auth.client, facilityId: incident.facility_id, route });
       const recipients = [...new Set([...(expanded ?? []), ...(extraRecipientIds ?? [])])].filter(Boolean);
       if (recipients.length === 0) return;
-      const jobs = buildIncidentNotificationJobs(eventCode, route, recipients, {
-        id: incident.id,
-        severity: incident.severity
-      });
+      const jobs = buildIncidentNotificationJobs(
+        eventCode,
+        route,
+        recipients,
+        { id: incident.id, severity: incident.severity },
+        escalationId
+      );
       if (jobs.length === 0) return;
       await pgInsert(auth.client, "notification_jobs", jobs, {
         onConflict: "dedupe_key",
@@ -488,7 +513,14 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         // escalation names one) is folded in as an extra recipient
         // alongside whatever the facility's incident.escalated route's
         // distribution list already resolves.
-        await emitIncidentNotifications(auth, env, "incident.escalated", incident, [escalation.target_user_id]);
+        await emitIncidentNotifications(
+          auth,
+          env,
+          "incident.escalated",
+          incident,
+          [escalation.target_user_id],
+          createdEscalation?.id ?? null
+        );
 
         return sendJson(response, 201, createdEscalation);
       })
@@ -718,8 +750,16 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
               filters: { incident_id: incident.id, status: { in: OPEN_FOLLOWUP_STATUSES } },
               select: "id"
             }),
+            // L5 (security review): a soft-deleted check must not count
+            // toward the gate -- DB guard 2.5 (0056/0057) already filters
+            // `and deleted_at is null`; without the matching filter here,
+            // a soft-deleted 'pass'/'waived' row let this pre-check allow a
+            // close that the trigger would then reject, surfacing as a raw
+            // check_violation/409 instead of the friendly {error,
+            // blockingCheck} body below.
             pgSelect(auth.client, "incident_compliance_checks", {
               filters: { incident_id: incident.id },
+              extra: { deleted_at: "is.null" },
               select: "check_key,status"
             })
           ]);
@@ -1529,10 +1569,18 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
   // Renders the full legal packet: everything export.pdf covers, plus every
   // witness statement version, signatures/compliance checks (when those
   // rows exist -- see incident-pdf.mjs's renderIncidentPacket doc comment),
-  // an evidence index, and the FULL audit timeline with chain hashes. Same
-  // guard as export.pdf (incidents.export.pdf) -- the packet is a strictly
-  // broader export of the same underlying case, not a separately-gated
-  // capability.
+  // an evidence index, and the FULL audit timeline with chain hashes.
+  //
+  // M1 (security review): unlike export.pdf, this route requires
+  // incidents.export.pdf AND one of incidents.audit.view/manage/review --
+  // the SAME set incident_audit_events' own SELECT policy requires. Without
+  // the second half, an export.pdf-only caller's own audit read is
+  // RLS-filtered to zero rows (the packet never sees a 403 -- PostgREST
+  // just returns an empty, "successful" result set), and the packet
+  // printed "Chain Valid: true" over that emptiness -- an integrity
+  // attestation over nothing. Requiring the same permission the read
+  // itself needs means a caller who reaches the chain-verification and
+  // audit-read code below is always ENTITLED to see what they get back.
   //
   // 409 while the incident is still a draft: unlike export.pdf (which
   // deliberately allows a watermarked draft copy, see that route's own
@@ -1549,6 +1597,25 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
   // (querying incident_audit_events a second time, filtered) -- a packet
   // must never leak another incident's audit content.
   //
+  // M1 continued: two more "verified" edge cases, both independent of the
+  // permission fix above (a genuinely legitimate caller can still hit
+  // either one) --
+  //   * the facility-wide chain fetch is capped at CHAIN_VERIFICATION_LIMIT
+  //     rows; hitting that cap means only a PREFIX of the real chain was
+  //     checked (a prefix of a valid chain trivially re-verifies as
+  //     "valid", which would silently under-report), so the route marks
+  //     the result `truncated: true` and the rendered "Chain Valid" line
+  //     stops reading `true` outright -- see incident-pdf.mjs's own
+  //     "Chain Verification Note" handling.
+  //   * a submitted-or-later incident must have at least one audit event of
+  //     its own (submission itself always writes one) -- if the
+  //     incident-scoped audit read comes back empty anyway, that is not a
+  //     legitimate "nothing happened yet" case (this route already
+  //     rejected drafts above) but a sign the caller's read is silently
+  //     filtered or the incident's own audit trail is broken; the packet
+  //     is refused (409) rather than rendered with a fabricated-looking
+  //     empty timeline and an unearned "valid" chain stamp.
+  //
   // Every successful packet export writes an incident_audit_events row
   // (event_type "incident.packet_exported") carrying the packet's own
   // content hash and the chain-verification result, matching export.pdf's
@@ -1561,6 +1628,11 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
         const incident = await loadIncident(auth.client, params.id);
         if (!incident) return sendJson(response, 404, { error: "incident not found" });
         if (!requirePerm(auth, incident.facility_id, EXPORT_PDF, response)) return;
+        // M1: incident_audit_events' own SELECT policy requires one of
+        // incidents.audit.view/manage/review -- require it here too, so a
+        // caller who reaches the audit-chain read below is always entitled
+        // to see what it returns (see this route's own header comment).
+        if (!requireAnyPerm(auth, incident.facility_id, [AUDIT_VIEW, MANAGE, REVIEW], response)) return;
         if (incident.status === "draft") {
           return sendJson(response, 409, {
             error: "a legal packet can only be generated for a submitted-or-later incident"
@@ -1629,7 +1701,7 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
             filters: { facility_id: incident.facility_id },
             select: "id,event_type,incident_id,facility_id,event_payload,created_at,prev_hash,row_hash",
             order: "created_at.asc,id.asc",
-            limit: 10000
+            limit: CHAIN_VERIFICATION_LIMIT
           }),
           tryOptionalSelect(auth.client, "incident_signatures", {
             filters: { incident_id: incident.id },
@@ -1641,7 +1713,38 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
           })
         ]);
 
-        const chainVerification = verifyIncidentAuditChain(chainRows ?? []);
+        // M1: a submitted-or-later incident must carry at least its own
+        // "incident.submitted" audit event -- an empty incident-scoped read
+        // here (distinct from the facility-wide chainRows fetch below) is
+        // never a legitimate "nothing happened yet" state for a
+        // non-draft incident (the draft check above already excluded the
+        // one case where zero events would be expected), so refuse the
+        // packet outright rather than render a fabricated-looking empty
+        // Audit Timeline under an unearned "valid" chain stamp.
+        if ((auditEvents ?? []).length === 0) {
+          return sendJson(response, 409, {
+            error:
+              "no audit events are readable for this incident; a legal packet cannot be generated without a verifiable audit trail"
+          });
+        }
+
+        const rawChainVerification = verifyIncidentAuditChain(chainRows ?? []);
+        // M1: the facility-wide fetch above is capped at
+        // CHAIN_VERIFICATION_LIMIT rows -- hitting that cap means only a
+        // PREFIX of the real chain was checked, and a prefix of a valid
+        // chain trivially re-verifies as "valid" (verifyIncidentAuditChain
+        // has no way to know it was handed a partial chain), so that case
+        // is downgraded here rather than reported as verified. `noRows`
+        // covers the (should-be-impossible now that AUDIT_VIEW/MANAGE/
+        // REVIEW is required above, but still checked defensively) case of
+        // an empty facility-wide read.
+        const chainTruncated = (chainRows ?? []).length >= CHAIN_VERIFICATION_LIMIT;
+        const chainNoRows = (chainRows ?? []).length === 0;
+        const chainVerification = {
+          ...rawChainVerification,
+          truncated: chainTruncated,
+          noRows: chainNoRows
+        };
 
         // Stamped once, here -- incident-pdf.mjs never reads the clock
         // itself (same contract renderIncidentPdf documents).
@@ -1677,8 +1780,10 @@ export function registerIncidentRoutes(router, { authenticate, sendJson, readBod
               actor: auth.claims.sub,
               format: "pdf",
               documentHash: pkg.documentHash,
-              chainValid: chainVerification.valid,
-              chainBrokenAt: chainVerification.brokenAt
+              chainValid: !chainVerification.truncated && !chainVerification.noRows && chainVerification.valid,
+              chainBrokenAt: chainVerification.brokenAt,
+              chainTruncated: chainVerification.truncated,
+              chainNoRows: chainVerification.noRows
             }
           })
         );

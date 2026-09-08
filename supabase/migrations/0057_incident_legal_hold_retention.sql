@@ -112,6 +112,38 @@ as $$
 declare
   v_manage_or_review boolean;
 begin
+  -- Guard 4 (H1, security review, Wave 3 Slice 3B): a hard DELETE of
+  -- incident_reports was previously admitted straight through by the
+  -- FOR ALL "incident managers can manage reports" policy (0004/0026/0038)
+  -- with NO before-delete guard at all -- so a legally-held incident (and,
+  -- via ON DELETE CASCADE, every one of its 10 child-table FKs) could be
+  -- permanently destroyed by any incidents.manage holder, defeating every
+  -- guarantee this migration's OWN Guard 0/fn_incident_child_legal_hold_guard
+  -- claim to provide. Rejects the DELETE outright when the row being
+  -- removed is under legal hold, or (matching guard 3's own posture below)
+  -- has left draft -- a submitted-or-later incident's evidentiary record
+  -- must go through a status transition, never a hard delete. Exempted when
+  -- auth.uid() is null (the same service-role/definer-context carve-out
+  -- every other guard in this function uses): a future retention/purge job
+  -- (Wave 4 IN-25) must still be able to hard-delete a row once its hold is
+  -- lifted and its retention window has passed. Checked BEFORE the INSERT
+  -- branch (mutually exclusive tg_op values, so ordering has no functional
+  -- effect -- placed first only because a DELETE has no `new` row to reason
+  -- about, mirroring how the INSERT branch below has no `old` row).
+  if tg_op = 'DELETE' then
+    if auth.uid() is not null then
+      if old.legal_hold is true then
+        raise exception 'incident_reports %: an incident under legal hold may not be deleted.', old.id
+          using errcode = 'check_violation';
+      end if;
+      if old.status <> 'draft' then
+        raise exception 'incident_reports %: no longer a draft; may not be deleted (use a status transition instead).', old.id
+          using errcode = 'check_violation';
+      end if;
+    end if;
+    return old;
+  end if;
+
   -- M2 (0048): BEFORE INSERT branch -- legal_hold may only be created true by
   -- an actor holding incidents.legal_hold.manage. No OLD row exists yet, so
   -- none of the UPDATE-only guards below (including the new Guard 0) apply.
@@ -285,9 +317,12 @@ begin
 end;
 $$;
 
+-- H1: "or delete" added to the trigger event list so Guard 4 above actually
+-- fires -- a trigger registered only "before insert or update" never sees a
+-- DELETE statement at all, regardless of what the function body checks.
 drop trigger if exists incident_reports_transition_guard on incident_reports;
 create trigger incident_reports_transition_guard
-  before insert or update on incident_reports
+  before insert or update or delete on incident_reports
   for each row execute function fn_incident_report_transition_guard();
 
 revoke execute on function fn_incident_report_transition_guard() from public, authenticated;
@@ -343,8 +378,22 @@ begin
     from incident_reports
     where id = v_incident_id;
 
-  if v_legal_hold is true then
-    raise exception '% %: parent incident % is under legal hold; delete is rejected.', tg_table_name, v_row_id, v_incident_id
+  -- H1 (security review): fail CLOSED when the parent row cannot be found,
+  -- rather than letting a NULL lookup read as "not held" and pass the
+  -- delete through. This is exactly the gap the review's reproduction
+  -- exploited: ON DELETE CASCADE's system-generated trigger removes the
+  -- parent row (and fires this AFTER as part of the SAME statement) before
+  -- cascading to the child rows referencing it, so by the time THIS
+  -- trigger's own SELECT above runs, `select ... where id = v_incident_id`
+  -- already returns no rows regardless of whether the parent was ever
+  -- held -- `v_legal_hold is true` was therefore always false on that path,
+  -- silently admitting the cascade-driven child delete no matter what.
+  -- `not found` (set by the SELECT INTO immediately above) catches that
+  -- case directly, independent of -- and even if some future change ever
+  -- weakens or removes -- Guard 4's own top-level DELETE block on
+  -- incident_reports itself.
+  if not found or v_legal_hold is true then
+    raise exception '% %: parent incident % is under legal hold or could not be found; delete is rejected.', tg_table_name, v_row_id, v_incident_id
       using errcode = 'check_violation';
   end if;
 
@@ -403,6 +452,44 @@ create trigger incident_attachments_legal_hold_soft_delete_guard
 drop trigger if exists incident_witness_statements_legal_hold_guard on incident_witness_statements;
 create trigger incident_witness_statements_legal_hold_guard
   before update on incident_witness_statements
+  for each row
+  when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+
+-- incident_followup_actions / incident_escalations (H2, security review):
+-- 0057's original matrix covered incident_people/incident_attachments/
+-- incident_witness_statements/incident_amendments but left these two out --
+-- both carry the identical `for all`/incidents.manage FOR ALL policy shape
+-- as incident_people/incident_attachments (0004/0038), which structurally
+-- admits a real hard DELETE, and both already carry a deleted_at column
+-- (0004) admitting a soft-delete UPDATE. They are also two of the packet's
+-- own rendered sections ("Follow-Up Actions", "Escalation History") --
+-- first-class case evidence, not incidental rows -- so a held case's
+-- corrective-action record and escalation chain were erasable by any
+-- incidents.manage holder even though every other child table in this
+-- matrix was already protected. Guarded identically to incident_people/
+-- incident_attachments above: the same generic fn_incident_child_legal_hold_
+-- guard, both a BEFORE DELETE and a BEFORE UPDATE OF deleted_at trigger.
+drop trigger if exists incident_followup_actions_legal_hold_delete_guard on incident_followup_actions;
+create trigger incident_followup_actions_legal_hold_delete_guard
+  before delete on incident_followup_actions
+  for each row execute function fn_incident_child_legal_hold_guard();
+
+drop trigger if exists incident_followup_actions_legal_hold_soft_delete_guard on incident_followup_actions;
+create trigger incident_followup_actions_legal_hold_soft_delete_guard
+  before update on incident_followup_actions
+  for each row
+  when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+
+drop trigger if exists incident_escalations_legal_hold_delete_guard on incident_escalations;
+create trigger incident_escalations_legal_hold_delete_guard
+  before delete on incident_escalations
+  for each row execute function fn_incident_child_legal_hold_guard();
+
+drop trigger if exists incident_escalations_legal_hold_soft_delete_guard on incident_escalations;
+create trigger incident_escalations_legal_hold_soft_delete_guard
+  before update on incident_escalations
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
   execute function fn_incident_child_legal_hold_guard();
