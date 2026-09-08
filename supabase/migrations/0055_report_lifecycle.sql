@@ -288,6 +288,7 @@ create policy "report publishers can lock or revise submissions" on report_submi
 create or replace function fn_report_submission_transition_guard()
 returns trigger
 language plpgsql
+security definer
 set search_path = public
 as $$
 declare
@@ -522,8 +523,8 @@ create trigger report_submissions_audit
 -- and still covers every other entity_table (branding, etc.) exactly as
 -- before.
 -- ---------------------------------------------------------------------------
-drop policy if exists "report template governors can read template publish change requests" on admin_change_requests;
-create policy "report template governors can read template publish change requests" on admin_change_requests
+drop policy if exists "template governors can read publish change requests" on admin_change_requests;
+create policy "template governors can read publish change requests" on admin_change_requests
   for select
   using (
     entity_table = 'report_template_versions'
@@ -535,8 +536,8 @@ create policy "report template governors can read template publish change reques
 -- the self-approval bypass -- a request can never even be CREATED under
 -- someone else's identity (section (h) below closes the UPDATE-side half:
 -- requested_by can never be REASSIGNED after the fact either).
-drop policy if exists "report template governors can create template publish change requests" on admin_change_requests;
-create policy "report template governors can create template publish change requests" on admin_change_requests
+drop policy if exists "template governors can create publish change requests" on admin_change_requests;
+create policy "template governors can create publish change requests" on admin_change_requests
   for insert
   with check (
     entity_table = 'report_template_versions'
@@ -545,8 +546,8 @@ create policy "report template governors can create template publish change requ
     and requested_by = (select auth.uid())
   );
 
-drop policy if exists "report template governors can advance template publish change requests" on admin_change_requests;
-create policy "report template governors can advance template publish change requests" on admin_change_requests
+drop policy if exists "template governors can advance publish change requests" on admin_change_requests;
+create policy "template governors can advance publish change requests" on admin_change_requests
   for update
   using (
     entity_table = 'report_template_versions'
@@ -560,11 +561,15 @@ create policy "report template governors can advance template publish change req
   );
 
 -- ---------------------------------------------------------------------------
--- (g) M-1(a): fn_report_template_version_publish_guard() -- BEFORE UPDATE
--- trigger on report_template_versions. Enforces DR-26's governance rule AT
--- THE DATABASE LAYER: when this version's facility has
--- daily_reports.templatePublishRequiresApproval enabled, an is_published
--- false -> true transition is only legal when an admin_change_requests row
+-- (g) M-1(a): fn_report_template_version_publish_guard() -- BEFORE INSERT OR
+-- UPDATE trigger on report_template_versions. Enforces DR-26's governance
+-- rule AT THE DATABASE LAYER: when this version's facility has
+-- daily_reports.templatePublishRequiresApproval enabled, a version becoming
+-- published -- an UPDATE flipping is_published false -> true, OR an INSERT
+-- that arrives with is_published = true already set (without the INSERT arm
+-- an actor could skip the guarded transition entirely by inserting the new
+-- version pre-published and then pointing report_templates.active_version at
+-- it) -- is only legal when an admin_change_requests row
 -- for this exact (entity_table='report_template_versions', entity_id=this
 -- version) exists with status 'approved' (the status the row carries the
 -- moment applyTemplatePublish flips is_published -- see
@@ -608,7 +613,7 @@ declare
   v_requires_approval boolean := false;
   v_approved boolean;
 begin
-  if tg_op = 'UPDATE' and old.is_published = false and new.is_published = true then
+  if new.is_published = true and (tg_op = 'INSERT' or old.is_published = false) then
     select id into v_module_id from modules where code = 'daily_reports';
 
     if v_module_id is not null then
@@ -654,7 +659,7 @@ $$;
 
 drop trigger if exists report_template_versions_publish_guard on report_template_versions;
 create trigger report_template_versions_publish_guard
-  before update on report_template_versions
+  before insert or update on report_template_versions
   for each row execute function fn_report_template_version_publish_guard();
 
 revoke execute on function fn_report_template_version_publish_guard() from public, authenticated;
