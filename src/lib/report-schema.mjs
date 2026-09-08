@@ -60,7 +60,7 @@ export function isSupportedFieldType(type) {
 //      not the end anchor) -- an unanchored pattern can be forced into more
 //      backtracking by a longer input than the author intended, and it also
 //      changes what "matches" means (substring vs whole-value).
-//   3. Must not contain a backreference (`\1`-`\9`) -- not needed for field
+//   3. Must not contain a backreference (`\1`-`\9`, `\k<name>`) -- not needed for field
 //      validation patterns and removes another engine-dependent complexity
 //      source.
 //   4. Structural grammar (unsafeRegexStructureReason), scanned left to
@@ -109,6 +109,16 @@ export function isSupportedFieldType(type) {
 //           ranges multiplying out to 8192 (`{1,64}` twice plus a `?`).
 //           Ordinary field patterns -- `^\d+(\.\d+)?$`, `^[A-Z]{2}-\d{4}$`,
 //           `^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,10}$` -- all fit.
+//        g. Alternation-path cap. (f) counts paths, but each path also
+//           re-scans whatever follows the groups, so a run of optional or
+//           alternating groups in front of a long exact tail
+//           (`^(|a)(|a)...(|a)[a-z]{500}x$`, 22 groups, measured 9 s) blows
+//           up well inside the (f) budget -- an EMPTY alternative also
+//           defeats the engine's identical-prefix folding that the (f)
+//           calibration relied on. The product of alternatives over every
+//           group (x2 per optional group) is therefore capped separately at
+//           MAX_REGEX_ALTERNATION_PATHS (2^8): at most eight optional or
+//           two-way groups in one pattern, ~80 ms against the worst tail.
 //   5. Must be syntactically valid (`new RegExp(pattern)` does not throw).
 //      Constructing a RegExp only compiles it -- it never executes matching
 //      -- so this step carries no backtracking risk regardless of shape.
@@ -125,7 +135,15 @@ const MAX_REGEX_QUANTIFIERS = 8;
 // this engine for the worst shapes that still fit inside it; the shapes the
 // security review timed in seconds sit at 2^27 and above.
 const MAX_REGEX_BACKTRACK_BUDGET = 2 ** 22;
-const BACKREFERENCE_RE = /\\[1-9]/;
+// Separate, much tighter cap on alternation/optional-group paths (rule (g)).
+// The budget above counts how many ways the input can be split, but every
+// one of those paths re-scans whatever follows the groups; with a long
+// exact tail (`[a-z]{500}`) each path costs hundreds of steps, and an empty
+// alternative (`(|a)`) defeats V8's prefix folding entirely. 2^8 paths with
+// the worst allowed tail measured ~80 ms; 2^10 already ~280 ms.
+const MAX_REGEX_ALTERNATION_PATHS = 2 ** 8;
+// `\1`-`\9` numbered and `\k<name>` named backreferences.
+const BACKREFERENCE_RE = /\\(?:[1-9]|k<)/;
 const LOOKAROUND_AT_RE = /^\(\?(?:=|!|<=|<!)/;
 const GROUP_QUANTIFIER_RE = /^(?:\*|\+|\{\d*(?:,\d*)?\})/;
 const BRACE_QUANTIFIER_RE = /^\{(\d+)(?:(,)(\d*))?\}/;
@@ -142,8 +160,12 @@ function unsafeRegexStructureReason(pattern) {
   // the input" over every quantifier and alternation seen so far.
   let ambiguity = 1;
   // Number of `|`-separated alternatives inside the currently open group
-  // (1 = no alternation). Folded into `ambiguity` when the group closes.
+  // (1 = no alternation). Folded into `ambiguity` and `altPaths` when the
+  // group closes.
   let groupBranches = 1;
+  // Rule (g): product of alternatives over every group, x2 per optional
+  // group -- the number of distinct group-choice paths the engine can walk.
+  let altPaths = 1;
   let i = 0;
   const n = pattern.length;
 
@@ -201,6 +223,7 @@ function unsafeRegexStructureReason(pattern) {
       i += 1;
       // Rule (c): each alternative is one more way to match the same span.
       ambiguity *= groupBranches;
+      altPaths *= groupBranches;
       groupBranches = 1;
       const rest = pattern.slice(i);
       if (GROUP_QUANTIFIER_RE.test(rest)) {
@@ -209,10 +232,14 @@ function unsafeRegexStructureReason(pattern) {
       if (rest[0] === "?") {
         quantifiers += 1;
         ambiguity *= 2;
+        altPaths *= 2;
         i += 1;
         if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") {
           return "must not repeat a group -- only a single trailing ? is allowed after a group";
         }
+      }
+      if (altPaths > MAX_REGEX_ALTERNATION_PATHS) {
+        return "has too many alternation or optional-group paths -- use at most 8 optional or alternating groups";
       }
       if (overBudget()) return budgetReason;
       continue;

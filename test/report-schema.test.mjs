@@ -414,6 +414,31 @@ test("unsafeRegexPatternReason cannot be desynchronised by the empty-class forms
   assert.equal(unsafeRegexPatternReason("^[[]$"), null); // literal [ inside a class
 });
 
+// Third re-verification (H-3): the budget counts paths, but every path also
+// re-scans the tail. Twenty-two optional groups in front of `[a-z]{500}`
+// measured 9 s while sitting inside the budget, and an EMPTY alternative
+// `(|a)` defeats the engine's prefix folding. Alternation paths are capped
+// separately at 2^8.
+test("unsafeRegexPatternReason caps alternation and optional-group paths independently of the budget", () => {
+  const optional = (n) => "^" + "(|a)".repeat(n);
+  assert.match(unsafeRegexPatternReason(optional(22) + "[a-z]{500}x$"), /alternation or optional-group paths/);
+  assert.match(unsafeRegexPatternReason(optional(22) + "x$"), /alternation or optional-group paths/);
+  assert.match(unsafeRegexPatternReason("^(a|a)".repeat(1) + "(a|a)".repeat(8) + "x$"), /alternation or optional-group paths/);
+  assert.match(unsafeRegexPatternReason("^" + "(a)?".repeat(9) + "x$"), /alternation or optional-group paths/);
+  assert.match(unsafeRegexPatternReason("^(|a)".repeat(1) + "(|a)".repeat(8) + "x$"), /alternation or optional-group paths/);
+  // Eight two-way choices are still fine, with or without a long exact tail.
+  assert.equal(unsafeRegexPatternReason(optional(8) + "[a-z]{190}x$"), null);
+  assert.equal(unsafeRegexPatternReason("^" + "(a)?".repeat(8) + "x$"), null);
+  assert.equal(unsafeRegexPatternReason("^(AM|PM)$"), null);
+  assert.equal(unsafeRegexPatternReason("^\\d+(\\.\\d+)?$"), null);
+  assert.equal(unsafeRegexPatternReason("^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$"), null);
+});
+
+test("unsafeRegexPatternReason rejects named backreferences as well as numbered ones", () => {
+  assert.match(unsafeRegexPatternReason("^(?<n>[a-z]*)\\k<n>x$"), /backreferences/);
+  assert.match(unsafeRegexPatternReason("^(a)\\1$"), /backreferences/);
+});
+
 test("unsafeRegexPatternReason rejects bounded ranges whose combinations still explode", () => {
   assert.match(
     unsafeRegexPatternReason("^\\d{1,64}\\d{1,64}\\d{1,64}\\d{1,64}x$"),
@@ -438,7 +463,8 @@ test("every pattern the allow-list accepts in these tests matches a 512-characte
     "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$",
     "^\\d+\\d{1,64}\\d{1,64}x$",
     "^\\d+(\\.\\d+)?$",
-    "^(a|a)?(a|a)?\\d+\\d+y$"
+    "^(a|a)?(a|a)?\\d+\\d+y$",
+    "^(|a)(|a)(|a)(|a)(|a)(|a)(|a)(|a)[a-z]{190}x$"
   ];
   for (const pattern of accepted) {
     assert.equal(unsafeRegexPatternReason(pattern), null, pattern);
