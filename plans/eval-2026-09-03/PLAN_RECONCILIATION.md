@@ -17,6 +17,17 @@ SC-08, CM-09, CM-11 and OP-12 are DONE, IN-11 and CM-14 are PARTIAL (witness sta
 SMS), and CM-07's evidence now names a real FCM adapter. Every M1 task is now DONE or owner-only. Rollups
 below are updated in place.
 
+**Status update 2026-09-08 (Wave 3 Slices 3A–3C open as PRs #25, #26, #27):** 24 more rows changed — the
+whole Reports M2 workflow/distribution slice (DR-16 … DR-24, DR-26), the Incidents legal core (IN-13 …
+IN-21, and IN-11 flips from PARTIAL to DONE now that signatures and compliance checks exist), and the
+Work Orders assets/SLA/PM slice (WO-11, WO-12, WO-13, WO-15, WO-16, WO-17, WO-18, WO-19, WO-20, WO-21) are
+DONE. Each row is evidenced against migrations 0052–0061 on `claude/wave3-slice-3c` @ `dfa9570` (3A: PR
+#25, migrations 0052–0055; 3B: PR #26, migrations 0056–0058; 3C: PR #27, migrations 0059–0061). 3C's
+security review ran three rounds (2 High / 4 Medium / 3 Low in round one, one High regression and three
+smaller items in round two, all closed) and is signed off at `9f3959c`; all three slices carry a final
+sign-off in `plans/SECURITY_REVIEW_2026-09_WAVE3.md`. Gate on `9f3959c`: 2447 unit tests, 41 RLS suites,
+61-migration replay. Rollups below are updated in place.
+
 **Method notes**
 
 - Local gate re-run during this evaluation: `npm test` → **1311/1311 pass**; `format:check`, `lint`,
@@ -57,17 +68,17 @@ below are updated in place.
 | DR-13 | Schema-driven entry UI | DONE | `src/public/js/report-form.mjs` (pure, unit-tested) + wiring in `app.js`; commit `31c4c1a`, 11 tests | — |
 | DR-14 | Manager review inbox UI | DONE | Filter bar + detail pane in `app.js`, same commit `31c4c1a` | — |
 | DR-15 | Single-submission PDF export | DONE | `GET /reports/:id/pdf`, `src/lib/admin/report-pdf.mjs`, gated `reports.export` + `reports.pdf_export` flag, draft→409; `reports-routes.mjs:571-` | — |
-| DR-16 | Field-type/validation-rule expansion (13 types, regex, visibility) | NOT STARTED | `src/lib/report-schema.mjs:1-17` — still exactly 10 types, no `datetime`/`counter`/`rating`, no `validation_rules`/`visibility_rules` | Everything in the task |
-| DR-17 | Signatures table + route | NOT STARTED | No `report_submission_signatures` table in any migration; grep for "signature" in reports schema empty | Table, route, submit-time check |
-| DR-18 | Workflow rule engine (pure) | NOT STARTED | No `evaluateWorkflow` anywhere in `src/lib` | Whole task |
-| DR-19 | Workflow event ledger + outbox | NOT STARTED | No `report_workflow_events` table | Whole task |
-| DR-20 | Workflow execution → incidents/work orders | NOT STARTED | Dependent on DR-18/19, neither exists | Whole task |
-| DR-21 | Report distribution lists/deliveries | NOT STARTED | No `report_distribution_lists`/`_deliveries` tables | Whole task |
-| DR-22 | Email delivery worker + provider adapter | NOT STARTED | No `sendEmail`/provider code anywhere (see OP-12 below — platform-wide gap) | Whole task |
-| DR-23 | PDF snapshot pipeline on submit | NOT STARTED | `pdf_status` still unwritten outside seed; no queue-driven renderer | Whole task |
-| DR-24 | Lock/revise lifecycle | NOT STARTED | Explicitly flagged unbuilt in code comment, `reports-routes.mjs:662` ("DR-24 (lock/revise) has not landed yet") | `/reports/:id/lock`, `/revise`, RLS extension |
-| DR-25 | Offline-first submission runtime | NOT STARTED | Comment in `0033_report_audit_and_scope.sql:8` flags it explicitly unbuilt; no IndexedDB code in `src/public/js` | Whole task |
-| DR-26 | Template governance (two-step publish) | NOT STARTED | No use of `admin_change_requests` from report-template routes | Whole task |
+| DR-16 | Field-type/validation-rule expansion (13 types, regex, visibility) | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `src/lib/report-schema.mjs` adds `datetime`/`counter`/`rating` field types plus anchored, length-capped `validation_rules`, `default_value`, `help_text`, `isDefect`/`defectWhen` (feeds WO-21); `test/report-schema.test.mjs` | — |
+| DR-17 | Signatures table + route | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `report_submission_signatures` table, `supabase/migrations/0052_report_signatures.sql`, submit-time completeness check, sign-once guard; `supabase/tests/report_signatures.sql` | — |
+| DR-18 | Workflow rule engine (pure) | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `evaluateWorkflow` in `src/lib/report-workflow.mjs` (`create_incident`/`create_work_order`/`create_work_order:defect:<fieldKey>`/`notify`/`queue_pdf` actions, OSHA classification wired through `classifyOshaReview`); `test/report-workflow.test.mjs` | — |
+| DR-19 | Workflow event ledger + outbox | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `report_workflow_events` table + `internal.enqueue_report_workflow(uuid)`/`public.enqueue_report_workflow` definer RPCs, `supabase/migrations/0053_report_workflow_events.sql`; `supabase/tests/report_workflow_events.sql` | — |
+| DR-20 | Workflow execution → incidents/work orders | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `src/lib/report-workflow-executor.mjs` drives pending events through service-role-only definer RPCs (`internal.mint_workflow_incident`, `internal.mint_workflow_work_order`) so a submitter without `incidents.manage`/`work_orders.manage` cannot mint either row directly; `test/report-workflow-executor.test.mjs` | — |
+| DR-21 | Report distribution lists/deliveries | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `report_distribution_lists`, `report_deliveries`, `supabase/migrations/0054_report_distribution.sql`, writes gated on `reports.distribution.manage`; `test/report-distribution.test.mjs`, `test/report-distribution-routes.test.mjs`, `supabase/tests/report_distribution.sql` | — |
+| DR-22 | Email delivery worker + provider adapter | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): distribution deliveries are drained through the Slice 2C email adapter (`src/lib/notifications/email.mjs`, Resend) rather than a report-specific provider; `test/report-distribution-worker.test.mjs` | — |
+| DR-23 | PDF snapshot pipeline on submit | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `report_submissions` grows `pdf_status`/`pdf_storage_path`/`pdf_content_hash`/`pdf_attempts` columns, `supabase/migrations/0055_report_lifecycle.sql`; deterministic snapshot content hash | — |
+| DR-24 | Lock/revise lifecycle | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `fn_report_submission_transition_guard()` extends the `WITH CHECK` for `submitted → locked` and `submitted\|locked → revised`, `supabase/migrations/0055_report_lifecycle.sql`; `supabase/tests/report_lifecycle.sql` | — |
+| DR-25 | Offline-first submission runtime | NOT STARTED | Comment in `0033_report_audit_and_scope.sql:8` flags it explicitly unbuilt; no IndexedDB code in `src/public/js`. Not in Wave 3's scope (3A covered DR-16…DR-24, DR-26 only) | Whole task |
+| DR-26 | Template governance (two-step publish) | DONE (2026-09-08) | Wave 3 Slice 3A (PR #25): `fn_report_template_version_publish_guard()` reads the `daily_reports.templatePublishRequiresApproval` setting and routes non-exempt publishes through `admin_change_requests` so the author cannot self-approve, `supabase/migrations/0055_report_lifecycle.sql`; `test/report-templates-routes.test.mjs`, `test/report-templates.test.mjs` | — |
 | DR-27 | Reports settings registry keys (submit policy default, caps, digest hour, retention) | PARTIAL | `settings-registry.mjs` has only the pre-existing 3 `daily_reports` keys (unchanged since plan baseline) | New keys never added |
 | DR-28 | PDF/report access audit (`report.pdf_downloaded`/`viewed`) | NOT STARTED | No such event types emitted; PDF route doesn't insert an audit row | Whole task |
 | DR-29 | Scheduled reminders/digests | NOT STARTED | No `report.missing` cron/script | Whole task |
@@ -79,7 +90,8 @@ below are updated in place.
 
 **Spot-checks (DR):** DR-04 (`report-templates-routes.mjs` read fully — CRUD/publish/archive all present and 409-gated), DR-09 (traced `attachments-routes.mjs` → `storage.mjs` → migration `0030_storage.sql` bucket policy → test), DR-12 (`reports-compliance.mjs` pure calculator + route, date-range cap enforced).
 
-**DR rollup:** DONE 16, PARTIAL 1, NOT STARTED 17, OWNER-ONLY 0 (of 34). *(updated 2026-09-06: DR-34 done)*
+**DR rollup:** DONE 26, PARTIAL 1, NOT STARTED 7, OWNER-ONLY 0 (of 34). *(updated 2026-09-08: DR-16, DR-17,
+DR-18, DR-19, DR-20, DR-21, DR-22, DR-23, DR-24, DR-26 done via Wave 3 Slice 3A; 2026-09-06: DR-34 done)*
 
 ---
 
@@ -97,17 +109,17 @@ below are updated in place.
 | IN-08 | Incident summary PDF | DONE | `GET /incidents/:id/export.pdf`, `src/lib/incident-pdf.mjs`; amendment watermark, draft watermark, `incident.exported` audit event; commit `4865502`; `test/incident-pdf.test.mjs` | — |
 | IN-09 | Server-generated incident numbers | DONE | `nextIncidentNo` in `incidents.mjs:304-`, retry-on-conflict in `incidents-routes.mjs:230-245` | — |
 | IN-10 | Capture form + detail UI | DONE (2026-09-07) | Wave 2 (PR #21): the people section renders the real list, add-person form and statement history from the new IN-12 routes | — |
-| IN-11 | Schema completion migration (witness statements, signatures, compliance checks) | PARTIAL (2026-09-07) | Wave 2 (PR #21): migration 0050 adds `incident_witness_statements` (versioned, append-only, sign-once) with RLS and tests; signatures, compliance checks and training triggers are not built | Signatures, compliance checks, training triggers (Wave 3 IN-13+) |
+| IN-11 | Schema completion migration (witness statements, signatures, compliance checks) | DONE (2026-09-08) | Wave 2 (PR #21) landed `incident_witness_statements` (migration 0050); Wave 3 Slice 3B (PR #26) completes the set — `incident_signatures` and `incident_compliance_checks`, `supabase/migrations/0056_incident_compliance.sql`. Training triggers are out of Slice 3B's scope (folded into TR-10, Wave 3F) | Training-trigger wiring belongs to TR-10, not this task |
 | IN-12 | People & witness statement routes | DONE (2026-09-07) | Wave 2 (PR #21): `src/lib/http/incidents-people-routes.mjs` — people list/add/update/remove, statements list/add/sign, audit events, 27 route tests, `supabase/tests/incident_people_statements.sql` | — |
-| IN-13 | Signatures route | NOT STARTED | Depends on IN-11 | Whole task |
-| IN-14 | OSHA recordability decision tree | NOT STARTED | `classifyOshaReview` in `incidents.mjs` is still the original stub (unchanged since plan baseline) | Whole task |
-| IN-15 | Compliance-check routes + evidence-completeness gate | NOT STARTED | No route | Whole task |
-| IN-16 | Legal hold + retention controls | NOT STARTED | No `POST /incidents/:id/legal-hold`; `legal_hold` remains settable only at create | Dedicated toggle route, RLS hardening |
-| IN-17 | Cross-module creation (followup→work-order, followup→training) | NOT STARTED | No `/incidents/:id/followups/:fid/work-order` or `/training-triggers` route (WO-03 covers the *incident→WO* direction generically, but not this specific followup-linked path) | Whole task |
-| IN-18 | Legal packet PDF bundle | NOT STARTED | IN-08's PDF is single-section; no statements/evidence-index/packet-hash extension | Whole task |
-| IN-19 | Supervisor review workspace UI | NOT STARTED | No split-pane review workspace beyond IN-10's detail drawer | Whole task |
-| IN-20 | Notification emission on submit/escalate/SLA breach | NOT STARTED | No `notification_jobs` insert from incidents routes | Whole task |
-| IN-21 | SLA breach auto-escalation sweep | NOT STARTED | No `scripts/incident-sla-sweep.mjs` | Whole task |
+| IN-13 | Signatures route | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `incident_signatures` table (`signature_role` enum reporter/witness/supervisor/manager), append-only/sign-once guard, closure gate extended to require supervisor signoff when `requires_osha_review`, `supabase/migrations/0056_incident_compliance.sql` | — |
+| IN-14 | OSHA recordability decision tree | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `classifyOshaReview` now evaluates the facility's `incidents.oshaDecisionTree` settings-registry key; `src/lib/http/incidents-compliance-routes.mjs` exposes and evaluates the tree; `src/lib/settings-registry.mjs:145` | — |
+| IN-15 | Compliance-check routes + evidence-completeness gate | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `incident_compliance_checks` table + routes, closure gate requiring high/critical incidents to pass compliance checks before closing, `supabase/migrations/0056_incident_compliance.sql`; `supabase/tests/incident_compliance.sql` | — |
+| IN-16 | Legal hold + retention controls | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): dedicated legal-hold write path gated on `incidents.legal_hold.manage`, `fn_incident_child_legal_hold_guard()` extends the hold to child rows and blocks re-pointing a held child (hardened further at `f111a52`), `supabase/migrations/0057_incident_legal_hold_retention.sql`; `supabase/tests/incident_legal_hold.sql` | — |
+| IN-17 | Cross-module creation (followup→work-order, followup→training) | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `public.create_work_order_from_incident(followup_id)` definer RPC for a caller who holds `incidents.manage`/`incidents.review` but not `work_orders.manage`; direct RLS-scoped insert for a caller who holds both; provenance column `work_orders.source_followup_id`, `supabase/migrations/0058_incident_cross_module.sql`; `supabase/tests/incident_cross_module.sql`. Training-trigger half is TR-10 (Wave 3F) | Followup→training half is TR-10, not this task |
+| IN-18 | Legal packet PDF bundle | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `src/lib/incident-pdf.mjs` extends the IN-08 summary PDF into a full legal packet (statements, evidence index, packet-level integrity hash); `test/incident-pdf.test.mjs` | — |
+| IN-19 | Supervisor review workspace UI | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `src/public/js/incident-review.mjs` (pure helpers behind the review workspace, merged timeline, close-readiness check) + `app.js` wiring; `test/incident-review.test.mjs` | — |
+| IN-20 | Notification emission on submit/escalate/SLA breach | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `notification_jobs` inserts from incidents routes with a `dedupe_key` (`${incidentId}:${eventCode}:${escalationId}:${recipientId}`) upserted `onConflict: "dedupe_key"`, `src/lib/incidents.mjs`, `src/lib/http/incidents-routes.mjs:211-230` | — |
+| IN-21 | SLA breach auto-escalation sweep | DONE (2026-09-08) | Wave 3 Slice 3B (PR #26): `scripts/incident-sla-sweep.mjs` + `src/lib/incident-sla-sweep.mjs`; `test/incident-sla-sweep.test.mjs` | — |
 | IN-22 | Chain verification + access-audit endpoint | NOT STARTED | No `GET /incidents/:id/audit`; chain verify exists only generically (`admin/audit`, `OP-21`'s verify-all), not incident-scoped | Whole task |
 | IN-23 | Dashboard/analytics polish | NOT STARTED | No `/facilities/:id/incidents/summary` route | Whole task |
 | IN-24 | Rate limiting + break-glass read path | PARTIAL (2026-09-06) | Security-review half closed by `plans/SECURITY_REVIEW_2026-09.md` (incident write-path guards, legal hold, audit payload, durable throttle). No 429 on incident submit/export and no justification-capturing break-glass read path | Feature half (Wave 4) |
@@ -115,7 +127,9 @@ below are updated in place.
 
 **Spot-checks (IN):** IN-04 (traced amendment route → `buildAmendment`/hash → migration `0032` INSERT policy → `supabase/tests/incident_immutability.sql`), IN-08 (traced PDF route → `incident-pdf.mjs` → deterministic-render test), IN-09 (formatter + retry-on-unique-violation confirmed in route body).
 
-**IN rollup:** DONE 11, PARTIAL 2, NOT STARTED 12, OWNER-ONLY 0 (of 25). *(updated 2026-09-07: IN-10, IN-12 done; IN-11 partial; 2026-09-06: IN-24 partial)*
+**IN rollup:** DONE 21, PARTIAL 1, NOT STARTED 3, OWNER-ONLY 0 (of 25). *(updated 2026-09-08: IN-11, IN-13,
+IN-14, IN-15, IN-16, IN-17, IN-18, IN-19, IN-20, IN-21 done via Wave 3 Slice 3B; 2026-09-07: IN-10, IN-12
+done; 2026-09-06: IN-24 partial)*
 
 ---
 
@@ -133,17 +147,17 @@ below are updated in place.
 | WO-08 | RLS SQL proof for work-orders family | DONE | `supabase/tests/work_orders_scope.sql`; also closed cross-facility FK gaps via `0035_work_order_facility_consistency.sql`; commit `12982bf` | — |
 | WO-09 | Input hardening + dead-code cleanup | DONE | `authCanAccessFacility` dead import removed (commit `0c291d9`); asset/department/assignee cross-facility validation added (commit `12982bf`) | — |
 | WO-10 | Real end-user Work Orders UI | DONE | `src/public/js/work-order-filters.mjs` + `app.js`; filter chips, create form, comment thread, status/assign actions; commit `0188302` | — |
-| WO-11 | Assets registry schema extension | NOT STARTED | No `category`/`criticality`/`metadata`/`install_date` columns added to `assets` beyond baseline | Whole task |
-| WO-12 | Assets CRUD API | NOT STARTED | No `/facilities/:id/assets` route | Whole task |
-| WO-13 | Asset UI + picker | NOT STARTED | No asset picker in `app.js` | Whole task |
-| WO-14 | Storage/signed URLs for attachments | DONE (superseded) | Actually delivered — the platform storage primitive (OP-15/16/17) provides exactly this, generically, ahead of WO-14's module-specific plan; signed download URLs confirmed in `attachments-routes.mjs` | — |
-| WO-15 | SLA tracking columns + domain state | NOT STARTED | No `sla_due_at`/`first_response_at`/`sla_breached_at` columns; no `slaState()` helper | Whole task |
-| WO-16 | Overdue detection → notification enqueue | NOT STARTED | No `scripts/work-order-sla-scan.mjs`; nothing enqueues `notification_jobs` for `work_order.overdue` | Whole task |
-| WO-17 | Recurring PM: schema | NOT STARTED | No `pm_plans`/`pm_plan_occurrences` tables | Whole task |
-| WO-18 | PM cadence domain lib | NOT STARTED | No `preventive-maintenance.mjs` | Whole task |
-| WO-19 | PM generation job | NOT STARTED | No `scripts/pm-generate.mjs` | Whole task |
-| WO-20 | PM API + UI | NOT STARTED | Depends on WO-17/18/19 | Whole task |
-| WO-21 | Report-defect auto-creation | NOT STARTED | No `isDefect`/`extractDefects` in `report-schema.mjs`; report submit route doesn't create work orders | Whole task |
+| WO-11 | Assets registry schema extension | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `assets` gains `category`/`criticality`/`metadata`/`install_date`, `supabase/migrations/0059_assets_registry.sql`; `supabase/tests/assets_registry.sql` | — |
+| WO-12 | Assets CRUD API | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `GET/POST /facilities/:facilityId/assets`, `GET/PATCH /assets/:id`, `POST /assets/:id/retire` in `src/lib/http/work-orders-routes.mjs:927-1099` (deliberately not a separate `assets.*` permission code — reuses `work_orders.read`/`.manage`, rationale documented at `work-orders-routes.mjs:902-925`); `test/assets-routes.test.mjs` | — |
+| WO-13 | Asset UI + picker | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `src/public/js/assets.mjs` + `app.js` wiring for an asset list/picker | — |
+| WO-14 | Storage/signed URLs for attachments | DONE (superseded) | Actually delivered — the platform storage primitive (OP-15/16/17) provides exactly this, generically, ahead of WO-14's module-specific plan; signed download URLs confirmed in `attachments-routes.mjs`. Excluded from Wave 3 Slice 3C's scope by plan (already superseded) | — |
+| WO-15 | SLA tracking columns + domain state | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `sla_due_at`/`first_response_at`/`resolved_at`/`sla_breached_at` columns, all writable only through the service-role-only `internal.set_work_order_sla_fields`/`public.set_work_order_sla_fields` RPCs, `supabase/migrations/0060_work_order_sla.sql`; `supabase/tests/work_order_sla.sql` | — |
+| WO-16 | Overdue detection → notification enqueue | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `scripts/work-order-sla-scan.mjs` + `src/lib/work-order-sla-scan.mjs` enqueue `notification_jobs` for overdue work orders; `test/work-order-sla-scan.test.mjs`. Known follow-up: the scan's dedupe check still filters on `payload_jsonb->>dedupeKey` rather than 0058's later `dedupe_key` column (`work-order-sla-scan.mjs:27-33`) | Switch the dedupe filter to the `dedupe_key` column |
+| WO-17 | Recurring PM: schema | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `pm_plans`, `pm_plan_occurrences` (four separate RLS policies each, per the WO-07 lesson), `supabase/migrations/0061_preventive_maintenance.sql`; `supabase/tests/preventive_maintenance.sql` | — |
+| WO-18 | PM cadence domain lib | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `src/lib/preventive-maintenance.mjs`; `test/preventive-maintenance.test.mjs` | — |
+| WO-19 | PM generation job | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `scripts/pm-generate.mjs`; `test/pm-generation.test.mjs` | — |
+| WO-20 | PM API + UI | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27): `src/lib/http/pm-plans-routes.mjs`, `src/public/js/pm-plan-filters.mjs`; `test/pm-plans-routes.test.mjs`, `test/pm-plan-filters.test.mjs` | — |
+| WO-21 | Report-defect auto-creation | DONE (2026-09-08) | Wave 3 Slice 3C (PR #27, built alongside 3A): `isDefect`/`defectWhen` fields in `report-schema.mjs`, workflow actions typed `create_work_order:defect:<fieldKey>` in `report-workflow.mjs`, facility-scoped idempotent mint through the DR-20 executor | — |
 | WO-22 | Backlog & SLA dashboard aggregates | NOT STARTED | No `/work-orders/summary` route | Whole task |
 | WO-23 | Work order PDF/export | NOT STARTED | No WO-specific PDF renderer | Whole task |
 | WO-24 | Audit + soft-delete/cancel semantics | NOT STARTED | `DELETE /work-orders/:id` doesn't exist; comment in `0026_soft_delete_policy_hardening.sql:67` explicitly flags this as future work needing a SECURITY DEFINER RPC | Whole task |
@@ -153,7 +167,12 @@ below are updated in place.
 
 **Spot-checks (WO):** WO-02 (`canTransition`/`applyStatusChange` traced into the PATCH handler, confirmed history-row-per-field write), WO-03 (dual-permission guard traced, confirmed facility always inherited from the incident not the body), WO-08 (`work_orders_scope.sql` read — cross-facility isolation + soft-delete assertions present).
 
-**WO rollup:** DONE 12 (WO-14 counted as delivered via the platform primitive), PARTIAL 0, NOT STARTED 15, OWNER-ONLY 0 (of 27). *(updated 2026-09-06: WO-27 done)*
+**WO rollup:** DONE 22 (WO-14 counted as delivered via the platform primitive), PARTIAL 0, NOT STARTED 5,
+OWNER-ONLY 0 (of 27). *(updated 2026-09-08: WO-11, WO-12, WO-13, WO-15, WO-16, WO-17, WO-18, WO-19, WO-20,
+WO-21 done via Wave 3 Slice 3C — code-complete and unit/RLS-tested on `f58dafb`; the slice's security
+review found 2 High/4 Medium/3 Low in round 1 and one High regression plus three smaller items in round
+2, all closed and signed off at `9f3959c` (`plans/SECURITY_REVIEW_2026-09_WAVE3.md`); 2026-09-06: WO-27
+done)*
 
 ---
 
@@ -287,14 +306,19 @@ below are updated in place.
 
 | Module | DONE | PARTIAL | NOT STARTED | OWNER-ONLY | Total |
 |---|---|---|---|---|---|
-| Daily Reports (DR) | 16 | 1 | 17 | 0 | 34 |
-| Incidents (IN) | 11 | 2 | 12 | 0 | 25 |
-| Work Orders (WO) | 12 | 0 | 15 | 0 | 27 |
+| Daily Reports (DR) | 26 | 1 | 7 | 0 | 34 |
+| Incidents (IN) | 21 | 1 | 3 | 0 | 25 |
+| Work Orders (WO) | 22 | 0 | 5 | 0 | 27 |
 | Scheduling (SC) | 9 | 0 | 15 | 0 | 24 |
 | Communications (CM) | 11 | 1 | 6 | 0 | 18 |
 | Training (TR) | 6 | 0 | 10 | 0 | 16 |
 | Platform/Ops (OP) | 18 | 0 | 0 | 6 | 24 |
-| **Total** | **83** | **4** | **75** | **6** | **168** |
+| **Total** | **113** | **3** | **46** | **6** | **168** |
+
+*(as of 2026-09-08, after Wave 3 Slices 3A–3C: was DONE 83 / PARTIAL 4 / NOT STARTED 75 / OWNER-ONLY 6 as
+of 2026-09-07 — Wave 3 3A–3C moved 30 rows from NOT STARTED or PARTIAL to DONE: DR-16, DR-17, DR-18,
+DR-19, DR-20, DR-21, DR-22, DR-23, DR-24, DR-26 (10); IN-11, IN-13, IN-14, IN-15, IN-16, IN-17, IN-18,
+IN-19, IN-20, IN-21 (10); WO-11, WO-12, WO-13, WO-15, WO-16, WO-17, WO-18, WO-19, WO-20, WO-21 (10).)*
 
 ### By plan milestone (M1/M2/M3, per each module's own plan phasing)
 
@@ -304,22 +328,23 @@ Each module plan phases its own tasks M1/M2/M3; OP's P1/P2/P3 are treated as the
 | Milestone | Planned | Done | Partial | Not started | Owner-only |
 |---|---|---|---|---|---|
 | M1 (MVP) | 67 | 63 | 0 | 0 | 4 |
-| M2 (design-complete) | 62 | 11 | 2 | 48 | 1 |
-| M3 (polish) | 39 | 9 | 2 | 27 | 1 |
-| **Total** | **168** | **83** | **4** | **75** | **6** |
+| M2 (design-complete) | 62 | 39 | 1 | 21 | 1 |
+| M3 (polish) | 39 | 11 | 2 | 25 | 1 |
+| **Total** | **168** | **113** | **3** | **46** | **6** |
 
 **Headline: all of M1 (MVP) is built and working — 63 of 67 fully (OP-05 closed by Wave 1's migration
 0042 on 2026-09-06; IN-10, SC-08 and CM-09 closed by Wave 2 on 2026-09-07); the remaining 4 are pure
 dashboard actions (OP-01/02/03/06).
-M2 is *not* uniformly untouched, contrary to a surface read of the wave commits: because the platform
-workstream front-loaded its storage and notification-worker primitives (both nominally OP "P2"/M2-phase
-work) ahead of schedule to unblock every module's M1 slice, 9 of M2's 62 tasks are done — all of them
-either OP-10/11/13–18 (storage + worker core) or WO-14 (storage-dependent, delivered generically by the
-same primitive). No module's own M2 phase (new tables, new cross-module automations, richer workflows)
-has begun — DR-16 onward, IN-11 onward, WO-11/15/17 onward, SC-10 onward, CM-10 onward, and TR-07 onward
-are all NOT STARTED. M3 progress is confined to Platform/Ops' P3 slice (observability, audit-verify
-cron, sign-in throttle) plus two folded-in items (CM-15 via the worker, WO-27 partially via the RLS
-audit) — no module's own M3 phase has begun.**
+M2 moved from barely started to nearly two-thirds done in Wave 3: Slices 3A–3C (2026-09-08) closed
+DR-16…DR-24/DR-26 (Reports M2, all 10 of that phase's tasks), IN-11/13…19 (Incidents M2, 8 of 9 — IN-12
+had already landed in Wave 2), and WO-11…WO-21 (Work Orders M2, all 10 of that phase's tasks, alongside
+WO-14 already delivered generically in Wave 1). That is 28 of the 30 tasks flipped this wave; the other
+2 (IN-20, IN-21) are Incidents M3 tasks that shipped early because Slice 3B built the whole legal-hold/
+compliance/notification arc as one PR. What remains untouched in M2 is Scheduling (SC-10 onward),
+Communications (CM-10 onward) and Training (TR-07 onward) — Wave 3 Slices 3D–3G, not yet started.
+M3 progress beyond Platform/Ops' P3 slice and the two Wave-1/2 folded-in items (CM-15 via the worker,
+WO-27 partially via the RLS audit) is now IN-20 and IN-21 (notification emission and the SLA sweep,
+both Slice 3B) — the first M3 tasks any module's own plan has completed.**
 
 ---
 
@@ -332,7 +357,7 @@ audit) — no module's own M3 phase has begun.**
 | A | Scheduling (templates, board, assign/unassign, conflict checks) | **Yes**, with a caveat | Templates (SC-02), generation (SC-03), assignment with 409 conflicts (SC-05), board UI (SC-08) all work through the API. Caveat: the board's assignment view is session-local (no `GET /shift_assignments`), so a second visit or a second user does not see assignments made in a prior session until the page's local cache happens to include them — a real but narrow gap, not a broken feature. |
 | B | Reports (submission by department, configurable required fields, photo attachment, dashboard) | **Yes** | Full lifecycle: template author → publish → fill (schema-driven UI, DR-13) → submit → review inbox (DR-14) → attachments (DR-09/OP-17) → compliance dashboard (DR-12) → PDF (DR-15). All confirmed via route + test inspection. |
 | C | Incidents (form, severity/type, evidence attachment, follow-ups, exportable PDF) | **Yes** | Capture UI (IN-10, minus the People placeholder) → submit/transition (IN-03) → evidence upload (IN-07) → follow-ups (IN-05) → summary PDF (IN-08). Amendments and escalation also work, exceeding MVP scope. |
-| D | Maintenance/work orders (create from report/incident or manual, priority/status/assignee/due date, comment thread + attachments) | **Yes** | Manual create + create-from-incident (WO-03) both work; comment thread (WO-01); attachments (WO-06/OP-17); UI (WO-10). "Create from report" specifically (auto-creation on defect flag) is **not** built (that's WO-21/M2) — only the incident path and manual entry exist, which still satisfies the roadmap's "or manual entry" phrasing. |
+| D | Maintenance/work orders (create from report/incident or manual, priority/status/assignee/due date, comment thread + attachments) | **Yes** | Manual create + create-from-incident (WO-03) both work; comment thread (WO-01); attachments (WO-06/OP-17); UI (WO-10). "Create from report" (auto-creation on a defect-flagged field) now also works — WO-21/DR-16, Wave 3 Slice 3A/3C (2026-09-08). |
 | E | Communication (department + all-ops channels, priority announcements, read receipts + required ack, push + in-app) | **Partial** | Channels (CM-04), compose+publish (CM-03/CM-08), required-ack (CM-01/route), in-app delivery via the worker (CM-06) all work. Read-receipt *display* is session-local (CM-09 gap — no GET for `message_acknowledgements`). Push exists only as a documented no-op adapter (CM-07) — tokens register and the worker marks them "sent," but no device actually receives a push notification without a real APNS/FCM integration (OP-12-equivalent, not built). |
 | F | Training (manual assignment, completion tracking, cert record + expiry + evidence upload) | **Yes** | Manual assignment (TR-01), completion with progress gating (TR-06), certification wallet with expiry status (TR-02), evidence upload (TR-03). All confirmed working end to end. |
 
@@ -366,13 +391,18 @@ audit) — no module's own M3 phase has begun.**
 
 ## 5. Top 10 highest-value unfinished items (priority order)
 
-1. **CM-11 (ack/read compliance rollup endpoint) + wiring the UI to it.** The single biggest "looks done but isn't" gap: required-acknowledgement is the module's headline MVP feature (roadmap §1.2.E) and its state is currently only visible per-browser-session. A pilot facility's compliance dashboard would show stale data on day one.
+1. ~~**CM-11 (ack/read compliance rollup endpoint) + wiring the UI to it.**~~ **DONE, Wave 2 (2026-09-07).**
 2. **`message_audiences.audience_ref_id` cross-facility guard.** A live, unresolved security finding in a shipped feature (not hypothetical — documented and explicitly deferred in `plans/RLS_AUDIT.md`). Small, well-scoped fix; should not wait for a "finishing plan," it's a today-sized patch.
 3. **SC-08's missing `GET /shift_assignments`.** The weekly board — the flagship MVP capability A — silently misrepresents who's assigned to what across sessions/users. Cheap fix (a list route, following every other module's pattern) with outsized trust impact for a scheduling product.
 4. **CM-07/CM-14/OP-09/OP-12 real push+email delivery.** Communication's whole value proposition (roadmap §1.2.E: "Push + in-app notifications") is currently in-app only; push is a documented no-op and email doesn't exist at all. This is the platform's largest remaining infra gap and blocks a dozen downstream M2/M3 tasks across every module (escalations, reminders, expiry alerts) per the master plan's own dependency table.
 5. **OP-01/02/03 — go-live itself.** Everything above is moot for a real pilot until the app is actually deployed and login works; still fully OWNER-ONLY and unverifiable from source. Should be sequenced first in wall-clock time even though it's a "cheap" task.
 6. **OP-05 — SECURITY DEFINER RPC posture decision.** Explicitly and repeatedly flagged as deferred ("tracked separately as OP-05") across two migrations; blocks a clean Supabase advisor report and is a prerequisite the plan itself calls out before any RLS-adjacent work should be considered fully closed.
-7. **IN-11/12/13/14/15 (witness statements, signatures, OSHA tree, compliance checks).** This is the incidents module's own stated "legal-defensibility core" continuing into M2 — the amendments/audit chain (M1, done) only gets full value once compliance sign-off exists; right now `classifyOshaReview` is still a stub.
-8. **WO-15/16 (SLA tracking + overdue notifications).** Maintenance's other headline MVP-adjacent promise ("SLA tracking" is explicitly Phase-2 per the roadmap, but overdue detection is the most natural next win once the notification worker — already built — exists to consume it); currently `due_at` exists but nothing tracks breach or alerts on it.
+7. ~~**IN-11/12/13/14/15 (witness statements, signatures, OSHA tree, compliance checks).**~~ **DONE, Wave 2
+   (IN-12) + Wave 3 Slice 3B (IN-11, IN-13, IN-14, IN-15), 2026-09-08 — one round of security review closed,
+   part of Slice 3B's sign-off.**
+8. ~~**WO-15/16 (SLA tracking + overdue notifications).**~~ **DONE, Wave 3 Slice 3C (2026-09-08) —
+   `supabase/migrations/0060_work_order_sla.sql`, `scripts/work-order-sla-scan.mjs`; security review
+   signed off for the whole slice at `9f3959c`.**
 9. **TR-11 (certification expiry evaluator).** `certificationStatus()` is a pure function sitting unused by any scheduled process — certifications silently go stale with no alert to anyone, undermining the module's core "certification record storage" promise (roadmap §1.2.F) the moment a cert actually expires.
-10. **DR-16 (field-type/validation-rule expansion).** The most-visible remaining gap in the reports module for actual template authors: no `datetime`/`counter`/`rating` fields, no regex/visibility rules — template authors are currently limited to the 10 baseline types with no conditional logic, which will surface as a support request in week one of any pilot.
+10. ~~**DR-16 (field-type/validation-rule expansion).**~~ **DONE, Wave 3 Slice 3A (2026-09-08) —
+    `src/lib/report-schema.mjs` now supports 13 field types plus validation/visibility rules.**
