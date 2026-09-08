@@ -253,6 +253,15 @@ alter table work_orders
 -- different facility can no longer be found/collide with the real mint even
 -- if one somehow existed) -- this WITH CHECK guard closes the INSERT path
 -- that could create the squatting row in the first place.
+--
+-- N-1 (security re-verification): the latest prior definition of this
+-- policy is 0058, NOT 0038 -- 0058 added the source_followup_id guard for
+-- IN-17's cross-module work orders, and the first version of this file
+-- re-created the policy from 0038's list and silently dropped it, which
+-- reopened the same squatting bypass on incident follow-ups. Every guard
+-- of the latest prior definition is carried forward here (seven in total)
+-- and supabase/tests/work_order_sla.sql section 5c asserts the full list
+-- against pg_policies so a future redefinition cannot drop one unnoticed.
 drop policy if exists "work order managers can manage work orders" on work_orders;
 create policy "work order managers can manage work orders" on work_orders
   for all using (internal.has_permission((select auth.uid()), facility_id, 'work_orders.manage') and deleted_at is null)
@@ -264,6 +273,7 @@ create policy "work order managers can manage work orders" on work_orders
     and internal.fn_assert_same_facility(facility_id, 'pm_plans', source_pm_plan_id)
     and internal.fn_assert_same_facility(facility_id, 'pm_plan_occurrences', source_pm_occurrence_id)
     and internal.fn_assert_same_facility(facility_id, 'report_submissions', source_submission_id)
+    and internal.fn_assert_same_facility(facility_id, 'incident_followup_actions', source_followup_id)
   );
 
 notify pgrst, 'reload schema';

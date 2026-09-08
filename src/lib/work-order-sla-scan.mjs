@@ -280,8 +280,15 @@ export async function scanWorkOrderSla(client, { now = new Date(), config = {}, 
       // enqueued -- revert the claim so the next pass retries it, and
       // record the failure instead of throwing it out of the loop.
       summary.breached -= 1;
-      await revertBreachClaim(client, claimed.id, nowIso);
       summary.errors.push({ workOrderId: claimed.id, stage: "notify", error: error.message });
+      // N-4: the revert is itself a network call; if it fails the row stays
+      // stamped, which is exactly what the next line records -- it must not
+      // throw out of the loop and abort the remaining candidates.
+      try {
+        await revertBreachClaim(client, claimed.id, nowIso);
+      } catch (revertError) {
+        summary.errors.push({ workOrderId: claimed.id, stage: "revert", error: revertError.message });
+      }
     }
   }
 

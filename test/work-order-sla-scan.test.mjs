@@ -167,6 +167,46 @@ test("scanWorkOrderSla returns an all-zero summary when there is nothing to scan
   assert.deepEqual(summary, { scanned: 0, breached: 0, enqueued: 0, deduped: 0, noRoute: 0, errors: [] });
 });
 
+// N-4 (security re-verification): the revert itself is a network call. If
+// it fails, the pass must record that too and carry on with the remaining
+// candidates rather than throwing out of the drain.
+test("scanWorkOrderSla records a failed revert and still processes the remaining candidates", async (t) => {
+  const wo1 = workOrder({ id: "wo-1" });
+  const wo2 = workOrder({ id: "wo-2", sla_due_at: "2026-08-13T09:00:00.000Z" });
+  stubFetch(t, (table, method, url, body) => {
+    if (table === "work_orders" && method === "GET") return [wo1, wo2];
+    if (table === "work_orders" && method === "PATCH") {
+      if (body.sla_breached_at === null) throw new Error("simulated revert failure");
+      const wo = url.searchParams.get("id") === "eq.wo-1" ? wo1 : wo2;
+      return [{ ...wo, ...body }];
+    }
+    if (table === "notification_routes" && method === "GET") return [ROUTE];
+    if (table === "distribution_lists" && method === "GET") return [{ id: "list-1", facility_id: "fac-1", active: true }];
+    if (table === "distribution_list_members" && method === "GET") {
+      return [{ id: "m-1", facility_id: "fac-1", distribution_list_id: "list-1", member_type: "employee", member_ref_id: "emp-1" }];
+    }
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "notification_jobs" && method === "GET") return [];
+    if (table === "notification_jobs" && method === "POST") {
+      if (body[0].payload_jsonb.work_order_id === "wo-1") throw new Error("simulated notification_jobs insert failure");
+      return [{ id: "job-2" }];
+    }
+    return [];
+  });
+
+  const summary = await scanWorkOrderSla(client(), { now: NOON, limit: 25 });
+
+  assert.equal(summary.scanned, 2);
+  assert.equal(summary.enqueued, 1, "wo-2 must still be enqueued after wo-1's revert failed");
+  assert.deepEqual(
+    summary.errors.map((e) => [e.workOrderId, e.stage]),
+    [
+      ["wo-1", "notify"],
+      ["wo-1", "revert"]
+    ]
+  );
+});
+
 // M-3 (security review, wave3-slice-3c): a post-claim failure on one
 // candidate must revert its sla_breached_at stamp and be recorded in
 // summary.errors, without throwing out of scanWorkOrderSla and without

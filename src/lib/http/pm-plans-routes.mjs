@@ -36,6 +36,12 @@ const DEFAULT_OCCURRENCE_WINDOW_DAYS = 56; // 8 weeks -- WO-20's "upcoming-occur
 // entirely still cannot force unbounded materialization.
 const MAX_OCCURRENCE_WINDOW_DAYS = 400;
 
+function isCalendarDateStr(value) {
+  if (typeof value !== "string" || !DATE_PATTERN.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
 
@@ -345,11 +351,13 @@ export function registerPmPlanRoutes(router, { authenticate, sendJson, readBody 
         const today = todayDateStr();
         const fromParam = qp.get("from");
         const toParam = qp.get("to");
-        if (fromParam !== null && !DATE_PATTERN.test(fromParam)) {
-          return sendJson(response, 400, { error: "from must be YYYY-MM-DD" });
+        // N-3 (security re-verification): the pattern alone admits 9999-99-99,
+        // which parses to NaN and slipped past the window cap below.
+        if (fromParam !== null && !isCalendarDateStr(fromParam)) {
+          return sendJson(response, 400, { error: "from must be a valid YYYY-MM-DD date" });
         }
-        if (toParam !== null && !DATE_PATTERN.test(toParam)) {
-          return sendJson(response, 400, { error: "to must be YYYY-MM-DD" });
+        if (toParam !== null && !isCalendarDateStr(toParam)) {
+          return sendJson(response, 400, { error: "to must be a valid YYYY-MM-DD date" });
         }
         const from = fromParam ?? today;
         const to = toParam ?? addDaysToDateStr(from, DEFAULT_OCCURRENCE_WINDOW_DAYS);
@@ -361,7 +369,7 @@ export function registerPmPlanRoutes(router, { authenticate, sendJson, readBody 
         const spanDays = Math.round(
           (new Date(`${to}T00:00:00.000Z`).getTime() - new Date(`${from}T00:00:00.000Z`).getTime()) / 86400000
         );
-        if (spanDays > MAX_OCCURRENCE_WINDOW_DAYS) {
+        if (!Number.isFinite(spanDays) || spanDays > MAX_OCCURRENCE_WINDOW_DAYS) {
           return sendJson(response, 400, {
             error: `window (from..to) must not exceed ${MAX_OCCURRENCE_WINDOW_DAYS} days`
           });

@@ -483,4 +483,58 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 5c. N-1 (security re-verification): the work_orders manage policy must
+-- carry EVERY guard of its latest prior definition. 0061's first version
+-- re-created it from 0038's list and dropped 0058's source_followup_id
+-- guard, reopening the squatting bypass for incident follow-ups. Two
+-- checks: the behavioural one (facility A cannot name a facility-B
+-- follow-up) and a structural one against pg_policies listing all seven
+-- guarded columns, so a future redefinition cannot drop one silently.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '', true);
+insert into incident_reports (id, facility_id, incident_no, report_type, status, severity, occurred_at, location_text, summary) values
+  ('60e00000-0000-0000-0000-000000000e0b', '60bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'INC-2026-WOSLAB', 'incident', 'under_review', 'medium', '2026-08-01T00:00:00Z', 'Pool B', 'Facility B incident')
+on conflict (id) do nothing;
+insert into incident_followup_actions (id, facility_id, incident_id, action_type, status, description) values
+  ('60e10000-0000-0000-0000-000000000f0b', '60bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '60e00000-0000-0000-0000-000000000e0b', 'corrective_action', 'open', 'Facility B follow-up')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"60000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    insert into work_orders (facility_id, title, description, source_type, source_followup_id)
+    values (
+      '60aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Squat follow-up', 'Facility A squatting on B''s follow-up',
+      'incident', '60e10000-0000-0000-0000-000000000f0b'
+    );
+    raise exception 'WOSLA FAIL (N-1): facility A manage holder inserted a work order naming facility B''s source_followup_id';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+reset role;
+
+do $$
+declare
+  v_check text;
+  v_col text;
+begin
+  select pg_get_expr(polwithcheck, polrelid) into v_check
+    from pg_policy
+    where polrelid = 'work_orders'::regclass and polname = 'work order managers can manage work orders';
+  if v_check is null then
+    raise exception 'WOSLA FAIL (N-1): the work_orders manage policy is missing';
+  end if;
+  foreach v_col in array array['asset_id', 'department_id', 'assigned_to_employee_id', 'source_pm_plan_id', 'source_pm_occurrence_id', 'source_submission_id', 'source_followup_id'] loop
+    if position(v_col in v_check) = 0 then
+      raise exception 'WOSLA FAIL (N-1): the work_orders manage policy no longer guards % -- carry every guard of the latest prior definition forward', v_col;
+    end if;
+  end loop;
+end;
+$$;
+
 rollback;

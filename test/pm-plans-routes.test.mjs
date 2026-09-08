@@ -428,6 +428,22 @@ test("GET pm-plan occurrences rejects a window wider than the maximum span with 
   assert.match(result.payload.error, /must not exceed/);
 });
 
+// N-3 (security re-verification): the YYYY-MM-DD pattern alone admits
+// 9999-99-99, which parses to NaN and slipped past the window cap.
+test("GET pm-plan occurrences rejects a well-formed but impossible calendar date", async (t) => {
+  const plan = planFixture({ cadence_type: "interval", interval_days: 1, anchor_date: "2020-01-01" });
+  stubFetch(t, (table, method) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  for (const query of ["from=2026-09-07&to=9999-99-99", "from=2026-02-30&to=2026-03-01", "from=2026-13-01"]) {
+    const result = await call("GET", `/pm-plans/plan-1/occurrences?${query}`);
+    assert.equal(result.status, 400, query);
+    assert.match(result.payload.error, /valid YYYY-MM-DD/, query);
+  }
+});
+
 test("GET pm-plan occurrences accepts a window right at the maximum span", async (t) => {
   const plan = planFixture({ cadence_type: "interval", interval_days: 30, anchor_date: "2026-01-01" });
   stubFetch(t, (table, method) => {

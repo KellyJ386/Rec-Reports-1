@@ -238,6 +238,40 @@ test("conflict repair: two concurrent passes racing the SAME unlinked occurrence
   assert.equal(workOrderCount, 1, "exactly one work order should have been minted across both passes");
 });
 
+// N-2 (security re-verification): claimGenerationSlot takes a durable claim
+// before the mint. If the mint fails, the claim must be given back (CAS on
+// the exact stamped value, only where no work order got linked) so the next
+// pass retries instead of skipping a half-claimed row forever.
+test("a failed mint reverts the generation claim and records the error instead of stranding the occurrence", async (t) => {
+  const plan = intervalPlanRow();
+  const captured = stubFetch(t, (table, method, url) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    if (table === "pm_plan_occurrences" && method === "POST") return [{ id: "occ-new", work_order_id: null }];
+    if (table === "pm_plan_occurrences" && method === "PATCH") {
+      if (url.searchParams.get("generated_at") === "is.null") return [{ id: "occ-new", generated_at: NOW.toISOString() }];
+      return [{ id: "occ-new" }];
+    }
+    if (table === "work_orders" && method === "POST") throw new Error("simulated work_orders insert failure");
+    return [];
+  });
+
+  const summary = await generatePmWorkOrders(client(), { now: NOW, config: {} });
+
+  assert.equal(summary.created, 0);
+  assert.equal(summary.errors.length, 1);
+  assert.match(summary.errors[0].error, /simulated work_orders insert failure/);
+  const revert = captured.find(
+    (c) =>
+      c.table === "pm_plan_occurrences" &&
+      c.method === "PATCH" &&
+      c.url.searchParams.get("work_order_id") === "is.null" &&
+      c.body?.generated_at === null
+  );
+  assert.ok(revert, "the generation claim should be CAS-reverted to null after a failed mint");
+  assert.equal(revert.url.searchParams.get("generated_at"), `eq.${NOW.toISOString()}`);
+  assert.ok(!captured.some((c) => c.table === "pm_plans" && c.method === "PATCH"), "last_generated_at must not advance on a failed mint");
+});
+
 test("horizon: an occurrence past the horizon is never generated, even when its lead time would otherwise make it due", async (t) => {
   // scheduled_for = NOW+17d (2026-04-01). lead_time_days=60 means
   // generationDate = scheduled_for - 60d = 2026-01-31, well before NOW --

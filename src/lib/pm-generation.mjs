@@ -159,6 +159,23 @@ async function claimGenerationSlot(client, occurrenceId, now) {
   return (rows ?? []).length > 0;
 }
 
+// N-2 (security re-verification): claimGenerationSlot takes a durable claim
+// BEFORE mintWorkOrder. If the mint then fails, the occurrence would sit
+// with generated_at set and work_order_id null forever -- every later pass
+// skips it as "already claimed" and the repair branch never fires. Mirror
+// work-order-sla-scan.mjs's revertBreachClaim: CAS the claim back to null
+// only where it still carries exactly the value this pass stamped and no
+// work order was linked, so a concurrent successful pass is never undone.
+async function revertGenerationClaim(client, occurrenceId, stampedIso) {
+  await pgUpdate(
+    client,
+    "pm_plan_occurrences",
+    { id: occurrenceId, generated_at: stampedIso },
+    { generated_at: null },
+    { returning: false, extra: { work_order_id: "is.null" } }
+  );
+}
+
 async function mintWorkOrder(client, plan, occurrenceId, occurrence, config) {
   const domainRow = workOrderFromPlan(plan, occurrence, config);
   const dbRow = {
@@ -228,7 +245,18 @@ export async function generatePmWorkOrders(client, { now = new Date(), config = 
           summary.skipped += 1;
           continue;
         }
-        await mintWorkOrder(client, plan, claim.occurrenceId, occurrence, config);
+        try {
+          await mintWorkOrder(client, plan, claim.occurrenceId, occurrence, config);
+        } catch (error) {
+          // N-2: give the slot back before reporting, so the next pass
+          // retries instead of skipping a permanently half-claimed row.
+          try {
+            await revertGenerationClaim(client, claim.occurrenceId, now.toISOString());
+          } catch (revertError) {
+            summary.errors.push({ planId: plan.id, scheduledFor: occurrence.scheduledFor, stage: "revert", error: revertError.message });
+          }
+          throw error;
+        }
         summary.created += 1;
         if (claim.repair) summary.repaired += 1;
         planTouched = true;
