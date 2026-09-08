@@ -90,15 +90,40 @@ export function nextEscalationLevel(currentLevel) {
 // `incident` needs only `{ id, severity }` -- callers pass the minimal shape
 // rather than a full incident_reports row, keeping this function's input
 // surface as small as its output.
-export function buildIncidentNotificationJobs(eventCode, route, recipients, incident) {
+//
+// M3 (security review, Wave 3 Slice 3B): `escalationId`, when given, is
+// folded into `dedupe_key`. Without it, the key was
+// `${incidentId}:${eventCode}:${recipientId}` -- carrying no escalation id,
+// level, or timestamp -- so the SECOND, THIRD, ... SLA breach or manual
+// re-escalation on the SAME incident (exactly the escalating-severity case
+// IN-21 exists to surface) reused the identical key as the first, and
+// notification_jobs' unique dedupe_key index silently dropped every
+// notification after the first for a recipient already notified once.
+// Passing the specific escalation row's own id (always a fresh,
+// server-generated UUID -- incident-sla-sweep.mjs's newEscalation.id, or
+// incidents-routes.mjs's freshly-inserted escalation's id) makes each
+// breach/re-escalation's key distinct while a genuine RETRY of the exact
+// same breach (same escalation id) still dedupes as intended. Also closes
+// part of M2's "predictable dedupe_key" pre-seeding concern: an attacker
+// cannot pre-insert a colliding key for a not-yet-created escalation, since
+// its id does not exist until the row is (service-role- or route-inserted,
+// unpredictably) created. `escalationId` defaults to null (`incident.
+// submitted`, which carries none) and is rendered as the literal string
+// "n/a" in the key, matching every other caller's existing behavior.
+export function buildIncidentNotificationJobs(eventCode, route, recipients, incident, escalationId = null) {
   const incidentId = incident?.id ?? null;
   const bypass = QUIET_HOURS_BYPASS_SEVERITIES.has(incident?.severity);
   return (recipients ?? [])
     .filter((recipientId) => recipientId)
     .map((recipientId) => {
       const job = buildNotificationJob(eventCode, route, [recipientId]);
-      job.dedupe_key = `${incidentId}:${eventCode}:${recipientId}`;
-      job.payload_jsonb = { ...job.payload_jsonb, incidentId, quietHoursBypass: bypass };
+      job.dedupe_key = `${incidentId}:${eventCode}:${escalationId ?? "n/a"}:${recipientId}`;
+      job.payload_jsonb = {
+        ...job.payload_jsonb,
+        incidentId,
+        escalationId: escalationId ?? null,
+        quietHoursBypass: bypass
+      };
       return job;
     });
 }

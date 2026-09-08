@@ -25,6 +25,17 @@ const TASK_CREATOR = [
 const EXPORTER = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.export.pdf"] }
 ];
+// M1 (security review): the legal packet route requires incidents.export.pdf
+// AND one of incidents.audit.view/manage/review -- EXPORTER above (export.pdf
+// alone) is now the "denied" fixture for that route; this is the "allowed"
+// one.
+const EXPORTER_WITH_AUDIT = [
+  {
+    facilityId: "fac-1",
+    status: "active",
+    permissions: ["incidents.read", "incidents.export.pdf", "incidents.audit.view"]
+  }
+];
 const ESCALATOR = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.escalate"] }
 ];
@@ -670,6 +681,30 @@ test("POST status closing a requires_osha_review incident with no supervisor_sig
   assert.match(result.payload.error, /supervisor_signoff/);
   assert.equal(result.payload.blockingCheck, "supervisor_signoff");
   assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// L5 (security review): the route's own pre-check must filter soft-deleted
+// compliance checks the same way DB guard 2.5 does (0056/0057's `and
+// deleted_at is null`) -- otherwise a soft-deleted 'pass' row lets this
+// pre-check allow a close the trigger then rejects, surfacing a raw
+// check_violation/409 instead of the friendly {error, blockingCheck} body.
+test("POST status: the compliance-checks pre-check query filters out soft-deleted rows (deleted_at is.null)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    // A soft-deleted 'pass' row would satisfy an UNFILTERED closure gate --
+    // returning it here would make the test below fail if the route ever
+    // stopped sending the deleted_at=is.null filter, since a real Postgres
+    // instance would have excluded it from this query already.
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409); // no live evidence_complete check -> still blocked
+  const complianceQuery = captured.find((c) => c.table === "incident_compliance_checks" && c.method === "GET");
+  assert.ok(complianceQuery, "expected a compliance-checks GET");
+  assert.equal(complianceQuery.url.searchParams.get("deleted_at"), "is.null");
 });
 
 test("POST status closing a legal-hold incident without incidents.legal_hold.manage is blocked (409)", async (t) => {
@@ -1439,6 +1474,22 @@ test("GET export.pdf marks an amended incident's audit event and lists amendment
 
 // --- GET /incidents/:id/packet.pdf (IN-18) -----------------------------------
 
+// M1 (security review): a submitted-or-later incident's own audit-scoped
+// read must never come back empty (the route now 409s when it does -- see
+// "GET packet.pdf 409s when no incident-scoped audit events are readable"
+// below), so every fixture below defaults to at least this one row unless a
+// test explicitly overrides it to [] to exercise that new rejection.
+const DEFAULT_AUDIT_EVENT = {
+  id: "audit-1",
+  incident_id: "inc-1",
+  event_type: "incident.submitted",
+  actor_user_id: "user-1",
+  event_payload: {},
+  created_at: "2026-07-18T10:00:00Z",
+  prev_hash: null,
+  row_hash: "0".repeat(64)
+};
+
 function respondPacket(overrides = {}) {
   return (table, method, parsed) => {
     if (table === "incident_reports") return [SUBMITTED_INCIDENT];
@@ -1455,7 +1506,7 @@ function respondPacket(overrides = {}) {
       // Two distinct queries hit this table: one filtered by incident_id
       // (display), one by facility_id (chain verification) -- distinguish
       // them by which filter the query actually carries.
-      if (parsed.searchParams.get("incident_id")) return overrides.auditEvents ?? [];
+      if (parsed.searchParams.get("incident_id")) return overrides.auditEvents ?? [DEFAULT_AUDIT_EVENT];
       if (parsed.searchParams.get("facility_id")) return overrides.chainRows ?? [];
     }
     return [];
@@ -1470,16 +1521,31 @@ test("GET packet.pdf denies a reader without incidents.export.pdf with 403 and w
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
 });
 
+// M1 (security review): incidents.export.pdf alone used to be sufficient --
+// but incident_audit_events' own SELECT policy requires incidents.audit.view
+// (or manage/review), so an export-only caller's own audit read was silently
+// RLS-filtered to zero rows and the packet printed "Chain Valid: true" over
+// nothing. The route now requires the audit permission too.
+test("GET packet.pdf denies an export-only caller (no audit permission) with 403 and writes nothing", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /incidents\.audit\.view/);
+  assert.ok(!captured.some((c) => c.table === "incident_people"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
 test("GET packet.pdf 404s when the incident is missing", async (t) => {
   stubFetch(t, () => []);
-  const { call } = mount({ memberships: EXPORTER });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
   const result = await call("GET", "/incidents/nope/packet.pdf");
   assert.equal(result.status, 404);
 });
 
 test("GET packet.pdf 409s while the incident is a draft, before any child table is queried", async (t) => {
   const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // INCIDENT is a draft
-  const { call } = mount({ memberships: EXPORTER });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
   const result = await call("GET", "/incidents/inc-1/packet.pdf");
   assert.equal(result.status, 409);
   assert.match(result.payload.error, /submitted-or-later/i);
@@ -1487,8 +1553,46 @@ test("GET packet.pdf 409s while the incident is a draft, before any child table 
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
 });
 
+// M1: a submitted-or-later incident whose incident-scoped audit read comes
+// back empty (distinct from the facility-wide chain fetch, which the next
+// test covers) is refused rather than rendered with a fabricated-looking
+// empty timeline over an unearned "valid" chain stamp.
+test("GET packet.pdf 409s when no incident-scoped audit events are readable", async (t) => {
+  const captured = stubFetch(t, respondPacket({ auditEvents: [] }));
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /audit trail/i);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// M1: hitting the facility-wide chain fetch's row cap means only a PREFIX
+// of the real chain was checked -- that must downgrade the result rather
+// than report "valid" the way a genuinely short, complete chain would.
+test("GET packet.pdf marks the chain truncated (not valid) when the facility-wide fetch hits its row cap", async (t) => {
+  const chainRows = Array.from({ length: 10000 }, (_, index) => ({
+    id: `chain-${index}`,
+    event_type: "incident.submitted",
+    incident_id: "inc-1",
+    facility_id: "fac-1",
+    event_payload: {},
+    created_at: "2026-07-18T10:00:00Z",
+    prev_hash: null,
+    row_hash: "0".repeat(64)
+  }));
+  const captured = stubFetch(t, respondPacket({ chainRows }));
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_payload.chainTruncated, true);
+  assert.equal(auditInsert.body[0].event_payload.chainValid, false);
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.match(bytes, /NOT FULLY VERIFIED/);
+});
+
 test("GET packet.pdf happy path returns a packet envelope containing every section", async (t) => {
-  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
   const PERSON = {
     id: "person-1",
     person_role: "injured_party",
@@ -1547,7 +1651,7 @@ test("GET packet.pdf happy path returns a packet envelope containing every secti
 
 test("GET packet.pdf writes an incident.packet_exported audit event carrying the packet hash and chain result", async (t) => {
   const captured = stubFetch(t, respondPacket());
-  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
   const result = await call("GET", "/incidents/inc-1/packet.pdf");
   assert.equal(result.status, 200);
 
@@ -1559,10 +1663,15 @@ test("GET packet.pdf writes an incident.packet_exported audit event carrying the
   assert.equal(event.actor_user_id, "user-8");
   assert.equal(event.event_type, "incident.packet_exported");
   assert.match(event.event_payload.documentHash, /^[0-9a-f]{64}$/);
-  // An empty chainRows fixture (no rows fetched) verifies as valid: true,
-  // brokenAt: null (verifyIncidentAuditChain's vacuous-chain case).
-  assert.equal(event.event_payload.chainValid, true);
+  // M1 (security review): an empty chainRows fixture (no facility-wide rows
+  // fetched) is a "noRows" state, not a verified chain -- the route no
+  // longer stamps chainValid: true over that emptiness the way
+  // verifyIncidentAuditChain's own vacuous-chain "valid: true" would read in
+  // isolation.
+  assert.equal(event.event_payload.chainValid, false);
   assert.equal(event.event_payload.chainBrokenAt, null);
+  assert.equal(event.event_payload.chainNoRows, true);
+  assert.equal(event.event_payload.chainTruncated, false);
 });
 
 test("GET packet.pdf omits the Signatures/Compliance Checks sections when those tables don't exist in this tree (defensive absence)", async (t) => {
@@ -1576,12 +1685,21 @@ test("GET packet.pdf omits the Signatures/Compliance Checks sections when those 
     if (table === "incident_signatures" || table === "incident_compliance_checks") {
       // Simulates PostgREST's "relation does not exist" response for a
       // sibling migration's table this tree doesn't carry yet.
-      return { ok: false, status: 404, text: async () => JSON.stringify({ message: "relation not found" }) };
+      // L4 (security review): tryOptionalSelect now only swallows the
+      // missing-relation CODE (PGRST205/42P01), not every PostgrestError --
+      // so this fixture must carry the code real PostgREST actually sends
+      // for "could not find the table/view in the schema cache", not just a
+      // free-text message.
+      return {
+        ok: false,
+        status: 404,
+        text: async () => JSON.stringify({ code: "PGRST205", message: "relation not found" })
+      };
     }
     const data = respondPacket()(table, init.method, parsed) ?? [];
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
-  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
   const result = await call("GET", "/incidents/inc-1/packet.pdf");
   assert.equal(result.status, 200);
   const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
@@ -1592,9 +1710,43 @@ test("GET packet.pdf omits the Signatures/Compliance Checks sections when those 
   assert.match(bytes, /== Packet Integrity ==/);
 });
 
+// L4 (security review): tryOptionalSelect must rethrow anything OTHER than
+// a missing-relation PostgrestError -- a 403 (RLS denied these specific
+// rows, not "the table doesn't exist") must never silently degrade to [],
+// which would let a legal packet omit its Signatures/Compliance Checks
+// sections with no indication anywhere that the omission was an
+// authorization failure rather than "this incident genuinely has none".
+test("GET packet.pdf propagates (does not swallow) a non-missing-relation PostgrestError from a tryOptionalSelect table", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_signatures") {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => JSON.stringify({ code: "42501", message: "permission denied" })
+      };
+    }
+    const data = respondPacket()(table, init.method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  // withAuth's own PostgrestError->HTTP translation (guard.mjs) turns the
+  // rethrown 403 into a 403 response rather than a 200 with a silently
+  // omitted section -- the fix under test is that tryOptionalSelect no
+  // longer swallows this into [] itself; guard.mjs's existing translation
+  // layer is what turns the rethrow into a client-visible status.
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+});
+
 test("GET packet.pdf: a failing audit write returns 500 instead of the packet envelope", async (t) => {
   const captured = stubFetchAuditFailure(t, respondPacket());
-  const { call } = mount({ memberships: EXPORTER, userId: "user-8" });
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
   const result = await call("GET", "/incidents/inc-1/packet.pdf");
   assert.equal(result.status, 500);
   assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
@@ -1778,7 +1930,9 @@ test("POST submit emits an incident.submitted notification job when a route is c
   assert.ok(jobsInsert, "expected a notification_jobs insert");
   assert.match(jobsInsert.url.search, /on_conflict=dedupe_key/);
   assert.equal(jobsInsert.body.length, 1);
-  assert.equal(jobsInsert.body[0].dedupe_key, "inc-1:incident.submitted:emp-route-1");
+  // M3: incident.submitted carries no escalation id, so the discriminator
+  // segment is the literal "n/a" (buildIncidentNotificationJobs' default).
+  assert.equal(jobsInsert.body[0].dedupe_key, "inc-1:incident.submitted:n/a:emp-route-1");
   assert.equal(jobsInsert.body[0].event_type, "incident.submitted");
   assert.equal(jobsInsert.body[0].payload_jsonb.quietHoursBypass, true); // INCIDENT.severity === 'high'
 });
@@ -1814,8 +1968,18 @@ test("POST escalate emits an incident.escalated notification job that folds in t
 
   const jobsInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
   assert.ok(jobsInsert, "expected a notification_jobs insert");
+  // M3: the freshly-created escalation's own id ("esc-9", per the
+  // incident_escalations POST stub above) is now the dedupe-key
+  // discriminator, so a later escalation on the same incident/recipient
+  // gets a different key instead of colliding with this one's.
   const dedupeKeys = jobsInsert.body.map((job) => job.dedupe_key).sort();
-  assert.deepEqual(dedupeKeys, ["inc-1:incident.escalated:emp-route-1", "inc-1:incident.escalated:emp-target"]);
+  assert.deepEqual(dedupeKeys, [
+    "inc-1:incident.escalated:esc-9:emp-route-1",
+    "inc-1:incident.escalated:esc-9:emp-target"
+  ]);
+  for (const job of jobsInsert.body) {
+    assert.equal(job.payload_jsonb.escalationId, "esc-9");
+  }
 });
 
 test("POST escalate: a failed notification emission does not fail the response (best-effort)", async (t) => {

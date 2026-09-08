@@ -197,21 +197,29 @@ async function notifySlaBreach(client, { escalation, newEscalation, incident }) 
     const expanded = await expandRouteRecipients({ client, facilityId: incident.facility_id, route });
     const recipients = [...new Set([...(expanded ?? []), escalation.target_user_id])].filter(Boolean);
     if (recipients.length === 0) return false;
-    const jobs = buildIncidentNotificationJobs(NOTIFICATION_EVENT_CODE, route, recipients, {
-      id: incident.id,
-      severity: incident.severity
-    });
+    // M3 (security review): newEscalation.id -- the fresh row THIS breach
+    // creates, always a new server-generated UUID -- is passed as the
+    // dedupe-key discriminator, so the second/third/... breach on the same
+    // incident no longer collapses onto the first breach's already-used
+    // dedupe_key (see buildIncidentNotificationJobs' own doc comment).
+    const jobs = buildIncidentNotificationJobs(
+      NOTIFICATION_EVENT_CODE,
+      route,
+      recipients,
+      { id: incident.id, severity: incident.severity },
+      newEscalation.id
+    );
     if (jobs.length === 0) return false;
-    // Fold in escalation context so a channel adapter (or a human reading
-    // notification_jobs) can trace the notification back to which
-    // escalation breached and which one replaced it, without disturbing
-    // buildIncidentNotificationJobs' own {route_id, priority, channels,
-    // recipients, incidentId, quietHoursBypass} shape.
+    // Fold in the BREACHED escalation's own id (buildIncidentNotificationJobs
+    // already stamped payload_jsonb.escalationId = newEscalation.id, the
+    // dedupe-key discriminator) as breachedEscalationId, so a channel
+    // adapter (or a human reading notification_jobs) can trace the
+    // notification back to which prior escalation breached, not just which
+    // one replaced it.
     for (const job of jobs) {
       job.payload_jsonb = {
         ...job.payload_jsonb,
-        escalationId: escalation.id,
-        newEscalationId: newEscalation.id
+        breachedEscalationId: escalation.id
       };
     }
     await pgInsert(client, "notification_jobs", jobs, {

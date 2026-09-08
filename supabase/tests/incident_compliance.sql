@@ -25,6 +25,12 @@
 --      blocks it again; a 'waived' result (recorded by a reviewer) passes.
 --  10. Closure gate: an incident with requires_osha_review additionally
 --      needs a passing/waived supervisor_signoff check, independent of (9).
+--  11. L2 (security review): a manage-only holder (no incidents.review)
+--      cannot overwrite a reviewer's 'waived' determination with 'pass'
+--      (0 rows affected, RLS-filtered by the USING clause), and cannot
+--      soft-delete (set deleted_at) ANY compliance check either (WITH
+--      CHECK rejection) -- both now require incidents.review. A reviewer
+--      can still do both.
 -- Runs against a migrated database inside a rolled-back transaction, so no
 -- fixture persists.
 begin;
@@ -177,6 +183,38 @@ begin
   exception
     when insufficient_privilege then null; -- expected
   end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 3c. L1 (security review): fn_attachment_path_facility's dedicated
+-- incident_signatures branch binds signature_image_path to THIS row's own
+-- incident_id, not just the facility+module -- a same-facility, "incidents"-
+-- module path naming a DIFFERENT incident (e3, also Facility A) is rejected
+-- even though the shared four-module regex would have accepted it. A path
+-- correctly scoped to the signature's own incident (e1) is accepted.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  begin
+    insert into incident_signatures (facility_id, incident_id, signer_user_id, role, attestation_text, signed_name, signature_image_path) values
+      ('56aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '56e00000-0000-0000-0000-0000000000e1', '56000000-0000-0000-0000-000000000a01', 'manager', 'cross-incident path attempt', 'IC Manager',
+       'facilities/56aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/incidents/56e00000-0000-0000-0000-0000000000e3/evidence.jpg');
+    raise exception 'IC FAIL (L1): a signature on e1 was accepted with a signature_image_path naming a DIFFERENT incident (e3)';
+  exception
+    when check_violation then null; -- expected
+  end;
+end;
+$$;
+
+do $$
+begin
+  insert into incident_signatures (id, facility_id, incident_id, signer_user_id, role, attestation_text, signed_name, signature_image_path) values
+    ('56200000-0000-0000-0000-000000002099', '56aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '56e00000-0000-0000-0000-0000000000e1', '56000000-0000-0000-0000-000000000a01', 'manager', 'correctly scoped path', 'IC Manager',
+     'facilities/56aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/incidents/56e00000-0000-0000-0000-0000000000e1/evidence.jpg');
+exception
+  when check_violation then
+    raise exception 'IC FAIL (L1): a signature_image_path correctly scoped to its own incident was rejected';
 end;
 $$;
 
@@ -412,5 +450,121 @@ end;
 $$;
 
 reset role;
+
+-- ---------------------------------------------------------------------------
+-- 11. L2 (security review): manage-only cannot overwrite a reviewer's
+-- waiver, and cannot soft-delete any compliance check either.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '{"sub":"56000000-0000-0000-0000-000000000a02","role":"authenticated"}', true);
+set local role authenticated;
+
+-- 11a. Reviewer waives a fresh check on e1 (unused check_key so far).
+do $$
+begin
+  insert into incident_compliance_checks (id, facility_id, incident_id, check_key, status, checked_by, notes) values
+    ('56300000-0000-0000-0000-000000003003', '56aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '56e00000-0000-0000-0000-0000000000e1', 'supervisor_signoff', 'waived', '56000000-0000-0000-0000-000000000a02', 'reviewer waiver for L2 test');
+exception
+  when insufficient_privilege then
+    raise exception 'IC FAIL (L2 setup): incidents.review holder was denied waiving a compliance check';
+end;
+$$;
+
+reset role;
+
+select set_config('request.jwt.claims', '{"sub":"56000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+-- 11b. Manage-only (no incidents.review) tries to overwrite the waiver with
+-- 'pass' -- rejected by the USING clause (row is not even visible to this
+-- UPDATE), affecting 0 rows rather than raising -- the row is silently left
+-- untouched, matching PostgreSQL's normal "no matching row under RLS" UPDATE
+-- semantics.
+do $$
+declare
+  v_row_count int;
+begin
+  update incident_compliance_checks
+    set status = 'pass', checked_by = '56000000-0000-0000-0000-000000000a01'
+    where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'supervisor_signoff';
+  get diagnostics v_row_count = row_count;
+  if v_row_count <> 0 then
+    raise exception 'IC FAIL (L2): a manage-only holder overwrote a reviewer''s waived check with pass (% row(s) affected)', v_row_count;
+  end if;
+end;
+$$;
+
+do $$
+declare
+  v_status text;
+begin
+  select status into v_status from incident_compliance_checks
+    where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'supervisor_signoff';
+  if v_status <> 'waived' then
+    raise exception 'IC FAIL (L2): the waived check''s status changed to % despite the UPDATE reporting 0 rows affected', v_status;
+  end if;
+end;
+$$;
+
+-- 11c. The SAME manage-only holder tries to soft-delete a DIFFERENT
+-- (non-waived, their own) check -- rejected by the WITH CHECK clause
+-- (raises, since the row IS visible under USING but the resulting row
+-- fails WITH CHECK's deleted_at is null / incidents.review requirement).
+do $$
+begin
+  begin
+    update incident_compliance_checks
+      set deleted_at = now()
+      where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'legal_review';
+    raise exception 'IC FAIL (L2): a manage-only holder soft-deleted a compliance check';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
+do $$
+declare
+  v_deleted_at timestamptz;
+begin
+  select deleted_at into v_deleted_at from incident_compliance_checks
+    where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'legal_review';
+  if v_deleted_at is not null then
+    raise exception 'IC FAIL (L2): legal_review''s deleted_at was set despite the rejected UPDATE';
+  end if;
+end;
+$$;
+
+reset role;
+
+-- 11d. A reviewer CAN still soft-delete a check (including their own
+-- waiver) -- proving 11b/11c tightened the MANAGE-only path specifically,
+-- not compliance-check soft-delete altogether.
+select set_config('request.jwt.claims', '{"sub":"56000000-0000-0000-0000-000000000a02","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+begin
+  update incident_compliance_checks
+    set deleted_at = now(), checked_by = '56000000-0000-0000-0000-000000000a02'
+    where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'supervisor_signoff';
+exception
+  when insufficient_privilege then
+    raise exception 'IC FAIL (L2): an incidents.review holder was denied soft-deleting their own waived compliance check';
+end;
+$$;
+
+reset role;
+
+do $$
+declare
+  v_deleted_at timestamptz;
+begin
+  select deleted_at into v_deleted_at from incident_compliance_checks
+    where incident_id = '56e00000-0000-0000-0000-0000000000e1' and check_key = 'supervisor_signoff';
+  if v_deleted_at is null then
+    raise exception 'IC FAIL (L2): the reviewer''s soft-delete did not actually set deleted_at';
+  end if;
+end;
+$$;
 
 rollback;

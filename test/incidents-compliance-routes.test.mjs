@@ -163,6 +163,55 @@ test("POST signatures rejects a signatureImagePath outside the incident's own fa
   assert.equal(result.status, 400);
 });
 
+// L1 (security review): the path must be bound to THIS signature's own
+// incident, not just the facility+module -- a same-facility,
+// "incidents"-module path naming a DIFFERENT incident id must now be
+// rejected, where the module-only check previously admitted it.
+// assertPathInFacility requires a genuinely UUID-shaped facilityId (it
+// throws on "fac-1" before ever looking at the path), so these two tests
+// use their own UUID-shaped facility/membership/incident fixtures rather
+// than the file's usual human-readable "fac-1" -- everything else about
+// the request is identical to the tests around them.
+const UUID_FACILITY_ID = "11111111-1111-1111-1111-111111111111";
+const UUID_INCIDENT = { ...INCIDENT, facility_id: UUID_FACILITY_ID };
+const UUID_MANAGER = [
+  { facilityId: UUID_FACILITY_ID, status: "active", permissions: ["incidents.read", "incidents.manage"] }
+];
+const UUID_PATH = `/facilities/${UUID_FACILITY_ID}/incidents/inc-1`;
+
+test("POST signatures rejects a signatureImagePath under a DIFFERENT incident in the same facility/module with 400", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [UUID_INCIDENT] : []));
+  const { call } = mount({ memberships: UUID_MANAGER });
+  const result = await call("POST", `${UUID_PATH}/signatures`, {
+    role: "witness",
+    attestationText: "I attest",
+    signedName: "Someone",
+    signatureImagePath: `facilities/${UUID_FACILITY_ID}/incidents/inc-OTHER/x.png`
+  });
+  assert.equal(result.status, 400);
+});
+
+test("POST signatures accepts a signatureImagePath scoped to this incident's own id", async (t) => {
+  const scopedPath = `facilities/${UUID_FACILITY_ID}/incidents/inc-1/x.png`;
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports") return [UUID_INCIDENT];
+    if (table === "incident_signatures" && method === "POST") {
+      return [{ ...SIGNATURE, facility_id: UUID_FACILITY_ID, role: "witness", signature_image_path: scopedPath }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: UUID_MANAGER, userId: "user-9" });
+  const result = await call("POST", `${UUID_PATH}/signatures`, {
+    role: "witness",
+    attestationText: "I attest",
+    signedName: "Someone",
+    signatureImagePath: scopedPath
+  });
+  assert.equal(result.status, 201);
+  const insert = captured.find((c) => c.table === "incident_signatures" && c.method === "POST");
+  assert.equal(insert.body[0].signature_image_path, scopedPath);
+});
+
 test("POST signatures happy path (non-supervisor role) inserts a signature, writes one audit event, and does not touch compliance checks", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports") return [INCIDENT];
@@ -230,6 +279,22 @@ test("GET compliance-checks returns the list for a reader", async (t) => {
   const result = await call("GET", `${PATH}/compliance-checks`);
   assert.equal(result.status, 200);
   assert.equal(result.payload[0].check_key, "evidence_complete");
+});
+
+// L5 (security review): matches the closure gate's own route-layer
+// pre-check (incidents-routes.mjs) filtering out soft-deleted rows, so a
+// caller here never sees a check the closure gate itself already ignores.
+test("GET compliance-checks filters out soft-deleted rows (deleted_at is.null)", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "incident_compliance_checks") return [COMPLIANCE_CHECK];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", `${PATH}/compliance-checks`);
+  assert.equal(result.status, 200);
+  const query = captured.find((c) => c.table === "incident_compliance_checks");
+  assert.equal(query.url.searchParams.get("deleted_at"), "is.null");
 });
 
 // --- POST .../compliance-checks ----------------------------------------------

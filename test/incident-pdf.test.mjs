@@ -511,6 +511,27 @@ test("renderIncidentPacket's chain verification block reports a broken chain whe
   assert.match(text, /\(Chain Broken At: 1\) Tj/);
 });
 
+// M1 (security review): "Chain Valid: true" must never print over a chain
+// the route marked truncated (the facility-wide fetch hit its row cap, so
+// only a prefix was actually checked) or unread (noRows).
+test("renderIncidentPacket's chain verification block reports NOT valid and names the reason when truncated", () => {
+  const chainRows = buildFacilityChain();
+  const rawVerification = verifyIncidentAuditChain(chainRows); // valid: true in isolation
+  const text = asText(
+    renderIncidentPacket(buildPacketArgs({ chainVerification: { ...rawVerification, truncated: true } }))
+  );
+  assert.match(text, /\(Chain Valid: No\) Tj/);
+  assert.match(text, /NOT FULLY VERIFIED/);
+});
+
+test("renderIncidentPacket's chain verification block reports NOT valid and names the reason when no rows were readable", () => {
+  const text = asText(
+    renderIncidentPacket(buildPacketArgs({ chainVerification: { valid: true, brokenAt: null, noRows: true } }))
+  );
+  assert.match(text, /\(Chain Valid: No\) Tj/);
+  assert.match(text, /NOT VERIFIED -- no audit rows/);
+});
+
 test("renderIncidentPacket prints a Packet Integrity block, last, with a packet-level sha256", () => {
   const text = asText(renderIncidentPacket(buildPacketArgs()));
   assert.match(text, /== Packet Integrity ==/);

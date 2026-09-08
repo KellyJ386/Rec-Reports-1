@@ -24,19 +24,29 @@
 --      caller cannot insert an unrelated event_type through it; the new
 --      dedupe_key UNIQUE partial index rejects a bare duplicate INSERT and
 --      accepts an ON CONFLICT DO NOTHING retry as a true no-op.
+--   7. M2 (security review): quietHoursBypass:true is rejected for a
+--      LOW-severity incident (even from an incidents.manage holder) and
+--      accepted for a HIGH-severity one -- the RLS policy now enforces the
+--      SAME rule buildIncidentNotificationJobs claims to, not just the JS
+--      layer. dedupe_key is silently OVERWRITTEN by a BEFORE INSERT trigger
+--      regardless of what the client sends, closing the "pre-seed a future
+--      genuine emission's key" vector: an escalate-only actor's attempt to
+--      set an attacker-chosen dedupe_key never sticks.
 -- Runs inside a transaction that is rolled back, so no fixture persists.
 begin;
 
 insert into auth.users (id, email) values
   ('58000000-0000-0000-0000-000000000a01', 'icm-reviewer@test'),
   ('58000000-0000-0000-0000-000000000a02', 'icm-reader@test'),
-  ('58000000-0000-0000-0000-000000000a03', 'icm-outsider@test')
+  ('58000000-0000-0000-0000-000000000a03', 'icm-outsider@test'),
+  ('58000000-0000-0000-0000-000000000a04', 'icm-escalator@test')
 on conflict (id) do nothing;
 
 insert into app_users (id, full_name, email) values
   ('58000000-0000-0000-0000-000000000a01', 'ICM Reviewer', 'icm-reviewer@test'),
   ('58000000-0000-0000-0000-000000000a02', 'ICM Reader', 'icm-reader@test'),
-  ('58000000-0000-0000-0000-000000000a03', 'ICM Outsider', 'icm-outsider@test')
+  ('58000000-0000-0000-0000-000000000a03', 'ICM Outsider', 'icm-outsider@test'),
+  ('58000000-0000-0000-0000-000000000a04', 'ICM Escalator', 'icm-escalator@test')
 on conflict (id) do nothing;
 
 insert into organizations (id, name) values
@@ -53,22 +63,29 @@ on conflict (id) do nothing;
 insert into roles (id, facility_id, name) values
   ('58c00000-0000-0000-0000-0000000000c1', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'ICM Reviewer Role'),
   ('58c00000-0000-0000-0000-0000000000c2', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'ICM Reader Role'),
-  ('58c00000-0000-0000-0000-0000000000c3', '58bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'ICM Outsider Role')
+  ('58c00000-0000-0000-0000-0000000000c3', '58bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'ICM Outsider Role'),
+  ('58c00000-0000-0000-0000-0000000000c4', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'ICM Escalator Role')
 on conflict (id) do nothing;
 
 -- The reviewer deliberately holds NO work_orders.manage/training.manage --
 -- the whole point of #1 is that incidents.review alone reaches the RPC.
+-- The escalator (M2/#7 below) deliberately holds ONLY incidents.read +
+-- incidents.escalate -- neither incidents.manage nor incidents.review --
+-- matching the review's own threat model exactly.
 insert into role_permissions (role_id, permission_code) values
   ('58c00000-0000-0000-0000-0000000000c1', 'incidents.read'),
   ('58c00000-0000-0000-0000-0000000000c1', 'incidents.review'),
   ('58c00000-0000-0000-0000-0000000000c2', 'incidents.read'),
-  ('58c00000-0000-0000-0000-0000000000c3', 'incidents.manage')
+  ('58c00000-0000-0000-0000-0000000000c3', 'incidents.manage'),
+  ('58c00000-0000-0000-0000-0000000000c4', 'incidents.read'),
+  ('58c00000-0000-0000-0000-0000000000c4', 'incidents.escalate')
 on conflict do nothing;
 
 insert into memberships (id, user_id, facility_id, role_id, status) values
   ('58d10000-0000-0000-0000-0000000000d1', '58000000-0000-0000-0000-000000000a01', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '58c00000-0000-0000-0000-0000000000c1', 'active'),
   ('58d10000-0000-0000-0000-0000000000d2', '58000000-0000-0000-0000-000000000a02', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '58c00000-0000-0000-0000-0000000000c2', 'active'),
-  ('58d10000-0000-0000-0000-0000000000d3', '58000000-0000-0000-0000-000000000a03', '58bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '58c00000-0000-0000-0000-0000000000c3', 'active')
+  ('58d10000-0000-0000-0000-0000000000d3', '58000000-0000-0000-0000-000000000a03', '58bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '58c00000-0000-0000-0000-0000000000c3', 'active'),
+  ('58d10000-0000-0000-0000-0000000000d4', '58000000-0000-0000-0000-000000000a04', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '58c00000-0000-0000-0000-0000000000c4', 'active')
 on conflict (id) do nothing;
 
 -- One employee per facility -- used both for the cross-facility
@@ -83,8 +100,13 @@ on conflict (id) do nothing;
 -- superuser fixture-loading role (matches every other supabase/tests/*.sql
 -- file's convention of loading fixtures ahead of the `set local role
 -- authenticated` sections below).
+-- ICM2 is LOW severity, used only by the M2 quietHoursBypass tests (#7)
+-- below -- buildIncidentNotificationJobs' own rule only stamps
+-- quietHoursBypass:true for high/critical severity, so a low-severity
+-- incident is the negative case the RLS policy must now also enforce.
 insert into incident_reports (id, facility_id, incident_no, report_type, status, severity, occurred_at, location_text, summary) values
-  ('58f00000-0000-0000-0000-0000000000f1', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM1', 'incident', 'under_review', 'high', now(), 'Loading dock', 'Forklift near-miss')
+  ('58f00000-0000-0000-0000-0000000000f1', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM1', 'incident', 'under_review', 'high', now(), 'Loading dock', 'Forklift near-miss'),
+  ('58f00000-0000-0000-0000-0000000000f2', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM2', 'incident', 'under_review', 'low', now(), 'Break room', 'Minor spill, no injury')
 on conflict (id) do nothing;
 
 insert into incident_followup_actions (id, facility_id, incident_id, action_type, status, description) values
@@ -243,6 +265,11 @@ $$;
 -- 6a. notification_jobs: the reviewer can insert an 'incident.escalated' job
 -- through their own client -- proving the new incident-scoped INSERT policy
 -- closes the gap (communications.publish is NOT held here at all).
+-- payload_jsonb.incidentId is included (buildIncidentNotificationJobs' real
+-- shape) so the M2 dedupe_key-trigger tests below (7c/7d) exercise a
+-- realistic payload; the client-supplied dedupe_key here is deliberately the
+-- OLD, pre-M3 three-part shape -- proving the M2 trigger overwrites it
+-- regardless of what the client sends (see 6c).
 -- ---------------------------------------------------------------------------
 do $$
 begin
@@ -250,7 +277,7 @@ begin
   values (
     '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'incident.escalated',
-    '{"recipients":["58e00000-0000-0000-0000-0000000000e1"]}'::jsonb,
+    '{"incidentId":"58f00000-0000-0000-0000-0000000000f1","recipients":["58e00000-0000-0000-0000-0000000000e1"]}'::jsonb,
     '58f00000-0000-0000-0000-0000000000f1:incident.escalated:58e00000-0000-0000-0000-0000000000e1'
   );
 exception
@@ -277,42 +304,66 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 6c. notification_jobs_dedupe_key_uidx: a bare second INSERT with the SAME
--- dedupe_key raises unique_violation; the same insert with
--- ON CONFLICT (dedupe_key) DO NOTHING is a true no-op (row count unchanged)
--- -- exactly the two shapes pgInsert's plain vs. ignoreDuplicates modes
--- produce over PostgREST.
+-- 6c. M2 (security review): fn_notification_job_dedupe_key silently
+-- OVERWRITES the client-supplied dedupe_key with a value computed from
+-- facility_id/event_type/payload_jsonb -- so 6a's row does NOT actually
+-- carry the old-format literal string it was inserted with. This is the
+-- direct proof that a client cannot set an arbitrary, decoupled dedupe_key
+-- (the pre-seeding vector M2 flags): whatever string they send is discarded
+-- in favor of the DB's own computation. notification_jobs_dedupe_key_uidx:
+-- a bare second INSERT whose payload computes to the SAME key raises
+-- unique_violation; the same insert with ON CONFLICT (dedupe_key) DO
+-- NOTHING is a true no-op (row count unchanged) -- exactly the two shapes
+-- pgInsert's plain vs. ignoreDuplicates modes produce over PostgREST.
 -- ---------------------------------------------------------------------------
 do $$
+declare
+  v_stored_key text;
+begin
+  select dedupe_key into v_stored_key from notification_jobs
+    where facility_id = '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+      and event_type = 'incident.escalated'
+      and payload_jsonb ->> 'incidentId' = '58f00000-0000-0000-0000-0000000000f1';
+  if v_stored_key = '58f00000-0000-0000-0000-0000000000f1:incident.escalated:58e00000-0000-0000-0000-0000000000e1' then
+    raise exception 'ICM FAIL: 6a''s client-supplied dedupe_key was stored VERBATIM -- the M2 recompute trigger did not fire';
+  end if;
+  if v_stored_key is null then
+    raise exception 'ICM FAIL: 6a''s row lost its dedupe_key entirely (expected the trigger-computed value, got NULL)';
+  end if;
+  perform set_config('icm_test.computed_dedupe_key', v_stored_key, true);
+end;
+$$;
+
+select set_config('request.jwt.claims', '{"sub":"58000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+do $$
+declare
+  v_computed_key text := current_setting('icm_test.computed_dedupe_key');
 begin
   begin
+    -- Same facility/event_type/payload as 6a -- the trigger computes the
+    -- IDENTICAL key regardless of what dedupe_key text is supplied here,
+    -- so this collides with 6a's row even though the literal string sent
+    -- differs.
     insert into notification_jobs (facility_id, event_type, payload_jsonb, dedupe_key)
     values (
       '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       'incident.escalated',
-      '{}'::jsonb,
-      '58f00000-0000-0000-0000-0000000000f1:incident.escalated:58e00000-0000-0000-0000-0000000000e1'
+      '{"incidentId":"58f00000-0000-0000-0000-0000000000f1","recipients":["58e00000-0000-0000-0000-0000000000e1"]}'::jsonb,
+      'attacker-chosen-arbitrary-key'
     );
-    raise exception 'ICM FAIL: a bare duplicate dedupe_key INSERT was accepted (unique index missing?)';
+    raise exception 'ICM FAIL: a bare duplicate (post-recompute) dedupe_key INSERT was accepted (unique index missing, or the recompute trigger is not deterministic)';
   exception
-    when unique_violation then null; -- expected (the uniqueness check runs at the index level,
-                                      -- independent of the reviewer's own SELECT visibility below)
+    when unique_violation then null; -- expected
   end;
 
-  -- A true no-op: ON CONFLICT DO NOTHING against the same dedupe_key must
-  -- not raise, and must not add a row (verified below via `reset role`,
-  -- since the reviewer holds no communications.publish and so cannot
-  -- SELECT notification_jobs at all under its own "for all" policy --
-  -- exactly why the INSERT-only policy added in 0058 was necessary in the
-  -- first place; SELECT visibility for the incident event codes stays
-  -- unchanged, matching that this module only ever inserts with
-  -- `returning: false`).
   insert into notification_jobs (facility_id, event_type, payload_jsonb, dedupe_key)
   values (
     '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'incident.escalated',
-    '{}'::jsonb,
-    '58f00000-0000-0000-0000-0000000000f1:incident.escalated:58e00000-0000-0000-0000-0000000000e1'
+    '{"incidentId":"58f00000-0000-0000-0000-0000000000f1","recipients":["58e00000-0000-0000-0000-0000000000e1"]}'::jsonb,
+    'another-attacker-chosen-key'
   )
   on conflict (dedupe_key) do nothing;
 end;
@@ -325,9 +376,9 @@ declare
   v_count int;
 begin
   select count(*) into v_count from notification_jobs
-    where dedupe_key = '58f00000-0000-0000-0000-0000000000f1:incident.escalated:58e00000-0000-0000-0000-0000000000e1';
+    where dedupe_key = current_setting('icm_test.computed_dedupe_key');
   if v_count <> 1 then
-    raise exception 'ICM FAIL: expected exactly 1 notification_jobs row for this dedupe_key after the bare-conflict and ON CONFLICT DO NOTHING attempts, saw %', v_count;
+    raise exception 'ICM FAIL: expected exactly 1 notification_jobs row for the trigger-computed dedupe_key after the bare-conflict and ON CONFLICT DO NOTHING attempts, saw %', v_count;
   end if;
 end;
 $$;
@@ -402,5 +453,108 @@ begin
   end;
 end;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- 7. M2 (security review): quietHoursBypass:true is gated on the REFERENCED
+-- incident's own severity, not the caller's permission level -- an actor
+-- holding ONLY incidents.escalate (neither incidents.manage nor
+-- incidents.review) reaches the INSERT policy either way.
+-- ---------------------------------------------------------------------------
+select set_config('request.jwt.claims', '{"sub":"58000000-0000-0000-0000-000000000a04","role":"authenticated"}', true);
+set local role authenticated;
+
+-- 7a. Rejected: quietHoursBypass:true against the LOW-severity incident
+-- (ICM2) -- this is the exact probe the review ran (N1): an escalate-only
+-- actor paging anyone at 3 AM for a low-severity incident.
+do $$
+begin
+  begin
+    insert into notification_jobs (facility_id, event_type, payload_jsonb)
+    values (
+      '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'incident.escalated',
+      jsonb_build_object(
+        'incidentId', '58f00000-0000-0000-0000-0000000000f2',
+        'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1'),
+        'channels', jsonb_build_array('push', 'email', 'sms'),
+        'quietHoursBypass', true,
+        'body', 'attacker text'
+      )
+    );
+    raise exception 'ICM FAIL (M2): an incidents.escalate-only actor inserted quietHoursBypass:true against a LOW-severity incident';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
+-- 7b. Accepted: quietHoursBypass:true against the HIGH-severity incident
+-- (ICM1) -- the SAME actor, same permission set, only the referenced
+-- incident's severity differs. Proves the fix is not simply "no one may
+-- ever bypass quiet hours" -- the legitimate high/critical case still
+-- works.
+do $$
+begin
+  insert into notification_jobs (facility_id, event_type, payload_jsonb)
+  values (
+    '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    'incident.escalated',
+    jsonb_build_object(
+      'incidentId', '58f00000-0000-0000-0000-0000000000f1',
+      'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1'),
+      'quietHoursBypass', true
+    )
+  );
+exception
+  when insufficient_privilege then
+    raise exception 'ICM FAIL (M2): quietHoursBypass:true was rejected for a genuinely HIGH-severity incident';
+end;
+$$;
+
+-- 7c. Rejected: quietHoursBypass:true naming an incidentId that does not
+-- resolve to a high/critical row in THIS facility at all (a nonexistent
+-- id) -- the exists() sub-select correctly finds no match rather than
+-- erroring on a malformed/absent reference.
+do $$
+begin
+  begin
+    insert into notification_jobs (facility_id, event_type, payload_jsonb)
+    values (
+      '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'incident.escalated',
+      jsonb_build_object(
+        'incidentId', 'not-a-real-incident-id',
+        'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1'),
+        'quietHoursBypass', true
+      )
+    );
+    raise exception 'ICM FAIL (M2): quietHoursBypass:true was accepted with a non-resolving/malformed incidentId (expected a clean RLS denial, not a pass)';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
+-- 7d. A quietHoursBypass:false (or absent) row against the LOW-severity
+-- incident is unaffected -- the new clause only constrains the bypass flag,
+-- never blanket-blocks low-severity notifications.
+do $$
+begin
+  insert into notification_jobs (facility_id, event_type, payload_jsonb)
+  values (
+    '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    'incident.escalated',
+    jsonb_build_object(
+      'incidentId', '58f00000-0000-0000-0000-0000000000f2',
+      'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1')
+    )
+  );
+exception
+  when insufficient_privilege then
+    raise exception 'ICM FAIL (M2): a normal (non-bypass) notification_jobs insert for a low-severity incident was unexpectedly rejected';
+end;
+$$;
+
+reset role;
 
 rollback;

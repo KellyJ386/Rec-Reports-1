@@ -161,16 +161,46 @@ create unique index if not exists notification_jobs_dedupe_key_uidx
 -- RLS entirely, so it never needs this policy -- it is included in the
 -- `event_type` list anyway for symmetry/defense in depth, not because
 -- anything authenticated currently inserts it.
+--
+-- M2 (security review): the ORIGINAL version of this policy constrained
+-- only facility_id (via the permission checks) and event_type -- every
+-- other column, including payload_jsonb, was attacker-controlled. Probed:
+-- an actor holding only incidents.escalate inserted, through their own
+-- RLS-scoped client, an ARBITRARY payload_jsonb (`{"channels":["push",
+-- "email","sms"],"quietHoursBypass":true,"body":"attacker text",...}`) --
+-- the high/critical-only quiet-hours-bypass rule (incidents.mjs's
+-- QUIET_HOURS_BYPASS_SEVERITIES) is enforced ONLY in JavaScript, so ANY
+-- incident actor could page any same-facility employee on any channel at
+-- 3 AM for a LOW-severity incident. The added clause below ties
+-- quietHoursBypass to the SAME rule the JS layer already claims to
+-- enforce: it must be absent/false, UNLESS the row's own payload names an
+-- incident (payload_jsonb->>'incidentId') that is actually high/critical
+-- severity in THIS SAME facility -- read as text and matched against
+-- incident_reports.id::text (never cast the untrusted jsonb value to uuid,
+-- which would raise "invalid input syntax for type uuid" on a malformed
+-- value and turn a bad payload into a 500 instead of a clean RLS denial).
+-- A manage/review/escalate holder gets no special exemption -- the rule is
+-- the INCIDENT's severity, exactly matching buildIncidentNotificationJobs'
+-- own business logic, not the caller's permission level.
 drop policy if exists "incident actors can insert incident notification jobs" on notification_jobs;
 create policy "incident actors can insert incident notification jobs" on notification_jobs
   for insert
   with check (
     (
-      internal.has_permission(auth.uid(), facility_id, 'incidents.manage')
-      or internal.has_permission(auth.uid(), facility_id, 'incidents.review')
-      or internal.has_permission(auth.uid(), facility_id, 'incidents.escalate')
+      internal.has_permission((select auth.uid()), facility_id, 'incidents.manage')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.escalate')
     )
     and event_type in ('incident.submitted', 'incident.escalated', 'incident.sla_breached')
+    and (
+      coalesce(payload_jsonb ->> 'quietHoursBypass', 'false') <> 'true'
+      or exists (
+        select 1 from incident_reports r
+        where r.id::text = payload_jsonb ->> 'incidentId'
+          and r.facility_id = notification_jobs.facility_id
+          and r.severity in ('high', 'critical')
+      )
+    )
   );
 
 -- Companion SELECT policy, same scope as the INSERT policy above. Not just
@@ -182,20 +212,75 @@ create policy "incident actors can insert incident notification jobs" on notific
 -- row's own WITH CHECK passes (verified empirically against a live
 -- Postgres 16 instance while building supabase/tests/incident_cross_module.sql
 -- -- this is exactly pgInsert's ignoreDuplicates path, IN-20's whole
--- dedupe mechanism). Scoped identically to the INSERT policy (same three
--- event codes, same permission set) so this grants no broader read access
--- into notification_jobs than the write access already granted.
+-- dedupe mechanism). Scoped identically to the INSERT policy's permission/
+-- event-type predicate (SELECT does not need the quietHoursBypass clause --
+-- an already-inserted row's payload is read-only history at that point, not
+-- something this policy could still prevent) so this grants no broader read
+-- access into notification_jobs than the write access already granted.
 drop policy if exists "incident actors can read incident notification jobs" on notification_jobs;
 create policy "incident actors can read incident notification jobs" on notification_jobs
   for select
   using (
     (
-      internal.has_permission(auth.uid(), facility_id, 'incidents.manage')
-      or internal.has_permission(auth.uid(), facility_id, 'incidents.review')
-      or internal.has_permission(auth.uid(), facility_id, 'incidents.escalate')
+      internal.has_permission((select auth.uid()), facility_id, 'incidents.manage')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.escalate')
     )
     and event_type in ('incident.submitted', 'incident.escalated', 'incident.sla_breached')
   );
+
+-- fn_notification_job_dedupe_key(): M2 continued. dedupe_key was otherwise
+-- free text the client fully controls -- an authenticated actor could
+-- pre-insert a row carrying the SAME key a future genuine emission would
+-- use (${incidentId}:${eventCode}:${recipientId}, incidents.mjs's ORIGINAL
+-- formula), which notification_jobs_dedupe_key_uidx + pgInsert's
+-- ignoreDuplicates would then silently treat that future, real emission as
+-- an already-handled duplicate -- permanently suppressing e.g. an
+-- incident.sla_breached alert to a named recipient (see M3's dedupe_key fix
+-- in src/lib/incidents.mjs, which independently closes most of this by
+-- folding an unpredictable escalation id into the key). This trigger closes
+-- the vector directly and unconditionally, for EVERY caller including
+-- service-role (a BEFORE trigger fires for every role -- RLS bypass never
+-- skips a trigger): whenever a caller supplies a non-null dedupe_key (opting
+-- in to dedup at all -- a caller that wants no dedup leaves it null and is
+-- untouched), it is OVERWRITTEN with a value computed purely from the row's
+-- own validated columns (facility_id, event_type, and the incidentId/
+-- escalationId/first-recipient already present in payload_jsonb), never
+-- from whatever string the client sent. A caller can therefore no longer
+-- set an ARBITRARY key decoupled from their own row's real content; the
+-- worst they can do is a row that collides with ITS OWN future resend of
+-- the identical event, which is exactly what dedup is supposed to do.
+create or replace function fn_notification_job_dedupe_key()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.dedupe_key is not null then
+    new.dedupe_key := new.facility_id::text || ':' || new.event_type || ':' ||
+      coalesce(new.payload_jsonb ->> 'incidentId', '') || ':' ||
+      coalesce(new.payload_jsonb ->> 'escalationId', 'n/a') || ':' ||
+      coalesce(new.payload_jsonb -> 'recipients' ->> 0, '');
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists notification_jobs_dedupe_key on notification_jobs;
+create trigger notification_jobs_dedupe_key
+  before insert on notification_jobs
+  for each row execute function fn_notification_job_dedupe_key();
+
+revoke execute on function fn_notification_job_dedupe_key() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_notification_job_dedupe_key() from anon;
+  end if;
+end
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 3. incident_training_triggers (IN-17). facility_id + incident_id +
@@ -223,18 +308,27 @@ create index if not exists incident_training_triggers_facility_incident_idx
 
 alter table incident_training_triggers enable row level security;
 
+-- L7 (security review): every predicate below uses 0049's `(select
+-- auth.uid())` InitPlan-caching form (per-statement evaluation, not
+-- per-row) rather than the bare `auth.uid()` this file originally shipped
+-- with for its two NEW tables (notification_jobs above, incident_training_
+-- triggers here) -- matching 0056's own convention for its new policies.
+-- The recreated work_orders policy above is deliberately left in its
+-- pre-existing bare form (0038's own convention, unchanged by this
+-- migration) -- that one is not a regression, only these two brand-new
+-- policy sets are.
 drop policy if exists "incident readers can read training triggers" on incident_training_triggers;
 create policy "incident readers can read training triggers" on incident_training_triggers
   for select
-  using (internal.has_permission(auth.uid(), facility_id, 'incidents.read'));
+  using (internal.has_permission((select auth.uid()), facility_id, 'incidents.read'));
 
 drop policy if exists "incident managers can create training triggers" on incident_training_triggers;
 create policy "incident managers can create training triggers" on incident_training_triggers
   for insert
   with check (
     (
-      internal.has_permission(auth.uid(), facility_id, 'incidents.manage')
-      or internal.has_permission(auth.uid(), facility_id, 'incidents.review')
+      internal.has_permission((select auth.uid()), facility_id, 'incidents.manage')
+      or internal.has_permission((select auth.uid()), facility_id, 'incidents.review')
     )
     and internal.fn_assert_same_facility(facility_id, 'incident_reports', incident_id)
     and internal.fn_assert_same_facility(facility_id, 'employees', employee_id)

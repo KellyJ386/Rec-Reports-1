@@ -242,11 +242,19 @@ test("sweepIncidentEscalations emits an incident.sla_breached notification job w
   assert.ok(jobsInsert, "expected a notification_jobs insert");
   assert.match(jobsInsert.url.search, /on_conflict=dedupe_key/);
   assert.match(jobsInsert.headers.Prefer, /resolution=ignore-duplicates/);
+  // M3: the dedupe key now carries the FRESH escalation's own id (esc-2,
+  // newEscalation -- the row this specific breach created), not just
+  // incidentId:eventCode:recipientId, so a second breach on the same
+  // incident/recipient (a different newEscalation id) no longer collides
+  // with this one's key.
   const dedupeKeys = jobsInsert.body.map((job) => job.dedupe_key).sort();
-  assert.deepEqual(dedupeKeys, ["inc-1:incident.sla_breached:emp-1", "inc-1:incident.sla_breached:emp-target"]);
+  assert.deepEqual(dedupeKeys, [
+    "inc-1:incident.sla_breached:esc-2:emp-1",
+    "inc-1:incident.sla_breached:esc-2:emp-target"
+  ]);
   for (const job of jobsInsert.body) {
-    assert.equal(job.payload_jsonb.escalationId, "esc-1");
-    assert.equal(job.payload_jsonb.newEscalationId, "esc-2");
+    assert.equal(job.payload_jsonb.escalationId, "esc-2");
+    assert.equal(job.payload_jsonb.breachedEscalationId, "esc-1");
     assert.equal(job.payload_jsonb.quietHoursBypass, true); // incident() defaults to severity: 'high'
   }
 });
