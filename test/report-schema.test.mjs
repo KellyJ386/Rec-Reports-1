@@ -434,6 +434,22 @@ test("unsafeRegexPatternReason caps alternation and optional-group paths indepen
   assert.equal(unsafeRegexPatternReason("^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$"), null);
 });
 
+// The two caps multiply: 2^8 group paths x 2^14 quantifier splits stays
+// inside both, and every path re-scans an exact {440} tail. Charging {n}
+// its scan length closes the product axis (measured 3.6 s before).
+test("unsafeRegexPatternReason charges an exact {n} its scan length so long tails cannot ride a full budget", () => {
+  const tail = "[a-z]*[a-z]{0,31}[a-z]{440}x$";
+  assert.match(unsafeRegexPatternReason("^" + "(a)?".repeat(4) + "(|a)".repeat(4) + tail), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^" + "(|a)".repeat(7) + "(a)?" + tail), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^" + "(|a|aa|aaa)".repeat(4) + tail), /backtracking potential/);
+  assert.match(unsafeRegexPatternReason("^" + "(|a)".repeat(8) + tail), /backtracking potential/);
+  // Exact repetitions in ordinary patterns are cheap and stay accepted.
+  assert.equal(unsafeRegexPatternReason("^\\d{4}-\\d{2}-\\d{2}$"), null);
+  assert.equal(unsafeRegexPatternReason("^\\d{3}-\\d{2}-\\d{4}$"), null);
+  assert.equal(unsafeRegexPatternReason("^[A-Z]{2}-\\d{4}$"), null);
+  assert.equal(unsafeRegexPatternReason("^(|a)(|a)(|a)(|a)(|a)(|a)(|a)(|a)[a-z]{190}x$"), null);
+});
+
 test("unsafeRegexPatternReason rejects named backreferences as well as numbered ones", () => {
   assert.match(unsafeRegexPatternReason("^(?<n>[a-z]*)\\k<n>x$"), /backreferences/);
   assert.match(unsafeRegexPatternReason("^(a)\\1$"), /backreferences/);
