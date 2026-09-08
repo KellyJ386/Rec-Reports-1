@@ -6,7 +6,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Reports: expanded field types (datetime, counter, rating) with validation and visibility rules;
+  submission signatures; a workflow engine that turns a submitted report into incident, work order and
+  notification actions, run under a server-side execution path so a submitter cannot mint an incident or
+  work order directly; template-bound distribution lists and a delivery ledger; PDF snapshots taken at
+  submit time; lock/revise lifecycle; two-step template-publish governance for facilities that require it
+  (migrations 0052–0055).
+- Incidents: signatures and a closure gate requiring supervisor signoff on recordable incidents; a
+  configurable OSHA recordability decision tree; compliance checks; legal hold with retention controls
+  that extend to child rows and block re-pointing a held row; cross-module work order creation from a
+  follow-up action; a legal packet PDF (statements, evidence index, packet-level integrity hash); a
+  supervisor review workspace; deduplicated notification jobs on submit/escalate/SLA breach; an SLA
+  breach auto-escalation sweep (migrations 0056–0058).
+- Work orders: an assets registry (category, criticality, metadata, install date) with CRUD routes and a
+  picker UI; SLA tracking columns written only through a service-role-only path, plus a scheduled overdue
+  scan; recurring preventive maintenance (plans, cadence rules, a generation job, routes and UI); work
+  orders auto-created from a report field flagged as a defect (migrations 0059–0061).
+
+### Changed
+
+- Report distribution deliveries are drained through the existing email adapter rather than a
+  report-specific one.
+
+### Security
+
+- One independent review round for the work-order slice (assets, SLA, preventive maintenance) found and
+  closed 2 High, 4 Medium and 3 Low findings; re-verification of the fixes is in progress. The reports and
+  incidents slices each passed independent review and were judged safe to merge.
 
 ## [Wave 2] - 2026-09-07
 
