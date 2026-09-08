@@ -120,12 +120,22 @@ export async function pgSelect(client, table, options = {}) {
   return request(client, "GET", table, { query, headers, signal });
 }
 
+// `ignoreDuplicates` (IN-20): sends `Prefer: resolution=ignore-duplicates`
+// instead of merge-duplicates, alongside the same `on_conflict` query param
+// -- PostgREST's upsert semantics for "insert, but silently skip any row
+// that collides with an existing one on the given conflict target" rather
+// than overwriting it. Used for notification_jobs' dedupe_key unique partial
+// index: a retried/re-run job-building call can insert the identical
+// (incident_id, event_type, recipient_id) row again and get back a 201 with
+// that row simply dropped from the result, never a 409. Mutually exclusive
+// with `merge` (ignoreDuplicates wins if both are somehow set, since a
+// caller only ever needs one upsert resolution strategy per call).
 export async function pgInsert(client, table, rows, options = {}) {
-  const { returning = true, onConflict, merge = false, signal } = options;
+  const { returning = true, onConflict, merge = false, ignoreDuplicates = false, signal } = options;
   const query = onConflict ? buildQuery({ extra: { on_conflict: onConflict } }) : "";
   const headers = buildHeaders(client, {
     returning,
-    prefer: merge ? "resolution=merge-duplicates" : undefined
+    prefer: ignoreDuplicates ? "resolution=ignore-duplicates" : merge ? "resolution=merge-duplicates" : undefined
   });
   return request(client, "POST", table, { query, body: rows, headers, signal });
 }

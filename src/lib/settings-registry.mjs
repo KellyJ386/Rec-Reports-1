@@ -10,6 +10,59 @@
 
 const TIME_OF_DAY_PATTERN = "^([01]\\d|2[0-3]):[0-5]\\d$";
 
+// IN-14: the shipped default OSHA-style recordability decision tree,
+// consumed by src/lib/incidents.mjs's evaluateOshaDecisionTree (pure --
+// this file only carries the data, never the traversal logic, so there is
+// no import cycle with incidents.mjs, which itself imports configValue from
+// here). Shape: `nodes` is a DAG keyed by node id, each node a yes/no
+// question; an answer either names the next node id to visit or is a
+// terminal `{ outcome, timer? }` leaf. `outcome` is one of "recordable" /
+// "first_aid_only" / "not_work_related" / "needs_more_info" (the last is
+// also evaluateOshaDecisionTree's own malformed-config/insufficient-answers
+// fallback outcome, so a tenant-authored tree that omits it as an explicit
+// leaf still degrades to the same safe value). `timers` maps a terminal
+// leaf's optional `timer` key to a regulatory deadline, applied only when
+// that leaf is reached: fatality -> 8 hours (29 CFR 1904.39 fatality
+// report), hospitalization/amputation/eye-loss -> 24 hours (same section,
+// in-patient hospitalization), any other recordable case -> 7 calendar days
+// (29 CFR 1904.7's OSHA 300 log entry deadline).
+const DEFAULT_OSHA_DECISION_TREE = Object.freeze({
+  start: "fatality",
+  nodes: Object.freeze({
+    fatality: Object.freeze({
+      question: "Did the incident result in a fatality?",
+      yes: Object.freeze({ outcome: "recordable", timer: "fatality" }),
+      no: "hospitalization"
+    }),
+    hospitalization: Object.freeze({
+      question: "Did the incident result in in-patient hospitalization, amputation, or loss of an eye?",
+      yes: Object.freeze({ outcome: "recordable", timer: "hospitalization" }),
+      no: "work_related"
+    }),
+    work_related: Object.freeze({
+      question: "Was the injury or illness work-related?",
+      yes: "recordable_criteria",
+      no: Object.freeze({ outcome: "not_work_related" })
+    }),
+    recordable_criteria: Object.freeze({
+      question:
+        "Did it involve days away from work, restricted duty or job transfer, medical treatment beyond first aid, loss of consciousness, or a diagnosed significant injury/illness?",
+      yes: Object.freeze({ outcome: "recordable", timer: "recordable" }),
+      no: "first_aid"
+    }),
+    first_aid: Object.freeze({
+      question: "Was only first aid administered, with no further treatment needed?",
+      yes: Object.freeze({ outcome: "first_aid_only" }),
+      no: Object.freeze({ outcome: "needs_more_info" })
+    })
+  }),
+  timers: Object.freeze({
+    fatality: Object.freeze({ hours: 8 }),
+    hospitalization: Object.freeze({ hours: 24 }),
+    recordable: Object.freeze({ days: 7 })
+  })
+});
+
 export const settingsRegistry = Object.freeze(
   [
     // --- Scheduling (module code: scheduling) ------------------------------
@@ -86,6 +139,56 @@ export const settingsRegistry = Object.freeze(
       scopes: ["organization", "facility"],
       default: true, // incidents.mjs escalationSeverities set escalates high/critical today
       validation: {},
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.oshaDecisionTree",
+      module: "incidents",
+      label: "OSHA recordability decision tree",
+      dataType: "json",
+      scopes: ["organization", "facility"],
+      default: DEFAULT_OSHA_DECISION_TREE, // IN-14: see the constant's own header above
+      validation: {},
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.retentionDaysStandard",
+      module: "incidents",
+      label: "Retention period, standard incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 2555, // 7 years -- incidents.mjs retentionEligibleAt's "standard" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.retentionDaysOsha",
+      module: "incidents",
+      label: "Retention period, OSHA-recordable incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 1825, // 5 years -- OSHA 1904.33; incidents.mjs retentionEligibleAt's "osha" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.retentionDaysMinor",
+      module: "incidents",
+      label: "Retention period, minor incidents (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 1095, // 3 years -- incidents.mjs retentionEligibleAt's "minor" class (IN-16)
+      validation: { min: 1, max: 36500 },
+      permission: "admin.manage"
+    },
+    {
+      key: "incidents.maxEscalationLevel",
+      module: "incidents",
+      label: "Maximum auto-escalation level",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 5, // IN-21: incident-sla-sweep.mjs caps nextEscalationLevel chaining at this level
+      validation: { min: 1, max: 20 },
       permission: "admin.manage"
     },
 
@@ -234,6 +337,16 @@ export function validateSettingValue(key, value) {
       errors.push(`${label} must be a string`);
     } else if (validation.pattern && !new RegExp(validation.pattern).test(value)) {
       errors.push(`${label} is not in the expected format`);
+    }
+  } else if (dataType === "json") {
+    // IN-14: a tenant-authored config blob (the OSHA decision tree today).
+    // Only "is this a plain object" is enforced here -- the shape a
+    // consumer actually needs (a DAG with a start node, etc.) is validated
+    // defensively by that consumer at read time (evaluateOshaDecisionTree's
+    // malformed-config fallback), never by the registry, since a future
+    // json-typed setting may have a completely different internal shape.
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      errors.push(`${label} must be a JSON object`);
     }
   } else {
     errors.push(`${label} has an unsupported dataType: ${dataType}`);

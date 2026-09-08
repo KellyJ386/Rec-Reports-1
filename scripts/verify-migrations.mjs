@@ -40,6 +40,8 @@ const requiredRlsTables = [
   "incident_audit_events",
   "incident_amendments",
   "incident_witness_statements",
+  "incident_signatures",
+  "incident_compliance_checks",
   "assets",
   "work_orders",
   "work_order_updates",
@@ -87,7 +89,8 @@ const requiredRlsTables = [
   "auth_throttle",
   "report_workflow_events",
   "report_distribution_lists",
-  "report_deliveries"
+  "report_deliveries",
+  "incident_training_triggers"
 ];
 
 for (const table of requiredRlsTables) {
@@ -114,6 +117,7 @@ for (const helper of [
   "fn_incident_report_transition_guard",
   "fn_incident_witness_statement_guard",
   "fn_report_submission_signature_guard",
+  "fn_incident_signature_guard",
   "internal.apply_incident_amendment",
   "public.apply_incident_amendment",
   "internal.enqueue_report_workflow",
@@ -121,7 +125,9 @@ for (const helper of [
   "internal.mint_workflow_incident",
   "public.mint_workflow_incident",
   "internal.mint_workflow_work_order",
-  "public.mint_workflow_work_order"
+  "public.mint_workflow_work_order",
+  "internal.create_work_order_from_incident",
+  "public.create_work_order_from_incident"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);
@@ -267,6 +273,44 @@ while ((policyMatch = policyPattern.exec(combinedSql)) !== null) {
 for (const table of requiredRlsTables) {
   if (!policyTables.has(table)) {
     throw new Error(`Migrations do not define a create policy statement for ${table}.`);
+  }
+}
+
+// Guard carry-forward: a trigger function that several migrations >= 0043
+// redefine with `create or replace` is replaced whole -- the LAST definition
+// wins and silently drops anything an earlier migration added. Slice 3B hit
+// exactly this: 0057 recreated fn_incident_report_transition_guard from the
+// 0048 text and lost 0056's closure gate until the RLS suite caught it. Every
+// guard in these functions is labelled `-- Guard <id>` (or `-- Guard <id>
+// (...)`), so the rule is mechanical: for each function redefined more than
+// once from 0043 on, every guard label present in an earlier definition must
+// also appear in every later one.
+const guardedFunctionDefinition = /create\s+or\s+replace\s+function\s+(?:public\.)?(fn_[a-z0-9_]+)\s*\([^)]*\)[\s\S]*?\$\$([\s\S]*?)\$\$/gi;
+const guardLabelPattern = /^\s*--\s*Guard\s+([0-9]+(?:\.[0-9]+)?[a-z]?)\b/gim;
+const guardLabelsByFunction = new Map();
+for (const file of files) {
+  const fileNumber = Number.parseInt(file.slice(0, 4), 10);
+  if (Number.isNaN(fileNumber) || fileNumber < 43) continue;
+  const fileSql = readFileSync(join(migrationDir.pathname, file), "utf8");
+  guardedFunctionDefinition.lastIndex = 0;
+  let definition;
+  while ((definition = guardedFunctionDefinition.exec(fileSql)) !== null) {
+    const [, functionName, body] = definition;
+    const labels = new Set();
+    guardLabelPattern.lastIndex = 0;
+    let label;
+    while ((label = guardLabelPattern.exec(body)) !== null) labels.add(label[1]);
+    if (labels.size === 0) continue;
+    const earlier = guardLabelsByFunction.get(functionName);
+    if (earlier) {
+      const dropped = [...earlier.labels].filter((id) => !labels.has(id));
+      if (dropped.length > 0) {
+        throw new Error(
+          `${file}: redefines ${functionName}() without guard(s) ${dropped.map((id) => `"Guard ${id}"`).join(", ")} that ${earlier.file} added; a create or replace must carry every earlier guard forward.`
+        );
+      }
+    }
+    guardLabelsByFunction.set(functionName, { file, labels });
   }
 }
 

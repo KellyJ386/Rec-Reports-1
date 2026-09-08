@@ -21,6 +21,7 @@ import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
 import { registerReportDistributionRoutes } from "../src/lib/http/report-distribution-routes.mjs";
 import { registerIncidentRoutes } from "../src/lib/http/incidents-routes.mjs";
 import { registerIncidentPeopleRoutes } from "../src/lib/http/incidents-people-routes.mjs";
+import { registerIncidentComplianceRoutes } from "../src/lib/http/incidents-compliance-routes.mjs";
 import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
@@ -323,6 +324,9 @@ registerIncidentRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: people involved + witness statements (IN-12, incidents.read /
 // incidents.manage or incidents.review).
 registerIncidentPeopleRoutes(userRouter, { authenticate, sendJson, readBody });
+// Incidents: signatures, compliance checks, OSHA decision-tree evaluation
+// (IN-13/IN-14/IN-15, incidents.read / incidents.manage or incidents.review).
+registerIncidentComplianceRoutes(userRouter, { authenticate, sendJson, readBody });
 // Work orders: dashboard list, create (incl. from incidents), status updates.
 registerWorkOrderRoutes(userRouter, { authenticate, sendJson, readBody });
 // Scheduling: periods, shifts, and publish-readiness/conflict validation.
