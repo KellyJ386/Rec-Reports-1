@@ -106,7 +106,8 @@ on conflict (id) do nothing;
 -- incident is the negative case the RLS policy must now also enforce.
 insert into incident_reports (id, facility_id, incident_no, report_type, status, severity, occurred_at, location_text, summary) values
   ('58f00000-0000-0000-0000-0000000000f1', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM1', 'incident', 'under_review', 'high', now(), 'Loading dock', 'Forklift near-miss'),
-  ('58f00000-0000-0000-0000-0000000000f2', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM2', 'incident', 'under_review', 'low', now(), 'Break room', 'Minor spill, no injury')
+  ('58f00000-0000-0000-0000-0000000000f2', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM2', 'incident', 'under_review', 'low', now(), 'Break room', 'Minor spill, no injury'),
+  ('58f00000-0000-0000-0000-0000000000f3', '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'INC-2026-ICM3', 'incident', 'draft', 'low', now(), 'Pool deck', 'Still a draft')
 on conflict (id) do nothing;
 
 insert into incident_followup_actions (id, facility_id, incident_id, action_type, status, description) values
@@ -532,6 +533,50 @@ begin
   exception
     when insufficient_privilege then null; -- expected
   end;
+end;
+$$;
+
+-- 7e. NEW-1 (security re-verification): an incident.submitted job can only be
+-- written once the referenced incident has left draft. Pre-seeding one for a
+-- DRAFT incident (ICM3) would occupy the dedupe key the genuine emission
+-- computes at submit time and silently suppress it.
+do $$
+begin
+  begin
+    insert into notification_jobs (facility_id, event_type, payload_jsonb)
+    values (
+      '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'incident.submitted',
+      jsonb_build_object(
+        'incidentId', '58f00000-0000-0000-0000-0000000000f3',
+        'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1'),
+        'channels', jsonb_build_array('push')
+      )
+    );
+    raise exception 'ICM FAIL (NEW-1): an incident.submitted job was pre-seeded for a DRAFT incident';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
+-- 7f. ...and is accepted for an incident that has already been submitted
+-- (ICM2 is under_review), so the genuine emission path is unaffected.
+do $$
+begin
+  insert into notification_jobs (facility_id, event_type, payload_jsonb)
+  values (
+    '58aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    'incident.submitted',
+    jsonb_build_object(
+      'incidentId', '58f00000-0000-0000-0000-0000000000f2',
+      'recipients', jsonb_build_array('58e00000-0000-0000-0000-0000000000e1'),
+      'channels', jsonb_build_array('push')
+    )
+  );
+exception
+  when insufficient_privilege then
+    raise exception 'ICM FAIL (NEW-1): an incident.submitted job was rejected for an incident that has left draft';
 end;
 $$;
 

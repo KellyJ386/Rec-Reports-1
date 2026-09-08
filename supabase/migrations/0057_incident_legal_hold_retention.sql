@@ -337,9 +337,14 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- (b) fn_incident_child_legal_hold_guard(): generic BEFORE DELETE / BEFORE
--- UPDATE OF deleted_at guard shared by incident_people, incident_attachments,
--- and incident_witness_statements (see this file's header for why
--- incident_amendments needs nothing further). SECURITY DEFINER + fixed
+-- UPDATE OF deleted_at / BEFORE UPDATE OF incident_id guard shared by
+-- incident_people, incident_attachments, incident_witness_statements,
+-- incident_followup_actions and incident_escalations (see this file's header
+-- for why incident_amendments needs nothing further). The incident_id arm
+-- (security re-verification, NEW-2): re-pointing a child row at another
+-- incident removes it from the held case exactly as a delete would -- every
+-- consumer filters by incident_id -- so a move is rejected when EITHER the
+-- old or the new parent is held (or cannot be found). SECURITY DEFINER + fixed
 -- search_path so the incident_reports lookup below resolves regardless of
 -- which role fires the trigger and always bypasses that table's own RLS
 -- (matching 0041's fn_attachment_path_facility and every other definer
@@ -371,8 +376,22 @@ begin
     return new;
   end if;
 
-  v_incident_id := coalesce(new.incident_id, old.incident_id);
   v_row_id := coalesce(new.id, old.id);
+
+  -- NEW-2 (security re-verification): a re-point is checked against BOTH
+  -- parents. The old parent is checked here; the new parent falls through
+  -- to the ordinary lookup below (coalesce picks new.incident_id).
+  if tg_op = 'UPDATE' and new.incident_id is distinct from old.incident_id then
+    select legal_hold into v_legal_hold
+      from incident_reports
+      where id = old.incident_id;
+    if not found or v_legal_hold is true then
+      raise exception '% %: parent incident % is under legal hold or could not be found; moving the row to another incident is rejected.', tg_table_name, v_row_id, old.incident_id
+        using errcode = 'check_violation';
+    end if;
+  end if;
+
+  v_incident_id := coalesce(new.incident_id, old.incident_id);
 
   select legal_hold into v_legal_hold
     from incident_reports
@@ -428,6 +447,12 @@ create trigger incident_people_legal_hold_soft_delete_guard
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
   execute function fn_incident_child_legal_hold_guard();
+drop trigger if exists incident_people_legal_hold_repoint_guard on incident_people;
+create trigger incident_people_legal_hold_repoint_guard
+  before update of incident_id on incident_people
+  for each row
+  when (new.incident_id is distinct from old.incident_id)
+  execute function fn_incident_child_legal_hold_guard();
 
 -- incident_attachments: same shape as incident_people (forward-looking for
 -- the soft-delete side -- no attachment-removal route exists yet, matching
@@ -443,6 +468,12 @@ create trigger incident_attachments_legal_hold_soft_delete_guard
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
   execute function fn_incident_child_legal_hold_guard();
+drop trigger if exists incident_attachments_legal_hold_repoint_guard on incident_attachments;
+create trigger incident_attachments_legal_hold_repoint_guard
+  before update of incident_id on incident_attachments
+  for each row
+  when (new.incident_id is distinct from old.incident_id)
+  execute function fn_incident_child_legal_hold_guard();
 
 -- incident_witness_statements: hard DELETE is already unconditionally
 -- rejected by fn_incident_witness_statement_guard (0050); this ADDS a
@@ -454,6 +485,12 @@ create trigger incident_witness_statements_legal_hold_guard
   before update on incident_witness_statements
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+drop trigger if exists incident_witness_statements_legal_hold_repoint_guard on incident_witness_statements;
+create trigger incident_witness_statements_legal_hold_repoint_guard
+  before update of incident_id on incident_witness_statements
+  for each row
+  when (new.incident_id is distinct from old.incident_id)
   execute function fn_incident_child_legal_hold_guard();
 
 -- incident_followup_actions / incident_escalations (H2, security review):
@@ -481,6 +518,12 @@ create trigger incident_followup_actions_legal_hold_soft_delete_guard
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
   execute function fn_incident_child_legal_hold_guard();
+drop trigger if exists incident_followup_actions_legal_hold_repoint_guard on incident_followup_actions;
+create trigger incident_followup_actions_legal_hold_repoint_guard
+  before update of incident_id on incident_followup_actions
+  for each row
+  when (new.incident_id is distinct from old.incident_id)
+  execute function fn_incident_child_legal_hold_guard();
 
 drop trigger if exists incident_escalations_legal_hold_delete_guard on incident_escalations;
 create trigger incident_escalations_legal_hold_delete_guard
@@ -492,6 +535,12 @@ create trigger incident_escalations_legal_hold_soft_delete_guard
   before update on incident_escalations
   for each row
   when (new.deleted_at is distinct from old.deleted_at)
+  execute function fn_incident_child_legal_hold_guard();
+drop trigger if exists incident_escalations_legal_hold_repoint_guard on incident_escalations;
+create trigger incident_escalations_legal_hold_repoint_guard
+  before update of incident_id on incident_escalations
+  for each row
+  when (new.incident_id is distinct from old.incident_id)
   execute function fn_incident_child_legal_hold_guard();
 
 -- incident_amendments: deliberately untouched -- fn_block_audit_mutation
