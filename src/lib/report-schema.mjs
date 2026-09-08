@@ -101,8 +101,8 @@ export function isSupportedFieldType(type) {
 //           case instead. Every quantifier multiplies a running "ambiguity"
 //           by the number of ways it can split a MAX_REGEX_INPUT_LENGTH
 //           (512) character input -- `*`, `+`, `{n,}` by 512; `{n,m}` by
-//           (m - n + 1); `?` by 2; `{n}` by n (its per-path scan cost, see
-//           (g)); a group with k alternatives
+//           the larger of (m - n + 1) and n; `?` by 2; `{n}` by n (its
+//           per-path scan cost, see (g)); a group with k alternatives
 //           by k -- and the pattern is rejected once that product exceeds
 //           MAX_REGEX_BACKTRACK_BUDGET (2^22). In practice: two unbounded
 //           quantifiers are always fine (2^18), a third is never fine
@@ -280,9 +280,12 @@ function unsafeRegexStructureReason(pattern) {
         } else if (match[3] === "") {
           ambiguity *= MAX_REGEX_INPUT_LENGTH; // {n,}: unbounded
         } else {
-          // {n,m}: (m - n + 1) ways, but never more than the input allows.
+          // {n,m}: (m - n + 1) ways, but never more than the input allows --
+          // or the n characters every path must re-scan, whichever is
+          // larger (same per-path cost as an exact {n}).
           const max = Number(match[3]);
-          ambiguity *= Math.min(Math.max(max - min, 0) + 1, MAX_REGEX_INPUT_LENGTH);
+          const ways = Math.min(Math.max(max - min, 0) + 1, MAX_REGEX_INPUT_LENGTH);
+          ambiguity *= Math.max(ways, Math.min(min, MAX_REGEX_INPUT_LENGTH));
         }
         if (overBudget()) return budgetReason;
         i += match[0].length;

@@ -448,6 +448,10 @@ test("unsafeRegexPatternReason charges an exact {n} its scan length so long tail
   assert.equal(unsafeRegexPatternReason("^\\d{3}-\\d{2}-\\d{4}$"), null);
   assert.equal(unsafeRegexPatternReason("^[A-Z]{2}-\\d{4}$"), null);
   assert.equal(unsafeRegexPatternReason("^(|a)(|a)(|a)(|a)(|a)(|a)(|a)(|a)[a-z]{190}x$"), null);
+  // A wide {n,m} range with a large n is charged its scan length too.
+  assert.match(unsafeRegexPatternReason("^(|a)(|a)(|a)(|a)(|a)(|a)(|a)(|a).*.{480,511}x$"), /backtracking potential/);
+  assert.equal(unsafeRegexPatternReason("^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,10}$"), null);
+  assert.equal(unsafeRegexPatternReason("^[A-Z]{1,3}\\d{1,6}[A-Z]?$"), null);
 });
 
 test("unsafeRegexPatternReason rejects named backreferences as well as numbered ones", () => {
