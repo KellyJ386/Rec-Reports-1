@@ -46,9 +46,15 @@ export const permissions = Object.freeze([
   // reports.publish is wired into RLS (0044, Slice 1C S-5): it gates the
   // report_template_versions UPDATE policy's is_published=true transition
   // (OR reports.template.manage for every other field). reports.workflow.manage
-  // and reports.distribution.manage are BFF-only by design, reserved for
-  // DR-18/DR-21 (scripts/typecheck.mjs's bffOnlyPermissionCodes) -- no route
-  // or RLS predicate exists for either yet.
+  // is BFF-only by design (scripts/typecheck.mjs's bffOnlyPermissionCodes)
+  // -- still true after DR-18/19/20 (0053): evaluateWorkflow is pure, the
+  // submit-time enqueue RPC is gated on reports.submit, and execution runs
+  // under the service-role drain, so no authenticated route or policy needs
+  // it; it is reserved for a future admin surface that lets a facility
+  // CONFIGURE a template version's workflow_json. reports.distribution.manage
+  // (DR-21, 0054) is no longer BFF-only: it gates report_distribution_lists'
+  // write RLS policy and the .../report-distribution-lists routes
+  // (src/lib/http/report-distribution-routes.mjs).
   "reports.publish",
   "reports.workflow.manage",
   "reports.distribution.manage",

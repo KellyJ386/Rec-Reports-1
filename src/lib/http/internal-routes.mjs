@@ -1,4 +1,5 @@
-// Internal, CRON_SECRET-guarded routes (OP-13/OP-14/OP-21) -- machine-to-
+// Internal, CRON_SECRET-guarded routes (OP-13/OP-14/OP-21, plus DR-22's
+// report-distribution fan-out riding the same drain invocation) -- machine-to-
 // machine endpoints that Vercel Cron (or the local dev worker loop, or an
 // operator with curl) hits directly. These are deliberately NOT reachable
 // through the normal facility-token/JWT `authenticate()` pipeline every
@@ -29,6 +30,10 @@ import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
 import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
+import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
+import { processReportSubmittedEvents } from "../report-distribution.mjs";
+import { processReportPdfJobs } from "../report-pdf-worker.mjs";
+import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
@@ -117,11 +122,46 @@ async function handleDrain(request, response, { env }, sendJson) {
   // call site. Unset (dev default) flows through as `undefined`, which
   // reportError treats as a silent no-op -- identical to every other call
   // site in this codebase.
+  const now = new Date();
   const summary = await drainAll({
     client,
-    now: new Date(),
+    now,
     limit,
     config: { dsn: env.OBSERVABILITY_DSN, emailAdapter, pushAdapter }
+  });
+
+  // DR-20: the report workflow ledger's own drain pass, on the same
+  // CRON_SECRET-guarded service-role client and the same cadence as the
+  // notifications drain above. Never throws (see
+  // report-workflow-executor.mjs's own per-event try/catch) -- a broken
+  // workflow event can dead-letter itself, but can never fail this route.
+  const reportWorkflow = await executeReportWorkflowEvents(client, { now, limit, adapters: { emailAdapter, pushAdapter } });
+
+  // DR-22: report-submission fan-out runs in the SAME drain invocation,
+  // right after the generic notification worker -- see
+  // src/lib/notifications/worker.mjs's RESERVED_OUTBOX_EVENT_TYPES for why
+  // ordering relative to drainAll above is safe (that claim already
+  // excludes 'report.submitted', so there is no race to lose either way).
+  // config.appUrl builds the report link in every distribution email body.
+  const reportDistributionSummary = await processReportSubmittedEvents({
+    client,
+    now,
+    limit,
+    adapters: { email: emailAdapter },
+    config: { dsn: env.OBSERVABILITY_DSN, appUrl: env.APP_URL }
+  });
+
+  // DR-23: drain report_submissions.pdf_status = 'queued' rows on the same
+  // cadence as the notifications drain, using the same service-role client
+  // (RLS bypass is required here too -- the drain must see every facility's
+  // queued snapshots, not just one caller's) and a Storage client built from
+  // the same server env the attachment routes already use
+  // (createStorageClientFromEnv, src/lib/storage.mjs). See
+  // report-pdf-worker.mjs for the render -> upload -> record pipeline.
+  const reportPdf = await processReportPdfJobs(client, createStorageClientFromEnv(env), {
+    now: new Date(),
+    limit,
+    config: { dsn: env.OBSERVABILITY_DSN }
   });
 
   // S-7: sweep stale auth_throttle rows (older than 1 hour) on the same
@@ -132,7 +172,13 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
-  sendJson(response, 200, { ...summary, authThrottleSwept: authThrottleSwept.deleted });
+  sendJson(response, 200, {
+    ...summary,
+    reportWorkflow,
+    reportDistribution: reportDistributionSummary,
+    reportPdf,
+    authThrottleSwept: authThrottleSwept.deleted
+  });
 }
 
 // GET /internal/audit/verify-all's chain fetch for one facility. Fetches

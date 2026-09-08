@@ -12,6 +12,16 @@
 --   4. A member without reports.template.manage cannot insert a template.
 --   5. active_version can only be set to a version_number that is actually
 --      published for that template (fn_report_template_active_version_published).
+--   6. M-1(a) (security review): with
+--      daily_reports.templatePublishRequiresApproval enabled for the
+--      facility, the SAME actor (holding both reports.template.manage AND
+--      reports.publish) who could publish directly in step 3 above can no
+--      longer flip is_published false -> true without an approved
+--      admin_change_requests row for that exact version --
+--      fn_report_template_version_publish_guard enforces this at the DB
+--      layer, independent of whatever the route layer separately checks.
+--      Once such a row exists (status='approved', reviewed_by different
+--      from requested_by), the identical UPDATE succeeds.
 -- Runs against a migrated database inside a rolled-back transaction, so no
 -- fixture persists.
 begin;
@@ -196,6 +206,137 @@ begin
   exception
     when insufficient_privilege then null; -- expected: fn_report_template_active_version_published raised
   end;
+end;
+$$;
+
+reset role;
+
+-- ---------------------------------------------------------------------------
+-- 6. M-1(a): a SECOND draft version, published under governance. Fixture
+-- ordering: table-owner writes (no RLS involved) turn on
+-- daily_reports.templatePublishRequiresApproval for Facility A, and seed a
+-- second reviewer (RT Reviewer, holding the SAME template.manage+publish
+-- actor set) so approval can come from someone other than the requester.
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values
+  ('28000000-0000-0000-0000-000000000a03', 'rt-reviewer@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('28000000-0000-0000-0000-000000000a03', 'RT Reviewer', 'rt-reviewer@test')
+on conflict (id) do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('28d00000-0000-0000-0000-0000000000d3', '28000000-0000-0000-0000-000000000a03', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28c00000-0000-0000-0000-0000000000c1', 'active')
+on conflict (id) do nothing;
+
+-- daily_reports module id is fixed by supabase/seed.sql
+-- (00000000-0000-0000-0000-000000002801); this facility fixture never ran
+-- seed.sql's own facility rows, but modules is a global catalog table, so
+-- the row is already there regardless of which facility references it.
+insert into facility_module_overrides (facility_id, module_id, enabled, config_patch_jsonb) values
+  ('28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '00000000-0000-0000-0000-000000002801', true, '{"daily_reports.templatePublishRequiresApproval": true}'::jsonb)
+on conflict (facility_id, module_id) do update set config_patch_jsonb = excluded.config_patch_jsonb;
+
+insert into report_template_versions (id, facility_id, template_id, version_number, schema_json) values
+  ('28100000-0000-0000-0000-000000001004', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28100000-0000-0000-0000-000000001001', 2, '{"sections":[]}'::jsonb)
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"28000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+set local role authenticated;
+
+-- 6a. Direct publish is now rejected -- no admin_change_requests row exists
+-- for this version yet, even though the actor holds every permission the
+-- ROUTE layer requires.
+do $$
+begin
+  begin
+    update report_template_versions set is_published = true
+      where id = '28100000-0000-0000-0000-000000001004';
+    raise exception 'RT FAIL: direct publish succeeded under templatePublishRequiresApproval with no change request at all';
+  exception
+    when insufficient_privilege then null; -- expected: fn_report_template_version_publish_guard raised
+  end;
+end;
+$$;
+
+-- 6a2. M-1(a) INSERT arm: inserting a brand-new version that is ALREADY
+-- is_published = true (skipping the false -> true UPDATE the guard watched
+-- before) must be rejected the same way -- otherwise "insert pre-published,
+-- then point active_version at it" would bypass governance entirely.
+do $$
+begin
+  begin
+    insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published)
+      values ('28100000-0000-0000-0000-000000001005', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28100000-0000-0000-0000-000000001001', 3, '{"sections":[]}'::jsonb, true);
+    raise exception 'RT FAIL: inserting a pre-published version succeeded under templatePublishRequiresApproval with no change request';
+  exception
+    when insufficient_privilege then null; -- expected: fn_report_template_version_publish_guard raised on INSERT
+  end;
+end;
+$$;
+
+-- 6a3. The INSERT arm only bites when is_published is true: an unpublished
+-- draft version still inserts freely (the governed transition is publishing,
+-- not authoring).
+do $$
+begin
+  insert into report_template_versions (id, facility_id, template_id, version_number, schema_json, is_published)
+    values ('28100000-0000-0000-0000-000000001006', '28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '28100000-0000-0000-0000-000000001001', 3, '{"sections":[]}'::jsonb, false);
+exception
+  when insufficient_privilege then
+    raise exception 'RT FAIL: inserting an UNPUBLISHED draft version was denied by the publish guard';
+end;
+$$;
+
+-- 6b. Stage + approve a change request for this exact version (requester
+-- 28...a01, a DIFFERENT reviewer 28...a03) -- then the identical publish
+-- UPDATE succeeds.
+do $$
+declare
+  v_cr_id uuid;
+begin
+  insert into admin_change_requests (facility_id, entity_table, entity_id, change_summary, status, requested_by)
+    values ('28aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'report_template_versions', '28100000-0000-0000-0000-000000001004', 'Governance fixture', 'draft', '28000000-0000-0000-0000-000000000a01')
+    returning id into v_cr_id;
+  update admin_change_requests set status = 'pending_review' where id = v_cr_id;
+  perform set_config('rt_test.cr_id', v_cr_id::text, true);
+end;
+$$;
+
+select set_config('request.jwt.claims', '{"sub":"28000000-0000-0000-0000-000000000a03","role":"authenticated"}', true);
+
+do $$
+declare
+  v_cr_id uuid := current_setting('rt_test.cr_id')::uuid;
+begin
+  update admin_change_requests
+    set status = 'approved', reviewed_by = '28000000-0000-0000-0000-000000000a03', reviewed_at = now()
+    where id = v_cr_id;
+exception
+  when insufficient_privilege then
+    raise exception 'RT FAIL: a different-reviewer approval was denied';
+end;
+$$;
+
+select set_config('request.jwt.claims', '{"sub":"28000000-0000-0000-0000-000000000a01","role":"authenticated"}', true);
+
+do $$
+begin
+  update report_template_versions set is_published = true
+    where id = '28100000-0000-0000-0000-000000001004';
+exception
+  when insufficient_privilege then
+    raise exception 'RT FAIL: publish was denied even though an approved change request exists for this version';
+end;
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from report_template_versions
+    where id = '28100000-0000-0000-0000-000000001004' and is_published = true
+  ) then
+    raise exception 'RT FAIL: publishing under an approved change request did not persist';
+  end if;
 end;
 $$;
 

@@ -196,5 +196,55 @@ exception
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- M-1(b) (security review): requested_by is now frozen once set -- the
+-- OLD self-approval bypass reassigned requested_by on a status-UNCHANGED
+-- statement (a no-op as far as the transition trigger's early return was
+-- concerned), then separately approved as the original requester under the
+-- now-different requested_by. A fourth, fresh draft request proves the
+-- freeze holds BOTH on a status-unchanged UPDATE and bundled into a legal
+-- status transition.
+-- ---------------------------------------------------------------------------
+insert into admin_change_requests (id, facility_id, entity_table, change_summary, status, requested_by) values
+  ('79e00000-0000-0000-0000-00000000e004', '79aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'branding_profiles', 'requested_by freeze fixture', 'draft', '79999999-9999-9999-9999-999999999991')
+on conflict (id) do nothing;
+
+select set_config('request.jwt.claims', '{"sub":"79999999-9999-9999-9999-999999999991","role":"authenticated"}', true);
+
+-- Status-unchanged reassignment: the exact shape the old bypass used.
+do $$
+begin
+  begin
+    update admin_change_requests set requested_by = '79999999-9999-9999-9999-999999999992'
+      where id = '79e00000-0000-0000-0000-00000000e004';
+    raise exception 'CR FAIL: requested_by was reassigned on a status-unchanged UPDATE';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
+do $$
+begin
+  if (select requested_by from admin_change_requests where id = '79e00000-0000-0000-0000-00000000e004')
+     <> '79999999-9999-9999-9999-999999999991' then
+    raise exception 'CR FAIL: requested_by changed despite the rejected UPDATE';
+  end if;
+end;
+$$;
+
+-- Bundled into an otherwise-legal status transition -- still rejected.
+do $$
+begin
+  begin
+    update admin_change_requests set status = 'pending_review', requested_by = '79999999-9999-9999-9999-999999999992'
+      where id = '79e00000-0000-0000-0000-00000000e004';
+    raise exception 'CR FAIL: requested_by was reassigned bundled into a legal status transition';
+  exception
+    when insufficient_privilege then null; -- expected
+  end;
+end;
+$$;
+
 reset role;
 rollback;

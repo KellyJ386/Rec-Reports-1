@@ -29,20 +29,31 @@ test("typecheck's has_permission regex matches the internal.-qualified call form
   const match = hasPermissionPattern.exec(sample);
   assert.ok(match, "expected the regex to match an internal.-qualified has_permission call");
   assert.equal(match[1], "reports.read");
+
+  // DR-21 (0054): also matches the InitPlan-caching `(select auth.uid())`
+  // wrapper 0049's own header made the go-forward convention for every new
+  // policy from 0050 onward -- the bare form above must keep matching too
+  // (older policies still use it), so this is additive, not a replacement.
+  const wrappedSample = "internal.has_permission((select auth.uid()), facility_id, 'reports.distribution.manage')";
+  hasPermissionPattern.lastIndex = 0;
+  const wrappedMatch = hasPermissionPattern.exec(wrappedSample);
+  assert.ok(wrappedMatch, "expected the regex to match a (select auth.uid())-wrapped has_permission call");
+  assert.equal(wrappedMatch[1], "reports.distribution.manage");
 });
 
-// Slice 1C, S-5: exactly the three codes documented as BFF-only (no DB write
-// of their own, or reserved for a future DR-18/DR-21 route) may skip the
+// Slice 1C, S-5: exactly the two codes documented as BFF-only (no DB write
+// of their own, or reserved for a future DR-18/DR-20 route) may skip the
 // "appears in a has_permission(...) literal" coverage rule.
-test("bffOnlyPermissionCodes lists exactly the three documented BFF-only codes", () => {
+// reports.distribution.manage graduated out of this set in 0054 (DR-21): it
+// now has its own has_permission(...) literal in report_distribution_lists'
+// RLS policy, so it is covered like every other RLS-wired code instead of
+// being listed here.
+test("bffOnlyPermissionCodes lists exactly the two documented BFF-only codes", () => {
   const source = readFileSync(new URL("../scripts/typecheck.mjs", import.meta.url), "utf8");
   const listMatch = source.match(/const bffOnlyPermissionCodes = new Set\(\[([\s\S]*?)\]\);/);
   assert.ok(listMatch, "expected a bffOnlyPermissionCodes Set literal in scripts/typecheck.mjs");
   const codes = [...listMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(
-    new Set(codes),
-    new Set(["incidents.export.pdf", "reports.workflow.manage", "reports.distribution.manage"])
-  );
+  assert.deepEqual(new Set(codes), new Set(["incidents.export.pdf", "reports.workflow.manage"]));
 });
 
 // The coverage rule's own scanner (anyHasPermissionPattern) must match both
@@ -67,4 +78,11 @@ test("typecheck's any-has_permission regex matches internal.-qualified and 4-arg
   const fourArgMatch = anyHasPermissionPattern.exec(fourArgSample);
   assert.ok(fourArgMatch, "expected a match against the 4-arg department-scoped overload");
   assert.equal(fourArgMatch[1], "reports.read");
+
+  // DR-21 (0054): the wrapped (select auth.uid()) form, same as above.
+  const wrappedSample = "with check (internal.has_permission((select auth.uid()), facility_id, 'reports.distribution.manage'))";
+  anyHasPermissionPattern.lastIndex = 0;
+  const wrappedMatch = anyHasPermissionPattern.exec(wrappedSample);
+  assert.ok(wrappedMatch, "expected a match against a (select auth.uid())-wrapped call");
+  assert.equal(wrappedMatch[1], "reports.distribution.manage");
 });

@@ -45,7 +45,18 @@ const combinedMigrationSql = migrationFiles
   .map((file) => readFileSync(join(migrationDir.pathname, file), "utf8"))
   .join("\n");
 
-const hasPermissionPattern = /has_permission\(\s*auth\.uid\(\)\s*,\s*[^,]+,\s*'([^']+)'\s*\)/g;
+// DR-21 fix: both has_permission patterns below used to require the bare
+// `auth.uid()` call as the literal first argument, which silently missed
+// every 0049+ policy written with the InitPlan-caching `(select auth.uid())`
+// wrapper that migration's own header made the go-forward convention (see
+// 0050's header: "every auth.uid() is wrapped (select auth.uid())... for new
+// policies from here forward"). That gap was invisible until now because
+// every 0049-0053 code with a wrapped-only call already had an EARLIER,
+// unwrapped has_permission(...) literal satisfying the uncoveredCodes check
+// below -- 0054's reports.distribution.manage is the first code whose only
+// RLS wiring is a wrapped call, which is what surfaced this. Both patterns
+// now accept either form.
+const hasPermissionPattern = /has_permission\(\s*(?:\(select auth\.uid\(\)\)|auth\.uid\(\))\s*,\s*[^,]+,\s*'([^']+)'\s*\)/g;
 const migrationCodes = new Set();
 let match;
 while ((match = hasPermissionPattern.exec(combinedMigrationSql)) !== null) {
@@ -68,25 +79,29 @@ if (unknownMigrationCodes.length > 0) {
 // RLS, not merely gated at the HTTP layer -- EXCEPT the codes below, which
 // are BFF-only by design (documented in src/lib/permissions.mjs's own
 // comments): incidents.export.pdf has no DB write beyond an audit event
-// already covered by another code's policy; reports.workflow.manage and
-// reports.distribution.manage are reserved for DR-18/DR-21 with no route or
-// policy yet. Any other code that stops appearing in a migration (or a new
-// code that's added without one) is a real regression of the kind S-5 itself
-// fixed for incidents.escalate/tasks.create/legal_hold.manage/audit.view and
+// already covered by another code's policy; reports.workflow.manage stays
+// BFF-only even after DR-18/19/20 (0053_report_workflow_events.sql) --
+// workflow evaluation is pure, the submit-time enqueue RPC is gated on
+// reports.submit, and execution runs entirely under the service-role drain
+// client, so no authenticated-role route or policy predicate needs it; it
+// remains reserved for a future template-workflow CONFIGURATION surface.
+// reports.distribution.manage graduated out of this set in 0054 (DR-21): it
+// now gates report_distribution_lists' INSERT/UPDATE/DELETE policy directly
+// and is picked up by the anyMigrationCodes scan below. Any other code that
+// stops appearing in a migration (or a new code that's added without one)
+// is a real regression of the kind S-5 itself fixed for
+// incidents.escalate/tasks.create/legal_hold.manage/audit.view and
 // reports.publish.
-const bffOnlyPermissionCodes = new Set([
-  "incidents.export.pdf",
-  "reports.workflow.manage",
-  "reports.distribution.manage"
-]);
+const bffOnlyPermissionCodes = new Set(["incidents.export.pdf", "reports.workflow.manage"]);
 
 // Broader than hasPermissionPattern above (which only matches the 3-arg
 // has_permission(auth.uid(), X, 'code') shape): this also matches the 4-arg
 // has_permission(auth.uid(), facility_id, department_id, 'code') overload
 // (0023) and internal.has_permission(...) (0042) alike, since the permission
 // code is always the literal, quoted, LAST argument immediately before the
-// closing paren in every call site in this codebase.
-const anyHasPermissionPattern = /has_permission\(\s*auth\.uid\(\)\s*,\s*[^']*'([^']+)'\s*\)/g;
+// closing paren in every call site in this codebase. Accepts either
+// auth.uid() form -- see the DR-21 comment above hasPermissionPattern.
+const anyHasPermissionPattern = /has_permission\(\s*(?:\(select auth\.uid\(\)\)|auth\.uid\(\))\s*,\s*[^']*'([^']+)'\s*\)/g;
 const anyMigrationCodes = new Set();
 let anyMatch;
 while ((anyMatch = anyHasPermissionPattern.exec(combinedMigrationSql)) !== null) {
