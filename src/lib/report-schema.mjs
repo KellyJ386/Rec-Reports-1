@@ -73,7 +73,7 @@ export function isSupportedFieldType(type) {
 //      not the end anchor) -- an unanchored pattern can be forced into more
 //      backtracking by a longer input than the author intended, and it also
 //      changes what "matches" means (substring vs whole-value).
-//   3. Must not contain a backreference (`\1`-`\9`) -- not needed for field
+//   3. Must not contain a backreference (`\1`-`\9`, `\k<name>`) -- not needed for field
 //      validation patterns and removes another engine-dependent complexity
 //      source.
 //   4. Structural grammar (unsafeRegexStructureReason), scanned left to
@@ -114,7 +114,8 @@ export function isSupportedFieldType(type) {
 //           case instead. Every quantifier multiplies a running "ambiguity"
 //           by the number of ways it can split a MAX_REGEX_INPUT_LENGTH
 //           (512) character input -- `*`, `+`, `{n,}` by 512; `{n,m}` by
-//           (m - n + 1); `?` by 2; `{n}` by 1; a group with k alternatives
+//           the larger of (m - n + 1) and n; `?` by 2; `{n}` by n (its
+//           per-path scan cost, see (g)); a group with k alternatives
 //           by k -- and the pattern is rejected once that product exceeds
 //           MAX_REGEX_BACKTRACK_BUDGET (2^22). In practice: two unbounded
 //           quantifiers are always fine (2^18), a third is never fine
@@ -122,6 +123,16 @@ export function isSupportedFieldType(type) {
 //           ranges multiplying out to 8192 (`{1,64}` twice plus a `?`).
 //           Ordinary field patterns -- `^\d+(\.\d+)?$`, `^[A-Z]{2}-\d{4}$`,
 //           `^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,10}$` -- all fit.
+//        g. Alternation-path cap. (f) counts paths, but each path also
+//           re-scans whatever follows the groups, so a run of optional or
+//           alternating groups in front of a long exact tail
+//           (`^(|a)(|a)...(|a)[a-z]{500}x$`, 22 groups, measured 9 s) blows
+//           up well inside the (f) budget -- an EMPTY alternative also
+//           defeats the engine's identical-prefix folding that the (f)
+//           calibration relied on. The product of alternatives over every
+//           group (x2 per optional group) is therefore capped separately at
+//           MAX_REGEX_ALTERNATION_PATHS (2^8): at most eight optional or
+//           two-way groups in one pattern, ~80 ms against the worst tail.
 //   5. Must be syntactically valid (`new RegExp(pattern)` does not throw).
 //      Constructing a RegExp only compiles it -- it never executes matching
 //      -- so this step carries no backtracking risk regardless of shape.
@@ -138,7 +149,15 @@ const MAX_REGEX_QUANTIFIERS = 8;
 // this engine for the worst shapes that still fit inside it; the shapes the
 // security review timed in seconds sit at 2^27 and above.
 const MAX_REGEX_BACKTRACK_BUDGET = 2 ** 22;
-const BACKREFERENCE_RE = /\\[1-9]/;
+// Separate, much tighter cap on alternation/optional-group paths (rule (g)).
+// The budget above counts how many ways the input can be split, but every
+// one of those paths re-scans whatever follows the groups; with a long
+// exact tail (`[a-z]{500}`) each path costs hundreds of steps, and an empty
+// alternative (`(|a)`) defeats V8's prefix folding entirely. 2^8 paths with
+// the worst allowed tail measured ~80 ms; 2^10 already ~280 ms.
+const MAX_REGEX_ALTERNATION_PATHS = 2 ** 8;
+// `\1`-`\9` numbered and `\k<name>` named backreferences.
+const BACKREFERENCE_RE = /\\(?:[1-9]|k<)/;
 const LOOKAROUND_AT_RE = /^\(\?(?:=|!|<=|<!)/;
 const GROUP_QUANTIFIER_RE = /^(?:\*|\+|\{\d*(?:,\d*)?\})/;
 const BRACE_QUANTIFIER_RE = /^\{(\d+)(?:(,)(\d*))?\}/;
@@ -155,8 +174,12 @@ function unsafeRegexStructureReason(pattern) {
   // the input" over every quantifier and alternation seen so far.
   let ambiguity = 1;
   // Number of `|`-separated alternatives inside the currently open group
-  // (1 = no alternation). Folded into `ambiguity` when the group closes.
+  // (1 = no alternation). Folded into `ambiguity` and `altPaths` when the
+  // group closes.
   let groupBranches = 1;
+  // Rule (g): product of alternatives over every group, x2 per optional
+  // group -- the number of distinct group-choice paths the engine can walk.
+  let altPaths = 1;
   let i = 0;
   const n = pattern.length;
 
@@ -214,6 +237,7 @@ function unsafeRegexStructureReason(pattern) {
       i += 1;
       // Rule (c): each alternative is one more way to match the same span.
       ambiguity *= groupBranches;
+      altPaths *= groupBranches;
       groupBranches = 1;
       const rest = pattern.slice(i);
       if (GROUP_QUANTIFIER_RE.test(rest)) {
@@ -222,10 +246,14 @@ function unsafeRegexStructureReason(pattern) {
       if (rest[0] === "?") {
         quantifiers += 1;
         ambiguity *= 2;
+        altPaths *= 2;
         i += 1;
         if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") {
           return "must not repeat a group -- only a single trailing ? is allowed after a group";
         }
+      }
+      if (altPaths > MAX_REGEX_ALTERNATION_PATHS) {
+        return "has too many alternation or optional-group paths -- use at most 8 optional or alternating groups";
       }
       if (overBudget()) return budgetReason;
       continue;
@@ -257,13 +285,20 @@ function unsafeRegexStructureReason(pattern) {
         quantifiers += 1;
         const min = Number(match[1]);
         if (match[2] === undefined) {
-          // {n}: exact repetition -- exactly one way to match.
+          // {n}: exact repetition -- one way to split, but every surviving
+          // path re-scans those n characters, so it is charged n steps
+          // (H-3: eight optional groups times two bounded quantifiers times
+          // an exact {440} tail sat inside both caps at 3.6 s).
+          ambiguity *= Math.min(Math.max(min, 1), MAX_REGEX_INPUT_LENGTH);
         } else if (match[3] === "") {
           ambiguity *= MAX_REGEX_INPUT_LENGTH; // {n,}: unbounded
         } else {
-          // {n,m}: (m - n + 1) ways, but never more than the input allows.
+          // {n,m}: (m - n + 1) ways, but never more than the input allows --
+          // or the n characters every path must re-scan, whichever is
+          // larger (same per-path cost as an exact {n}).
           const max = Number(match[3]);
-          ambiguity *= Math.min(Math.max(max - min, 0) + 1, MAX_REGEX_INPUT_LENGTH);
+          const ways = Math.min(Math.max(max - min, 0) + 1, MAX_REGEX_INPUT_LENGTH);
+          ambiguity *= Math.max(ways, Math.min(min, MAX_REGEX_INPUT_LENGTH));
         }
         if (overBudget()) return budgetReason;
         i += match[0].length;
