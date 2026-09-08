@@ -151,8 +151,8 @@ function buildWorkOrderParams(rawParams, { config, now }) {
 // through the same slaHoursForPriority math -- since a defect field carries
 // no severity signal of its own beyond "this fired".
 //
-// `eventType` is set to `create_work_order:<fieldKey>` rather than the
-// default `<type>:<index>` composition: actionEventType (used by
+// `eventType` is set to `create_work_order:defect:<fieldKey>` rather than
+// the default `<type>:<index>` composition: actionEventType (used by
 // report-workflow-executor.mjs when it inserts each derived action's ledger
 // row -- the RPC itself only ever inserts one 'evaluate' event, see H-1)
 // honors an action's own eventType when present (falling back to type:index
@@ -160,9 +160,23 @@ function buildWorkOrderParams(rawParams, { config, now }) {
 // by the field that produced it -- and, since that table's uniqueness is
 // (submission_id, event_type), this is also what keeps two DIFFERENT
 // defects on the same submission from colliding into a single ledger row.
-// `params.sourceDefectKey` carries the same field key through to
-// internal.mint_workflow_work_order (0060), which is what keeps the DB-side
-// idempotency guard per-defect rather than per-submission (see that
+//
+// L-1 (security review, wave3-slice-3c): the extra `defect:` segment is
+// deliberate namespacing, not decoration -- field keys have no charset
+// restriction of their own beyond report-schema.mjs's validateFieldKey
+// (added alongside this fix), and a template author could otherwise name a
+// field `0`, `1`, etc., producing an eventType (`create_work_order:0`)
+// indistinguishable from the DEFAULT `${type}:${index}` composition a rule-
+// authored create_work_order action at that same index would get. Since
+// report_workflow_events' uniqueness is (submission_id, event_type), that
+// collision made the executor's own 409 "already enqueued" catch swallow
+// one of the two work orders silently. `defect:` can never collide with a
+// bare integer index, closing the collision at the source rather than
+// only relying on the field-key charset check below.
+//
+// `params.sourceDefectKey` carries the same field key (unprefixed) through
+// to internal.mint_workflow_work_order (0060), which is what keeps the
+// DB-side idempotency guard per-defect rather than per-submission (see that
 // migration's header for the full derivation).
 function buildDefectWorkOrderAction(defect, { config, now }) {
   const priority = configValue(config, "workOrders.defaultPriority");
@@ -170,7 +184,7 @@ function buildDefectWorkOrderAction(defect, { config, now }) {
   const dueAt = new Date(now.getTime() + slaHours * 60 * 60 * 1000).toISOString();
   return {
     type: "create_work_order",
-    eventType: `create_work_order:${defect.fieldKey}`,
+    eventType: `create_work_order:defect:${defect.fieldKey}`,
     params: {
       priority,
       slaHours,

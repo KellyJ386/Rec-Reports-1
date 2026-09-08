@@ -192,11 +192,14 @@ async function handleDrain(request, response, { env }, sendJson) {
   // WO-16: same drain invocation, same service-role client (a work order's
   // sla_breached_at can only ever be written by a service-role session --
   // 0060's DB trigger rejects any authenticated-session write to it -- so
-  // this scan MUST run here, never off an end-user route). Never throws
-  // (every per-row failure inside scanWorkOrderSla simply isn't counted as
-  // breached/enqueued; the next pass retries it since sla_breached_at is
-  // only stamped on a successful claim), so a broken scan can't turn a
-  // healthy drain into a 500 any more than the other consumers above can.
+  // this scan MUST run here, never off an end-user route). M-3 (security
+  // review, wave3-slice-3c): every per-candidate failure inside
+  // scanWorkOrderSla is caught internally (see that module's own header) --
+  // a failure claiming a row is skipped; a failure after a successful claim
+  // reverts the sla_breached_at stamp and is recorded in the returned
+  // summary's `errors` array, so the next pass retries it. Neither shape
+  // ever throws out of scanWorkOrderSla itself, so a broken scan can't turn
+  // a healthy drain into a 500 any more than the other consumers above can.
   const workOrderSla = await scanWorkOrderSla(client, { now, limit, config: { dsn: env.OBSERVABILITY_DSN } });
   // WO-19: PM work-order generation, same cadence/service-role client as
   // every other drain step above. `config` is deliberately the flat,

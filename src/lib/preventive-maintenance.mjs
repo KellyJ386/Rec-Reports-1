@@ -32,6 +32,21 @@ import { configValue } from "./settings-registry.mjs";
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
+// H-2 (security review, wave3-slice-3c): a hard ceiling on how many
+// occurrence dates either generator below will ever materialize into an
+// array, independent of whatever window the caller asks for. This is the
+// LAST line of defense, not the first (pm-plans-routes.mjs's own
+// MAX_OCCURRENCE_WINDOW_DAYS rejects an over-wide ?from=/?to= window before
+// this module is ever called) -- but a caller with a wide-but-legal window
+// against a plan with a very short interval_days (the minimum is 1, per
+// pm_plans_interval_shape's check constraint) can still ask for hundreds of
+// thousands of dates well inside a "reasonable" window, e.g. a decade at
+// interval_days=1. 1000 comfortably covers every real generation/preview use
+// (WO-19's own pmHorizonDays default is nowhere near this many days, and
+// WO-20's UI strip is 8 weeks), while bounding worst-case materialization to
+// a small, constant-size array regardless of what a caller supplies.
+const MAX_OCCURRENCES = 1000;
+
 // 'YYYY-MM-DD' (or any value new Date() accepts) -> whole UTC days since the
 // epoch. Truncates a datetime input down to its UTC calendar date first, so
 // passing an ISO timestamp (e.g. a row's created_at) behaves the same as
@@ -101,6 +116,7 @@ function intervalOccurrenceDatesInWindow(plan, fromStr, toStr) {
     const day = anchorDay + n * interval;
     if (day > toDay) break;
     if (day >= fromDay) dates.push(fromEpochDay(day));
+    if (dates.length >= MAX_OCCURRENCES) break;
   }
   return dates;
 }
@@ -120,8 +136,9 @@ function seasonalOccurrenceDatesInWindow(plan, fromStr, toStr) {
   const toYear = new Date(toDay * MS_PER_DAY).getUTCFullYear();
 
   const dates = [];
-  for (let year = fromYear; year <= toYear; year += 1) {
+  for (let year = fromYear; year <= toYear && dates.length < MAX_OCCURRENCES; year += 1) {
     for (const month of plan.seasonMonths ?? []) {
+      if (dates.length >= MAX_OCCURRENCES) break;
       const dateStr = seasonalDateFor(year, month, anchorDayOfMonth);
       const day = toEpochDay(dateStr);
       if (day >= fromDay && day <= toDay) dates.push(dateStr);

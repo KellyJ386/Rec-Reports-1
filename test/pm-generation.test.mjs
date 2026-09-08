@@ -91,9 +91,22 @@ test("generates a work order + linked occurrence for a due interval occurrence",
   assert.equal(woInsert.body[0].source_pm_occurrence_id, "occ-1");
   assert.equal(woInsert.body[0].due_at, "2026-03-15T00:00:00.000Z");
 
-  const occLink = captured.find((c) => c.table === "pm_plan_occurrences" && c.method === "PATCH");
+  // M-4: the generation-slot CAS claim runs BEFORE minting, gated on
+  // generated_at is.null (extra passthrough), and stamps generated_at --
+  // separate from the post-mint link PATCH, which only sets work_order_id.
+  const genClaim = captured.find(
+    (c) => c.table === "pm_plan_occurrences" && c.method === "PATCH" && c.url.searchParams.get("generated_at") === "is.null"
+  );
+  assert.ok(genClaim, "expected a CAS'd generated_at claim PATCH before minting");
+  assert.ok(genClaim.body.generated_at);
+  assert.equal(genClaim.body.work_order_id, undefined);
+
+  const occLink = captured.find(
+    (c) => c.table === "pm_plan_occurrences" && c.method === "PATCH" && c.body.work_order_id !== undefined
+  );
+  assert.ok(occLink, "expected a link PATCH setting work_order_id");
   assert.equal(occLink.body.work_order_id, "wo-1");
-  assert.ok(occLink.body.generated_at);
+  assert.equal(occLink.body.generated_at, undefined);
 
   const planPatch = captured.find((c) => c.table === "pm_plans" && c.method === "PATCH");
   assert.ok(planPatch, "last_generated_at should be updated when a work order was created");
@@ -167,8 +180,62 @@ test("conflict repair: an occurrence claimed but never linked to a work order is
 
   const woInsert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
   assert.equal(woInsert.body[0].source_pm_occurrence_id, "occ-existing");
-  const occLink = captured.find((c) => c.table === "pm_plan_occurrences" && c.method === "PATCH");
+
+  // M-4: the repair path also goes through the generated_at CAS claim
+  // before minting -- not just the fresh-insert path.
+  const genClaim = captured.find(
+    (c) => c.table === "pm_plan_occurrences" && c.method === "PATCH" && c.url.searchParams.get("generated_at") === "is.null"
+  );
+  assert.ok(genClaim, "expected a CAS'd generated_at claim PATCH on the repair path too");
+
+  const occLink = captured.find(
+    (c) => c.table === "pm_plan_occurrences" && c.method === "PATCH" && c.body.work_order_id !== undefined
+  );
   assert.equal(occLink.body.work_order_id, "wo-repaired");
+});
+
+// M-4 (security review, wave3-slice-3c): two concurrent passes both
+// legitimately reaching the repair branch for the SAME occurrence id (both
+// see work_order_id still null) must still mint exactly ONE work order --
+// the generated_at CAS claim, not the occurrence-row conflict alone, is
+// what decides the single winner. See probes reference in
+// preventive-maintenance's/pm-generation's own module header for the race
+// this closes.
+test("conflict repair: two concurrent passes racing the SAME unlinked occurrence mint exactly one work order", async (t) => {
+  const plan = intervalPlanRow();
+  let generationSlotClaimed = false;
+  let workOrderCount = 0;
+  stubFetch(t, (table, method, url) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    // Both passes see the occurrence already claimed by an earlier,
+    // interrupted run (work_order_id still null) -- via the conflict path.
+    if (table === "pm_plan_occurrences" && method === "POST") return CONFLICT;
+    if (table === "pm_plan_occurrences" && method === "GET") return [{ id: "occ-existing", work_order_id: null }];
+    if (table === "pm_plan_occurrences" && method === "PATCH") {
+      if (url.searchParams.get("generated_at") === "is.null") {
+        // Only the FIRST caller wins the CAS -- the second gets zero rows
+        // back, exactly like a real is.null-guarded UPDATE racing another
+        // writer.
+        if (generationSlotClaimed) return [];
+        generationSlotClaimed = true;
+        return [{ id: "occ-existing", generated_at: NOW.toISOString() }];
+      }
+      return [{ id: "occ-existing", work_order_id: "wo-repaired" }];
+    }
+    if (table === "work_orders" && method === "POST") {
+      workOrderCount += 1;
+      return [{ id: "wo-repaired" }];
+    }
+    if (table === "pm_plans" && method === "PATCH") return [{ id: "plan-1" }];
+    return [];
+  });
+
+  const first = await generatePmWorkOrders(client(), { now: NOW, config: {} });
+  const second = await generatePmWorkOrders(client(), { now: NOW, config: {} });
+
+  assert.equal(first.created + second.created, 1, "exactly one pass should report a mint");
+  assert.equal(first.skipped + second.skipped, 1, "the losing pass should skip, not double-mint");
+  assert.equal(workOrderCount, 1, "exactly one work order should have been minted across both passes");
 });
 
 test("horizon: an occurrence past the horizon is never generated, even when its lead time would otherwise make it due", async (t) => {

@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { createClient, pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import {
@@ -31,13 +31,43 @@ const WORK_ORDER_COLUMNS =
 // request body); first_response_at/resolved_at are stamped by this route
 // layer itself off other request fields (a status transition, a posted
 // comment), never taken verbatim from the body; sla_breached_at is stamped
-// ONLY by the SLA scan (src/lib/work-order-sla-scan.mjs) -- 0060's DB
-// trigger is the backstop for that one specifically, this list is the
-// route-layer rejection for all four.
+// ONLY by the SLA scan (src/lib/work-order-sla-scan.mjs). This list is the
+// route-layer REJECTION of a client-supplied value for all four (a 400
+// before any fetch); the actual write boundary is the DB layer -- see the
+// next comment.
 const CLIENT_IMMUTABLE_SLA_FIELDS = ["sla_due_at", "first_response_at", "sla_breached_at", "resolved_at"];
 
 function rejectedSlaFields(payload) {
   return CLIENT_IMMUTABLE_SLA_FIELDS.filter((field) => payload[field] !== undefined);
+}
+
+// M-1 (security review, wave3-slice-3c): 0060's DB trigger now rejects an
+// `authenticated` session's write to ANY of sla_due_at/first_response_at/
+// resolved_at/sla_breached_at, on both INSERT and UPDATE -- not just
+// sla_breached_at, which is all it covered before this fix (a
+// work_orders.manage holder could otherwise PATCH sla_due_at out to evade
+// WO-16's overdue scan, or forge first_response_at/resolved_at directly
+// through PostgREST with their own JWT; CLIENT_IMMUTABLE_SLA_FIELDS above
+// was route-layer-only and never the actual boundary, exactly what 0038
+// concluded for department_id/assigned_to_employee_id). The three
+// legitimate route-layer stamps below (create-time sla_due_at,
+// first_response_at, resolved_at) now go through
+// internal.set_work_order_sla_fields, a service-role-only SECURITY DEFINER
+// RPC (0060) called via a dedicated service-role client -- same
+// buildServiceClient shape internal-routes.mjs's drain and
+// work-order-sla-scan.mjs's claimBreach already use for a service-role
+// write -- AFTER this route's own permission/facility-ref checks have
+// already run under the caller's own client, exactly as before. This adds
+// no new authorization surface: it only relocates WHERE the already-decided
+// write physically lands, so the DB trigger can reject the same column from
+// every other path.
+function buildServiceClient(env) {
+  if (!env?.SUPABASE_URL || !env?.SUPABASE_SERVICE_ROLE_KEY) return null;
+  return createClient({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_ROLE_KEY });
+}
+
+async function stampWorkOrderSlaFields(serviceClient, workOrderId, fields) {
+  return pgRpc(serviceClient, "set_work_order_sla_fields", { p_work_order_id: workOrderId, p_fields: fields });
 }
 
 // Maps one DB-shaped work_orders row (snake_case) to slaState's camelCase
@@ -488,6 +518,14 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           });
         }
 
+        // M-1: fail before any write if the service-role client this route
+        // needs to stamp sla_due_at is unavailable -- never insert a work
+        // order and then discover the stamp can't be applied.
+        const serviceClient = buildServiceClient(env);
+        if (!serviceClient) {
+          return sendJson(response, 503, { error: "work order creation is disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+        }
+
         const refCheck = await resolveFacilityRefs(auth.client, incident.facility_id, {
           assigned_to_employee_id: assignee
         });
@@ -524,6 +562,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         const slaDueAt = workOrderDueAt({ priority: created.priority }, config, now).toISOString();
         const resolvedDueAt = dueAt ?? slaDueAt;
 
+        // M-1: sla_due_at is no longer part of this INSERT -- 0060's DB
+        // trigger rejects an authenticated session's write to it, so it is
+        // stamped in a second call, through the service-role RPC, right
+        // after this row is created.
         const row = {
           facility_id: created.facilityId,
           department_id: null,
@@ -536,11 +578,13 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           status: created.status,
           assigned_to_employee_id: assignee ?? null,
           due_at: resolvedDueAt,
-          sla_due_at: slaDueAt,
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
-        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        const inserted = (rows ?? [])[0] ?? null;
+        if (!inserted) return sendJson(response, 201, null);
+        const stamped = await stampWorkOrderSlaFields(serviceClient, inserted.id, { sla_due_at: slaDueAt });
+        return sendJson(response, 201, stamped);
       })
   );
 
@@ -589,6 +633,13 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
 
+        // M-1: fail before any write if the service-role client this route
+        // needs to stamp sla_due_at is unavailable.
+        const serviceClient = buildServiceClient(env);
+        if (!serviceClient) {
+          return sendJson(response, 503, { error: "work order creation is disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+        }
+
         const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
           asset_id: body.payload.asset_id,
           department_id: body.payload.department_id,
@@ -603,6 +654,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         const now = new Date();
         const slaDueAt = workOrderDueAt({ priority }, config, now).toISOString();
 
+        // M-1: sla_due_at is no longer part of this INSERT -- 0060's DB
+        // trigger rejects an authenticated session's write to it, so it is
+        // stamped in a second call, through the service-role RPC, right
+        // after this row is created.
         const row = {
           facility_id: params.facilityId,
           department_id: body.payload.department_id ?? null,
@@ -613,13 +668,15 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           description,
           priority,
           status: "open",
-          sla_due_at: slaDueAt,
           assigned_to_employee_id: body.payload.assigned_to_employee_id ?? null,
           due_at: body.payload.due_at ?? null,
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
-        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        const inserted = (rows ?? [])[0] ?? null;
+        if (!inserted) return sendJson(response, 201, null);
+        const stamped = await stampWorkOrderSlaFields(serviceClient, inserted.id, { sla_due_at: slaDueAt });
+        return sendJson(response, 201, stamped);
       })
   );
 
@@ -676,8 +733,23 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           return sendJson(response, 409, { error: `illegal status transition: ${workOrder.status} -> ${nextStatus}` });
         }
 
+        // M-1: a status transition always sets resolved_at (and sometimes
+        // first_response_at) below -- both are DB-trigger-guarded columns
+        // now, so a service-role client is required whenever nextStatus is
+        // present. priority-only / assignee-only PATCHes never touch either
+        // column and are completely unaffected -- no service client needed,
+        // no behavior change from before this fix.
+        let serviceClient = null;
+        if (nextStatus !== undefined) {
+          serviceClient = buildServiceClient(env);
+          if (!serviceClient) {
+            return sendJson(response, 503, { error: "work order status updates are disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+          }
+        }
+
         const now = new Date();
         const patch = {};
+        const slaPatch = {};
         const history = [];
 
         if (nextStatus !== undefined) {
@@ -689,9 +761,12 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           // reopen), mirroring completed_at's own reopen-clears behavior
           // above. first_response_at stamps once, the first time a work
           // order moves off 'open' -- never re-stamped or cleared after.
-          patch.resolved_at = isResolvingStatus(nextStatus) ? workOrder.resolved_at ?? now.toISOString() : null;
+          // M-1: both now go through slaPatch/stampWorkOrderSlaFields, NOT
+          // the `patch` object below -- 0060's DB trigger rejects an
+          // authenticated write to either.
+          slaPatch.resolved_at = isResolvingStatus(nextStatus) ? workOrder.resolved_at ?? now.toISOString() : null;
           if (workOrder.status === "open" && !workOrder.first_response_at) {
-            patch.first_response_at = now.toISOString();
+            slaPatch.first_response_at = now.toISOString();
           }
           history.push({
             update_type: "status_change",
@@ -738,7 +813,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           );
         }
 
-        const updated = (rows ?? [])[0] ?? null;
+        let updated = (rows ?? [])[0] ?? null;
+        if (updated && Object.keys(slaPatch).length > 0) {
+          updated = await stampWorkOrderSlaFields(serviceClient, params.id, slaPatch);
+        }
         return sendJson(response, 200, updated ? withSla(updated, now) : null);
       })
   );
@@ -782,6 +860,18 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requirePerm(auth, workOrder.facility_id, MANAGE, response)) return;
 
+        // M-1: fail before any write if a first_response_at stamp will be
+        // needed and the service-role client for it is unavailable -- never
+        // post the comment and then discover the stamp can't be applied.
+        const needsFirstResponseStamp = !workOrder.first_response_at;
+        let serviceClient = null;
+        if (needsFirstResponseStamp) {
+          serviceClient = buildServiceClient(env);
+          if (!serviceClient) {
+            return sendJson(response, 503, { error: "work order updates are disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+          }
+        }
+
         const row = {
           facility_id: workOrder.facility_id,
           work_order_id: workOrder.id,
@@ -795,15 +885,11 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
 
         // WO-15: a comment is a "first response" exactly like a status
         // change off open is (see the PATCH route above) -- stamp it once,
-        // only when nothing has stamped it yet, never overwrite it.
-        if (!workOrder.first_response_at) {
-          await pgUpdate(
-            auth.client,
-            "work_orders",
-            { id: workOrder.id },
-            { first_response_at: new Date().toISOString() },
-            { returning: false }
-          );
+        // only when nothing has stamped it yet, never overwrite it. M-1:
+        // this now goes through the service-role RPC -- 0060's DB trigger
+        // rejects an authenticated write to first_response_at.
+        if (needsFirstResponseStamp) {
+          await stampWorkOrderSlaFields(serviceClient, workOrder.id, { first_response_at: new Date().toISOString() });
         }
 
         return sendJson(response, 201, (rows ?? [])[0] ?? null);

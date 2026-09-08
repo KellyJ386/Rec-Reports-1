@@ -80,3 +80,5 @@ create index if not exists assets_facility_category_idx on assets(facility_id, c
 -- database. supabase/seed.sql itself carries the matching update for the
 -- row's INSERT statement; nothing to do here (a migration should not seed
 -- data -- that stays seed.sql's job) beyond noting the pairing.
+
+notify pgrst, 'reload schema';

@@ -32,6 +32,32 @@ test("report template schemas require valid sections and fields", () => {
   assert.match(validateReportTemplateSchema({ sections: [] })[0], /at least one section/);
 });
 
+// L-1 (security review, wave3-slice-3c): a bare-integer field key (e.g. "0")
+// would otherwise collide with actionEventType's default `${type}:${index}`
+// composition once report-workflow.mjs namespaces a defect's own eventType
+// -- rejected here, at template-authoring time, on top of (not instead of)
+// that namespacing fix.
+test("report template schemas reject a field key that does not start with a lowercase letter", () => {
+  const schema = {
+    sections: [{ title: "Section", fields: [{ key: "0", label: "Numeric key", type: "text" }] }]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /\.key must match/);
+});
+
+test("report template schemas reject a field key with an uppercase letter, hyphen, or leading underscore", () => {
+  for (const key of ["Gate", "gate-broken", "_gate"]) {
+    const schema = { sections: [{ title: "Section", fields: [{ key, label: "Field", type: "text" }] }] };
+    assert.match(validateReportTemplateSchema(schema)[0], /\.key must match/, `expected "${key}" to be rejected`);
+  }
+});
+
+test("report template schemas accept every real field-key shape already in use (single letters, snake_case)", () => {
+  for (const key of ["a", "n", "gate_broken", "pool_ready", "chemical_level"]) {
+    const schema = { sections: [{ title: "Section", fields: [{ key, label: "Field", type: "text" }] }] };
+    assert.deepEqual(validateReportTemplateSchema(schema), [], `expected "${key}" to be accepted`);
+  }
+});
+
 test("report submission validation enforces required answers and field types", () => {
   assert.deepEqual(validateReportSubmission(openingChecklist, { pool_ready: "pass", attendance: 42 }), []);
   assert.deepEqual(validateReportSubmission(openingChecklist, { pool_ready: "maybe", attendance: "many" }), [

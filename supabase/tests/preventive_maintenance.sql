@@ -19,6 +19,10 @@
 --   8. A cross-facility source_pm_plan_id on a work_orders INSERT is
 --      rejected (the same-facility guard 0061 added to the existing
 --      "work order managers can manage work orders" policy's WITH CHECK).
+--   9. M-2 (security review, wave3-slice-3c): a cross-facility
+--      default_assignee_employee_id is rejected on both pm_plans INSERT and
+--      UPDATE (fn_assert_same_facility, same shape as asset_id's existing
+--      guard above).
 --
 -- Runs inside begin/rollback so fixtures never persist.
 begin;
@@ -68,6 +72,13 @@ on conflict (id) do nothing;
 insert into assets (id, facility_id, name, asset_tag, status) values
   ('90300000-0000-0000-0000-0000000000a1', '90000000-0000-0000-0000-0000000000c0', 'Pool Pump A', 'PM-A-PUMP-1', 'active'),
   ('90300000-0000-0000-0000-0000000000b1', '90000000-0000-0000-0000-0000000000c1', 'Pool Pump B', 'PM-B-PUMP-1', 'active')
+on conflict (id) do nothing;
+
+-- Employees: one per facility, for M-2's cross-facility
+-- default_assignee_employee_id guard checks.
+insert into employees (id, facility_id, first_name, last_name, status) values
+  ('90600000-0000-0000-0000-0000000000a1', '90000000-0000-0000-0000-0000000000c0', 'A', 'Tech', 'active'),
+  ('90600000-0000-0000-0000-0000000000b1', '90000000-0000-0000-0000-0000000000c1', 'B', 'Tech', 'active')
 on conflict (id) do nothing;
 
 -- Live PM plans: one per facility.
@@ -213,6 +224,55 @@ begin
   exception
     when insufficient_privilege then null; -- expected: fn_assert_same_facility blocked the write
   end;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 9. M-2: a cross-facility default_assignee_employee_id is rejected on both
+-- pm_plans INSERT and UPDATE.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  begin
+    insert into pm_plans (facility_id, default_assignee_employee_id, title, cadence_type, interval_days, anchor_date)
+    values (
+      '90000000-0000-0000-0000-0000000000c0', '90600000-0000-0000-0000-0000000000b1',
+      'Cross-tenant assignee injection', 'interval', 30, '2026-01-01'
+    );
+    raise exception 'PM SCOPE FAIL: Facility A manager attached a Facility B employee as a Facility A pm plan default assignee (INSERT)';
+  exception
+    when insufficient_privilege then null; -- expected: fn_assert_same_facility blocked the write
+  end;
+end;
+$$;
+
+do $$
+begin
+  begin
+    update pm_plans
+      set default_assignee_employee_id = '90600000-0000-0000-0000-0000000000b1'
+      where id = '90400000-0000-0000-0000-0000000000a1';
+    raise exception 'PM SCOPE FAIL: Facility A manager attached a Facility B employee as a Facility A pm plan default assignee (UPDATE)';
+  exception
+    when insufficient_privilege then null; -- expected: fn_assert_same_facility blocked the write
+  end;
+end;
+$$;
+
+-- Control: a SAME-facility default_assignee_employee_id is accepted.
+do $$
+declare
+  new_id uuid;
+begin
+  insert into pm_plans (facility_id, default_assignee_employee_id, title, cadence_type, interval_days, anchor_date)
+  values (
+    '90000000-0000-0000-0000-0000000000c0', '90600000-0000-0000-0000-0000000000a1',
+    'Same-facility assignee', 'interval', 30, '2026-01-01'
+  )
+  returning id into new_id;
+  if new_id is null then
+    raise exception 'PM SCOPE FAIL: a same-facility default_assignee_employee_id was rejected';
+  end if;
 end;
 $$;
 reset role;

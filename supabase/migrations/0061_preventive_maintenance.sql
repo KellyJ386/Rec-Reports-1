@@ -120,12 +120,28 @@ create policy "pm plan readers can read pm plans" on pm_plans
   for select
   using (internal.has_permission((select auth.uid()), facility_id, 'work_orders.read') and deleted_at is null);
 
+-- M-2 (security review, wave3-slice-3c): default_assignee_employee_id is a
+-- second FK on this table into a facility-scoped table (employees), same as
+-- asset_id, but it shipped with no fn_assert_same_facility guard on either
+-- WITH CHECK clause below -- a work_orders.manage holder at facility A could
+-- point a plan at a facility-B employee, and pm-generation.mjs's
+-- mintWorkOrder copies default_assignee_employee_id straight into
+-- work_orders.assigned_to_employee_id UNDER THE SERVICE-ROLE CLIENT (RLS
+-- bypassed there), landing exactly the cross-facility assignment 0038's
+-- fn_assert_same_facility(facility_id,'employees',assigned_to_employee_id)
+-- guard exists to prevent. Closed here at the DB layer, matching asset_id's
+-- existing guard shape on both clauses (pm-plans-routes.mjs already resolves
+-- this ref in JS -- see resolveFacilityRefs-equivalent validation there --
+-- so this is defense-in-depth for the class 0038 closed, not a live route
+-- hole, but the RLS layer should never rely on the route layer alone for a
+-- cross-facility FK, same posture as every other guard in this file).
 drop policy if exists "pm plan managers can create pm plans" on pm_plans;
 create policy "pm plan managers can create pm plans" on pm_plans
   for insert
   with check (
     internal.has_permission((select auth.uid()), facility_id, 'work_orders.manage')
     and internal.fn_assert_same_facility(facility_id, 'assets', asset_id)
+    and internal.fn_assert_same_facility(facility_id, 'employees', default_assignee_employee_id)
   );
 
 drop policy if exists "pm plan managers can update pm plans" on pm_plans;
@@ -135,6 +151,7 @@ create policy "pm plan managers can update pm plans" on pm_plans
   with check (
     internal.has_permission((select auth.uid()), facility_id, 'work_orders.manage')
     and internal.fn_assert_same_facility(facility_id, 'assets', asset_id)
+    and internal.fn_assert_same_facility(facility_id, 'employees', default_assignee_employee_id)
   );
 
 drop policy if exists "pm plan managers can delete pm plans" on pm_plans;
@@ -217,10 +234,25 @@ alter table work_orders
 -- Carries forward EVERY guard 0038_rls_audit_hardening.sql's version of this
 -- policy already had (asset_id, department_id, assigned_to_employee_id --
 -- confirmed as the latest prior definition by grepping every migration for
--- this exact policy name) and only adds the two new pm-provenance columns;
+-- this exact policy name) and adds the two new pm-provenance columns;
 -- dropping any of the three existing guards here would silently reopen the
 -- Class B cross-tenant gaps 0038 closed (supabase/tests/rls_audit_hardening.sql
 -- asserts all five).
+--
+-- H-1 (security review, wave3-slice-3c): a SIXTH guard is added here --
+-- source_submission_id, an existing column (0053) that had never carried a
+-- fn_assert_same_facility guard at all until this fix. A work_orders.manage
+-- holder at facility A who learned a facility-B report_submissions id (only
+-- reports.read on B is needed to read one -- e.g. a multi-facility member)
+-- could otherwise pre-insert a work order at facility A claiming that
+-- foreign submission id as its own source_submission_id ("squatting" on the
+-- key facility B's own workflow mint will look up). See 0060's
+-- work_orders_facility_source_submission_defect_uidx / mint_workflow_work_order
+-- comments for the other half of this fix (the mint RPC's own lookup and
+-- the unique index are now ALSO facility-scoped, so a squatting row from a
+-- different facility can no longer be found/collide with the real mint even
+-- if one somehow existed) -- this WITH CHECK guard closes the INSERT path
+-- that could create the squatting row in the first place.
 drop policy if exists "work order managers can manage work orders" on work_orders;
 create policy "work order managers can manage work orders" on work_orders
   for all using (internal.has_permission((select auth.uid()), facility_id, 'work_orders.manage') and deleted_at is null)
@@ -231,4 +263,7 @@ create policy "work order managers can manage work orders" on work_orders
     and internal.fn_assert_same_facility(facility_id, 'employees', assigned_to_employee_id)
     and internal.fn_assert_same_facility(facility_id, 'pm_plans', source_pm_plan_id)
     and internal.fn_assert_same_facility(facility_id, 'pm_plan_occurrences', source_pm_occurrence_id)
+    and internal.fn_assert_same_facility(facility_id, 'report_submissions', source_submission_id)
   );
+
+notify pgrst, 'reload schema';

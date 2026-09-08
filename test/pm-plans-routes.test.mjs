@@ -404,3 +404,49 @@ test("GET pm-plan occurrences defaults to an 8-week window from today when from/
   const today = new Date().toISOString().slice(0, 10);
   assert.match(occGet.url.search, new RegExp(`scheduled_for=gte\\.${today}`));
 });
+
+// H-2 (security review, wave3-slice-3c): an unbounded ?from=/?to= window
+// used to let occurrencesInWindow materialize millions of dates in-process
+// (see probes-3c/p6_occurrence_dos.mjs -- interval_days=1,
+// 2026-09-07..9999-12-31 produced 2.9M+ entries before this fix). The route
+// now rejects an over-wide window with 400 before ever calling
+// occurrencesInWindow, ahead of even the permission guard's DB read below
+// mattering for THIS check -- the date-shape/span validation runs after the
+// plan load+guard in this route (see the file's own comment), so the guard
+// still runs first, but no occurrence computation ever happens for a
+// rejected window.
+test("GET pm-plan occurrences rejects a window wider than the maximum span with 400, before any occurrence computation", async (t) => {
+  const plan = planFixture({ cadence_type: "interval", interval_days: 1, anchor_date: "2020-01-01" });
+  stubFetch(t, (table, method) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    if (table === "pm_plan_occurrences" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/pm-plans/plan-1/occurrences?from=2026-09-07&to=9999-12-31");
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /must not exceed/);
+});
+
+test("GET pm-plan occurrences accepts a window right at the maximum span", async (t) => {
+  const plan = planFixture({ cadence_type: "interval", interval_days: 30, anchor_date: "2026-01-01" });
+  stubFetch(t, (table, method) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    if (table === "pm_plan_occurrences" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/pm-plans/plan-1/occurrences?from=2026-01-01&to=2027-02-05"); // exactly 400 days
+  assert.equal(result.status, 200);
+});
+
+test("GET pm-plan occurrences rejects a window one day past the maximum span", async (t) => {
+  const plan = planFixture({ cadence_type: "interval", interval_days: 30, anchor_date: "2026-01-01" });
+  stubFetch(t, (table, method) => {
+    if (table === "pm_plans" && method === "GET") return [plan];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/pm-plans/plan-1/occurrences?from=2026-01-01&to=2027-02-06"); // 401 days
+  assert.equal(result.status, 400);
+});

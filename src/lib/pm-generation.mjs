@@ -28,10 +28,20 @@
 //       - work_order_id already set  -> fully generated already; skip.
 //       - work_order_id still null   -> an earlier pass claimed the slot but
 //         crashed/failed before minting+linking a work order (or is doing so
-//         concurrently, best-effort only -- this is not safe against two
-//         generation runs racing on the SAME already-claimed-but-unlinked
-//         row at the same instant). Repair it: mint the work order now and
-//         link it to the existing occurrence row.
+//         concurrently). Repair it: mint the work order now and link it to
+//         the existing occurrence row.
+//
+// M-4 (security review, wave3-slice-3c): claimOccurrenceSlot's INSERT/
+// conflict dance above only serializes on the (pm_plan_id, scheduled_for)
+// ROW -- it does NOT by itself prevent two concurrent passes from both
+// reaching the repair branch for the SAME occurrence id (both see
+// work_order_id still null) and both proceeding to mintWorkOrder, double-
+// minting. claimGenerationSlot below closes that: generated_at is CAS'd
+// (`extra: { generated_at: "is.null" }`) immediately after
+// claimOccurrenceSlot succeeds, on both the fresh-insert and repair paths
+// alike, so only the pass whose UPDATE lands first ever calls
+// mintWorkOrder -- the loser sees 0 rows back and skips. This makes the
+// "or is doing so concurrently" repair case fully safe, not best-effort.
 //
 // Never backfills: the occurrence window's lower bound is always
 // max(anchor-derived start, the plan's own created_at date) -- see
@@ -120,7 +130,36 @@ async function claimOccurrenceSlot(client, plan, occurrence) {
   }
 }
 
-async function mintWorkOrder(client, plan, occurrenceId, occurrence, config, now) {
+// M-4 (security review, wave3-slice-3c): the SECOND, narrower claim that
+// actually serializes "who gets to mint the work order" -- claimOccurrenceSlot
+// above only serializes on the (pm_plan_id, scheduled_for) ROW, not on
+// whether minting has started. Two concurrent passes can both legitimately
+// reach claimOccurrenceSlot's repair branch for the SAME occurrence id (pass
+// A inserts the row and is mid-flight on its own work_orders INSERT when
+// pass B's insert conflicts, finds work_order_id still null, and also
+// returns repair:true) -- pre-fix, BOTH then called mintWorkOrder
+// unconditionally, minting two work orders for one occurrence and leaving
+// whichever pgUpdate ran last as the row's sole surviving link (the other
+// work order silently orphaned). generated_at is now the claim marker for
+// MINTING itself, CAS'd (`extra: { generated_at: "is.null" }`, the same
+// is-null CAS discipline work-order-sla-scan.mjs's claimBreach already
+// uses) immediately after claimOccurrenceSlot succeeds, on BOTH the fresh-
+// insert and the repair path alike: whichever pass's UPDATE lands first
+// wins (0 rows back for the loser -- skip, no mint), so at most one pass
+// ever calls mintWorkOrder for a given occurrence id, regardless of how it
+// got claimed.
+async function claimGenerationSlot(client, occurrenceId, now) {
+  const rows = await pgUpdate(
+    client,
+    "pm_plan_occurrences",
+    { id: occurrenceId },
+    { generated_at: now.toISOString() },
+    { returning: true, extra: { generated_at: "is.null" } }
+  );
+  return (rows ?? []).length > 0;
+}
+
+async function mintWorkOrder(client, plan, occurrenceId, occurrence, config) {
   const domainRow = workOrderFromPlan(plan, occurrence, config);
   const dbRow = {
     facility_id: domainRow.facilityId,
@@ -139,12 +178,7 @@ async function mintWorkOrder(client, plan, occurrenceId, occurrence, config, now
     created_by: null
   };
   const [workOrder] = await pgInsert(client, "work_orders", [dbRow], { returning: true });
-  await pgUpdate(
-    client,
-    "pm_plan_occurrences",
-    { id: occurrenceId },
-    { work_order_id: workOrder.id, generated_at: now.toISOString() }
-  );
+  await pgUpdate(client, "pm_plan_occurrences", { id: occurrenceId }, { work_order_id: workOrder.id });
   return workOrder;
 }
 
@@ -186,7 +220,15 @@ export async function generatePmWorkOrders(client, { now = new Date(), config = 
           summary.skipped += 1;
           continue;
         }
-        await mintWorkOrder(client, plan, claim.occurrenceId, occurrence, config, now);
+        // M-4: the actual mint-serialization point -- see
+        // claimGenerationSlot's own comment for why this is needed even
+        // after claimOccurrenceSlot already succeeded.
+        const gotGenerationSlot = await claimGenerationSlot(client, claim.occurrenceId, now);
+        if (!gotGenerationSlot) {
+          summary.skipped += 1;
+          continue;
+        }
+        await mintWorkOrder(client, plan, claim.occurrenceId, occurrence, config);
         summary.created += 1;
         if (claim.repair) summary.repaired += 1;
         planTouched = true;
