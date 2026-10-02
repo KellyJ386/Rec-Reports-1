@@ -808,6 +808,27 @@ a.primary:focus-visible {
   gap: 8px;
 }
 
+/* DR-17: shared by the fill-in form (interactive "Sign as <role>" buttons)
+   and the review inbox's detail pane (read-only list). */
+.report-signatures {
+  display: grid;
+  gap: 8px;
+}
+
+.report-signature-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.report-signature-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 @media (max-width: 720px) {
   .report-form-actions {
     flex-direction: column;

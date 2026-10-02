@@ -21,6 +21,7 @@ const requiredRlsTables = [
   "report_template_versions",
   "report_submissions",
   "report_submission_attachments",
+  "report_submission_signatures",
   "audit_events",
   "outbox_events",
   "employees",
@@ -83,7 +84,10 @@ const requiredRlsTables = [
   "subscription_plans",
   "tenant_subscriptions",
   "usage_counters",
-  "auth_throttle"
+  "auth_throttle",
+  "report_workflow_events",
+  "report_distribution_lists",
+  "report_deliveries"
 ];
 
 for (const table of requiredRlsTables) {
@@ -109,8 +113,15 @@ for (const helper of [
   "fn_incident_report_audit",
   "fn_incident_report_transition_guard",
   "fn_incident_witness_statement_guard",
+  "fn_report_submission_signature_guard",
   "internal.apply_incident_amendment",
-  "public.apply_incident_amendment"
+  "public.apply_incident_amendment",
+  "internal.enqueue_report_workflow",
+  "public.enqueue_report_workflow",
+  "internal.mint_workflow_incident",
+  "public.mint_workflow_incident",
+  "internal.mint_workflow_work_order",
+  "public.mint_workflow_work_order"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

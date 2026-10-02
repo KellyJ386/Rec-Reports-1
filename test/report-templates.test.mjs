@@ -4,7 +4,9 @@ import {
   validateTemplateInput,
   nextTemplateVersionNumber,
   buildTemplateDraftUpdate,
-  buildTemplatePublish
+  buildTemplatePublish,
+  isSandboxTemplate,
+  validateChangeSummary
 } from "../src/lib/report-templates.mjs";
 
 const VALID_SCHEMA = {
@@ -107,4 +109,32 @@ test("buildTemplatePublish refuses a version that does not belong to the templat
 test("buildTemplatePublish requires target and version objects", () => {
   assert.ok(buildTemplatePublish(null, { id: "v-1" }).error);
   assert.ok(buildTemplatePublish({ id: "t-1" }, null).error);
+});
+
+// --- DR-26: isSandboxTemplate ------------------------------------------------
+
+test("isSandboxTemplate is true only for sandbox === true (strict, not truthy)", () => {
+  assert.equal(isSandboxTemplate({ sandbox: true }), true);
+  assert.equal(isSandboxTemplate({ sandbox: false }), false);
+  assert.equal(isSandboxTemplate({ sandbox: 1 }), false);
+  assert.equal(isSandboxTemplate({ sandbox: "true" }), false);
+  assert.equal(isSandboxTemplate({}), false);
+  assert.equal(isSandboxTemplate(null), false);
+  assert.equal(isSandboxTemplate(undefined), false);
+});
+
+// --- DR-26: validateChangeSummary --------------------------------------------
+
+test("validateChangeSummary accepts a non-empty string up to 500 characters", () => {
+  assert.deepEqual(validateChangeSummary("Publishing the revised checklist."), { valid: true, errors: [] });
+  assert.equal(validateChangeSummary("x".repeat(500)).valid, true);
+});
+
+test("validateChangeSummary rejects missing, blank, and over-length summaries", () => {
+  assert.equal(validateChangeSummary(undefined).valid, false);
+  assert.equal(validateChangeSummary("").valid, false);
+  assert.equal(validateChangeSummary("   ").valid, false);
+  const tooLong = validateChangeSummary("x".repeat(501));
+  assert.equal(tooLong.valid, false);
+  assert.match(tooLong.errors[0], /500 characters or fewer/);
 });

@@ -2,6 +2,13 @@ import { api } from "../api.js";
 import { el, clearChildren, errorBanner, emptyState, tableScroll, toast } from "../ui.js";
 import { getContext } from "../state.js";
 
+// Kept in sync BY HAND with src/lib/report-schema.mjs's supportedFieldTypes
+// -- this admin page is served statically (no bundler, src/public is the
+// entire served tree) so it cannot import that module directly; instead
+// test/forms-page-field-types.test.mjs reads this file's source as text and
+// asserts the two lists are exactly equal, so any future addition to
+// report-schema.mjs's allowedFieldTypes without a matching edit here fails
+// that test instead of silently leaving the builder's type <select> stale.
 const FIELD_TYPES = [
   "text",
   "textarea",
@@ -12,7 +19,10 @@ const FIELD_TYPES = [
   "date",
   "time",
   "photo",
-  "signature"
+  "signature",
+  "datetime",
+  "counter",
+  "rating"
 ];
 
 const STATUS_TONE = { draft: "badge-off", published: "badge-on", retired: "badge-denied" };

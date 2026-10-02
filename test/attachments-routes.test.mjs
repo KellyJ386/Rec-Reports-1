@@ -379,3 +379,113 @@ test("reports: a caller with only reports.create (no reports.submit) cannot uplo
 
   assert.equal(result.status, 403, "attachment upload should be gated like the PATCH draft-edit permission");
 });
+
+// --- Reports-only: DR-16 photo_constraints enforcement ---------------------
+
+const PHOTO_SCHEMA = {
+  sections: [
+    {
+      title: "Evidence",
+      fields: [
+        {
+          key: "deck_photo",
+          label: "Deck photo",
+          type: "photo",
+          photo_constraints: { maxCount: 1, maxBytes: 10, mimeTypes: ["image/png"] }
+        }
+      ]
+    }
+  ]
+};
+
+function reportsFixture(t, { existingAttachments = [] } = {}) {
+  const parentRow = { id: "rep-1", facility_id: FAC_1, status: "draft", template_version_id: "ver-1" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") return [parentRow];
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "ver-1", schema_json: PHOTO_SCHEMA }];
+    }
+    if (table === "report_submission_attachments" && method === "GET") return existingAttachments;
+    if (table === "report_submission_attachments" && method === "POST") return [{ id: "att-new" }];
+    return [];
+  });
+  return { parentRow, captured };
+}
+
+test("reports: photo_constraints.mimeTypes rejects a disallowed type even though it's globally allowed", async (t) => {
+  reportsFixture(t);
+  const memberships = membershipsFor(FAC_1, ["reports.read", "reports.submit"]);
+  const { callUpload } = mount({ memberships });
+
+  // image/jpeg passes the module-wide default allow-list but is not in this
+  // field's own narrower photo_constraints.mimeTypes.
+  const result = await callUpload("POST", "/reports/rep-1/attachments", {
+    headers: { "content-type": "image/jpeg", "x-file-name": "photo.jpg", "x-field-key": "deck_photo" }
+  });
+
+  assert.equal(result.status, 400);
+  assert.equal(result.payload.code, "mime_not_allowed");
+});
+
+test("reports: photo_constraints.mimeTypes accepts a type it explicitly lists", async (t) => {
+  reportsFixture(t);
+  const storage = stubStorageClient(t);
+  const memberships = membershipsFor(FAC_1, ["reports.read", "reports.submit"]);
+  const { callUpload } = mount({ memberships, createStorageClient: () => storage.client });
+
+  const result = await callUpload("POST", "/reports/rep-1/attachments", {
+    headers: { "content-type": "image/png", "x-file-name": "photo.png", "x-field-key": "deck_photo" },
+    body: Buffer.from("ok")
+  });
+
+  assert.equal(result.status, 201);
+});
+
+test("reports: photo_constraints.maxBytes rejects a file over the field's own (narrower) cap", async (t) => {
+  reportsFixture(t);
+  const { callUpload } = mount({ memberships: membershipsFor(FAC_1, ["reports.read", "reports.submit"]) });
+
+  const result = await callUpload("POST", "/reports/rep-1/attachments", {
+    headers: { "content-type": "image/png", "x-file-name": "photo.png", "x-field-key": "deck_photo" },
+    body: Buffer.from("this body is over ten bytes long")
+  });
+
+  assert.equal(result.status, 413);
+  assert.equal(result.payload.code, "file_too_large");
+});
+
+test("reports: photo_constraints.maxCount rejects a new upload once the field already has the max (409, no storage call)", async (t) => {
+  reportsFixture(t, { existingAttachments: [{ id: "att-existing" }] });
+  const storage = stubStorageClient(t);
+  const memberships = membershipsFor(FAC_1, ["reports.read", "reports.submit"]);
+  const { callUpload } = mount({ memberships, createStorageClient: () => storage.client });
+
+  const result = await callUpload("POST", "/reports/rep-1/attachments", {
+    headers: { "content-type": "image/png", "x-file-name": "photo2.png", "x-field-key": "deck_photo" }
+  });
+
+  assert.equal(result.status, 409);
+  assert.equal(storage.calls.length, 0);
+});
+
+test("reports: an upload to a field with no photo_constraints is unaffected", async (t) => {
+  const parentRow = { id: "rep-1", facility_id: FAC_1, status: "draft", template_version_id: "ver-1" };
+  stubFetch(t, (table, method) => {
+    if (table === "report_submissions" && method === "GET") return [parentRow];
+    if (table === "report_template_versions" && method === "GET") {
+      return [{ id: "ver-1", schema_json: PHOTO_SCHEMA }];
+    }
+    if (table === "report_submission_attachments" && method === "POST") return [{ id: "att-new" }];
+    return [];
+  });
+  const storage = stubStorageClient(t);
+  const memberships = membershipsFor(FAC_1, ["reports.read", "reports.submit"]);
+  const { callUpload } = mount({ memberships, createStorageClient: () => storage.client });
+
+  const result = await callUpload("POST", "/reports/rep-1/attachments", {
+    headers: { "content-type": "image/jpeg", "x-file-name": "other.jpg", "x-field-key": "other_field" },
+    body: Buffer.from("well over ten bytes of content here")
+  });
+
+  assert.equal(result.status, 201);
+});

@@ -9,7 +9,7 @@ import { computeDbRowHash } from "../src/lib/audit.mjs";
 // one global fetch stub, recording every call so assertions can inspect
 // exactly what each subsystem sent -- same programmable-stub style as
 // test/audit-routes.test.mjs and test/notifications-worker.test.mjs.
-function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = [] } = {}) {
+function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = [], reportWorkflowEvents = [] } = {}) {
   const captured = { postgrest: [], observability: [] };
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
@@ -21,7 +21,8 @@ function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = []
     }
     const table = parsed.pathname.replace("/rest/v1/", "");
     const method = init.method;
-    captured.postgrest.push({ table, method, url: parsed });
+    const body = init.body ? JSON.parse(init.body) : null;
+    captured.postgrest.push({ table, method, url: parsed, body });
     let data = [];
     if (table === "facilities" && method === "GET") data = facilities;
     else if (table === "audit_events" && method === "GET") {
@@ -30,6 +31,17 @@ function stubFetch(t, { facilities = [], chains = {}, sweptAuthThrottleRows = []
     } else if (table === "outbox_events" && method === "GET") data = [];
     else if (table === "notification_jobs" && method === "GET") data = [];
     else if (table === "auth_throttle" && method === "DELETE") data = sweptAuthThrottleRows;
+    else if (table === "report_workflow_events" && method === "GET") data = reportWorkflowEvents;
+    else if (table === "report_workflow_events" && method === "PATCH" && parsed.searchParams.get("status") === "eq.pending") {
+      // Claim step: PostgREST's return=representation on an UPDATE returns
+      // the FULL updated row, not a bare status marker -- echo the matching
+      // fixture row (with status flipped) so the executor dispatches on its
+      // real action, exactly like test/report-workflow-executor.test.mjs's
+      // own stubExecutor helper.
+      const id = parsed.searchParams.get("id")?.replace("eq.", "");
+      const match = reportWorkflowEvents.find((row) => row.id === id);
+      data = match ? [{ ...match, status: "processing" }] : [];
+    } else if (table === "report_workflow_events" && method === "PATCH") data = [];
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   t.after(() => {
@@ -254,6 +266,54 @@ test("drain: a sweep failure fails open -- the drain response still succeeds wit
   assert.equal(result.payload.authThrottleSwept, 0);
 });
 
+// ---------------------------------------------------------------------------
+// DR-20: the drain also runs the report workflow ledger's own pass
+// (executeReportWorkflowEvents, src/lib/report-workflow-executor.mjs) on the
+// same service-role client and reports its summary under `reportWorkflow`.
+// ---------------------------------------------------------------------------
+
+test("drain: invokes the report workflow executor and folds its summary into the response", async (t) => {
+  const pendingEvent = {
+    id: "wf-evt-1",
+    facility_id: "fac-1",
+    submission_id: "sub-1",
+    event_type: "queue_pdf:0",
+    action: { type: "queue_pdf", params: {} },
+    status: "pending",
+    attempts: 0,
+    available_at: "2026-01-01T00:00:00Z"
+  };
+  const captured = stubFetch(t, { reportWorkflowEvents: [pendingEvent] });
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: BASE_ENV,
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.reportWorkflow, { claimed: 1, processed: 1, skipped: 0, failed: 0, deadLettered: 0 });
+
+  const claimPatch = captured.postgrest.find(
+    (req) => req.table === "report_workflow_events" && req.method === "PATCH" && req.body?.status === "processing"
+  );
+  assert.ok(claimPatch, "expected the drain to claim the pending report_workflow_events row");
+
+  const pdfPatch = captured.postgrest.find((req) => req.table === "report_submissions" && req.method === "PATCH");
+  assert.ok(pdfPatch, "expected queue_pdf to flip report_submissions.pdf_status");
+  assert.equal(pdfPatch.body.pdf_status, "queued");
+});
+
+test("drain: an empty report_workflow_events queue reports an all-zero summary", async (t) => {
+  stubFetch(t, {});
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: BASE_ENV,
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.reportWorkflow, { claimed: 0, processed: 0, skipped: 0, failed: 0, deadLettered: 0 });
+});
+
 test("when OBSERVABILITY_DSN is unset, a broken chain is still reported in the response but no fetch fires", async (t) => {
   const captured = stubFetch(t, {
     facilities: [{ id: "fac-1" }],
@@ -270,4 +330,68 @@ test("when OBSERVABILITY_DSN is unset, a broken chain is still reported in the r
 
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(captured.observability.length, 0, "DSN unset must stay a silent no-op even for a broken chain");
+});
+
+// --- DR-23: report_submissions.pdf_status = 'queued' drain wiring -----------
+// The shared stubFetch above only handles facilities/audit_events/
+// outbox_events/notification_jobs/auth_throttle, so this test builds its own
+// inline stub (same style as the "sweep failure fails open" test above) to
+// answer the extra tables report-pdf-worker.mjs's processReportPdfJobs
+// queries, plus the Storage upload call, and proves the drain route's
+// response actually carries processReportPdfJobs' own summary shape.
+test("drain: processes a queued report_submissions row and folds the summary into the response as reportPdf", async (t) => {
+  const original = globalThis.fetch;
+  const submission = {
+    id: "sub-1",
+    facility_id: "fac-1",
+    department_id: null,
+    template_id: "tpl-1",
+    template_version_id: "ver-1",
+    report_date: "2026-07-18",
+    shift_ref: "AM",
+    status: "submitted",
+    submitted_by: "user-1",
+    submitted_at: "2026-07-18T20:00:00.000Z",
+    payload_json: { supervisor: "Sam" },
+    revision_of: null,
+    source: "web",
+    pdf_status: "queued",
+    pdf_storage_path: null,
+    pdf_content_hash: null,
+    pdf_attempts: 0
+  };
+  let uploadCalls = 0;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.startsWith("/storage/v1/object/")) {
+      uploadCalls += 1;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ Key: "attachments/mock" }) };
+    }
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const respond = {
+      report_submissions: method === "GET" ? [submission] : [{ ...submission, pdf_status: "generated" }],
+      report_templates: [{ id: "tpl-1", name: "Daily Pool Opening", code: "pool_open" }],
+      report_template_versions: [
+        { id: "ver-1", template_id: "tpl-1", version_number: 1, schema_json: { sections: [] } }
+      ],
+      facilities: [{ id: "fac-1", name: "Riverside Rec Center" }],
+      report_submission_attachments: [],
+      auth_throttle: []
+    }[table];
+    return { ok: true, status: 200, text: async () => JSON.stringify(respond ?? []) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.reportPdf, { claimed: 1, generated: 1, reused: 0, retried: 0, failed: 0 });
+  assert.equal(uploadCalls, 1);
 });
