@@ -74,6 +74,22 @@ export function isQueryShapeError(error) {
   return error instanceof PostgrestError && QUERY_SHAPE_CODES.has(String(error.body?.code ?? ""));
 }
 
+// L4 (security review, Wave 3 Slice 3B): the narrower "this table/relation
+// does not exist in the schema cache" subset of the query-shape codes above
+// -- 42P01 (undefined_table, raised by the underlying Postgres error) and
+// PGRST205 (PostgREST's own "could not find the table/view" code). Used by
+// incidents-routes.mjs's tryOptionalSelect, which degrades a read against a
+// table a sibling migration may not have created yet (e.g. a tree missing
+// 0056) to "no rows" -- that helper must NOT also swallow a genuine 403
+// (RLS denial) or 500 from the same table, which the broader
+// isQueryShapeError (42703/42883/... -- a broken query, not a missing
+// table) is not narrow enough to distinguish from "missing relation" either.
+const MISSING_RELATION_CODES = new Set(["42P01", "PGRST205"]);
+
+export function isMissingRelationError(error) {
+  return error instanceof PostgrestError && MISSING_RELATION_CODES.has(String(error.body?.code ?? ""));
+}
+
 export function translatePostgrestError(error) {
   if (!(error instanceof PostgrestError)) return null;
 

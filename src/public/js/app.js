@@ -18,6 +18,19 @@ import {
   validateStatementInput,
   buildStatementPayload
 } from "./incident-form.mjs";
+import {
+  mergeIncidentTimeline,
+  evaluateClosureGatePreview,
+  SIGNATURE_ROLES,
+  validateSignatureInput,
+  buildSignaturePayload,
+  COMPLIANCE_CHECK_KEYS,
+  validateComplianceCheckInput,
+  complianceCheckStatusOptions,
+  buildCompliancePayload,
+  nextOshaQuestion,
+  buildOshaEvaluationPayload
+} from "./incident-review.mjs";
 import { paginate } from "./list-pagination.mjs";
 import {
   WORK_ORDER_STATUSES,
@@ -26,6 +39,25 @@ import {
   validateWorkOrderCreate,
   buildWorkOrderCreatePayload
 } from "./work-order-filters.mjs";
+import {
+  ASSET_STATUSES,
+  ASSET_CRITICALITY_LEVELS,
+  buildAssetQuery,
+  validateAssetCreate,
+  buildAssetPayload,
+  assetPickerOptions,
+  findAssetName
+} from "./assets.mjs";
+import {
+  PM_CADENCE_TYPES,
+  PM_PRIORITIES,
+  formatSeasonMonths,
+  validatePmPlanCreate,
+  buildPmPlanPayload,
+  occurrenceStatusLabel,
+  formatOccurrenceDate,
+  upcomingOccurrences
+} from "./pm-plan-filters.mjs";
 import {
   weekBoundsFor,
   bucketShiftsByDay,
@@ -371,7 +403,11 @@ async function loadAllModules() {
   reportFormController.close();
   inboxDetailController.close();
   incidentsPanel.reset();
+  // workOrdersPanel.reset() also resets assetsPanel (WO-13's sub-panel) --
+  // see workOrdersPanel.reset()'s own comment for why that call lives there
+  // rather than a separate line here.
   workOrdersPanel.reset();
+  pmPlansPanel.reset();
   schedulePanel.reset();
   commsPanel.reset();
 
@@ -392,6 +428,7 @@ async function loadAllModules() {
       schedulePanel.load(),
       incidentsPanel.load(),
       workOrdersPanel.load(),
+      pmPlansPanel.load(),
       commsPanel.load(),
       loadTraining(),
       loadCertifications()
@@ -2317,7 +2354,28 @@ const incidentsPanel = (function () {
     statementErrorsByPersonId: {},
     openPersonId: null,
     statementFieldByPersonId: {},
-    statementFieldErrorsByPersonId: {}
+    statementFieldErrorsByPersonId: {},
+    // IN-19: the review workspace -- timeline (audit events + amendments),
+    // signatures, compliance checks, and the OSHA questionnaire. Only
+    // fetched/rendered for a submitted|under_review incident (openDetail).
+    reviewOpen: false,
+    auditEvents: [],
+    auditEventsError: null,
+    signatures: [],
+    signaturesError: null,
+    signOpen: false,
+    signFields: { role: "", attestationText: "", signedName: "" },
+    signErrors: {},
+    complianceChecks: [],
+    complianceChecksError: null,
+    complianceFields: { checkKey: "", status: "", notes: "" },
+    complianceErrors: {},
+    oshaTree: null,
+    oshaTreeError: null,
+    oshaOpen: false,
+    oshaAnswers: {},
+    oshaResult: null,
+    oshaError: null
   };
 
   function emptyCaptureFields() {
@@ -2378,8 +2436,34 @@ const incidentsPanel = (function () {
     state.openPersonId = null;
     state.statementFieldByPersonId = {};
     state.statementFieldErrorsByPersonId = {};
+    resetReviewWorkspace();
     const host = container();
     if (host) host.textContent = "";
+  }
+
+  // IN-19: resets every piece of review-workspace state -- shared by both
+  // reset() (leaving the module entirely) and openDetail() (switching to a
+  // different incident), matching every other sub-resource's own
+  // "cleared in both places" convention in this panel.
+  function resetReviewWorkspace() {
+    state.reviewOpen = false;
+    state.auditEvents = [];
+    state.auditEventsError = null;
+    state.signatures = [];
+    state.signaturesError = null;
+    state.signOpen = false;
+    state.signFields = { role: "", attestationText: "", signedName: "" };
+    state.signErrors = {};
+    state.complianceChecks = [];
+    state.complianceChecksError = null;
+    state.complianceFields = { checkKey: "", status: "", notes: "" };
+    state.complianceErrors = {};
+    state.oshaTree = null;
+    state.oshaTreeError = null;
+    state.oshaOpen = false;
+    state.oshaAnswers = {};
+    state.oshaResult = null;
+    state.oshaError = null;
   }
 
   async function submitCapture() {
@@ -2432,6 +2516,7 @@ const incidentsPanel = (function () {
     state.openPersonId = null;
     state.statementFieldByPersonId = {};
     state.statementFieldErrorsByPersonId = {};
+    resetReviewWorkspace();
     render();
     try {
       state.detail = await apiFetch(`/incidents/${id}`);
@@ -2466,8 +2551,43 @@ const incidentsPanel = (function () {
       state.escalationsError = error.message;
     }
     await loadPeople();
+    // IN-19: the review workspace (timeline, signatures, compliance checks)
+    // is only meaningful once an incident is under active review --
+    // matches the workspace's own gating in renderDetail() below.
+    if (isReviewableStatus(state.detail.status)) {
+      await loadReviewWorkspace();
+    }
     render();
     focusElement(document.querySelector("#incident-detail-panel h3"));
+  }
+
+  // IN-19: the review workspace applies to submitted|under_review
+  // incidents -- the two statuses the plan's split view targets ("a review
+  // view for submitted|under_review incidents").
+  function isReviewableStatus(status) {
+    return status === "submitted" || status === "under_review";
+  }
+
+  async function loadReviewWorkspace() {
+    if (!state.detailId) return;
+    const id = state.detailId;
+    const [auditEvents, signatures, complianceChecks] = await Promise.all([
+      apiFetch(`/incidents/${id}/audit-events`).catch((error) => {
+        state.auditEventsError = error.message;
+        return [];
+      }),
+      apiFetch(`/facilities/${currentFacility}/incidents/${id}/signatures`).catch((error) => {
+        state.signaturesError = error.message;
+        return [];
+      }),
+      apiFetch(`/facilities/${currentFacility}/incidents/${id}/compliance-checks`).catch((error) => {
+        state.complianceChecksError = error.message;
+        return [];
+      })
+    ]);
+    state.auditEvents = auditEvents || [];
+    state.signatures = signatures || [];
+    state.complianceChecks = complianceChecks || [];
   }
 
   function closeDetail() {
@@ -2682,6 +2802,138 @@ const incidentsPanel = (function () {
       render();
     } catch (error) {
       state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Review workspace (IN-19) -------------------------------------------
+
+  // Requests clarification: a follow-up action of type "documentation"
+  // whose description names what needs clarifying -- reuses the existing
+  // follow-up create route rather than a new endpoint, matching the plan's
+  // "request clarification (a follow-up)" wording.
+  async function requestClarification(note) {
+    const trimmed = (note || "").trim();
+    if (!trimmed) return;
+    try {
+      const created = await apiFetch(`/incidents/${state.detailId}/followups`, {
+        method: "POST",
+        body: { actionType: "documentation", description: `Clarification requested: ${trimmed}` }
+      });
+      state.followups.push(created);
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Signatures (IN-13) ---------------------------------------------------
+  async function submitSignature() {
+    const validation = validateSignatureInput(state.signFields);
+    state.signErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      focusElement(document.querySelector(".incident-sign-form .rr-error"));
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/signatures`, {
+        method: "POST",
+        body: buildSignaturePayload(state.signFields)
+      });
+      state.signatures.push(created);
+      state.signOpen = false;
+      state.signFields = { role: "", attestationText: "", signedName: "" };
+      state.signErrors = {};
+      state.detailActionError = null;
+      if (created.role === "supervisor") {
+        // A supervisor signature auto-records a supervisor_signoff compliance
+        // check server-side (incidents-compliance-routes.mjs) -- refresh so
+        // the closure-gate preview reflects it immediately.
+        state.complianceChecks = (await apiFetch(
+          `/facilities/${currentFacility}/incidents/${state.detailId}/compliance-checks`
+        ).catch(() => state.complianceChecks)) || state.complianceChecks;
+      }
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- Compliance checks (IN-15) ---------------------------------------------
+  async function submitComplianceCheck() {
+    const validation = validateComplianceCheckInput(state.complianceFields);
+    state.complianceErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const updated = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/compliance-checks`, {
+        method: "POST",
+        body: buildCompliancePayload(state.complianceFields)
+      });
+      const existingIndex = state.complianceChecks.findIndex((c) => c.check_key === updated.check_key);
+      if (existingIndex >= 0) state.complianceChecks[existingIndex] = updated;
+      else state.complianceChecks.push(updated);
+      state.complianceFields = { checkKey: "", status: "", notes: "" };
+      state.complianceErrors = {};
+      state.detailActionError = null;
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  // --- OSHA decision-tree questionnaire (IN-14) ------------------------------
+  async function openOshaQuestionnaire() {
+    state.oshaOpen = true;
+    state.oshaAnswers = {};
+    state.oshaResult = null;
+    state.oshaError = null;
+    render();
+    if (!state.oshaTree) {
+      try {
+        const { tree } = await apiFetch(`/facilities/${currentFacility}/incidents/osha-decision-tree`);
+        state.oshaTree = tree;
+        state.oshaTreeError = null;
+      } catch (error) {
+        state.oshaTreeError = error.message;
+      }
+      render();
+    }
+  }
+
+  function answerOshaQuestion(nodeId, answer) {
+    state.oshaAnswers = { ...state.oshaAnswers, [nodeId]: answer };
+    render();
+  }
+
+  async function submitOshaEvaluation() {
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/incidents/${state.detailId}/osha-evaluation`, {
+        method: "POST",
+        body: buildOshaEvaluationPayload(state.oshaAnswers)
+      });
+      state.oshaResult = result;
+      if (result.complianceCheck) {
+        const existingIndex = state.complianceChecks.findIndex((c) => c.check_key === "osha_recordability");
+        if (existingIndex >= 0) state.complianceChecks[existingIndex] = result.complianceCheck;
+        else state.complianceChecks.push(result.complianceCheck);
+      }
+      if (result.followup) state.followups.push(result.followup);
+      if (result.incident) {
+        state.detail = { ...state.detail, ...result.incident };
+        refreshListItem(state.detail);
+      }
+      state.oshaError = null;
+      render();
+    } catch (error) {
+      state.oshaError = error.message;
       render();
     }
   }
@@ -3151,7 +3403,199 @@ const incidentsPanel = (function () {
     panel.append(buildAttachmentsToggle("incidents", d.id, hasPerm("incidents.manage")));
     wireAttachmentToggles(panel);
 
+    // IN-19: the supervisor review workspace -- timeline, compliance
+    // checks, signatures, and the OSHA questionnaire -- only makes sense
+    // while an incident is actively under review.
+    if (isReviewableStatus(d.status)) {
+      panel.append(buildReviewWorkspace(d));
+    }
+
     return panel;
+  }
+
+  // IN-19: split review view for a submitted|under_review incident.
+  // "Split" here means two labeled groups within the same collapsible
+  // section (timeline/history on one side of the model, evidence/
+  // compliance/signatures/OSHA on the other) rather than a literal two-
+  // column CSS layout -- the mobile-first single-column body this app
+  // already uses throughout (see report-form.mjs's own layout notes)
+  // applies here too.
+  function buildReviewWorkspace(d) {
+    const section = el("div", { class: "incident-review-workspace" });
+    const toggleBtn = el("button", { type: "button" }, state.reviewOpen ? "Hide review workspace" : "Open review workspace");
+    toggleBtn.addEventListener("click", () => {
+      state.reviewOpen = !state.reviewOpen;
+      render();
+    });
+    section.append(toggleBtn);
+    if (!state.reviewOpen) return section;
+
+    const canWrite = hasPerm("incidents.manage") || hasPerm("incidents.review");
+    const canWaive = hasPerm("incidents.review");
+
+    section.append(el("h4", {}, "Timeline (immutable — audit events + amendments, permanently retained)"));
+    if (state.auditEventsError) section.append(el("p", { class: "rr-error", role: "alert" }, state.auditEventsError));
+    const timeline = mergeIncidentTimeline(state.auditEvents, state.amendments);
+    if (timeline.length === 0) {
+      section.append(el("p", { class: "item-subtitle" }, "No history yet."));
+    } else {
+      for (const entry of timeline) {
+        const row = el("div", { class: "module-item" });
+        row.append(el("div", { class: "item-title" }, `${new Date(entry.at).toLocaleString()} · ${entry.eventType}`));
+        if (entry.kind === "amendment" && entry.payload.reason) {
+          row.append(el("div", { class: "item-subtitle" }, entry.payload.reason));
+        }
+        section.append(row);
+      }
+    }
+
+    section.append(el("h4", {}, "Closure gate"));
+    const gate = evaluateClosureGatePreview(d, state.complianceChecks);
+    section.append(
+      el(
+        "p",
+        { class: gate.allowed ? "item-subtitle" : "rr-error", role: gate.allowed ? undefined : "alert" },
+        gate.allowed ? "This incident currently meets the requirements to close." : gate.reason
+      )
+    );
+
+    section.append(el("h4", {}, "Compliance checks"));
+    if (state.complianceChecksError) section.append(el("p", { class: "rr-error", role: "alert" }, state.complianceChecksError));
+    if (state.complianceChecks.length === 0) {
+      section.append(el("p", { class: "item-subtitle" }, "No compliance checks recorded yet."));
+    }
+    for (const check of state.complianceChecks) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${check.check_key} · ${check.status}`));
+      if (check.notes) row.append(el("div", { class: "item-subtitle" }, check.notes));
+      section.append(row);
+    }
+    if (canWrite) section.append(buildComplianceCheckForm(canWaive));
+
+    section.append(el("h4", {}, "Signatures"));
+    if (state.signaturesError) section.append(el("p", { class: "rr-error", role: "alert" }, state.signaturesError));
+    if (state.signatures.length === 0) section.append(el("p", { class: "item-subtitle" }, "No signatures yet."));
+    for (const signature of state.signatures) {
+      const row = el("div", { class: "module-item" });
+      row.append(el("div", { class: "item-title" }, `${signature.role} · ${signature.signed_name}`));
+      row.append(el("div", { class: "item-subtitle" }, `Signed ${new Date(signature.signed_at).toLocaleString()}`));
+      section.append(row);
+    }
+    if (canWrite) {
+      const signToggle = el("button", { type: "button" }, state.signOpen ? "Cancel" : "Sign incident");
+      signToggle.addEventListener("click", () => {
+        state.signOpen = !state.signOpen;
+        render();
+      });
+      section.append(signToggle);
+      if (state.signOpen) section.append(buildSignatureForm());
+    }
+
+    section.append(el("h4", {}, "OSHA recordability questionnaire"));
+    section.append(buildOshaQuestionnaire());
+
+    section.append(el("h4", {}, "Request clarification"));
+    section.append(buildClarificationForm());
+
+    return section;
+  }
+
+  function buildComplianceCheckForm(canWaive) {
+    const form = el("div", { class: "incident-compliance-form" });
+    const keySelect = document.createElement("select");
+    keySelect.setAttribute("aria-label", "Compliance check");
+    for (const key of COMPLIANCE_CHECK_KEYS) keySelect.append(el("option", { value: key }, key));
+    const statusSelect = document.createElement("select");
+    statusSelect.setAttribute("aria-label", "Result");
+    for (const status of complianceCheckStatusOptions(canWaive)) statusSelect.append(el("option", { value: status }, status));
+    const notesInput = el("input", { type: "text", placeholder: "Notes (optional)", "aria-label": "Notes" });
+    const submitBtn = el("button", { type: "button" }, "Record check");
+    submitBtn.addEventListener("click", () => {
+      state.complianceFields = { checkKey: keySelect.value, status: statusSelect.value, notes: notesInput.value };
+      submitComplianceCheck();
+    });
+    form.append(keySelect, statusSelect, notesInput, submitBtn);
+    if (state.complianceErrors.checkKey) form.append(el("div", { class: "rr-error", role: "alert" }, state.complianceErrors.checkKey));
+    if (state.complianceErrors.status) form.append(el("div", { class: "rr-error", role: "alert" }, state.complianceErrors.status));
+    return form;
+  }
+
+  function buildSignatureForm() {
+    const form = el("div", { class: "incident-sign-form" });
+    const roleSelect = document.createElement("select");
+    roleSelect.setAttribute("aria-label", "Signature role");
+    for (const role of SIGNATURE_ROLES) roleSelect.append(el("option", { value: role }, role));
+    const attestationInput = document.createElement("textarea");
+    attestationInput.setAttribute("aria-label", "Attestation statement");
+    const nameInput = el("input", { type: "text", "aria-label": "Signed name" });
+    const submitBtn = el("button", { type: "button" }, "Sign");
+    submitBtn.addEventListener("click", () => {
+      state.signFields = { role: roleSelect.value, attestationText: attestationInput.value, signedName: nameInput.value };
+      submitSignature();
+    });
+    form.append(
+      labeledField("Role", roleSelect, { required: true }),
+      labeledField("Attestation", attestationInput, { required: true, error: state.signErrors.attestationText }),
+      labeledField("Signed name", nameInput, { required: true, error: state.signErrors.signedName }),
+      submitBtn
+    );
+    return form;
+  }
+
+  function buildOshaQuestionnaire() {
+    const wrap = el("div", { class: "incident-osha-questionnaire" });
+    if (!state.oshaOpen) {
+      const startBtn = el("button", { type: "button" }, "Start OSHA evaluation");
+      startBtn.addEventListener("click", () => openOshaQuestionnaire());
+      wrap.append(startBtn);
+      return wrap;
+    }
+    if (state.oshaTreeError) {
+      wrap.append(el("p", { class: "rr-error", role: "alert" }, state.oshaTreeError));
+      return wrap;
+    }
+    if (!state.oshaTree) {
+      wrap.append(el("p", {}, "Loading questionnaire…"));
+      return wrap;
+    }
+    if (state.oshaError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.oshaError));
+    if (state.oshaResult) {
+      wrap.append(
+        el(
+          "p",
+          { class: "item-subtitle" },
+          `Outcome: ${state.oshaResult.outcome}${state.oshaResult.dueAt ? ` · due ${new Date(state.oshaResult.dueAt).toLocaleString()}` : ""}`
+        )
+      );
+      return wrap;
+    }
+    const step = nextOshaQuestion(state.oshaTree, state.oshaAnswers);
+    if (step.done) {
+      wrap.append(el("p", {}, `Outcome so far: ${step.outcome}. Submit to record this evaluation.`));
+      const submitBtn = el("button", { type: "button", class: "primary" }, "Submit evaluation");
+      submitBtn.addEventListener("click", () => submitOshaEvaluation());
+      wrap.append(submitBtn);
+      return wrap;
+    }
+    wrap.append(el("p", {}, step.question || step.nodeId));
+    const yesBtn = el("button", { type: "button" }, "Yes");
+    yesBtn.addEventListener("click", () => answerOshaQuestion(step.nodeId, "yes"));
+    const noBtn = el("button", { type: "button" }, "No");
+    noBtn.addEventListener("click", () => answerOshaQuestion(step.nodeId, "no"));
+    wrap.append(yesBtn, noBtn);
+    return wrap;
+  }
+
+  function buildClarificationForm() {
+    const form = el("div", { class: "incident-clarification-form" });
+    const noteInput = el("input", { type: "text", placeholder: "What needs clarifying?", "aria-label": "Clarification note" });
+    const submitBtn = el("button", { type: "button" }, "Request clarification");
+    submitBtn.addEventListener("click", () => {
+      requestClarification(noteInput.value);
+      noteInput.value = "";
+    });
+    form.append(noteInput, submitBtn);
+    return form;
   }
 
   function render() {
@@ -3227,6 +3671,11 @@ const incidentsPanel = (function () {
 // and status/assign actions.
 const workOrdersPanel = (function () {
   const state = {
+    // WO-13: "workOrders" | "assets" -- which sub-panel is on screen. Both
+    // share this one work-orders-workspace container; switching just
+    // re-renders it against the other panel's own state below (assetsPanel
+    // is a fully separate module -- see its own comment for why).
+    view: "workOrders",
     items: [],
     page: 1,
     pageSize: 10,
@@ -3234,6 +3683,13 @@ const workOrdersPanel = (function () {
     priority: "",
     employees: [],
     myEmployeeId: null,
+    // WO-13: the facility's assets, loaded alongside employees so the
+    // create form's asset picker (assetPickerOptions) and the detail view's
+    // asset-name lookup (findAssetName) both have data without a dedicated
+    // per-render fetch. Refreshed by assetsPanel's own create/edit/retire
+    // actions calling refreshAssetOptions() below, so the picker and the
+    // Assets sub-panel never drift apart within one session.
+    assets: [],
     createOpen: false,
     createFields: emptyCreateFields(),
     createErrors: {},
@@ -3271,10 +3727,26 @@ const workOrdersPanel = (function () {
     const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
     state.employees = employees || [];
     state.myEmployeeId = (state.employees.find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
+    await refreshAssetOptions();
     // P-7: loadList() below always ends in a render() (success or its own
     // catch), which is what actually clears aria-busy -- see render()'s own
     // comment further down.
     await loadList();
+  }
+
+  // WO-13: loads (or reloads) the facility's assets into state.assets, for
+  // the work order create form's picker and the work order detail view's
+  // asset-name lookup. A wide, unfiltered page (200, the route's own
+  // MAX_LIMIT) rather than the Assets sub-panel's own filtered/paginated
+  // fetch -- this is a lookup table for two OTHER views, not the Assets
+  // panel's list itself. Exposed so assetsPanel's own create/edit/retire
+  // actions can call it back after a write, keeping the picker and the
+  // Assets panel from drifting apart within one session without either one
+  // reaching into the other's state directly.
+  async function refreshAssetOptions() {
+    const params = buildAssetQuery({ pageSize: 200 });
+    const assets = await apiFetch(`/facilities/${currentFacility}/assets?${params.toString()}`).catch(() => []);
+    state.assets = assets || [];
   }
 
   async function loadList() {
@@ -3299,7 +3771,9 @@ const workOrdersPanel = (function () {
   }
 
   function reset() {
+    state.view = "workOrders";
     state.items = [];
+    state.assets = [];
     state.createOpen = false;
     state.createFields = emptyCreateFields();
     state.createErrors = {};
@@ -3309,8 +3783,22 @@ const workOrdersPanel = (function () {
     state.page = 1;
     state.detailId = null;
     state.detail = null;
+    assetsPanel.reset();
     const host = container();
     if (host) host.textContent = "";
+  }
+
+  // WO-13: switches between the "Work Orders" and "Assets" sub-panels
+  // sharing this workspace. Lazy-loads the Assets panel's own list on
+  // first switch to it (mirroring load()'s own lazy employee/asset fetch),
+  // not on every workOrdersPanel.load() -- a caller who never opens the
+  // Assets tab in a session never pays for that fetch.
+  function setView(view) {
+    state.view = view;
+    if (view === "assets" && !assetsPanel.hasLoaded()) {
+      assetsPanel.load();
+    }
+    render();
   }
 
   function setChip(chip) {
@@ -3355,6 +3843,11 @@ const workOrdersPanel = (function () {
   }
 
   async function openDetail(id) {
+    // WO-13: openDetail is a work-order-specific action (called from a card's
+    // "View" button, the home dashboard, and P-8 global search) -- always
+    // switch back to the Work Orders tab so its result is actually visible,
+    // even if the Assets tab happened to be open when it was invoked.
+    state.view = "workOrders";
     state.detailId = id;
     state.detail = null;
     state.detailError = null;
@@ -3444,8 +3937,16 @@ const workOrdersPanel = (function () {
     for (const priority of WORK_ORDER_PRIORITIES) prioritySelect.append(el("option", { value: priority }, priority));
     prioritySelect.value = f.priority;
     prioritySelect.addEventListener("change", () => (f.priority = prioritySelect.value));
-    const assetInput = el("input", { type: "text", placeholder: "Asset ID (optional)" });
-    assetInput.addEventListener("input", () => (f.assetId = assetInput.value));
+    // WO-13: asset picker, replacing a free-text asset id field with a
+    // <select> built from state.assets (assetPickerOptions -- shared with
+    // the Assets sub-panel below).
+    const assetSelect = document.createElement("select");
+    assetSelect.append(el("option", { value: "" }, "No asset"));
+    for (const option of assetPickerOptions(state.assets)) {
+      assetSelect.append(el("option", { value: option.value }, option.label));
+    }
+    assetSelect.value = f.assetId;
+    assetSelect.addEventListener("change", () => (f.assetId = assetSelect.value));
     const assigneeSelect = document.createElement("select");
     assigneeSelect.append(el("option", { value: "" }, "Unassigned"));
     for (const employee of state.employees) {
@@ -3463,7 +3964,7 @@ const workOrdersPanel = (function () {
       el("label", {}, ["Title", titleInput]),
       el("label", {}, ["Description", descInput]),
       el("label", {}, ["Priority", prioritySelect]),
-      el("label", {}, ["Asset", assetInput]),
+      el("label", {}, ["Asset", assetSelect]),
       el("label", {}, ["Assignee", assigneeSelect]),
       el("label", {}, ["Due date", dueInput]),
       submitBtn,
@@ -3509,6 +4010,12 @@ const workOrdersPanel = (function () {
     if (state.detailActionError) panel.append(el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, state.detailActionError));
 
     panel.append(el("p", { class: "item-subtitle" }, wo.description));
+    // WO-13: "WO detail shows the asset name" -- looked up from the
+    // already-loaded state.assets (the same list the create form's picker
+    // uses), so this never issues a fetch of its own. Omitted entirely when
+    // the work order has no asset, or the asset isn't in the loaded list.
+    const assetName = findAssetName(state.assets, wo.asset_id);
+    if (assetName) panel.append(el("p", { class: "item-subtitle" }, `Asset: ${assetName}`));
     panel.append(
       el(
         "p",
@@ -3575,6 +4082,12 @@ const workOrdersPanel = (function () {
     return panel;
   }
 
+  // WO-13: top-level render for the whole work-orders-workspace container --
+  // draws the Work Orders / Assets tab bar, then delegates to whichever
+  // sub-panel is active. Called on every workOrdersPanel state change
+  // (chip/priority/page/create/detail); assetsPanel manages its own re-
+  // renders independently once its container div is on screen (see
+  // setView's comment above).
   function render() {
     const host = container();
     if (!host) return;
@@ -3583,6 +4096,29 @@ const workOrdersPanel = (function () {
     // panel's only path to setLoading(host, true) -- clear aria-busy here
     // rather than adding a redundant try/finally there.
     host.setAttribute("aria-busy", "false");
+
+    const tabsRow = el("div", { class: "filter-chips", role: "tablist", "aria-label": "Work orders or assets" });
+    const woTabBtn = el(
+      "button",
+      { type: "button", class: state.view === "workOrders" ? "chip active" : "chip", "aria-selected": String(state.view === "workOrders") },
+      "Work Orders"
+    );
+    woTabBtn.addEventListener("click", () => setView("workOrders"));
+    const assetsTabBtn = el(
+      "button",
+      { type: "button", class: state.view === "assets" ? "chip active" : "chip", "aria-selected": String(state.view === "assets") },
+      "Assets"
+    );
+    assetsTabBtn.addEventListener("click", () => setView("assets"));
+    tabsRow.append(woTabBtn, assetsTabBtn);
+    host.append(tabsRow);
+
+    if (state.view === "assets") {
+      const assetsContainer = el("div", { id: "assets-subpanel" });
+      host.append(assetsContainer);
+      assetsPanel.render();
+      return;
+    }
 
     const chipsRow = el("div", { class: "filter-chips" });
     const chipLabels = { all: "All", open: "Open", overdue: "Overdue" };
@@ -3644,6 +4180,7 @@ const workOrdersPanel = (function () {
   // action): same gate as the toggle button in render() above.
   function openCreate() {
     if (!hasPerm("work_orders.manage")) return;
+    state.view = "workOrders";
     state.createOpen = true;
     render();
     // P-7: focus lands in the newly-opened create form's first field -- this
@@ -3653,7 +4190,803 @@ const workOrdersPanel = (function () {
 
   // openDetail exposed for P-8 (global search): the search box's work
   // orders leg calls the same function its own "View" button uses.
-  return { load, reset, openCreate, openDetail };
+  // refreshAssetOptions exposed for assetsPanel (below) to call back into
+  // after its own create/edit/retire writes, keeping the asset picker and
+  // work order detail's asset-name lookup in sync with the Assets panel.
+  return { load, reset, openCreate, openDetail, refreshAssetOptions };
+})();
+
+// --- Assets registry sub-panel (WO-13) --------------------------------------
+// Nested inside workOrdersPanel's own work-orders-workspace container (see
+// that panel's `render()`/`setView` for how the two tabs share it): list
+// with ?status=/?category=/?q= filters, a detail view showing the open-work-
+// order count (WO-12's own acceptance criterion), and a create/edit form.
+// Permissions mirror work-orders-routes.mjs's asset routes exactly --
+// work_orders.read to view, work_orders.manage to create/edit/retire (no
+// separate assets.* code; see that route file's header comment for the
+// full decision).
+const assetsPanel = (function () {
+  const state = {
+    loaded: false,
+    items: [],
+    page: 1,
+    pageSize: 10,
+    status: "",
+    category: "",
+    q: "",
+    createOpen: false,
+    createFields: emptyAssetFields(),
+    createErrors: {},
+    formError: null,
+    detailId: null,
+    detail: null,
+    detailError: null,
+    detailActionError: null,
+    editOpen: false,
+    editFields: null,
+    editErrors: {}
+  };
+
+  function emptyAssetFields() {
+    return {
+      name: "",
+      assetTag: "",
+      locationText: "",
+      category: "",
+      criticality: "",
+      installDate: "",
+      warrantyExpiresAt: ""
+    };
+  }
+
+  function container() {
+    return document.getElementById("assets-subpanel");
+  }
+
+  function hasLoaded() {
+    return state.loaded;
+  }
+
+  function refreshListItem(updated) {
+    if (!updated || !updated.id) return;
+    state.items = state.items.map((item) => (item.id === updated.id ? { ...item, ...updated } : item));
+  }
+
+  async function load() {
+    state.loaded = true;
+    await loadList();
+  }
+
+  async function loadList() {
+    if (!currentFacility) return;
+    try {
+      const params = buildAssetQuery({
+        status: state.status,
+        category: state.category,
+        q: state.q,
+        page: state.page,
+        pageSize: state.pageSize
+      });
+      state.items = (await apiFetch(`/facilities/${currentFacility}/assets?${params.toString()}`)) || [];
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.items = [];
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function reset() {
+    state.loaded = false;
+    state.items = [];
+    state.page = 1;
+    state.status = "";
+    state.category = "";
+    state.q = "";
+    state.createOpen = false;
+    state.createFields = emptyAssetFields();
+    state.createErrors = {};
+    state.formError = null;
+    state.detailId = null;
+    state.detail = null;
+    state.editOpen = false;
+    state.editFields = null;
+  }
+
+  function setStatus(status) {
+    state.status = status;
+    state.page = 1;
+    loadList();
+  }
+
+  function setCategory(category) {
+    state.category = category;
+    state.page = 1;
+    loadList();
+  }
+
+  function setQuery(q) {
+    state.q = q;
+    state.page = 1;
+    loadList();
+  }
+
+  function changePage(page) {
+    state.page = Math.max(1, page);
+    loadList();
+  }
+
+  async function createAsset() {
+    const validation = validateAssetCreate(state.createFields);
+    state.createErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const created = await apiFetch(`/facilities/${currentFacility}/assets`, {
+        method: "POST",
+        body: buildAssetPayload(state.createFields)
+      });
+      state.createOpen = false;
+      state.createFields = emptyAssetFields();
+      state.createErrors = {};
+      state.formError = null;
+      await loadList();
+      await workOrdersPanel.refreshAssetOptions();
+      await openDetail(created.id);
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function openDetail(id) {
+    state.detailId = id;
+    state.detail = null;
+    state.detailError = null;
+    state.detailActionError = null;
+    state.editOpen = false;
+    state.editFields = null;
+    render();
+    try {
+      state.detail = await apiFetch(`/assets/${id}`);
+    } catch (error) {
+      state.detailError = error.message;
+    }
+    render();
+    focusElement(document.querySelector("#asset-detail-panel h3"));
+  }
+
+  function closeDetail() {
+    state.detailId = null;
+    state.detail = null;
+    state.editOpen = false;
+    state.editFields = null;
+    render();
+  }
+
+  function startEdit() {
+    if (!state.detail) return;
+    state.editFields = {
+      name: state.detail.name || "",
+      assetTag: state.detail.asset_tag || "",
+      locationText: state.detail.location_text || "",
+      category: state.detail.category || "",
+      criticality: state.detail.criticality || "",
+      installDate: state.detail.install_date || "",
+      warrantyExpiresAt: state.detail.warranty_expires_at || ""
+    };
+    state.editErrors = {};
+    state.editOpen = true;
+    render();
+  }
+
+  function cancelEdit() {
+    state.editOpen = false;
+    state.editFields = null;
+    render();
+  }
+
+  async function saveEdit() {
+    const validation = validateAssetCreate(state.editFields);
+    state.editErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      const updated = await apiFetch(`/assets/${state.detailId}`, {
+        method: "PATCH",
+        body: buildAssetPayload(state.editFields)
+      });
+      state.detail = updated;
+      refreshListItem(updated);
+      state.editOpen = false;
+      state.editFields = null;
+      state.detailActionError = null;
+      await workOrdersPanel.refreshAssetOptions();
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  async function retire() {
+    try {
+      const updated = await apiFetch(`/assets/${state.detailId}/retire`, { method: "POST" });
+      state.detail = updated;
+      refreshListItem(updated);
+      state.detailActionError = null;
+      await workOrdersPanel.refreshAssetOptions();
+      render();
+    } catch (error) {
+      state.detailActionError = error.message;
+      render();
+    }
+  }
+
+  function buildCreateForm() {
+    const f = state.createFields;
+    const wrap = el("div", { class: "inline-form asset-create-form" });
+    const nameInput = el("input", { type: "text", value: f.name, placeholder: "Name" });
+    nameInput.addEventListener("input", () => (f.name = nameInput.value));
+    const tagInput = el("input", { type: "text", value: f.assetTag, placeholder: "Asset tag (optional)" });
+    tagInput.addEventListener("input", () => (f.assetTag = tagInput.value));
+    const locationInput = el("input", { type: "text", value: f.locationText, placeholder: "Location (optional)" });
+    locationInput.addEventListener("input", () => (f.locationText = locationInput.value));
+    const categoryInput = el("input", { type: "text", value: f.category, placeholder: "Category (optional)" });
+    categoryInput.addEventListener("input", () => (f.category = categoryInput.value));
+    const criticalitySelect = document.createElement("select");
+    criticalitySelect.append(el("option", { value: "" }, "No criticality set"));
+    for (const level of ASSET_CRITICALITY_LEVELS) criticalitySelect.append(el("option", { value: level }, level));
+    criticalitySelect.value = f.criticality;
+    criticalitySelect.addEventListener("change", () => (f.criticality = criticalitySelect.value));
+    const installInput = el("input", { type: "date", value: f.installDate });
+    installInput.addEventListener("input", () => (f.installDate = installInput.value));
+    const warrantyInput = el("input", { type: "date", value: f.warrantyExpiresAt });
+    warrantyInput.addEventListener("input", () => (f.warrantyExpiresAt = warrantyInput.value));
+    const submitBtn = el("button", { type: "button", class: "primary" }, "Create asset");
+    submitBtn.addEventListener("click", () => createAsset());
+    const errorEl = el("p", { class: "rr-error", role: "alert" }, Object.values(state.createErrors).join(" "));
+    wrap.append(
+      el("label", {}, ["Name", nameInput]),
+      el("label", {}, ["Asset tag", tagInput]),
+      el("label", {}, ["Location", locationInput]),
+      el("label", {}, ["Category", categoryInput]),
+      el("label", {}, ["Criticality", criticalitySelect]),
+      el("label", {}, ["Install date", installInput]),
+      el("label", {}, ["Warranty expires", warrantyInput]),
+      submitBtn,
+      errorEl
+    );
+    return wrap;
+  }
+
+  function buildEditForm() {
+    const f = state.editFields;
+    const wrap = el("div", { class: "inline-form asset-edit-form" });
+    const nameInput = el("input", { type: "text", value: f.name, placeholder: "Name" });
+    nameInput.addEventListener("input", () => (f.name = nameInput.value));
+    const tagInput = el("input", { type: "text", value: f.assetTag, placeholder: "Asset tag (optional)" });
+    tagInput.addEventListener("input", () => (f.assetTag = tagInput.value));
+    const locationInput = el("input", { type: "text", value: f.locationText, placeholder: "Location (optional)" });
+    locationInput.addEventListener("input", () => (f.locationText = locationInput.value));
+    const categoryInput = el("input", { type: "text", value: f.category, placeholder: "Category (optional)" });
+    categoryInput.addEventListener("input", () => (f.category = categoryInput.value));
+    const criticalitySelect = document.createElement("select");
+    criticalitySelect.append(el("option", { value: "" }, "No criticality set"));
+    for (const level of ASSET_CRITICALITY_LEVELS) criticalitySelect.append(el("option", { value: level }, level));
+    criticalitySelect.value = f.criticality;
+    criticalitySelect.addEventListener("change", () => (f.criticality = criticalitySelect.value));
+    const installInput = el("input", { type: "date", value: f.installDate });
+    installInput.addEventListener("input", () => (f.installDate = installInput.value));
+    const warrantyInput = el("input", { type: "date", value: f.warrantyExpiresAt });
+    warrantyInput.addEventListener("input", () => (f.warrantyExpiresAt = warrantyInput.value));
+    const saveBtn = el("button", { type: "button", class: "primary" }, "Save changes");
+    saveBtn.addEventListener("click", () => saveEdit());
+    const cancelBtn = el("button", { type: "button" }, "Cancel");
+    cancelBtn.addEventListener("click", () => cancelEdit());
+    const errorEl = el("p", { class: "rr-error", role: "alert" }, Object.values(state.editErrors).join(" "));
+    wrap.append(
+      el("label", {}, ["Name", nameInput]),
+      el("label", {}, ["Asset tag", tagInput]),
+      el("label", {}, ["Location", locationInput]),
+      el("label", {}, ["Category", categoryInput]),
+      el("label", {}, ["Criticality", criticalitySelect]),
+      el("label", {}, ["Install date", installInput]),
+      el("label", {}, ["Warranty expires", warrantyInput]),
+      saveBtn,
+      cancelBtn,
+      errorEl
+    );
+    return wrap;
+  }
+
+  function buildCard(asset) {
+    const card = el("div", { class: "asset-card" });
+    card.append(el("strong", {}, asset.asset_tag ? `${asset.asset_tag} — ${asset.name}` : asset.name));
+    card.append(el("div", { class: "item-subtitle" }, `Status: ${asset.status}${asset.category ? " · " + asset.category : ""}`));
+    if (asset.location_text) card.append(el("div", { class: "item-subtitle" }, asset.location_text));
+    const viewBtn = el("button", { type: "button" }, "View");
+    viewBtn.addEventListener("click", () => openDetail(asset.id));
+    card.append(viewBtn);
+    return card;
+  }
+
+  function renderDetail() {
+    // P-8-style static id so a future deep link (and this panel's own
+    // focus-after-load) has a stable target, matching work-order-detail-
+    // panel's own convention.
+    const panel = el("div", { class: "report-form-area asset-detail", id: "asset-detail-panel" });
+    const header = el("div", { class: "report-form-header" });
+    header.append(el("h3", {}, state.detail ? state.detail.name : "Loading asset…"));
+    const closeBtn = el("button", { type: "button" }, "Close");
+    closeBtn.addEventListener("click", () => closeDetail());
+    header.append(closeBtn);
+    panel.append(header);
+
+    if (state.detailError) {
+      panel.append(el("p", { class: "rr-error", role: "alert" }, state.detailError));
+      return panel;
+    }
+    if (!state.detail) {
+      panel.append(el("p", {}, "Loading…"));
+      return panel;
+    }
+    const asset = state.detail;
+    if (state.detailActionError) {
+      panel.append(el("p", { class: "rr-error", role: "alert", "aria-live": "polite" }, state.detailActionError));
+    }
+
+    if (asset.asset_tag) panel.append(el("p", { class: "item-subtitle" }, `Tag: ${asset.asset_tag}`));
+    if (asset.location_text) panel.append(el("p", { class: "item-subtitle" }, asset.location_text));
+    panel.append(
+      el(
+        "p",
+        {},
+        `Status: ${asset.status}${asset.category ? " · Category: " + asset.category : ""}${asset.criticality ? " · Criticality: " + asset.criticality : ""}`
+      )
+    );
+    if (asset.install_date) panel.append(el("p", { class: "item-subtitle" }, `Installed ${asset.install_date}`));
+    if (asset.warranty_expires_at) {
+      panel.append(el("p", { class: "item-subtitle" }, `Warranty expires ${asset.warranty_expires_at}`));
+    }
+    // WO-13's own acceptance criterion: the Assets panel's detail view shows
+    // the asset's open work order count.
+    panel.append(el("p", { class: "item-title" }, `Open work orders: ${asset.open_work_order_count ?? 0}`));
+
+    if (hasPerm("work_orders.manage")) {
+      if (state.editOpen) {
+        panel.append(buildEditForm());
+      } else {
+        const actionsRow = el("div", { class: "detail-actions" });
+        const editBtn = el("button", { type: "button" }, "Edit");
+        editBtn.addEventListener("click", () => startEdit());
+        actionsRow.append(editBtn);
+        if (asset.status !== "retired") {
+          const retireBtn = el("button", { type: "button" }, "Retire");
+          retireBtn.addEventListener("click", () => retire());
+          actionsRow.append(retireBtn);
+        }
+        panel.append(actionsRow);
+      }
+    }
+
+    return panel;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+
+    const filterRow = el("div", { class: "filter-chips" });
+    const statusSelect = document.createElement("select");
+    statusSelect.setAttribute("aria-label", "Filter assets by status");
+    statusSelect.append(el("option", { value: "" }, "All statuses"));
+    for (const status of ASSET_STATUSES) {
+      const opt = el("option", { value: status }, status);
+      if (state.status === status) opt.selected = true;
+      statusSelect.append(opt);
+    }
+    statusSelect.addEventListener("change", () => setStatus(statusSelect.value));
+    filterRow.append(statusSelect);
+
+    const categoryInput = el("input", { type: "text", value: state.category, placeholder: "Category" });
+    categoryInput.setAttribute("aria-label", "Filter assets by category");
+    categoryInput.addEventListener("change", () => setCategory(categoryInput.value));
+    filterRow.append(categoryInput);
+
+    const queryInput = el("input", { type: "search", value: state.q, placeholder: "Search name or tag" });
+    queryInput.setAttribute("aria-label", "Search assets by name or tag");
+    queryInput.addEventListener("change", () => setQuery(queryInput.value));
+    filterRow.append(queryInput);
+    host.append(filterRow);
+
+    if (hasPerm("work_orders.manage")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.createOpen ? "Cancel new asset" : "New asset"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.createOpen = !state.createOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.createOpen) host.append(buildCreateForm());
+    }
+
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.items.length === 0) {
+      listWrap.append(el("p", {}, "No assets match these filters."));
+    } else {
+      for (const asset of state.items) listWrap.append(buildCard(asset));
+    }
+    host.append(listWrap);
+
+    const paginationInfo = { page: state.page, hasPrev: state.page > 1, hasNext: state.items.length === state.pageSize };
+    const bar = buildPaginationBar(paginationInfo, (p) => changePage(p));
+    if (bar) host.append(bar);
+
+    if (state.detailId) host.append(renderDetail());
+  }
+
+  return { load, reset, hasLoaded, render };
+})();
+
+// --- Preventive maintenance sub-panel (WO-20) -------------------------------
+// Lives inside the work-orders panel's <details> but renders into its own
+// container (#pm-plans-workspace, a sibling of #work-orders-workspace) --
+// NOT nested inside workOrdersPanel's own container, since that panel's
+// render() clears its host's full contents (host.textContent = "") on every
+// state change, which would wipe out a nested PM sub-tree on every work-order
+// list refresh. Plan list, create/edit form, and (once a plan is selected)
+// an upcoming-occurrences strip built from GET .../pm-plans/:id/occurrences'
+// merged stored+preview response via upcomingOccurrences/occurrenceStatusLabel/
+// formatOccurrenceDate (pm-plan-filters.mjs).
+const pmPlansPanel = (function () {
+  const state = {
+    plans: [],
+    formError: null,
+    createOpen: false,
+    createFields: emptyPlanFields(),
+    createErrors: {},
+    editingId: null,
+    editFields: null,
+    editErrors: {},
+    selectedId: null,
+    occurrences: [],
+    occurrencesError: null
+  };
+
+  function emptyPlanFields() {
+    return {
+      title: "",
+      description: "",
+      cadenceType: "interval",
+      intervalDays: "",
+      seasonMonthsText: "",
+      anchorDate: "",
+      leadTimeDays: "",
+      priority: "",
+      assetId: ""
+    };
+  }
+
+  function container() {
+    return document.getElementById("pm-plans-workspace");
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    try {
+      state.plans = (await apiFetch(`/facilities/${currentFacility}/pm-plans`)) || [];
+      state.formError = null;
+    } catch (error) {
+      state.plans = [];
+      state.formError = error.message;
+    }
+    render();
+  }
+
+  function reset() {
+    state.plans = [];
+    state.formError = null;
+    state.createOpen = false;
+    state.createFields = emptyPlanFields();
+    state.createErrors = {};
+    state.editingId = null;
+    state.editFields = null;
+    state.editErrors = {};
+    state.selectedId = null;
+    state.occurrences = [];
+    state.occurrencesError = null;
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  async function createPlan() {
+    const validation = validatePmPlanCreate(state.createFields);
+    state.createErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      await apiFetch(`/facilities/${currentFacility}/pm-plans`, {
+        method: "POST",
+        body: buildPmPlanPayload(state.createFields)
+      });
+      state.createOpen = false;
+      state.createFields = emptyPlanFields();
+      state.createErrors = {};
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  function fieldsFromPlan(plan) {
+    return {
+      title: plan.title || "",
+      description: plan.description || "",
+      cadenceType: plan.cadence_type,
+      intervalDays: plan.interval_days != null ? String(plan.interval_days) : "",
+      seasonMonthsText: formatSeasonMonths(plan.season_months),
+      anchorDate: plan.anchor_date || "",
+      leadTimeDays: plan.lead_time_days != null ? String(plan.lead_time_days) : "",
+      priority: plan.priority || "",
+      assetId: plan.asset_id || ""
+    };
+  }
+
+  function openEdit(plan) {
+    state.editingId = plan.id;
+    state.editFields = fieldsFromPlan(plan);
+    state.editErrors = {};
+    render();
+  }
+
+  function closeEdit() {
+    state.editingId = null;
+    state.editFields = null;
+    state.editErrors = {};
+    render();
+  }
+
+  async function savePlan(planId) {
+    const validation = validatePmPlanCreate(state.editFields);
+    state.editErrors = validation.errors;
+    if (!validation.valid) {
+      render();
+      return;
+    }
+    try {
+      await apiFetch(`/pm-plans/${planId}`, { method: "PATCH", body: buildPmPlanPayload(state.editFields) });
+      state.editingId = null;
+      state.editFields = null;
+      state.editErrors = {};
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function deactivatePlan(planId) {
+    try {
+      await apiFetch(`/pm-plans/${planId}/deactivate`, { method: "POST" });
+      state.formError = null;
+      await load();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function selectPlan(planId) {
+    state.selectedId = state.selectedId === planId ? null : planId;
+    state.occurrences = [];
+    state.occurrencesError = null;
+    render();
+    if (!state.selectedId) return;
+    try {
+      state.occurrences = (await apiFetch(`/pm-plans/${state.selectedId}/occurrences`)) || [];
+    } catch (error) {
+      state.occurrencesError = error.message;
+    }
+    render();
+  }
+
+  function buildCadenceFields(fields, onChange) {
+    const wrap = el("div", { class: "pm-plan-cadence-fields" });
+    if (fields.cadenceType === "interval") {
+      const intervalInput = el("input", { type: "number", min: "1", value: fields.intervalDays });
+      intervalInput.addEventListener("input", () => onChange({ intervalDays: intervalInput.value }));
+      wrap.append(el("label", {}, ["Interval (days)", intervalInput]));
+    } else if (fields.cadenceType === "seasonal") {
+      const monthsInput = el("input", { type: "text", placeholder: "e.g. 3, 9", value: fields.seasonMonthsText });
+      monthsInput.addEventListener("input", () => onChange({ seasonMonthsText: monthsInput.value }));
+      wrap.append(el("label", {}, ["Months (1-12, comma-separated)", monthsInput]));
+    }
+    return wrap;
+  }
+
+  function buildPlanForm(fields, errors, onChange, onSubmit, submitLabel) {
+    const wrap = el("div", { class: "inline-form pm-plan-form" });
+    const titleInput = el("input", { type: "text", value: fields.title, placeholder: "Title" });
+    titleInput.addEventListener("input", () => onChange({ title: titleInput.value }));
+    const descInput = document.createElement("textarea");
+    descInput.placeholder = "Description (optional)";
+    descInput.value = fields.description;
+    descInput.addEventListener("input", () => onChange({ description: descInput.value }));
+
+    const cadenceSelect = document.createElement("select");
+    for (const cadence of PM_CADENCE_TYPES) cadenceSelect.append(el("option", { value: cadence }, cadence));
+    cadenceSelect.value = fields.cadenceType;
+    cadenceSelect.addEventListener("change", () => onChange({ cadenceType: cadenceSelect.value }));
+
+    const anchorInput = el("input", { type: "date", value: fields.anchorDate });
+    anchorInput.addEventListener("input", () => onChange({ anchorDate: anchorInput.value }));
+
+    const leadInput = el("input", { type: "number", min: "0", value: fields.leadTimeDays, placeholder: "0" });
+    leadInput.addEventListener("input", () => onChange({ leadTimeDays: leadInput.value }));
+
+    const prioritySelect = document.createElement("select");
+    prioritySelect.append(el("option", { value: "" }, "Default priority"));
+    for (const priority of PM_PRIORITIES) prioritySelect.append(el("option", { value: priority }, priority));
+    prioritySelect.value = fields.priority;
+    prioritySelect.addEventListener("change", () => onChange({ priority: prioritySelect.value }));
+
+    const assetInput = el("input", { type: "text", placeholder: "Asset ID (optional)", value: fields.assetId });
+    assetInput.addEventListener("input", () => onChange({ assetId: assetInput.value }));
+
+    const submitBtn = el("button", { type: "button", class: "primary" }, submitLabel);
+    submitBtn.addEventListener("click", onSubmit);
+
+    const errorText = Object.values(errors).join(" ");
+    wrap.append(
+      el("label", {}, ["Title", titleInput]),
+      el("label", {}, ["Description", descInput]),
+      el("label", {}, ["Cadence", cadenceSelect]),
+      buildCadenceFields(fields, onChange),
+      el("label", {}, ["Anchor date", anchorInput]),
+      el("label", {}, ["Lead time (days)", leadInput]),
+      el("label", {}, ["Priority", prioritySelect]),
+      el("label", {}, ["Asset", assetInput]),
+      submitBtn
+    );
+    if (errorText) wrap.append(el("p", { class: "rr-error", role: "alert" }, errorText));
+    return wrap;
+  }
+
+  function buildOccurrenceStrip() {
+    const strip = el("div", { class: "pm-occurrence-strip" });
+    if (state.occurrencesError) {
+      strip.append(el("p", { class: "rr-error", role: "alert" }, state.occurrencesError));
+      return strip;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const upcoming = upcomingOccurrences(state.occurrences, today, 16);
+    if (upcoming.length === 0) {
+      strip.append(el("p", { class: "item-subtitle" }, "No occurrences in the next 8 weeks."));
+      return strip;
+    }
+    for (const occurrence of upcoming) {
+      const chip = el("div", { class: occurrence.preview ? "pm-occurrence-chip preview" : "pm-occurrence-chip" });
+      chip.append(el("strong", {}, formatOccurrenceDate(occurrence.scheduledFor)));
+      chip.append(el("div", { class: "item-subtitle" }, occurrenceStatusLabel(occurrence)));
+      strip.append(chip);
+    }
+    return strip;
+  }
+
+  function buildPlanCard(plan) {
+    const card = el("div", { class: "work-order-card" });
+    card.append(el("strong", {}, plan.title));
+    const cadenceLabel =
+      plan.cadence_type === "interval"
+        ? `Every ${plan.interval_days} day(s)`
+        : `Months: ${formatSeasonMonths(plan.season_months)}`;
+    card.append(el("div", { class: "item-subtitle" }, cadenceLabel));
+    card.append(el("div", { class: "item-subtitle" }, `Anchor: ${plan.anchor_date} · ${plan.active ? "Active" : "Inactive"}`));
+    if (plan.description) card.append(el("div", { class: "item-subtitle" }, plan.description));
+
+    const actionsRow = el("div", { class: "detail-actions" });
+    const viewBtn = el("button", { type: "button" }, state.selectedId === plan.id ? "Hide occurrences" : "Upcoming occurrences");
+    viewBtn.addEventListener("click", () => selectPlan(plan.id));
+    actionsRow.append(viewBtn);
+
+    if (hasPerm("work_orders.manage")) {
+      const editBtn = el("button", { type: "button" }, "Edit");
+      editBtn.addEventListener("click", () => openEdit(plan));
+      actionsRow.append(editBtn);
+      if (plan.active) {
+        const deactivateBtn = el("button", { type: "button" }, "Deactivate");
+        deactivateBtn.addEventListener("click", () => deactivatePlan(plan.id));
+        actionsRow.append(deactivateBtn);
+      }
+    }
+    card.append(actionsRow);
+
+    if (state.editingId === plan.id) {
+      card.append(
+        buildPlanForm(
+          state.editFields,
+          state.editErrors,
+          (patch) => {
+            Object.assign(state.editFields, patch);
+            render();
+          },
+          () => savePlan(plan.id),
+          "Save changes"
+        )
+      );
+      const cancelBtn = el("button", { type: "button" }, "Cancel edit");
+      cancelBtn.addEventListener("click", () => closeEdit());
+      card.append(cancelBtn);
+    }
+
+    if (state.selectedId === plan.id) card.append(buildOccurrenceStrip());
+    return card;
+  }
+
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+    host.setAttribute("aria-busy", "false");
+
+    if (hasPerm("work_orders.manage")) {
+      const toggleBtn = el(
+        "button",
+        { type: "button", class: "primary" },
+        state.createOpen ? "Cancel new plan" : "New PM plan"
+      );
+      toggleBtn.addEventListener("click", () => {
+        state.createOpen = !state.createOpen;
+        render();
+      });
+      host.append(toggleBtn);
+      if (state.createOpen) {
+        host.append(
+          buildPlanForm(
+            state.createFields,
+            state.createErrors,
+            (patch) => {
+              Object.assign(state.createFields, patch);
+              render();
+            },
+            () => createPlan(),
+            "Create plan"
+          )
+        );
+      }
+    }
+
+    if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
+
+    const listWrap = el("div", { class: "module-list" });
+    if (state.plans.length === 0) {
+      listWrap.append(el("p", {}, "No preventive maintenance plans yet."));
+    } else {
+      for (const plan of state.plans) listWrap.append(buildPlanCard(plan));
+    }
+    host.append(listWrap);
+  }
+
+  return { load, reset };
 })();
 
 // --- Communications module (CM-08/CM-09/P-1) -----------------------------------

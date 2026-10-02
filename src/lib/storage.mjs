@@ -213,11 +213,27 @@ export function buildAttachmentPath(facilityId, module, recordId, filename) {
 // respond 404 (matching the existing notFoundOnDeny posture), never call
 // the storage client on failure, and never 403 (a 403 would confirm to an
 // unauthorized caller that *some* attachment exists at that id).
-export function assertPathInFacility(path, facilityId, module) {
+//
+// L1 (security review, Wave 3 Slice 3B): `recordId`, when given, tightens
+// the prefix from "facilities/{facilityId}/{module}/" to
+// "facilities/{facilityId}/{module}/{recordId}/" -- without it, a path is
+// only bound to the right facility and module, not the specific record
+// (e.g. incident) it claims to belong to, so a signature on incident A
+// could otherwise name a path under incident B in the same facility/module
+// and pass. Every existing caller omits it (unchanged, module-only
+// binding); incidents-compliance-routes.mjs's signature write path is the
+// first to pass it.
+export function assertPathInFacility(path, facilityId, module, recordId) {
   const safeFacilityId = assertUuid(facilityId, "facilityId");
-  if (typeof path !== "string" || !path.startsWith(`facilities/${safeFacilityId}/${module}/`)) {
+  const prefix =
+    recordId === undefined || recordId === null
+      ? `facilities/${safeFacilityId}/${module}/`
+      : `facilities/${safeFacilityId}/${module}/${assertSafeSegment(String(recordId), "recordId")}/`;
+  if (typeof path !== "string" || !path.startsWith(prefix)) {
     throw new StorageValidationError(
-      `path does not belong to facility ${facilityId} / module ${module}: ${JSON.stringify(path)}`,
+      `path does not belong to facility ${facilityId} / module ${module}${
+        recordId === undefined || recordId === null ? "" : ` / record ${recordId}`
+      }: ${JSON.stringify(path)}`,
       "path_outside_facility"
     );
   }

@@ -211,8 +211,12 @@ insert into incident_followup_actions (id, facility_id, incident_id, action_type
 on conflict (id) do nothing;
 
 
-insert into assets (id, facility_id, department_id, asset_tag, name, location_text) values
-  ('00000000-0000-0000-0000-000000001601', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'POOL-DECK-01', 'Pool deck safety mats', 'North pool deck')
+insert into assets (id, facility_id, department_id, asset_tag, name, location_text, category, criticality) values
+  ('00000000-0000-0000-0000-000000001601', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'POOL-DECK-01', 'Pool deck safety mats', 'North pool deck', 'safety_equipment', 'high')
+on conflict (id) do nothing;
+
+insert into assets (id, facility_id, department_id, asset_tag, name, location_text, status, category, criticality) values
+  ('00000000-0000-0000-0000-000000001602', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000301', 'PUMP-FILT-02', 'Pool filtration pump', 'Mechanical room', 'active', 'mechanical', 'critical')
 on conflict (id) do nothing;
 
 insert into work_orders (id, facility_id, department_id, asset_id, source_type, source_id, title, description, priority, status, assigned_to_employee_id, due_at) values
@@ -292,6 +296,13 @@ on conflict (id) do nothing;
 -- cert.expiring), required-ack escalation (0006 message_acknowledgements
 -- 'overdue' + design 3.3), and training assignment due dates (0007
 -- training_assignments).
+-- IN-20 (Wave 3 3B) adds incident.submitted and incident.sla_breached
+-- alongside the existing incident.escalated -- the three incident-lifecycle
+-- events incidents-routes.mjs/incident-sla-sweep.mjs emit notification_jobs
+-- for. Neither gets a seeded notification_routes row, matching every other
+-- event in this catalog: seed.sql seeds no notification_routes rows for ANY
+-- event code today -- a route is something a facility admin configures via
+-- the Notifications admin surface, not something this seed pre-wires.
 insert into notification_events (id, code, severity, module_code, default_channels_jsonb) values
   ('00000000-0000-0000-0000-000000003301', 'incident.escalated', 'critical', 'incidents', '["in_app","email"]'::jsonb),
   ('00000000-0000-0000-0000-000000003302', 'schedule.published', 'info', 'scheduling', '["in_app"]'::jsonb),
@@ -299,7 +310,9 @@ insert into notification_events (id, code, severity, module_code, default_channe
   ('00000000-0000-0000-0000-000000003304', 'report.missing', 'warning', 'daily_reports', '["in_app","email"]'::jsonb),
   ('00000000-0000-0000-0000-000000003305', 'cert.expiring', 'warning', 'training', '["in_app","email"]'::jsonb),
   ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
-  ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb)
+  ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003308', 'incident.submitted', 'info', 'incidents', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003309', 'incident.sla_breached', 'critical', 'incidents', '["in_app","email"]'::jsonb)
 on conflict (code) do nothing;
 
 -- Subscription plans (0018). feature_entitlements_jsonb names the entitlement

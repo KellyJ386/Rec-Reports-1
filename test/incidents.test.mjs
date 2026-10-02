@@ -6,14 +6,131 @@ import {
   shouldEscalateIncident,
   escalationDueAt,
   isEscalationOverdue,
+  nextEscalationLevel,
   canTransitionIncident,
   buildIncidentAuditEvent,
   buildAmendment,
+  buildIncidentNotificationJobs,
   AMENDABLE_INCIDENT_FIELDS,
   formatIncidentNo,
   nextIncidentNo,
-  INCIDENT_STATUSES
+  incidentRetentionClass,
+  retentionEligibleAt,
+  INCIDENT_STATUSES,
+  SIGNATURE_ROLES,
+  validateAttestationText,
+  COMPLIANCE_CHECK_KEYS,
+  COMPLIANCE_CHECK_STATUSES,
+  evaluateClosureGate,
+  evaluateOshaDecisionTree,
+  OSHA_OUTCOMES
 } from "../src/lib/incidents.mjs";
+import { settingsRegistry } from "../src/lib/settings-registry.mjs";
+
+// --- nextEscalationLevel (IN-21) ---------------------------------------------
+
+test("nextEscalationLevel returns currentLevel + 1", () => {
+  assert.equal(nextEscalationLevel(1), 2);
+  assert.equal(nextEscalationLevel(4), 5);
+});
+
+test("nextEscalationLevel treats a missing/non-positive level as 0, returning 1", () => {
+  assert.equal(nextEscalationLevel(0), 1);
+  assert.equal(nextEscalationLevel(-3), 1);
+  assert.equal(nextEscalationLevel(undefined), 1);
+  assert.equal(nextEscalationLevel(null), 1);
+});
+
+// --- buildIncidentNotificationJobs (IN-20) -----------------------------------
+
+const NOTIFY_ROUTE = {
+  id: "route-1",
+  facility_id: "fac-1",
+  priority: 5,
+  route_jsonb: { channels: ["in_app", "email"] }
+};
+
+test("buildIncidentNotificationJobs shapes one row per recipient with a per-recipient dedupe_key", () => {
+  const jobs = buildIncidentNotificationJobs("incident.escalated", NOTIFY_ROUTE, ["emp-1", "emp-2"], {
+    id: "inc-1",
+    severity: "medium"
+  });
+  assert.equal(jobs.length, 2);
+  // No escalationId argument given -- the discriminator segment defaults to
+  // the literal "n/a" (M3).
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.escalated:n/a:emp-1");
+  assert.equal(jobs[1].dedupe_key, "inc-1:incident.escalated:n/a:emp-2");
+  assert.equal(jobs[0].facility_id, "fac-1");
+  assert.equal(jobs[0].event_type, "incident.escalated");
+  assert.deepEqual(jobs[0].payload_jsonb.recipients, ["emp-1"]);
+  assert.deepEqual(jobs[0].payload_jsonb.channels, ["in_app", "email"]);
+  assert.equal(jobs[0].payload_jsonb.incidentId, "inc-1");
+  assert.equal(jobs[0].payload_jsonb.escalationId, null);
+});
+
+// M3 (security review): the second/third/... SLA breach or manual
+// re-escalation of the SAME incident must not reuse the first breach's
+// dedupe_key -- folding the escalation's own id into the key is what
+// distinguishes them, while a genuine RETRY of the identical breach (same
+// escalation id) still collapses onto the same key.
+test("buildIncidentNotificationJobs folds escalationId into dedupe_key so a second escalation does not collide with the first", () => {
+  const first = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-1");
+  const second = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-2");
+  assert.equal(first[0].dedupe_key, "inc-1:incident.sla_breached:esc-1:emp-1");
+  assert.equal(second[0].dedupe_key, "inc-1:incident.sla_breached:esc-2:emp-1");
+  assert.notEqual(first[0].dedupe_key, second[0].dedupe_key);
+  assert.equal(first[0].payload_jsonb.escalationId, "esc-1");
+  assert.equal(second[0].payload_jsonb.escalationId, "esc-2");
+
+  // A genuine retry of the SAME breach (identical escalationId) still
+  // dedupes as intended.
+  const retry = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  }, "esc-1");
+  assert.equal(retry[0].dedupe_key, first[0].dedupe_key);
+});
+
+test("buildIncidentNotificationJobs sets quietHoursBypass true for high/critical severity, false otherwise", () => {
+  const high = buildIncidentNotificationJobs("incident.escalated", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "high"
+  });
+  assert.equal(high[0].payload_jsonb.quietHoursBypass, true);
+
+  const critical = buildIncidentNotificationJobs("incident.sla_breached", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "critical"
+  });
+  assert.equal(critical[0].payload_jsonb.quietHoursBypass, true);
+
+  const low = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "low"
+  });
+  assert.equal(low[0].payload_jsonb.quietHoursBypass, false);
+
+  const medium = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1"], {
+    id: "inc-1",
+    severity: "medium"
+  });
+  assert.equal(medium[0].payload_jsonb.quietHoursBypass, false);
+});
+
+test("buildIncidentNotificationJobs drops falsy recipient ids and returns [] for an empty recipient list", () => {
+  assert.deepEqual(buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, [], { id: "inc-1" }), []);
+  const jobs = buildIncidentNotificationJobs("incident.submitted", NOTIFY_ROUTE, ["emp-1", null, undefined, ""], {
+    id: "inc-1"
+  });
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].dedupe_key, "inc-1:incident.submitted:n/a:emp-1");
+});
 
 test("shouldEscalateIncident escalates high severity, legal hold, or OSHA review", () => {
   assert.equal(shouldEscalateIncident({ severity: "high" }), true);
@@ -58,6 +175,18 @@ test("classifyOshaReview only flags accident outcomes with OSHA-style triggers",
   assert.equal(classifyOshaReview("incident", ["employee_injury"]), false);
   assert.equal(classifyOshaReview("accident", ["first_aid"]), false);
   assert.equal(classifyOshaReview("accident", ["employee_injury", "lost_time"]), true);
+});
+
+// IN-14: the tree-outcome expansion is additive -- every existing 2-arg call
+// above is unaffected (treeOutcome defaults to null), and a "recordable"
+// tree outcome flags OSHA review on its own, independent of report_type.
+test("classifyOshaReview also flags a 'recordable' OSHA decision-tree outcome, independent of report_type/outcomes", () => {
+  assert.equal(classifyOshaReview("incident", [], "recordable"), true);
+  assert.equal(classifyOshaReview("near_miss", [], "recordable"), true);
+  assert.equal(classifyOshaReview("incident", [], "first_aid_only"), false);
+  assert.equal(classifyOshaReview("incident", [], "not_work_related"), false);
+  assert.equal(classifyOshaReview("incident", [], "needs_more_info"), false);
+  assert.equal(classifyOshaReview("incident", [], null), false);
 });
 
 test("requiredIncidentFollowUps returns deduplicated compliance actions", () => {
@@ -383,4 +512,330 @@ test("nextIncidentNo ignores malformed / non-matching values instead of throwing
 test("nextIncidentNo defaults year to the current UTC year when omitted", () => {
   const year = new Date().getUTCFullYear();
   assert.equal(nextIncidentNo([]), `INC-${year}-0001`);
+});
+
+// --- Signatures (IN-13) ------------------------------------------------------
+
+test("validateAttestationText rejects blank/whitespace-only text", () => {
+  assert.equal(validateAttestationText("").valid, false);
+  assert.equal(validateAttestationText("   ").valid, false);
+  assert.equal(validateAttestationText(undefined).valid, false);
+  assert.equal(validateAttestationText(null).valid, false);
+});
+
+test("validateAttestationText accepts trimmed non-blank text up to 2000 chars, rejects longer", () => {
+  assert.equal(validateAttestationText("I attest this is accurate.").valid, true);
+  assert.equal(validateAttestationText("a".repeat(2000)).valid, true);
+  const tooLong = validateAttestationText("a".repeat(2001));
+  assert.equal(tooLong.valid, false);
+  assert.match(tooLong.error, /2000/);
+});
+
+test("SIGNATURE_ROLES matches the design doc's fixed vocabulary, supervisor included", () => {
+  assert.deepEqual(SIGNATURE_ROLES, ["reporter", "witness", "supervisor", "manager"]);
+});
+
+// --- Compliance checks + closure gate (IN-15) --------------------------------
+
+test("COMPLIANCE_CHECK_KEYS/STATUSES match the design doc's fixed vocabularies", () => {
+  assert.deepEqual(COMPLIANCE_CHECK_KEYS, ["evidence_complete", "supervisor_signoff", "osha_recordability", "legal_review"]);
+  assert.deepEqual(COMPLIANCE_CHECK_STATUSES, ["pass", "fail", "waived"]);
+});
+
+test("evaluateClosureGate allows a low/medium-severity, non-OSHA incident with no compliance checks at all", () => {
+  assert.deepEqual(evaluateClosureGate({ severity: "low", requiresOshaReview: false }, []), {
+    allowed: true,
+    reason: null,
+    reasonCode: null,
+    blockingCheck: null
+  });
+  assert.equal(evaluateClosureGate({ severity: "medium", requiresOshaReview: false }, []).allowed, true);
+});
+
+test("evaluateClosureGate blocks a high/critical incident with no evidence_complete check", () => {
+  for (const severity of ["high", "critical"]) {
+    const gate = evaluateClosureGate({ severity, requiresOshaReview: false }, []);
+    assert.equal(gate.allowed, false);
+    assert.equal(gate.reasonCode, "compliance_check_failed");
+    assert.equal(gate.blockingCheck, "evidence_complete");
+    assert.match(gate.reason, /evidence_complete/);
+  }
+});
+
+test("evaluateClosureGate blocks a high-severity incident whose evidence_complete check failed", () => {
+  const gate = evaluateClosureGate(
+    { severity: "high", requiresOshaReview: false },
+    [{ check_key: "evidence_complete", status: "fail" }]
+  );
+  assert.equal(gate.allowed, false);
+  assert.match(gate.reason, /failed/);
+  assert.equal(gate.blockingCheck, "evidence_complete");
+});
+
+test("evaluateClosureGate allows a high-severity incident whose evidence_complete check passed or was waived", () => {
+  assert.equal(
+    evaluateClosureGate({ severity: "high", requiresOshaReview: false }, [{ check_key: "evidence_complete", status: "pass" }])
+      .allowed,
+    true
+  );
+  assert.equal(
+    evaluateClosureGate({ severity: "critical", requiresOshaReview: false }, [
+      { check_key: "evidence_complete", status: "waived" }
+    ]).allowed,
+    true
+  );
+});
+
+test("evaluateClosureGate additionally requires supervisor_signoff when requiresOshaReview is true, independent of severity", () => {
+  const lowSeverityOsha = evaluateClosureGate({ severity: "low", requiresOshaReview: true }, []);
+  assert.equal(lowSeverityOsha.allowed, false);
+  assert.equal(lowSeverityOsha.blockingCheck, "supervisor_signoff");
+
+  assert.equal(
+    evaluateClosureGate({ severity: "low", requiresOshaReview: true }, [
+      { check_key: "supervisor_signoff", status: "pass" }
+    ]).allowed,
+    true
+  );
+});
+
+test("evaluateClosureGate on a high-severity, requires_osha_review incident: evidence_complete is checked before supervisor_signoff", () => {
+  // Only evidence_complete recorded -- supervisor_signoff still blocks.
+  const gate = evaluateClosureGate({ severity: "high", requiresOshaReview: true }, [
+    { check_key: "evidence_complete", status: "pass" }
+  ]);
+  assert.equal(gate.allowed, false);
+  assert.equal(gate.blockingCheck, "supervisor_signoff");
+
+  // Both recorded -- passes.
+  assert.equal(
+    evaluateClosureGate({ severity: "high", requiresOshaReview: true }, [
+      { check_key: "evidence_complete", status: "pass" },
+      { check_key: "supervisor_signoff", status: "waived" }
+    ]).allowed,
+    true
+  );
+});
+
+// --- OSHA recordability decision tree (IN-14) --------------------------------
+
+const TEST_TREE = {
+  start: "fatality",
+  nodes: {
+    fatality: { question: "Fatality?", yes: { outcome: "recordable", timer: "fatality" }, no: "hospitalization" },
+    hospitalization: {
+      question: "Hospitalization?",
+      yes: { outcome: "recordable", timer: "hospitalization" },
+      no: "work_related"
+    },
+    work_related: { question: "Work-related?", yes: "recordable_criteria", no: { outcome: "not_work_related" } },
+    recordable_criteria: {
+      question: "Meets recordable criteria?",
+      yes: { outcome: "recordable", timer: "recordable" },
+      no: "first_aid"
+    },
+    first_aid: { question: "First aid only?", yes: { outcome: "first_aid_only" }, no: { outcome: "needs_more_info" } }
+  },
+  timers: {
+    fatality: { hours: 8 },
+    hospitalization: { hours: 24 },
+    recordable: { days: 7 }
+  }
+};
+
+test("evaluateOshaDecisionTree is the shipped default in settings-registry.mjs (incidents.oshaDecisionTree)", () => {
+  const definition = settingsRegistry.find((d) => d.key === "incidents.oshaDecisionTree");
+  assert.ok(definition, "expected an incidents.oshaDecisionTree setting definition");
+  assert.equal(definition.dataType, "json");
+  assert.equal(definition.module, "incidents");
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(definition.default, { fatality: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-01T08:00:00.000Z");
+});
+
+test("evaluateOshaDecisionTree: fatality path is recordable with an 8-hour timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(TEST_TREE, { fatality: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.recordable, true);
+  assert.equal(result.dueAt, "2026-07-01T08:00:00.000Z");
+  assert.deepEqual(result.path, [{ nodeId: "fatality", question: "Fatality?", answer: "yes" }]);
+});
+
+test("evaluateOshaDecisionTree: hospitalization path is recordable with a 24-hour timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "yes" }, now);
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-02T00:00:00.000Z");
+  assert.equal(result.path.length, 2);
+});
+
+test("evaluateOshaDecisionTree: ordinary recordable-criteria path gets a 7-day timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const result = evaluateOshaDecisionTree(
+    TEST_TREE,
+    { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "yes" },
+    now
+  );
+  assert.equal(result.outcome, "recordable");
+  assert.equal(result.dueAt, "2026-07-08T00:00:00.000Z");
+});
+
+test("evaluateOshaDecisionTree: not-work-related and first-aid-only paths carry no timer", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const notWorkRelated = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "no", work_related: "no" }, now);
+  assert.equal(notWorkRelated.outcome, "not_work_related");
+  assert.equal(notWorkRelated.recordable, false);
+  assert.equal(notWorkRelated.dueAt, null);
+
+  const firstAid = evaluateOshaDecisionTree(
+    TEST_TREE,
+    { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "no", first_aid: "yes" },
+    now
+  );
+  assert.equal(firstAid.outcome, "first_aid_only");
+  assert.equal(firstAid.dueAt, null);
+});
+
+test("evaluateOshaDecisionTree: determinism -- identical tree/answers/now always produce identical output", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const answers = { fatality: "no", hospitalization: "no", work_related: "yes", recordable_criteria: "yes" };
+  const first = evaluateOshaDecisionTree(TEST_TREE, answers, now);
+  const second = evaluateOshaDecisionTree(TEST_TREE, answers, now);
+  assert.deepEqual(first, second);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- null/undefined/shapeless tree", () => {
+  for (const badTree of [null, undefined, {}, { start: "fatality" }, "not an object", 42]) {
+    const result = evaluateOshaDecisionTree(badTree, { fatality: "yes" });
+    assert.equal(result.outcome, "needs_more_info");
+    assert.equal(result.recordable, false);
+    assert.equal(result.dueAt, null);
+    assert.equal(result.malformed, true);
+  }
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- missing/invalid answer for the current node", () => {
+  const now = new Date("2026-07-01T00:00:00Z");
+  const missingAnswer = evaluateOshaDecisionTree(TEST_TREE, {}, now);
+  assert.equal(missingAnswer.outcome, "needs_more_info");
+  assert.equal(missingAnswer.malformed, true);
+  assert.deepEqual(missingAnswer.path, []);
+
+  const invalidAnswer = evaluateOshaDecisionTree(TEST_TREE, { fatality: "maybe" }, now);
+  assert.equal(invalidAnswer.outcome, "needs_more_info");
+  assert.equal(invalidAnswer.malformed, true);
+
+  // Insufficient answers partway through the tree: path holds what WAS
+  // legally walked before the missing answer.
+  const partial = evaluateOshaDecisionTree(TEST_TREE, { fatality: "no", hospitalization: "no" });
+  assert.equal(partial.outcome, "needs_more_info");
+  assert.equal(partial.malformed, true);
+  assert.equal(partial.path.length, 2);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- a node names a continuation absent from tree.nodes", () => {
+  const brokenTree = {
+    start: "fatality",
+    nodes: { fatality: { question: "Fatality?", yes: { outcome: "recordable" }, no: "nowhere" } }
+  };
+  const result = evaluateOshaDecisionTree(brokenTree, { fatality: "no" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+});
+
+test("evaluateOshaDecisionTree: malformed-config fallback -- a cyclic tree does not hang, falls back after bounded depth", () => {
+  const cyclicTree = {
+    start: "a",
+    nodes: {
+      a: { question: "A?", yes: { outcome: "recordable" }, no: "b" },
+      b: { question: "B?", yes: { outcome: "recordable" }, no: "a" }
+    }
+  };
+  const result = evaluateOshaDecisionTree(cyclicTree, { a: "no", b: "no" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+});
+
+test("evaluateOshaDecisionTree: a terminal leaf naming an outcome outside OSHA_OUTCOMES falls back safely", () => {
+  const badOutcomeTree = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "totally_made_up" }, no: { outcome: "not_work_related" } } }
+  };
+  const result = evaluateOshaDecisionTree(badOutcomeTree, { a: "yes" });
+  assert.equal(result.outcome, "needs_more_info");
+  assert.equal(result.malformed, true);
+  assert.ok(OSHA_OUTCOMES.includes("not_work_related")); // sanity: the OTHER leaf's outcome is legal
+});
+
+test("evaluateOshaDecisionTree: a recordable leaf with no `timer` key (or an unknown timer name) carries dueAt: null", () => {
+  const treeWithoutTimer = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "recordable" }, no: { outcome: "not_work_related" } } }
+  };
+  assert.equal(evaluateOshaDecisionTree(treeWithoutTimer, { a: "yes" }).dueAt, null);
+
+  const treeWithUnknownTimer = {
+    start: "a",
+    nodes: { a: { question: "A?", yes: { outcome: "recordable", timer: "does_not_exist" }, no: { outcome: "not_work_related" } } },
+    timers: { fatality: { hours: 8 } }
+  };
+  assert.equal(evaluateOshaDecisionTree(treeWithUnknownTimer, { a: "yes" }).dueAt, null);
+});
+
+// --- Retention (IN-16) -------------------------------------------------------
+
+test("incidentRetentionClass: OSHA-recordable incidents take priority over everything else", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: true, severity: "low", reportType: "near_miss" }), "osha");
+  assert.equal(incidentRetentionClass({ requiresOshaReview: true, severity: "critical" }), "osha");
+});
+
+test("incidentRetentionClass: near_miss or low severity (no OSHA review) is minor", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "near_miss", severity: "medium" }), "minor");
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "incident", severity: "low" }), "minor");
+});
+
+test("incidentRetentionClass: everything else falls back to standard", () => {
+  assert.equal(incidentRetentionClass({ requiresOshaReview: false, reportType: "accident", severity: "high" }), "standard");
+  assert.equal(incidentRetentionClass({}), "standard");
+});
+
+test("retentionEligibleAt uses occurredAt as the anchor and the registry defaults when unconfigured", () => {
+  const standard = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(standard.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+
+  const osha = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", requiresOshaReview: true });
+  assert.equal(osha.toISOString(), new Date(Date.UTC(2026, 0, 1) + 1825 * 86400000).toISOString());
+
+  const minor = retentionEligibleAt({ occurredAt: "2026-01-01T00:00:00Z", reportType: "near_miss" });
+  assert.equal(minor.toISOString(), new Date(Date.UTC(2026, 0, 1) + 1095 * 86400000).toISOString());
+});
+
+test("retentionEligibleAt honors facility-configured retention days", () => {
+  const eligible = retentionEligibleAt(
+    { occurredAt: "2026-01-01T00:00:00Z", severity: "high" },
+    { "incidents.retentionDaysStandard": 10 }
+  );
+  assert.equal(eligible.toISOString(), new Date(Date.UTC(2026, 0, 11)).toISOString());
+});
+
+test("retentionEligibleAt falls back to createdAt then reportedAt when occurredAt is absent", () => {
+  const fromCreated = retentionEligibleAt({ createdAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(fromCreated.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+
+  const fromReported = retentionEligibleAt({ reportedAt: "2026-01-01T00:00:00Z", severity: "high" });
+  assert.equal(fromReported.toISOString(), new Date(Date.UTC(2026, 0, 1) + 2555 * 86400000).toISOString());
+});
+
+test("retentionEligibleAt returns null when no anchor timestamp is available", () => {
+  assert.equal(retentionEligibleAt({ severity: "high" }), null);
+  assert.equal(retentionEligibleAt(null), null);
+});
+
+test("retentionEligibleAt is pure -- never reads the clock, deterministic for the same inputs", () => {
+  const incident = { occurredAt: "2026-01-01T00:00:00Z", requiresOshaReview: true };
+  const a = retentionEligibleAt(incident);
+  const b = retentionEligibleAt(incident);
+  assert.equal(a.toISOString(), b.toISOString());
 });
