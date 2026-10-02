@@ -38,6 +38,21 @@ as $$
   select (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')::uuid;
 $$;
 
+-- USAGE on schema auth for `authenticated` -- a real Supabase project grants
+-- this out of the box (the whole point of this file is to recreate what
+-- Supabase already provides), but this shim previously omitted it. Without
+-- it, ANY policy predicate that references `auth.uid()` -- even indirectly,
+-- as an argument to a SECURITY DEFINER helper like
+-- internal.has_permission(auth.uid(), ...) -- raises "permission denied for
+-- schema auth" the moment a query under `set local role authenticated`
+-- actually evaluates a row against it, which most existing supabase/tests/
+-- *.sql fixtures never happened to exercise (either no matching rows, or the
+-- call site passes an already-known uuid instead of re-deriving it via
+-- auth.uid()) but which newer fixtures do. Matches the exact
+-- grant-usage-to-authenticated pattern rls-bootstrap-post.sql already uses
+-- for `public`/`storage` and 0042_internal_helpers.sql uses for `internal`.
+grant usage on schema auth to authenticated;
+
 -- CI-only storage schema shim: minimal `storage` schema that
 -- 0030_storage.sql expects to exist on a real Supabase project.
 -- Supabase manages this out of the box; we recreate just enough for

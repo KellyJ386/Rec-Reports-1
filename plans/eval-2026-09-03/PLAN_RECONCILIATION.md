@@ -12,6 +12,11 @@ are updated in place and each changed row is dated. Everything else below is sti
 `8d9b0d7`. Claim 3 in §4 ("WO-27 / OP-24 are not closed by a dedicated artifact") is resolved by that
 document; the `message_audiences.audience_ref_id` gap it mentions is closed by migrations 0047/0048.
 
+**Status update 2026-09-07 (Wave 2 open as PRs #19, #20, #21, #24):** nine more rows changed — IN-10, IN-12,
+SC-08, CM-09, CM-11 and OP-12 are DONE, IN-11 and CM-14 are PARTIAL (witness statements only; email but no
+SMS), and CM-07's evidence now names a real FCM adapter. Every M1 task is now DONE or owner-only. Rollups
+below are updated in place.
+
 **Method notes**
 
 - Local gate re-run during this evaluation: `npm test` → **1311/1311 pass**; `format:check`, `lint`,
@@ -91,9 +96,9 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 | IN-07 | Attachments + Storage integration | DONE | Delivered via shared `attachments-routes.mjs` (module=`incidents`) + `storage.mjs`; commit `9a025bb` | — |
 | IN-08 | Incident summary PDF | DONE | `GET /incidents/:id/export.pdf`, `src/lib/incident-pdf.mjs`; amendment watermark, draft watermark, `incident.exported` audit event; commit `4865502`; `test/incident-pdf.test.mjs` | — |
 | IN-09 | Server-generated incident numbers | DONE | `nextIncidentNo` in `incidents.mjs:304-`, retry-on-conflict in `incidents-routes.mjs:230-245` | — |
-| IN-10 | Capture form + detail UI | PARTIAL | `src/public/js/incident-form.mjs` + `app.js` wiring, severity-gated fields, escalate/ack buttons all present (commit `0188302`) — but the "People involved" section is explicitly a placeholder (`app.js:1676`, "IN-12 is unbuilt") since there's no people-CRUD route | People/witness section is a stub; depends on IN-12 |
-| IN-11 | Schema completion migration (witness statements, signatures, compliance checks) | NOT STARTED | No `incident_witness_statements`/`incident_signatures`/`incident_compliance_checks`/`incident_training_triggers` tables anywhere | Whole task |
-| IN-12 | People & witness statement routes | NOT STARTED | Confirmed unbuilt in code comment `app.js:1678` | Whole task |
+| IN-10 | Capture form + detail UI | DONE (2026-09-07) | Wave 2 (PR #21): the people section renders the real list, add-person form and statement history from the new IN-12 routes | — |
+| IN-11 | Schema completion migration (witness statements, signatures, compliance checks) | PARTIAL (2026-09-07) | Wave 2 (PR #21): migration 0050 adds `incident_witness_statements` (versioned, append-only, sign-once) with RLS and tests; signatures, compliance checks and training triggers are not built | Signatures, compliance checks, training triggers (Wave 3 IN-13+) |
+| IN-12 | People & witness statement routes | DONE (2026-09-07) | Wave 2 (PR #21): `src/lib/http/incidents-people-routes.mjs` — people list/add/update/remove, statements list/add/sign, audit events, 27 route tests, `supabase/tests/incident_people_statements.sql` | — |
 | IN-13 | Signatures route | NOT STARTED | Depends on IN-11 | Whole task |
 | IN-14 | OSHA recordability decision tree | NOT STARTED | `classifyOshaReview` in `incidents.mjs` is still the original stub (unchanged since plan baseline) | Whole task |
 | IN-15 | Compliance-check routes + evidence-completeness gate | NOT STARTED | No route | Whole task |
@@ -110,7 +115,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 
 **Spot-checks (IN):** IN-04 (traced amendment route → `buildAmendment`/hash → migration `0032` INSERT policy → `supabase/tests/incident_immutability.sql`), IN-08 (traced PDF route → `incident-pdf.mjs` → deterministic-render test), IN-09 (formatter + retry-on-unique-violation confirmed in route body).
 
-**IN rollup:** DONE 9, PARTIAL 2, NOT STARTED 14, OWNER-ONLY 0 (of 25). *(updated 2026-09-06: IN-24 partial)*
+**IN rollup:** DONE 11, PARTIAL 2, NOT STARTED 12, OWNER-ONLY 0 (of 25). *(updated 2026-09-07: IN-10, IN-12 done; IN-11 partial; 2026-09-06: IN-24 partial)*
 
 ---
 
@@ -163,7 +168,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 | SC-05 | Assignment routes (assign/unassign, overlap 409) | DONE | `POST`/`PATCH` `/shifts/:shiftId/assignments`, reuses `shiftsOverlap`; commit `8578fff` | — |
 | SC-06 | Fix validate route (settings-aware, period-scoped) | DONE | `POST /schedule/validate` reads live config + `roleRequirements`; commit `1ce1510` | — |
 | SC-07 | Publish flow | DONE | `POST /schedule-periods/:id/publish`, new `schedule.publish` code (migration `0034_scheduling_publish.sql`), `buildChangeSummary`, override-reason path; commit `306c0a7` | — |
-| SC-08 | Weekly schedule board UI | PARTIAL | `src/public/js/schedule-board.mjs` + `app.js` deliver week grid, assign/unassign, generate/validate/publish, conflict/cert badges (commit `0188302`) — but there is **no `GET` for `shift_assignments`**, so the board only reflects assignments changed in the current browser session, not the true persisted state on load (documented in `app.js:1297`) | Missing read endpoint for persisted assignments |
+| SC-08 | Weekly schedule board UI | DONE (2026-09-07) | Wave 2 (PR #21): `GET /facilities/:id/shift-assignments?period_id=|shift_id=` under `schedule.read`; the board seeds `assignmentsByShiftId` from the server on load | — |
 | SC-09 | Facility employees listing route | DONE | `GET /facilities/:id/employees` — `scheduling-routes.mjs:655-` | — |
 | SC-10 | Migration for swaps/time-off/claims/availability | NOT STARTED | No `open_shift_claims`/`shift_swap_requests`/`time_off_requests`/`employee_availability` tables | Whole task |
 | SC-11 | Open-shift claim lifecycle | NOT STARTED | Depends on SC-10 | Whole task |
@@ -183,7 +188,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 
 **Spot-checks (SC):** SC-03 (traced `expandTemplates`/DST fix and its minute-sweep test), SC-07 (traced publish route → migration `0034` INSERT policy on `schedule_publications` → RLS test), SC-08 (confirmed the documented assignment-read gap directly in `app.js`).
 
-**SC rollup:** DONE 8, PARTIAL 1, NOT STARTED 15, OWNER-ONLY 0 (of 24).
+**SC rollup:** DONE 9, PARTIAL 0, NOT STARTED 15, OWNER-ONLY 0 (of 24). *(updated 2026-09-07: SC-08 done)*
 
 ---
 
@@ -197,14 +202,14 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 | CM-04 | `communication_channels` CRUD routes | DONE | `GET/POST /facilities/:id/channels` — `communications-routes.mjs:401-` | — |
 | CM-05 | Receipts routes (delivered/read marking) | DONE | `POST /messages/:id/receipt` upsert — `communications-routes.mjs:463-` | — |
 | CM-06 | Notification delivery worker (v1: in-app) | DONE | Delivered as the platform-wide worker, `src/lib/notifications/worker.mjs` (`claimDueJobs`, `processJob`), consumed by CM-03's publish enqueue; commits `5c8b272`, `3f75910` | — |
-| CM-07 | Push notification channel (device tokens + send) | DONE (adapter is a documented no-op) | Migration `0037_notification_preferences.sql`; `/me/device-tokens`, `/me/notification-preferences`; `src/lib/notifications/push.mjs` — but `push.mjs`'s `noopAdapter` is the *only* adapter shipped (no real APNS/FCM), by explicit design | Real provider integration (deliberately deferred, documented) |
+| CM-07 | Push notification channel (device tokens + send) | DONE (FCM adapter 2026-09-07) | Migration 0037, `/me/device-tokens`, `/me/notification-preferences`; Wave 2 (PR #20) adds `src/lib/notifications/fcm.mjs` (FCM HTTP v1, OAuth2 via service account) behind `PUSH_PROVIDER=fcm`; browser-side FCM token minting is a stub because the messaging SDK cannot load under the self-only CSP | Browser token minting; owner credentials (`FCM_SERVICE_ACCOUNT_JSON`, `FIREBASE_WEB_CONFIG_JSON`) |
 | CM-08 | UI: compose + channel/audience picker | DONE | `src/public/js/comms-compose.mjs` + `app.js`; commit `0188302` | — |
-| CM-09 | UI: read-receipt auto-marking + ack state | PARTIAL | Compose/read UI ships, but there is no `GET` for `message_acknowledgements`, so ack state shown in the UI is session-local, not the true persisted rollup (documented `comms-compose.mjs:77`, referencing unbuilt CM-11) | Persisted ack-state read path |
+| CM-09 | UI: read-receipt auto-marking + ack state | DONE (2026-09-07) | Wave 2 (PR #21): `GET .../messages/:id/acknowledgements|receipts` (`employeeId=me`), the panel seeds its acknowledged set from the server so ack state survives reload | — |
 | CM-10 | Required-ack escalation ladder | NOT STARTED | No `ack_state` transition sweep; no tier logic in `communications.mjs` beyond the M1 pure fns | Whole task |
-| CM-11 | Ack/read compliance reporting endpoint | NOT STARTED | Explicitly flagged unbuilt, `comms-compose.mjs:77` | Whole task |
+| CM-11 | Ack/read compliance reporting endpoint | DONE (2026-09-07) | Wave 2 (PR #21): `GET .../messages/:id/compliance` and `GET .../communications/compliance-summary?from&to`, computed by `summarizeAckCompliance` (tested); shift-window audiences are excluded, mirroring the publish path | — |
 | CM-12 | Shift-targeted messaging | NOT STARTED | `communications-routes.mjs:183` comment: "full current/next shift window computation is CM-12" — only a caller-supplied window is honored today | Whole task |
 | CM-13 | Emergency mode | NOT STARTED | No `emergency_alert_responses` table, no `/emergency-broadcast` route | Whole task |
-| CM-14 | SMS/email delivery channels | NOT STARTED | `communications.mjs:96` comment references CM-07/CM-14 adapters not existing yet; worker only ever marks `in_app`/`push` (no-op) sent | Whole task |
+| CM-14 | SMS/email delivery channels | PARTIAL (2026-09-07) | Wave 2 (PR #20): email via `src/lib/notifications/email.mjs` (Resend, one POST per recipient) consumed by the worker with `email_enabled` honoured; no SMS channel | SMS channel; owner credentials (`EMAIL_API_KEY`, `EMAIL_FROM`) |
 | CM-15 | Outbox retry/DLQ for jobs | DONE (superseded) | Delivered generically as part of the platform worker (OP-11: exponential backoff, `dead_letter` status) rather than as a CM-scoped task — same code serves both | — |
 | CM-16 | WebSocket/live counters | NOT STARTED | No realtime layer; explicitly a spike per the plan | Whole task |
 | CM-17 | Admin Comms Console | NOT STARTED | No admin-side comms template/emergency-launch UI | Whole task |
@@ -212,7 +217,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 
 **Spot-checks (CM):** CM-01 (migration `0025` read in full — self-insert/update policies with `fn_assert_same_facility`), CM-03 (traced publish route → `resolveMessageAudience` → job enqueue shape matching worker's `processJob` expectations), CM-07 (confirmed `push.mjs`'s adapter is genuinely a no-op, not a placeholder claim — this is accurately self-documented in the code, not a false "done").
 
-**CM rollup:** DONE 9 (CM-15 folded into the platform worker), PARTIAL 1, NOT STARTED 8 (of 18).
+**CM rollup:** DONE 11 (CM-15 folded into the platform worker), PARTIAL 1, NOT STARTED 6 (of 18). *(updated 2026-09-07: CM-09, CM-11 done; CM-14 partial)*
 
 ---
 
@@ -258,7 +263,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 | OP-09 | Email provider decision (Resend/Postmark/SES) | OWNER-ONLY | No `EMAIL_PROVIDER_API_KEY`/`EMAIL_FROM` anywhere in `.env.example` or `env.mjs`; grep for "resend"/"sendEmail" across the repo is empty; plan's own agent-assignment table lists this as owner-only ("signup/DNS") | Owner decision, then OP-12 |
 | OP-10 | Migration: delivery bookkeeping columns | DONE | `supabase/migrations/0029_delivery_bookkeeping.sql` (`last_error`, `next_attempt_at`, `dead_letter` status); commit `5c8b272` | — |
 | OP-11 | Worker core (claim/expand/deliver/retry/dead-letter) | DONE | `src/lib/notifications/worker.mjs`; `test/notifications-worker.test.mjs`; commit `5c8b272` | — |
-| OP-12 | Email channel adapter | NOT STARTED | No `src/lib/notifications/email.mjs`; depends on OP-09 | Whole task |
+| OP-12 | Email channel adapter | DONE (2026-09-07) | Wave 2 (PR #20): `src/lib/notifications/email.mjs` + `adapters.mjs` (`buildAdaptersFromEnv`), worker email path, test-send route `channel` | — |
 | OP-13 | Drain entry points (script + guarded route + cron) | DONE | `src/lib/http/internal-routes.mjs` (`CRON_SECRET`-guarded, 503 when unset, never open); `vercel.json` crons block; `scripts/notifications-worker.mjs`; commit `3f75910` | — |
 | OP-14 | Outbox drain (translate events → jobs) | DONE | `drainOutboxOnce` in `worker.mjs`; commit `3f75910` | — |
 | OP-15 | Storage bucket + policies migration | DONE | `supabase/migrations/0030_storage.sql`; SELECT-only `storage.objects` policy scoped to caller's facilities; commit `b845a7f` | — |
@@ -274,7 +279,7 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 
 **Spot-checks (OP):** OP-11/13/14 (`worker.mjs` read end-to-end: `claimDueJobs` optimistic-claim → `processJob` → `drainOnce`/`drainOutboxOnce`; `internal-routes.mjs` guard logic confirmed 503-when-unset), OP-15/16/17 (migration `0030` → `storage.mjs` → `attachments-routes.mjs`, full chain), OP-20 (`observability.mjs` read in full — AbortController+timeout, whitelist payload confirmed by description; not independently re-tested here but code matches commit's stated behavior and its own test file exists).
 
-**OP rollup:** DONE 17, PARTIAL 0, NOT STARTED 1 (OP-12), OWNER-ONLY 6 (OP-01, OP-02, OP-03, OP-06, OP-09, OP-22) (of 24). *(updated 2026-09-06: OP-05 and OP-24 done)*
+**OP rollup:** DONE 18, PARTIAL 0, NOT STARTED 0, OWNER-ONLY 6 (OP-01, OP-02, OP-03, OP-06, OP-09, OP-22) (of 24). *(updated 2026-09-07: OP-12 done; 2026-09-06: OP-05 and OP-24 done)*
 
 ---
 
@@ -283,13 +288,13 @@ document; the `message_audiences.audience_ref_id` gap it mentions is closed by m
 | Module | DONE | PARTIAL | NOT STARTED | OWNER-ONLY | Total |
 |---|---|---|---|---|---|
 | Daily Reports (DR) | 16 | 1 | 17 | 0 | 34 |
-| Incidents (IN) | 9 | 2 | 14 | 0 | 25 |
+| Incidents (IN) | 11 | 2 | 12 | 0 | 25 |
 | Work Orders (WO) | 12 | 0 | 15 | 0 | 27 |
-| Scheduling (SC) | 8 | 1 | 15 | 0 | 24 |
-| Communications (CM) | 9 | 1 | 8 | 0 | 18 |
+| Scheduling (SC) | 9 | 0 | 15 | 0 | 24 |
+| Communications (CM) | 11 | 1 | 6 | 0 | 18 |
 | Training (TR) | 6 | 0 | 10 | 0 | 16 |
-| Platform/Ops (OP) | 17 | 0 | 1 | 6 | 24 |
-| **Total** | **77** | **5** | **80** | **6** | **168** |
+| Platform/Ops (OP) | 18 | 0 | 0 | 6 | 24 |
+| **Total** | **83** | **4** | **75** | **6** | **168** |
 
 ### By plan milestone (M1/M2/M3, per each module's own plan phasing)
 
@@ -298,13 +303,14 @@ Each module plan phases its own tasks M1/M2/M3; OP's P1/P2/P3 are treated as the
 
 | Milestone | Planned | Done | Partial | Not started | Owner-only |
 |---|---|---|---|---|---|
-| M1 (MVP) | 67 | 60 | 3 | 0 | 4 |
-| M2 (design-complete) | 62 | 9 | 1 | 51 | 1 |
-| M3 (polish) | 39 | 8 | 1 | 29 | 1 |
-| **Total** | **168** | **77** | **5** | **80** | **6** |
+| M1 (MVP) | 67 | 63 | 0 | 0 | 4 |
+| M2 (design-complete) | 62 | 11 | 2 | 48 | 1 |
+| M3 (polish) | 39 | 9 | 2 | 27 | 1 |
+| **Total** | **168** | **83** | **4** | **75** | **6** |
 
-**Headline: essentially all of M1 (MVP) is built and working — 60 of 67 fully (OP-05 closed by Wave 1's
-migration 0042 on 2026-09-06), 3 with a real but narrow gap, 4 pure dashboard actions (OP-01/02/03/06).
+**Headline: all of M1 (MVP) is built and working — 63 of 67 fully (OP-05 closed by Wave 1's migration
+0042 on 2026-09-06; IN-10, SC-08 and CM-09 closed by Wave 2 on 2026-09-07); the remaining 4 are pure
+dashboard actions (OP-01/02/03/06).
 M2 is *not* uniformly untouched, contrary to a surface read of the wave commits: because the platform
 workstream front-loaded its storage and notification-worker primitives (both nominally OP "P2"/M2-phase
 work) ahead of schedule to unblock every module's M1 slice, 9 of M2's 62 tasks are done — all of them

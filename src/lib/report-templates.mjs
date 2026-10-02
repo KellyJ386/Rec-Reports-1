@@ -13,6 +13,7 @@
 import { validateReportTemplateSchema } from "./report-schema.mjs";
 
 const SNAKE_CASE_RE = /^[a-z][a-z0-9_]*$/;
+const MAX_CHANGE_SUMMARY_LENGTH = 500;
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
@@ -101,4 +102,38 @@ export function buildTemplatePublish(template, version) {
       patch: { active_version: version.version_number, status: "published" }
     }
   };
+}
+
+// DR-26: sandbox is a caller-facing flag on report_templates (0055) that
+// suppresses distribution/workflow side effects at submit time for reports
+// filed against it -- useful for a template still being piloted/tested
+// without notifying real recipients or minting real incidents/work orders.
+// This is the single, small, exported gate a future workflow/outbox builder
+// calls at the submit route's side-effect call site
+// (`if (!isSandboxTemplate(template)) { ...enqueue/evaluate... }`); no such
+// call site exists yet in this tree (DR-20's workflow execution and
+// DR-21/DR-22's distribution/outbox writers are separate, not-yet-landed
+// tasks), so nothing in this codebase calls it yet either -- it exists now
+// so that builder does not have to invent its own ad hoc `template.sandbox`
+// check, and so every future call site agrees on the same definition
+// (`=== true`, never a truthy check -- sandbox defaults to `false`, not
+// `null`/`undefined`, per the 0055 column default, but a defensive strict
+// check costs nothing and protects against a hand-built row that skipped
+// the column default, e.g. in a test fixture).
+export function isSandboxTemplate(template) {
+  return template?.sandbox === true;
+}
+
+// DR-26: required on every template-publish request (direct publish or a
+// governance change request alike) -- a short, human-written note on WHY
+// this version is going live. Same { valid, errors[] } shape as every other
+// validator in this module.
+export function validateChangeSummary(value) {
+  if (!isNonEmptyString(value)) {
+    return { valid: false, errors: ["changeSummary is required"] };
+  }
+  if (value.length > MAX_CHANGE_SUMMARY_LENGTH) {
+    return { valid: false, errors: [`changeSummary must be ${MAX_CHANGE_SUMMARY_LENGTH} characters or fewer`] };
+  }
+  return { valid: true, errors: [] };
 }

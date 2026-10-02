@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { pgSelect, pgInsert } from "../supabase-rest.mjs";
 import { makeGuards } from "./guard.mjs";
+import { findFieldByKey } from "../report-schema.mjs";
 import {
   createStorageClientFromEnv,
   buildAttachmentPath,
@@ -116,6 +117,29 @@ const MODULES = {
     // leaves draft (submitted/locked/revised are immutable, same as the
     // PATCH /reports/:id edit gate in reports-routes.mjs).
     enforceDraftOnUpload: true,
+    // DR-16: template_version_id is needed to resolve the target field's
+    // photo_constraints (resolvePhotoConstraints below) -- reports is the
+    // only module with a per-field constraint concept, so this is the only
+    // config carrying a select override; every other module keeps
+    // loadParent's default "id,facility_id,status".
+    parentSelect: "id,facility_id,status,template_version_id",
+    // Resolves the photo_constraints (maxCount/maxBytes/mimeTypes) declared
+    // on the pinned version's schema for whichever field_key an upload
+    // targets, or null when the field isn't a photo field / carries none.
+    // Only ever consulted for the reports module (every other config leaves
+    // this undefined, see the POST handler below).
+    async resolvePhotoConstraints(client, parent, fieldKey) {
+      if (!parent.template_version_id) return null;
+      const versionRows = await pgSelect(client, "report_template_versions", {
+        filters: { id: parent.template_version_id },
+        select: "schema_json",
+        limit: 1
+      });
+      const schema = versionRows?.[0]?.schema_json;
+      const field = findFieldByKey(schema, fieldKey);
+      if (!field || field.type !== "photo") return null;
+      return field.photo_constraints ?? null;
+    },
     buildAttachmentRow({ parent, path, contentType, checksum, fieldKey }) {
       return {
         facility_id: parent.facility_id,
@@ -211,7 +235,7 @@ export function registerAttachmentRoutes(router, deps) {
   async function loadParent(client, config, id) {
     const rows = await pgSelect(client, config.parentTable, {
       filters: { id },
-      select: "id,facility_id,status",
+      select: config.parentSelect ?? "id,facility_id,status",
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
@@ -280,6 +304,39 @@ export function registerAttachmentRoutes(router, deps) {
           return sendJson(response, 409, { error: `attachments can only be added to a draft ${config.parentLabel}` });
         }
 
+        // DR-16: a photo field's photo_constraints (maxCount/maxBytes/
+        // mimeTypes), read off the pinned schema for this upload's
+        // field_key. Only reports declares resolvePhotoConstraints; every
+        // other module's config leaves this undefined and photoConstraints
+        // stays null, a no-op below. mimeTypes and maxCount are checked
+        // here (before the body is read -- neither needs it); maxBytes is
+        // checked once the body is actually in hand, below.
+        const fieldKey = request.headers["x-field-key"] || "attachment";
+        let photoConstraints = null;
+        if (config.resolvePhotoConstraints) {
+          photoConstraints = await config.resolvePhotoConstraints(auth.client, parent, fieldKey);
+          if (photoConstraints) {
+            if (Array.isArray(photoConstraints.mimeTypes) && photoConstraints.mimeTypes.length > 0) {
+              try {
+                assertMimeAllowed(request.headers["content-type"], photoConstraints.mimeTypes);
+              } catch (error) {
+                return sendJson(response, storageErrorStatus(error), { error: error.message, code: error.code });
+              }
+            }
+            if (Number.isInteger(photoConstraints.maxCount) && photoConstraints.maxCount > 0) {
+              const existing = await pgSelect(auth.client, config.attachmentTable, {
+                filters: { [config.attachmentParentColumn]: parent.id, field_key: fieldKey },
+                select: "id"
+              });
+              if ((existing ?? []).length >= photoConstraints.maxCount) {
+                return sendJson(response, 409, {
+                  error: `field "${fieldKey}" already has the maximum of ${photoConstraints.maxCount} photo(s)`
+                });
+              }
+            }
+          }
+        }
+
         let bodyBuffer;
         try {
           bodyBuffer = await readRawBody(request, DEFAULT_MAX_UPLOAD_BYTES);
@@ -290,6 +347,9 @@ export function registerAttachmentRoutes(router, deps) {
 
         try {
           assertWithinSizeCap(bodyBuffer.length);
+          if (Number.isInteger(photoConstraints?.maxBytes) && photoConstraints.maxBytes > 0) {
+            assertWithinSizeCap(bodyBuffer.length, photoConstraints.maxBytes);
+          }
         } catch (error) {
           return sendJson(response, storageErrorStatus(error), { error: error.message, code: error.code });
         }
@@ -319,7 +379,7 @@ export function registerAttachmentRoutes(router, deps) {
           contentType,
           checksum,
           auth,
-          fieldKey: request.headers["x-field-key"]
+          fieldKey
         });
         const rows = await pgInsert(auth.client, config.attachmentTable, [row], { returning: true });
         return sendJson(response, 201, (rows ?? [])[0] ?? null);

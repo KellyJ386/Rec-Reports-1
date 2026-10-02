@@ -155,6 +155,16 @@ export const settingsRegistry = Object.freeze(
       permission: "admin.manage",
       entitlement: "notification_routing"
     },
+    {
+      key: "daily_reports.templatePublishRequiresApproval",
+      module: "daily_reports",
+      label: "Require approval before publishing a report template version",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: false, // DR-26: {} reproduces today's single-actor publish behavior
+      validation: {},
+      permission: "admin.manage"
+    },
 
     // --- Communications (module code: communications) ----------------------
     {

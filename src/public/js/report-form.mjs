@@ -52,6 +52,12 @@ export function fieldDescriptors(schemaJson) {
         required: !!field?.required,
         options: Array.isArray(field?.options) ? [...field.options] : undefined,
         helpText: field?.helpText ?? field?.help_text ?? undefined,
+        // DR-16: counter's optional step and rating's required scale, passed
+        // through so the runtime <input> can carry the matching min/max/step
+        // attributes (buildFieldInput, app.js) instead of rendering a bare
+        // unconstrained number box.
+        step: typeof field?.step === "number" ? field.step : undefined,
+        scale: typeof field?.scale === "number" ? field.scale : undefined,
         sectionIndex,
         sectionTitle: section?.title,
         fieldIndex,
@@ -83,7 +89,11 @@ function isEmpty(value) {
 function coerceFieldValue(descriptor, raw) {
   if (raw === undefined || raw === null) return raw;
   switch (descriptor.type) {
-    case "number": {
+    // counter/rating are both whole-number types answered through the same
+    // <input type="number">-shaped control as "number" -- same coercion.
+    case "number":
+    case "counter":
+    case "rating": {
       if (typeof raw === "number") return raw;
       const trimmed = String(raw).trim();
       if (trimmed === "") return "";
