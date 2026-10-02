@@ -11,7 +11,8 @@ import {
   evaluateVisibility,
   hiddenFieldKeys,
   findFieldByKey,
-  supportedFieldTypes
+  supportedFieldTypes,
+  extractDefects
 } from "../src/lib/report-schema.mjs";
 
 const openingChecklist = {
@@ -29,6 +30,32 @@ const openingChecklist = {
 test("report template schemas require valid sections and fields", () => {
   assert.deepEqual(validateReportTemplateSchema(openingChecklist), []);
   assert.match(validateReportTemplateSchema({ sections: [] })[0], /at least one section/);
+});
+
+// L-1 (security review, wave3-slice-3c): a bare-integer field key (e.g. "0")
+// would otherwise collide with actionEventType's default `${type}:${index}`
+// composition once report-workflow.mjs namespaces a defect's own eventType
+// -- rejected here, at template-authoring time, on top of (not instead of)
+// that namespacing fix.
+test("report template schemas reject a field key that does not start with a lowercase letter", () => {
+  const schema = {
+    sections: [{ title: "Section", fields: [{ key: "0", label: "Numeric key", type: "text" }] }]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /\.key must match/);
+});
+
+test("report template schemas reject a field key with an uppercase letter, hyphen, or leading underscore", () => {
+  for (const key of ["Gate", "gate-broken", "_gate"]) {
+    const schema = { sections: [{ title: "Section", fields: [{ key, label: "Field", type: "text" }] }] };
+    assert.match(validateReportTemplateSchema(schema)[0], /\.key must match/, `expected "${key}" to be rejected`);
+  }
+});
+
+test("report template schemas accept every real field-key shape already in use (single letters, snake_case)", () => {
+  for (const key of ["a", "n", "gate_broken", "pool_ready", "chemical_level"]) {
+    const schema = { sections: [{ title: "Section", fields: [{ key, label: "Field", type: "text" }] }] };
+    assert.deepEqual(validateReportTemplateSchema(schema), [], `expected "${key}" to be accepted`);
+  }
 });
 
 test("report submission validation enforces required answers and field types", () => {
@@ -791,4 +818,216 @@ test("validateSignatureRequirements rejects an unknown permission code and an un
   );
   assert.equal(normalizeSignatureRoleRequirement(42), null);
   assert.equal(normalizeSignatureRoleRequirement({ role: "supervisor", extra: true }), null);
+});
+
+// --- WO-21: the isDefect / defectWhen field convention ----------------------
+
+test("a checkbox field may declare isDefect without defectWhen (defaults to true)", () => {
+  const schema = {
+    sections: [
+      { title: "Checks", fields: [{ key: "pool_gate_broken", label: "Gate broken", type: "checkbox", isDefect: true }] }
+    ]
+  };
+  assert.deepEqual(validateReportTemplateSchema(schema), []);
+});
+
+test("a checkbox field may declare an explicit boolean defectWhen", () => {
+  const schema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [{ key: "gate_secure", label: "Gate secure", type: "checkbox", isDefect: true, defectWhen: false }]
+      }
+    ]
+  };
+  assert.deepEqual(validateReportTemplateSchema(schema), []);
+});
+
+test("a checkbox field rejects a non-boolean defectWhen", () => {
+  const schema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [{ key: "gate_secure", label: "Gate secure", type: "checkbox", isDefect: true, defectWhen: "nope" }]
+      }
+    ]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /defectWhen must be a boolean/);
+});
+
+test("a select field requires defectWhen when isDefect is true", () => {
+  const schema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [
+          { key: "chemical_level", label: "Chemical level", type: "select", isDefect: true, options: ["ok", "low", "critical"] }
+        ]
+      }
+    ]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /defectWhen is required/);
+});
+
+test("a select field's defectWhen must be one of its own options", () => {
+  const schema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [
+          {
+            key: "chemical_level",
+            label: "Chemical level",
+            type: "select",
+            isDefect: true,
+            defectWhen: "explosive",
+            options: ["ok", "low", "critical"]
+          }
+        ]
+      }
+    ]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /must be one of the field's own options/);
+});
+
+test("a select field with a valid defectWhen passes validation", () => {
+  const schema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [
+          {
+            key: "chemical_level",
+            label: "Chemical level",
+            type: "select",
+            isDefect: true,
+            defectWhen: "critical",
+            options: ["ok", "low", "critical"]
+          }
+        ]
+      }
+    ]
+  };
+  assert.deepEqual(validateReportTemplateSchema(schema), []);
+});
+
+test("isDefect is rejected on any field type other than checkbox/select", () => {
+  const schema = {
+    sections: [{ title: "Checks", fields: [{ key: "notes", label: "Notes", type: "textarea", isDefect: true }] }]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /only valid on checkbox or select fields/);
+});
+
+test("isDefect must be a boolean when present", () => {
+  const schema = {
+    sections: [{ title: "Checks", fields: [{ key: "gate", label: "Gate", type: "checkbox", isDefect: "yes" }] }]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /isDefect must be a boolean/);
+});
+
+test("defectWhen without isDefect:true is rejected", () => {
+  const schema = {
+    sections: [{ title: "Checks", fields: [{ key: "gate", label: "Gate", type: "checkbox", defectWhen: true }] }]
+  };
+  assert.match(validateReportTemplateSchema(schema)[0], /defectWhen is only valid when isDefect is true/);
+});
+
+// --- WO-21: extractDefects ---------------------------------------------
+
+const poolChecklist = {
+  sections: [
+    {
+      title: "Pool checks",
+      fields: [
+        { key: "gate_broken", label: "Gate broken", type: "checkbox", isDefect: true },
+        {
+          key: "chemical_level",
+          label: "Chemical level",
+          type: "select",
+          isDefect: true,
+          defectWhen: "critical",
+          options: ["ok", "low", "critical"]
+        },
+        { key: "attendance", label: "Attendance", type: "number" },
+        {
+          key: "filter_note",
+          label: "Filter note",
+          type: "textarea",
+          visibility_rules: [{ field: "gate_broken", op: "eq", value: true }]
+        }
+      ]
+    }
+  ]
+};
+
+test("extractDefects returns [] when nothing fires", () => {
+  const submission = { payload: { gate_broken: false, chemical_level: "ok", attendance: 40 } };
+  assert.deepEqual(extractDefects(submission, { schema_json: poolChecklist }), []);
+});
+
+test("extractDefects fires a checkbox defect and a select defect independently", () => {
+  const submission = { payload: { gate_broken: true, chemical_level: "critical", attendance: 40 } };
+  const defects = extractDefects(submission, { schema_json: poolChecklist });
+  assert.equal(defects.length, 2);
+  assert.deepEqual(defects[0], {
+    fieldKey: "gate_broken",
+    label: "Gate broken",
+    value: true,
+    summary: "Gate broken flagged as a defect"
+  });
+  assert.deepEqual(defects[1], {
+    fieldKey: "chemical_level",
+    label: "Chemical level",
+    value: "critical",
+    summary: "Chemical level: critical"
+  });
+});
+
+test("extractDefects ignores a select answer that isn't the declared defectWhen value", () => {
+  const submission = { payload: { gate_broken: false, chemical_level: "low", attendance: 40 } };
+  assert.deepEqual(extractDefects(submission, { schema_json: poolChecklist }), []);
+});
+
+test("extractDefects never fires for a field with no answer at all", () => {
+  const submission = { payload: { attendance: 40 } };
+  assert.deepEqual(extractDefects(submission, { schema_json: poolChecklist }), []);
+});
+
+test("extractDefects skips a defect field currently hidden by its own visibility_rules", () => {
+  const hiddenDefectSchema = {
+    sections: [
+      {
+        title: "Checks",
+        fields: [
+          { key: "toggle", label: "Toggle", type: "checkbox" },
+          {
+            key: "secondary_defect",
+            label: "Secondary defect",
+            type: "checkbox",
+            isDefect: true,
+            visibility_rules: [{ field: "toggle", op: "eq", value: true }]
+          }
+        ]
+      }
+    ]
+  };
+  const submission = { payload: { toggle: false, secondary_defect: true } };
+  assert.deepEqual(extractDefects(submission, { schema_json: hiddenDefectSchema }), []);
+});
+
+test("extractDefects accepts a version.schema fallback and an empty submission gracefully", () => {
+  assert.deepEqual(extractDefects({}, { schema: poolChecklist }), []);
+  assert.deepEqual(extractDefects(undefined, undefined), []);
+  assert.deepEqual(extractDefects({ payload: {} }, {}), []);
+});
+
+test("extractDefects preserves schema field order across sections", () => {
+  const multiSection = {
+    sections: [
+      { title: "A", fields: [{ key: "a", label: "A", type: "checkbox", isDefect: true }] },
+      { title: "B", fields: [{ key: "b", label: "B", type: "checkbox", isDefect: true }] }
+    ]
+  };
+  const defects = extractDefects({ payload: { a: true, b: true } }, { schema_json: multiSection });
+  assert.deepEqual(defects.map((d) => d.fieldKey), ["a", "b"]);
 });

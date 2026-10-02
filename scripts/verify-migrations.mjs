@@ -90,7 +90,9 @@ const requiredRlsTables = [
   "report_workflow_events",
   "report_distribution_lists",
   "report_deliveries",
-  "incident_training_triggers"
+  "incident_training_triggers",
+  "pm_plans",
+  "pm_plan_occurrences"
 ];
 
 for (const table of requiredRlsTables) {
