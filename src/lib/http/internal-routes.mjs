@@ -35,6 +35,7 @@ import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { processReportPdfJobs } from "../report-pdf-worker.mjs";
 import { scanWorkOrderSla } from "../work-order-sla-scan.mjs";
+import { sweepAckEscalations } from "../comms-escalation-sweep.mjs";
 import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
@@ -214,6 +215,13 @@ async function handleDrain(request, response, { env }, sendJson) {
   // generatePmWorkOrders already issues. Revisit by threading a
   // makeConfigLoader(client) through if/when that's needed.
   const pmGeneration = await generatePmWorkOrders(client, { now, limit, config: {} });
+  // CM-10: required-acknowledgement escalation ladder, same cadence and
+  // service-role client as every pass above. Like scanWorkOrderSla, every
+  // per-candidate failure is caught inside the sweep (claim reverted,
+  // recorded in the summary's `errors`), so it can't turn a healthy drain
+  // into a 500. Per-facility ladder settings are resolved inside the sweep
+  // (communications.ack* keys), unlike the global-defaults passes above.
+  const commsEscalation = await sweepAckEscalations(client, { now, limit });
 
   sendJson(response, 200, {
     ...summary,
@@ -223,7 +231,8 @@ async function handleDrain(request, response, { env }, sendJson) {
     authThrottleSwept: authThrottleSwept.deleted,
     incidentSla,
     workOrderSla,
-    pmGeneration
+    pmGeneration,
+    commsEscalation
   });
 }
 

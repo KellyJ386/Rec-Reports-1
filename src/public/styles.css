@@ -206,6 +206,33 @@ select { border: 1px solid var(--rr-border-strong); border-radius: 10px; padding
 .home-tile-hint { font-size: 0.85em; color: var(--rr-text-muted); }
 .home-tile-value.is-unavailable { color: var(--rr-text-faint); font-size: 1.1em; }
 
+/* CM-16: polled inbox status line + CM-13 emergency banner on the home
+   dashboard. The banner uses the existing danger tokens (already
+   contrast-checked); its buttons inherit the shared 44px tap-target rule. */
+.home-inbox { display: grid; gap: 8px; }
+.emergency-banner {
+  background: var(--rr-danger-bg);
+  border: 2px solid var(--rr-danger);
+  border-radius: 12px;
+  color: var(--rr-danger-text);
+  padding: 16px;
+}
+.emergency-banner[hidden] { display: none; }
+.emergency-banner p { margin: 8px 0 0; }
+button.emergency-help-btn { background: var(--rr-danger); border-color: var(--rr-danger); color: #ffffff; }
+.emergency-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.emergency-rollup { display: grid; gap: 4px; margin-top: 8px; }
+.emergency-approvals {
+  display: grid;
+  gap: 8px;
+  background: var(--rr-danger-bg);
+  border: 1px solid var(--rr-danger-border);
+  border-radius: 12px;
+  color: var(--rr-danger-text);
+  padding: 12px 16px;
+}
+.emergency-approval-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+
 .panel {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);

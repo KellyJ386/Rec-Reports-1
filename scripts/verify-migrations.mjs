@@ -92,7 +92,10 @@ const requiredRlsTables = [
   "report_deliveries",
   "incident_training_triggers",
   "pm_plans",
-  "pm_plan_occurrences"
+  "pm_plan_occurrences",
+  "message_escalation_events",
+  "emergency_alert_launches",
+  "emergency_alert_responses"
 ];
 
 for (const table of requiredRlsTables) {
@@ -129,7 +132,12 @@ for (const helper of [
   "internal.mint_workflow_work_order",
   "public.mint_workflow_work_order",
   "internal.create_work_order_from_incident",
-  "public.create_work_order_from_incident"
+  "public.create_work_order_from_incident",
+  "fn_notification_job_dedupe_key",
+  "fn_messages_guard_ack_escalation",
+  "fn_messages_guard_emergency_publish",
+  "fn_emergency_alert_launch_guard",
+  "fn_emergency_alert_response_guard"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

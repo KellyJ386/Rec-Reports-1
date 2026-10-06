@@ -631,9 +631,9 @@ test("POST .../messages/:id/publish resolves a role audience via memberships joi
   assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-1"]);
 });
 
-test("POST .../messages/:id/publish reports shift audiences unresolved when no shiftWindow is supplied", async (t) => {
+test("POST .../messages/:id/publish reports a ref-less shift audience unresolved when it has no window of any kind", async (t) => {
   const audiences = [
-    { id: "aud-1", message_id: "msg-draft", audience_type: "shift", audience_ref_id: "shift-1" },
+    { id: "aud-1", message_id: "msg-draft", audience_type: "shift", audience_ref_id: null, rule_jsonb: {} },
     { id: "aud-2", message_id: "msg-draft", audience_type: "employee", audience_ref_id: "emp-5" }
   ];
   const captured = stubFetch(t, (table, method) => {
@@ -649,12 +649,32 @@ test("POST .../messages/:id/publish reports shift audiences unresolved when no s
   assert.equal(result.payload.recipientCount, 1);
   assert.equal(result.payload.unresolvedAudiences.length, 1);
   assert.equal(result.payload.unresolvedAudiences[0].audienceType, "shift");
-  assert.equal(result.payload.unresolvedAudiences[0].audienceRefId, "shift-1");
-  // No shift_assignments query should have been issued without a shiftWindow.
-  assert.ok(!captured.some((c) => c.table === "shift_assignments"));
+  assert.equal(result.payload.unresolvedAudiences[0].audienceRefId, null);
+  // Nothing to resolve a window against: no shift or assignment query is issued.
+  assert.ok(!captured.some((c) => c.table === "shift_assignments" || c.table === "schedule_shifts"));
 
   const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
   assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-5"]);
+});
+
+test("POST .../messages/:id/publish resolves a specific-shift audience from its assignments without any window (CM-12)", async (t) => {
+  const audiences = [{ id: "aud-1", message_id: "msg-draft", audience_type: "shift", audience_ref_id: "shift-1" }];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [DRAFT_MESSAGE];
+    if (table === "messages" && method === "PATCH") return [DRAFT_MESSAGE];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "shift_assignments" && method === "GET") return [{ shift_id: "shift-1", employee_id: "emp-9" }];
+    if (table === "notification_jobs" && method === "POST") return [{ id: "job-1" }];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/messages/msg-draft/publish", {});
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.unresolvedAudiences, []);
+  const assignmentQuery = captured.find((c) => c.table === "shift_assignments");
+  assert.equal(assignmentQuery.url.searchParams.get("shift_id"), "in.(shift-1)");
+  const jobInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-9"]);
 });
 
 test("POST .../messages/:id/publish resolves shift audiences against shift_assignments when shiftWindow is supplied", async (t) => {

@@ -26,6 +26,7 @@ import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs"
 import { registerPmPlanRoutes } from "../src/lib/http/pm-plans-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
+import { registerCommunicationsEscalationRoutes } from "../src/lib/http/communications-escalation-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerSearchRoutes } from "../src/lib/http/search-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
@@ -336,6 +337,8 @@ registerPmPlanRoutes(userRouter, { authenticate, sendJson, readBody });
 registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 // Communications: messages + acknowledgements (communications.read / .publish).
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
+// Communications emergency mode (CM-13) + polled inbox summary (CM-16).
+registerCommunicationsEscalationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
 // Global search (P-8): GET /api/v1/search?facilityId=&q= fans out over

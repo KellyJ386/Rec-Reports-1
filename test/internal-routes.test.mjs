@@ -527,3 +527,58 @@ test("drain: generates a due PM work order and folds the summary into the respon
   assert.equal(result.payload.pmGeneration.created, 1);
   assert.deepEqual(result.payload.pmGeneration.errors, []);
 });
+
+// ---------------------------------------------------------------------------
+// CM-10: the drain also runs the required-acknowledgement escalation sweep and
+// folds its summary into the response under `commsEscalation`.
+// ---------------------------------------------------------------------------
+test("drain: escalates an overdue required-ack message and folds the summary into the response as commsEscalation", async (t) => {
+  const original = globalThis.fetch;
+  const overdue = {
+    id: "msg-1",
+    facility_id: "fac-1",
+    channel_id: "ch-1",
+    subject: "Safety SOP",
+    priority: "normal",
+    is_required_ack: true,
+    // Far in the past so the reminder tier is due at any real run time (the
+    // drain route always uses the real clock).
+    ack_due_at: "2020-01-01T00:00:00Z",
+    published_at: "2019-12-25T00:00:00Z",
+    ack_escalation_level: 0,
+    ack_escalated_at: null
+  };
+  const writes = [];
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    if (method !== "GET") writes.push({ table, method, body: init.body ? JSON.parse(init.body) : null });
+    const respond = {
+      messages: method === "GET" ? [overdue] : [{ ...overdue, ack_escalation_level: 1 }],
+      message_audiences: [{ id: "a1", message_id: "msg-1", facility_id: "fac-1", audience_type: "employee", audience_ref_id: "emp-1" }],
+      message_acknowledgements: [],
+      notification_jobs: method === "POST" ? [{ id: "job-1" }] : [],
+      message_escalation_events: method === "POST" ? [{ id: "ev-1" }] : []
+    }[table];
+    return { ok: true, status: 200, text: async () => JSON.stringify(respond ?? []) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.commsEscalation.scanned, 1);
+  assert.equal(result.payload.commsEscalation.escalated, 1);
+  assert.equal(result.payload.commsEscalation.jobsEnqueued, 1);
+  assert.deepEqual(result.payload.commsEscalation.errors, []);
+  const job = writes.find((write) => write.table === "notification_jobs" && write.method === "POST");
+  assert.equal(job.body[0].event_type, "message.ack_overdue");
+  assert.deepEqual(job.body[0].payload_jsonb.recipients, ["emp-1"]);
+});

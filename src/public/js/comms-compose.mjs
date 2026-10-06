@@ -38,11 +38,23 @@ export function buildComposePayload(fields = {}) {
   return payload;
 }
 
-// A row needs a type AND a target to be a real targeting rule; an
-// all-blank row is just the picker's default empty state, not an error, so
-// it's silently excluded rather than flagged.
+// CM-12: a `shift` audience row targets either one specific shift (the id the
+// row's target field holds, shiftMode "id" -- the default) or a window of
+// shifts resolved by the server when the message is published: "current"
+// (shifts in progress now) or "next" (the next shift to start). Window rows
+// need no target id.
+export const SHIFT_AUDIENCE_MODES = ["id", "current", "next"];
+
+function shiftWindowMode(row) {
+  return row && row.audienceType === "shift" && (row.shiftMode === "current" || row.shiftMode === "next") ? row.shiftMode : null;
+}
+
+// A row needs a type AND a target to be a real targeting rule (a shift-window
+// row's "target" is the window itself); an all-blank row is just the picker's
+// default empty state, not an error, so it's silently excluded rather than
+// flagged.
 function isCompleteAudienceRow(row) {
-  return !!row && !!row.audienceType && !!row.audienceRefId;
+  return !!row && !!row.audienceType && (!!row.audienceRefId || shiftWindowMode(row) !== null);
 }
 
 function isTouchedAudienceRow(row) {
@@ -67,11 +79,28 @@ export function validateAudienceRows(rows = []) {
 // Turns the audience picker's row state into the bulk array
 // POST /messages/:id/audiences expects. Incomplete rows are dropped rather
 // than sent -- call validateAudienceRows first to surface that as a form
-// error instead of silently publishing to fewer audiences than intended.
+// error instead of silently publishing to fewer audiences than intended. A
+// shift-window row is sent without a target id and with the window in `rule`.
 export function buildAudiencePayload(rows = []) {
   return (rows || [])
     .filter((row) => isCompleteAudienceRow(row) && AUDIENCE_TYPES.includes(row.audienceType))
-    .map((row) => ({ audienceType: row.audienceType, audienceRefId: row.audienceRefId }));
+    .map((row) => {
+      const window = shiftWindowMode(row);
+      if (window) return { audienceType: "shift", rule: { window } };
+      return { audienceType: row.audienceType, audienceRefId: row.audienceRefId };
+    });
+}
+
+// CM-13: priority "emergency" never goes through the ordinary publish flow --
+// the compose form switches to the launch-request flow for it.
+export function isEmergencyCompose(fields = {}) {
+  return fields.priority === "emergency";
+}
+
+// Whether a message card should offer the employee "I am safe" / "I need help":
+// a published emergency message the viewer has not answered yet.
+export function canRespondToEmergency(message, myResponse = null) {
+  return !!message && message.priority === "emergency" && !!message.published_at && !myResponse;
 }
 
 // Per-viewer ack-state badge. Answers "has the CURRENT user acknowledged

@@ -8,7 +8,10 @@ import {
   deriveAckState,
   ackedMessageIdsFromRows,
   shouldFetchCompliance,
-  formatComplianceSummary
+  formatComplianceSummary,
+  SHIFT_AUDIENCE_MODES,
+  isEmergencyCompose,
+  canRespondToEmergency
 } from "../src/public/js/comms-compose.mjs";
 
 test("validateComposeInput requires channel, subject, body", () => {
@@ -232,4 +235,48 @@ test("formatComplianceSummary returns an empty string for a missing or malformed
   assert.equal(formatComplianceSummary(null), "");
   assert.equal(formatComplianceSummary(undefined), "");
   assert.equal(formatComplianceSummary({}), "");
+});
+
+// --- CM-12: shift-window audience rows --------------------------------------------
+
+test("a shift-window row needs no target id; an id-mode shift row still does", () => {
+  assert.deepEqual(SHIFT_AUDIENCE_MODES, ["id", "current", "next"]);
+  assert.equal(validateAudienceRows([{ audienceType: "shift", audienceRefId: "", shiftMode: "current" }]).valid, true);
+  assert.equal(validateAudienceRows([{ audienceType: "shift", audienceRefId: "", shiftMode: "next" }]).valid, true);
+  assert.equal(validateAudienceRows([{ audienceType: "shift", audienceRefId: "", shiftMode: "id" }]).valid, false);
+  assert.equal(validateAudienceRows([{ audienceType: "shift", audienceRefId: "", shiftMode: undefined }]).valid, false);
+  // A window mode on a non-shift row is meaningless and does not complete it.
+  assert.equal(validateAudienceRows([{ audienceType: "role", audienceRefId: "", shiftMode: "current" }]).valid, false);
+});
+
+test("buildAudiencePayload sends a shift window in rule and omits the target id", () => {
+  const payload = buildAudiencePayload([
+    { audienceType: "shift", audienceRefId: "", shiftMode: "current" },
+    { audienceType: "shift", audienceRefId: "shift-9", shiftMode: "id" },
+    { audienceType: "shift", audienceRefId: "ignored-when-window", shiftMode: "next" },
+    { audienceType: "department", audienceRefId: "dept-1" }
+  ]);
+  assert.deepEqual(payload, [
+    { audienceType: "shift", rule: { window: "current" } },
+    { audienceType: "shift", audienceRefId: "shift-9" },
+    { audienceType: "shift", rule: { window: "next" } },
+    { audienceType: "department", audienceRefId: "dept-1" }
+  ]);
+});
+
+// --- CM-13: emergency compose / respond -------------------------------------------------
+
+test("isEmergencyCompose is true only for the emergency priority", () => {
+  assert.equal(isEmergencyCompose({ priority: "emergency" }), true);
+  assert.equal(isEmergencyCompose({ priority: "urgent" }), false);
+  assert.equal(isEmergencyCompose({}), false);
+});
+
+test("canRespondToEmergency: a published emergency message the viewer has not answered", () => {
+  const published = { priority: "emergency", published_at: "2026-08-13T12:00:00Z" };
+  assert.equal(canRespondToEmergency(published, null), true);
+  assert.equal(canRespondToEmergency(published, "safe"), false);
+  assert.equal(canRespondToEmergency({ ...published, published_at: null }, null), false);
+  assert.equal(canRespondToEmergency({ ...published, priority: "urgent" }, null), false);
+  assert.equal(canRespondToEmergency(null, null), false);
 });

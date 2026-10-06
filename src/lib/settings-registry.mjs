@@ -300,6 +300,56 @@ export const settingsRegistry = Object.freeze(
       validation: {},
       permission: "admin.manage"
     },
+    {
+      key: "communications.ackEscalationEnabled",
+      module: "communications",
+      label: "Escalate overdue required acknowledgements",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: true, // CM-10: comms-escalation-sweep.mjs only ever touches messages that opted in via is_required_ack + ack_due_at
+      validation: {},
+      permission: "admin.manage"
+    },
+    {
+      key: "communications.ackReminderAfterHours",
+      module: "communications",
+      label: "Ack escalation level 1 (reminder to non-acknowledgers): hours after the due time",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 0, // CM-10: remind as soon as the deadline passes
+      validation: { min: 0, max: 720 },
+      permission: "admin.manage"
+    },
+    {
+      key: "communications.ackSupervisorAfterHours",
+      module: "communications",
+      label: "Ack escalation level 2 (supervisor alert): hours after the due time",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 24, // CM-10: COMMUNICATION_TRAINING_SYSTEM_DESIGN.md section 3.3 ladder, T+Y
+      validation: { min: 0, max: 720 },
+      permission: "admin.manage"
+    },
+    {
+      key: "communications.ackManagerAfterHours",
+      module: "communications",
+      label: "Ack escalation level 3 (manager escalation): hours after the due time",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 48, // CM-10: COMMUNICATION_TRAINING_SYSTEM_DESIGN.md section 3.3 ladder, T+Z
+      validation: { min: 0, max: 720 },
+      permission: "admin.manage"
+    },
+    {
+      key: "communications.emergencyRequiresSecondApprover",
+      module: "communications",
+      label: "Emergency broadcast needs a second approver (not the requester)",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: true, // CM-13: four-eyes on the quiet-hours-bypassing broadcast; a single-publisher facility can turn it off
+      validation: {},
+      permission: "admin.manage"
+    },
 
     // --- Training (module code: training) ----------------------------------
     {

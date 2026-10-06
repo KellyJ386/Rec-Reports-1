@@ -1,6 +1,13 @@
 import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
 import { authCanAccessFacility, makeGuards } from "./guard.mjs";
-import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority, summarizeAckCompliance } from "../communications.mjs";
+import {
+  resolveMessageAudience,
+  shouldBypassQuietHours,
+  channelsForPriority,
+  summarizeAckCompliance,
+  normalizeShiftWindow
+} from "../communications.mjs";
+import { loadAudienceResolutionContext, resolutionContextFrom } from "../communications-audience.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
 const READ = "communications.read";
@@ -57,82 +64,6 @@ async function resolveAudienceRefs(client, facilityId, items) {
     if (!result.ok) return result;
   }
   return { ok: true };
-}
-
-// P-1: shared by the CM-03 publish route and the compliance routes below --
-// both need to expand a batch of message_audiences rows into the
-// employees/roleAssignments/shiftAssignments context resolveMessageAudience
-// requires. Extracted unchanged from the publish route (see its own doc
-// comment above for the per-query rationale, which still applies here
-// verbatim): the underlying employees/memberships/shift_assignments queries
-// each run at most once no matter how many audience rows are passed in --
-// including audience rows spanning MULTIPLE messages, which is what lets
-// the facility-wide compliance-summary route batch every required-ack
-// message's audience resolution into one call instead of one query set per
-// message.
-async function loadAudienceResolutionContext(client, facilityId, audiences, { shiftWindow = null } = {}) {
-  const resolvableAudiences = [];
-  const unresolvedAudiences = [];
-  for (const audience of audiences) {
-    if (audience.audience_type === "shift" && !shiftWindow) {
-      unresolvedAudiences.push({
-        id: audience.id,
-        audienceType: audience.audience_type,
-        audienceRefId: audience.audience_ref_id,
-        reason: "shiftWindow not supplied"
-      });
-      continue;
-    }
-    resolvableAudiences.push(audience);
-  }
-
-  const needsEmployees = resolvableAudiences.some(
-    (audience) => audience.audience_type === "department" || audience.audience_type === "role"
-  );
-  const roleRefIds = [
-    ...new Set(
-      resolvableAudiences.filter((audience) => audience.audience_type === "role").map((audience) => audience.audience_ref_id)
-    )
-  ];
-  const shiftRefIds = [
-    ...new Set(
-      resolvableAudiences.filter((audience) => audience.audience_type === "shift").map((audience) => audience.audience_ref_id)
-    )
-  ];
-
-  const employees = needsEmployees
-    ? (await pgSelect(client, "employees", {
-        filters: { facility_id: facilityId },
-        select: "id,department_id,user_id"
-      })) ?? []
-    : [];
-
-  let roleAssignments = [];
-  if (roleRefIds.length > 0) {
-    const memberships =
-      (await pgSelect(client, "memberships", {
-        filters: { facility_id: facilityId, role_id: { in: roleRefIds }, status: "active" },
-        select: "user_id,role_id"
-      })) ?? [];
-    const employeeIdByUserId = new Map(employees.map((employee) => [employee.user_id, employee.id]));
-    roleAssignments = memberships
-      .map((membership) => ({
-        role_id: membership.role_id,
-        employee_id: employeeIdByUserId.get(membership.user_id) ?? null
-      }))
-      .filter((assignment) => assignment.employee_id);
-  }
-
-  let shiftAssignments = [];
-  if (shiftRefIds.length > 0) {
-    shiftAssignments =
-      (await pgSelect(client, "shift_assignments", {
-        filters: { facility_id: facilityId, shift_id: { in: shiftRefIds }, status: { in: ["pending", "approved"] } },
-        select: "shift_id,employee_id"
-      })) ?? [];
-  }
-
-  return { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments };
 }
 
 // Groups a list of rows (message_audiences/message_receipts/
@@ -259,6 +190,15 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           return sendJson(response, 404, { error: "no employee record for this facility" });
         }
 
+        // CM-13: an emergency message is never published by the create
+        // route's legacy publishNow shortcut -- only through the
+        // emergency-launch approval flow.
+        if (body.payload.priority === "emergency" && body.payload.publishNow === true) {
+          return sendJson(response, 409, {
+            error: "emergency messages must be launched through the emergency-launch approval flow"
+          });
+        }
+
         const row = {
           facility_id: params.facilityId,
           channel_id: channelId,
@@ -316,22 +256,40 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (message.published_at) {
           return sendJson(response, 409, { error: "message already published" });
         }
+        // CM-13: an emergency message bypasses quiet hours on every channel,
+        // so it never goes out through the ordinary publish flow -- only
+        // through the emergency-launch + approval flow
+        // (communications-escalation-routes.mjs), which 0064's messages
+        // trigger also enforces at the database.
+        if (message.priority === "emergency") {
+          return sendJson(response, 409, {
+            error: "emergency messages must be launched through the emergency-launch approval flow"
+          });
+        }
 
         const audiences = (await pgSelect(auth.client, "message_audiences", {
           filters: { message_id: params.id },
           select: MESSAGE_AUDIENCES_COLUMNS
         })) ?? [];
 
+        // CM-12: `shiftWindow` ("current" | "next" | { from, to }) is the
+        // fallback window for a ref-less shift audience that carries no
+        // rule.window of its own; a specific shift id needs none. A malformed
+        // value is a clean 400 rather than a silently-empty audience.
         const shiftWindow = body.payload.shiftWindow ?? null;
-        const { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments } =
-          await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, { shiftWindow });
+        if (shiftWindow !== null && normalizeShiftWindow(shiftWindow) === null) {
+          return sendJson(response, 400, { error: "shiftWindow must be 'current', 'next', or { from, to } (at most 31 days)" });
+        }
+        const publishNow = new Date();
+        const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
+          shiftWindow,
+          now: publishNow
+        });
+        const { resolvableAudiences, unresolvedAudiences } = loaded;
 
-        const recipients = resolveMessageAudience(
-          { audiences: resolvableAudiences },
-          { employees, roleAssignments, shiftAssignments }
-        );
+        const recipients = resolveMessageAudience({ audiences: resolvableAudiences }, resolutionContextFrom(loaded));
 
-        const publishedAt = new Date().toISOString();
+        const publishedAt = publishNow.toISOString();
         await pgUpdate(
           auth.client,
           "messages",
@@ -502,14 +460,15 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             filters: { message_id: params.messageId },
             select: MESSAGE_AUDIENCES_COLUMNS
           })) ?? [];
-        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
-          auth.client,
-          message.facility_id,
-          audiences
-        );
+        // CM-12: shift windows are evaluated at the message's own
+        // published_at, so a re-resolution agrees with the publish snapshot.
+        const publishedAt = message.published_at ? new Date(message.published_at) : new Date();
+        const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
+          now: publishedAt
+        });
         const audienceEmployeeIds = resolveMessageAudience(
-          { audiences: resolvableAudiences },
-          { employees, roleAssignments, shiftAssignments }
+          { audiences: loaded.resolvableAudiences },
+          resolutionContextFrom(loaded, publishedAt)
         );
 
         const receipts =
@@ -583,12 +542,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             filters: { message_id: { in: requiredMessageIds } },
             select: MESSAGE_AUDIENCES_COLUMNS
           })) ?? [];
-        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
-          auth.client,
-          params.facilityId,
-          audiences
-        );
-        const audiencesByMessageId = groupByMessageId(resolvableAudiences);
+        const loaded = await loadAudienceResolutionContext(auth.client, params.facilityId, audiences, {
+          anchors: requiredMessages.map((message) => new Date(message.published_at))
+        });
+        const audiencesByMessageId = groupByMessageId(loaded.resolvableAudiences);
 
         const receipts =
           (await pgSelect(auth.client, "message_receipts", {
@@ -608,7 +565,7 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         for (const message of requiredMessages) {
           const audienceEmployeeIds = resolveMessageAudience(
             { audiences: audiencesByMessageId.get(message.id) ?? [] },
-            { employees, roleAssignments, shiftAssignments }
+            resolutionContextFrom(loaded, new Date(message.published_at))
           );
           const summary = summarizeAckCompliance(
             audienceEmployeeIds,
@@ -692,15 +649,55 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
 
-        const refCheck = await resolveAudienceRefs(auth.client, message.facility_id, body.payload);
+        // CM-12: a shift audience may carry a window (rule.window) and an
+        // optional department narrowing (rule.departmentId) instead of -- or
+        // alongside -- a specific shift id. The stored rule is rebuilt from
+        // the validated parts only, never the raw client object.
+        const rules = [];
+        const ruleErrors = [];
+        const departmentRefs = [];
+        for (const item of body.payload) {
+          if (item.audienceType !== "shift") {
+            rules.push(item.rule ?? {});
+            continue;
+          }
+          const rule = {};
+          const rawRule = item.rule && typeof item.rule === "object" && !Array.isArray(item.rule) ? item.rule : {};
+          if (rawRule.window !== undefined && rawRule.window !== null) {
+            const window = normalizeShiftWindow(rawRule.window);
+            if (!window) {
+              ruleErrors.push("rule.window must be 'current', 'next', or { from, to } (at most 31 days)");
+            } else {
+              rule.window =
+                window.kind === "range"
+                  ? { kind: "range", from: window.from.toISOString(), to: window.to.toISOString() }
+                  : window.kind;
+            }
+          }
+          if (rawRule.departmentId !== undefined && rawRule.departmentId !== null) {
+            if (typeof rawRule.departmentId !== "string" || rawRule.departmentId.length === 0) {
+              ruleErrors.push("rule.departmentId must be a department id");
+            } else {
+              rule.departmentId = rawRule.departmentId;
+              departmentRefs.push({ audienceType: "department", audienceRefId: rawRule.departmentId });
+            }
+          }
+          if ((item.audienceRefId ?? null) !== null && rule.window !== undefined) {
+            ruleErrors.push("a shift audience takes either a specific shift id or a rule.window, not both");
+          }
+          rules.push(rule);
+        }
+        if (ruleErrors.length > 0) return sendJson(response, 400, { errors: ruleErrors });
+
+        const refCheck = await resolveAudienceRefs(auth.client, message.facility_id, [...body.payload, ...departmentRefs]);
         if (!refCheck.ok) return sendJson(response, 400, { error: refCheck.error });
 
-        const rows = body.payload.map((item) => ({
+        const rows = body.payload.map((item, index) => ({
           facility_id: message.facility_id,
           message_id: params.id,
           audience_type: item.audienceType,
           audience_ref_id: item.audienceRefId ?? null,
-          rule_jsonb: item.rule ?? {}
+          rule_jsonb: rules[index]
         }));
 
         const inserted = await pgInsert(auth.client, "message_audiences", rows, { returning: true });
