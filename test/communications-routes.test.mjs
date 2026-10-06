@@ -30,9 +30,12 @@ const MESSAGE = {
 const DRAFT_MESSAGE = {
   ...MESSAGE,
   id: "msg-draft",
-  priority: "urgent",
+  priority: "normal",
   published_at: null
 };
+
+// NEW-1: an urgent draft is published only through public.publish_urgent_message().
+const URGENT_DRAFT = { ...DRAFT_MESSAGE, id: "msg-urgent", priority: "urgent" };
 
 function stubFetch(t, respond) {
   const captured = [];
@@ -42,7 +45,10 @@ function stubFetch(t, respond) {
     const table = parsed.pathname.replace("/rest/v1/", "");
     const method = init.method;
     captured.push({ table, method, url: parsed, body: init.body ? JSON.parse(init.body) : null });
-    const data = respond(table, method, parsed) ?? [];
+    const data = respond(table, method, parsed, init.body ? JSON.parse(init.body) : null) ?? [];
+    if (data && data.__status) {
+      return { ok: false, status: data.__status, text: async () => JSON.stringify(data.__body ?? { message: "boom" }) };
+    }
     return { ok: true, status: 200, text: async () => JSON.stringify(data) };
   };
   t.after(() => {
@@ -596,10 +602,102 @@ test("POST .../messages/:id/publish resolves department+employee audiences, publ
   // department dept-1 resolves emp-1 only (emp-2 is in dept-2); employee
   // audience emp-5 passes through directly; recipients dedup+sort.
   assert.deepEqual(jobInsert.body[0].payload_jsonb.recipients, ["emp-1", "emp-5"]);
-  // priority 'urgent' -> in_app + push, and bypasses quiet hours.
-  assert.deepEqual(jobInsert.body[0].payload_jsonb.channels, ["in_app", "push"]);
-  assert.equal(jobInsert.body[0].payload_jsonb.quietHoursBypass, true);
+  // priority 'normal' -> in_app only, and it does not bypass quiet hours (an
+  // urgent message goes through publish_urgent_message(), tested below).
+  assert.deepEqual(jobInsert.body[0].payload_jsonb.channels, ["in_app"]);
+  assert.equal(jobInsert.body[0].payload_jsonb.quietHoursBypass, false);
   assert.equal(jobInsert.body[0].payload_jsonb.messageId, "msg-draft");
+});
+
+// --- NEW-1: the urgent publish is one definer call ---------------------------------
+
+test("NEW-1: publishing an urgent message makes ONE rpc call and writes no job, message or audience-resolution rows itself", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [URGENT_DRAFT];
+    if (table === "message_audiences" && method === "GET") return [];
+    if (table === "rpc/publish_urgent_message") {
+      return { publishedAt: "2026-08-13T00:00:00+00:00", recipientCount: 4, unresolvedAudiences: 1, channels: ["in_app", "push"], quietHoursBypass: true };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  // The body tries to steer the page; none of it may reach the database.
+  const result = await call("POST", "/facilities/fac-1/messages/msg-urgent/publish", {
+    channels: ["sms", "email"],
+    recipients: ["attacker"],
+    title: "forged",
+    quietHoursBypass: false
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload, { publishedAt: "2026-08-13T00:00:00+00:00", recipientCount: 4, unresolvedAudiences: 1 });
+
+  const writes = captured.filter((c) => ["POST", "PATCH", "PUT", "DELETE"].includes(c.method));
+  assert.deepEqual(writes.map((c) => `${c.method} ${c.table}`), ["POST rpc/publish_urgent_message"]);
+  assert.deepEqual(writes[0].body, { p_message_id: "msg-urgent" }, "the caller supplies nothing but the message id");
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+  assert.ok(!captured.some((c) => c.table === "messages" && c.method === "PATCH"));
+});
+
+test("NEW-1: an urgent publish still refuses a reader, a published message and a missing message before any database write", async (t) => {
+  const logs = [];
+  const run = async (respond, call) => {
+    logs.push(stubFetch(t, respond));
+    return call();
+  };
+  const urgentGet = (row) => (table, method) => (table === "messages" && method === "GET" ? [row] : []);
+  assert.equal(
+    (await run(urgentGet(URGENT_DRAFT), () => mount({ memberships: READER }).call("POST", "/facilities/fac-1/messages/msg-urgent/publish", {}))).status,
+    403
+  );
+  assert.equal(
+    (await run(urgentGet({ ...URGENT_DRAFT, published_at: "2026-08-13T00:00:00Z" }), () => mount().call("POST", "/facilities/fac-1/messages/msg-urgent/publish", {}))).status,
+    409
+  );
+  assert.equal((await run(() => [], () => mount().call("POST", "/facilities/fac-1/messages/nope/publish", {}))).status, 404);
+  assert.ok(!logs.flat().some((c) => c.table.startsWith("rpc/") || c.method !== "GET"));
+});
+
+test("NEW-1: the urgent publish surfaces the function's refusals with their own status", async (t) => {
+  for (const [status, message] of [
+    [409, "an urgent publish job already exists for this message"],
+    [409, "message already published"],
+    [403, "publish_urgent_message: missing permission: communications.publish"],
+    [404, "message not found"],
+    [400, "ack_due_at must be later than the time the message is published"]
+  ]) {
+    stubFetch(t, (table, method) => {
+      if (table === "messages" && method === "GET") return [URGENT_DRAFT];
+      if (table === "rpc/publish_urgent_message") return { __status: status, __body: { code: `PT${status}`, message } };
+      return [];
+    });
+    const result = await mount().call("POST", "/facilities/fac-1/messages/msg-urgent/publish", {});
+    assert.equal(result.status, status, message);
+    assert.equal(result.payload.error, message);
+  }
+});
+
+test("NEW-1: an urgent publish of a ref-less shift audience writes the fallback window into the audience row first, so the database resolves it", async (t) => {
+  const audiences = [{ id: "aud-1", message_id: "msg-urgent", audience_type: "shift", audience_ref_id: null, rule_jsonb: {} }];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "messages" && method === "GET") return [URGENT_DRAFT];
+    if (table === "message_audiences" && method === "GET") return audiences;
+    if (table === "message_audiences" && method === "PATCH") return [{ ...audiences[0], rule_jsonb: { window: "current" } }];
+    if (table === "rpc/publish_urgent_message") return { publishedAt: "2026-08-13T00:00:00+00:00", recipientCount: 2, unresolvedAudiences: 0 };
+    return [];
+  });
+  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-urgent/publish", { shiftWindow: "current" });
+  assert.equal(result.status, 200);
+  const order = captured.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.table}`);
+  assert.deepEqual(order, ["PATCH message_audiences", "POST rpc/publish_urgent_message"]);
+});
+
+test("NEW-1: an urgent publish of a required-ack message with a past due time is a clean 400 before the rpc", async (t) => {
+  const captured = stubFetch(t, (table, method) =>
+    table === "messages" && method === "GET" ? [{ ...URGENT_DRAFT, is_required_ack: true, ack_due_at: "2020-01-01T00:00:00Z" }] : []
+  );
+  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-urgent/publish", {});
+  assert.equal(result.status, 400);
+  assert.ok(!captured.some((c) => c.table.startsWith("rpc/")));
 });
 
 test("POST .../messages/:id/publish resolves a role audience via memberships joined to employees", async (t) => {

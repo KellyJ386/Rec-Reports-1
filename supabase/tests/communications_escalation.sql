@@ -35,6 +35,12 @@
 --   9. Server-side audience resolution (employee, department, role, shift by
 --      id and by window), the approval queue, M-5 queue column + ack due
 --      validation, L-3 emergency_enabled column guard.
+--  10. Second review round: NEW-1 (the urgent publish is the definer function
+--      publish_urgent_message(); no client-written bypass job, no repeat after a
+--      cancel), NEW-2 (no client DELETE of a job, no client change to a
+--      message.emergency job, the launch lifecycle audited), NEW-3 (the audience
+--      resolver skips soft-deleted employees and counts a person once), M-5
+--      residual (ack_due_at / published_at after publish).
 -- Runs inside a transaction that is rolled back, so no fixture persists.
 begin;
 
@@ -152,6 +158,13 @@ insert into employees (id, facility_id, user_id, first_name, last_name, departme
   ('64000000-0000-0000-0000-0000000000e9', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000a1', 'Pat', 'PublisherOneAlt', null)
 on conflict (id) do nothing;
 
+-- NEW-3: a soft-deleted (former) employee who is still on the department roster, and the
+-- second row of publisher one created later than the first.
+insert into employees (id, facility_id, user_id, first_name, last_name, department_id, deleted_at) values
+  ('64000000-0000-0000-0000-0000000000ea', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', null, 'Ex', 'Staff', '64000000-0000-0000-0000-00000000d001', now() - interval '30 days')
+on conflict (id) do nothing;
+update employees set created_at = now() + interval '1 second' where id = '64000000-0000-0000-0000-0000000000e9';
+
 insert into communication_channels (id, facility_id, channel_type, name, emergency_enabled) values
   ('64000000-0000-0000-0000-0000000000c1', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'emergency', 'CE Emergency A', true),
   ('64000000-0000-0000-0000-0000000000c2', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'facility', 'CE Ordinary A', false),
@@ -175,6 +188,21 @@ insert into messages (id, facility_id, channel_id, author_employee_id, subject, 
   ('64000000-0000-0000-0000-0000000000fd', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c1', '64000000-0000-0000-0000-0000000000e1', 'Unpublished draft', 'x', 'emergency', false, null, null),
   ('64000000-0000-0000-0000-0000000000fe', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Urgent published', 'x', 'urgent', false, null, now() - interval '1 hour'),
   ('64000000-0000-0000-0000-0000000000ff', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Urgent draft', 'x', 'urgent', false, null, null)
+on conflict (id) do nothing;
+
+-- NEW-1 / NEW-3 drafts: two urgent drafts, an ordinary draft and an urgent required-ack draft
+-- with a due time already in the past.
+insert into messages (id, facility_id, channel_id, author_employee_id, subject, body_text, priority, is_required_ack, ack_due_at, published_at) values
+  ('64000000-0000-0000-0000-00000000f201', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Pool closed', 'Chlorine leak, secret body', 'urgent', false, null, null),
+  ('64000000-0000-0000-0000-00000000f202', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Urgent audience probe', 'x', 'urgent', false, null, null),
+  ('64000000-0000-0000-0000-00000000f203', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Ordinary draft', 'x', 'normal', false, null, null),
+  ('64000000-0000-0000-0000-00000000f204', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Urgent past due', 'x', 'urgent', true, now() - interval '1 day', null)
+on conflict (id) do nothing;
+insert into message_audiences (id, facility_id, message_id, audience_type, audience_ref_id) values
+  ('64000000-0000-0000-0000-0000f2010001', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-00000000f201', 'employee', '64000000-0000-0000-0000-0000000000e3'),
+  ('64000000-0000-0000-0000-0000f2010002', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-00000000f201', 'employee', '64000000-0000-0000-0000-0000000000ea'),
+  ('64000000-0000-0000-0000-0000f2020001', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-00000000f202', 'department', '64000000-0000-0000-0000-00000000d001'),
+  ('64000000-0000-0000-0000-0000f2020002', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-00000000f202', 'role', '64000000-0000-0000-0000-0000000000d1')
 on conflict (id) do nothing;
 
 -- Audiences, written by the owner before any launch exists (a launch freezes them).
@@ -384,6 +412,62 @@ begin
   if not exists (select 1 from pg_indexes where schemaname = 'public' and indexname = 'notification_jobs_emergency_message_uidx'
                  and indexdef like '%UNIQUE%') then
     raise exception 'CE FAIL: the one-emergency-job-per-message index is missing';
+  end if;
+
+  -- NEW-1: one quiet-hours-bypassing publish job per message, and the urgent publish is
+  -- the one-shot definer function (locks the message row, re-checks the permission,
+  -- resolves the audience on the server) behind an invoker wrapper.
+  if not exists (select 1 from pg_indexes where schemaname = 'public' and indexname = 'notification_jobs_urgent_publish_message_uidx'
+                 and indexdef like '%UNIQUE%' and indexdef like '%message.published%') then
+    raise exception 'CE FAIL: the one-urgent-publish-job-per-message index is missing';
+  end if;
+  foreach v_table in array array['internal.publish_urgent_message(uuid)', 'public.publish_urgent_message(uuid)'] loop
+    if not has_function_privilege('authenticated', v_table::regprocedure, 'execute') then
+      raise exception 'CE FAIL: authenticated cannot execute %', v_table;
+    end if;
+  end loop;
+  if exists (select 1 from pg_roles where rolname = 'anon')
+     and (has_function_privilege('anon', 'public.publish_urgent_message(uuid)'::regprocedure, 'execute')
+          or has_function_privilege('anon', 'internal.publish_urgent_message(uuid)'::regprocedure, 'execute')) then
+    raise exception 'CE FAIL: anon can execute publish_urgent_message';
+  end if;
+  if not (select prosecdef from pg_proc where oid = 'internal.publish_urgent_message(uuid)'::regprocedure)
+     or not exists (select 1 from pg_proc where oid = 'internal.publish_urgent_message(uuid)'::regprocedure and 'search_path=public' = any (proconfig)) then
+    raise exception 'CE FAIL: internal.publish_urgent_message must be SECURITY DEFINER with search_path = public';
+  end if;
+  if (select prosecdef from pg_proc where oid = 'public.publish_urgent_message(uuid)'::regprocedure) then
+    raise exception 'CE FAIL: the public publish_urgent_message wrapper must be SECURITY INVOKER';
+  end if;
+  v_def := pg_get_functiondef('internal.publish_urgent_message(uuid)'::regprocedure);
+  if v_def not like '%for update%' or v_def not like '%communications.publish%' or v_def not like '%fn_emergency_audience%'
+     or v_def not like '%in_app%' or v_def like '%sms%' or v_def like '%email%' then
+    raise exception 'CE FAIL: publish_urgent_message lost its row lock, permission re-check or server-side audience, or widened its channels';
+  end if;
+  if has_function_privilege('authenticated', 'public.fn_emergency_alert_launch_audit()'::regprocedure, 'execute') then
+    raise exception 'CE FAIL: authenticated can execute the launch audit trigger function';
+  end if;
+
+  -- NEW-1 / NEW-2: the client guard keeps its labelled guards, has no message.published
+  -- bypass exception any more, and also fires on DELETE (tgtype: 8 = DELETE).
+  v_def := pg_get_functiondef('public.fn_notification_jobs_client_guard()'::regprocedure);
+  foreach v_table in array array['Guard 1', 'Guard 2', 'Guard 3', 'Guard 4', 'Guard 5', 'Guard 6'] loop
+    if v_def not like '%' || v_table || '%' then
+      raise exception 'CE FAIL: fn_notification_jobs_client_guard lost %', v_table;
+    end if;
+  end loop;
+  if v_def like '%''message.published''%' then
+    raise exception 'CE FAIL: the client guard still has a message.published exception';
+  end if;
+  select count(*) into v_count from pg_trigger t
+  where t.tgrelid = 'public.notification_jobs'::regclass and t.tgname = 'notification_jobs_client_guard'
+    and (t.tgtype & 4) <> 0 and (t.tgtype & 8) <> 0 and (t.tgtype & 16) <> 0;
+  if v_count <> 1 then
+    raise exception 'CE FAIL: the client guard must fire on INSERT, UPDATE and DELETE';
+  end if;
+  -- NEW-2: the launch lifecycle is audited.
+  if not exists (select 1 from pg_trigger t where t.tgrelid = 'public.emergency_alert_launches'::regclass
+                 and t.tgname = 'emergency_alert_launches_audit' and (t.tgtype & 4) <> 0 and (t.tgtype & 16) <> 0) then
+    raise exception 'CE FAIL: the emergency launch audit trigger is missing';
   end if;
 end;
 $$;
@@ -680,20 +764,24 @@ select pg_temp.expect_error(
       '{"incidentId":"64000000-0000-0000-0000-00000000c0a1","quietHoursBypass":true,"recipients":["x"]}'::jsonb)$q$,
   array['42501']
 );
--- CM-03's urgent publish keeps working: the publish job of a published, same-facility,
--- urgent message carries the bypass -- once.
-select pg_temp.expect_rows(
-  'H-1: the urgent message''s own publish job may carry quietHoursBypass',
-  $q$insert into notification_jobs (id, facility_id, event_type, payload_jsonb) values
-     ('64000000-0000-0000-0000-000000000a21', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
-      '{"messageId":"64000000-0000-0000-0000-0000000000fe","quietHoursBypass":true,"recipients":["64000000-0000-0000-0000-0000000000e3"]}'::jsonb)$q$,
-  1
-);
+-- NEW-1: CM-03's urgent publish is NOT a client-writable shape any more. Whatever the
+-- state of an urgent message, a publisher cannot write its bypassing publish job
+-- directly: not with the plain shape the old route sent, and not with forged channels,
+-- recipients outside the audience and forged copy (probe G3).
 select pg_temp.expect_error(
-  'H-1: ... but not a second bypass job for the same message',
+  'NEW-1: the plain bypassing publish job of a PUBLISHED urgent message is rejected',
   $q$insert into notification_jobs (facility_id, event_type, payload_jsonb) values
      ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
-      '{"messageId":"64000000-0000-0000-0000-0000000000fe","quietHoursBypass":true,"recipients":["x"]}'::jsonb)$q$,
+      '{"messageId":"64000000-0000-0000-0000-0000000000fe","quietHoursBypass":true,"recipients":["64000000-0000-0000-0000-0000000000e3"]}'::jsonb)$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1 (G3): forged channels, recipients outside the audience and forged copy are rejected',
+  $q$insert into notification_jobs (facility_id, event_type, dedupe_key, payload_jsonb) values
+     ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published', 'k',
+      '{"messageId":"64000000-0000-0000-0000-0000000000fe","quietHoursBypass":true,"channels":["in_app","push","sms","email"],
+        "recipients":["64000000-0000-0000-0000-0000000000e2","64000000-0000-0000-0000-0000000000e3","64000000-0000-0000-0000-0000000000e5"],
+        "title":"EMERGENCY: evacuate now","body":"forged by one publisher"}'::jsonb)$q$,
   array['42501']
 );
 -- An ordinary job without the flag is unaffected.
@@ -733,21 +821,11 @@ select pg_temp.expect_rows(
   $q$update notification_jobs set status = 'cancelled' where id = '64000000-0000-0000-0000-000000000a22'$q$,
   1
 );
--- A bypassing job cannot be re-armed (a status reset would re-broadcast it); cancel only.
+-- NEW-2: a client cannot delete a job either (0006's FOR ALL policy still grants it).
 select pg_temp.expect_error(
-  'H-1: a bypassing job cannot be marked sent by a client',
-  $q$update notification_jobs set status = 'sent' where id = '64000000-0000-0000-0000-000000000a21'$q$,
+  'NEW-2: a publisher cannot delete an ordinary notification job',
+  $q$delete from notification_jobs where id = '64000000-0000-0000-0000-000000000a22'$q$,
   array['42501']
-);
-select pg_temp.expect_error(
-  'H-1: a bypassing job cannot be rescheduled by a client',
-  $q$update notification_jobs set scheduled_for = now() + interval '1 minute' where id = '64000000-0000-0000-0000-000000000a21'$q$,
-  array['42501']
-);
-select pg_temp.expect_rows(
-  'H-1: a bypassing job can be cancelled by a client',
-  $q$update notification_jobs set status = 'cancelled' where id = '64000000-0000-0000-0000-000000000a21'$q$,
-  1
 );
 reset role;
 select set_config('request.jwt.claims', '', true);
@@ -759,6 +837,16 @@ set local role authenticated;
 select pg_temp.expect_error(
   'H-1: a sent bypassing job cannot be reset to pending (re-broadcast) by a client',
   $q$update notification_jobs set status = 'pending', attempts = 0 where id = '64000000-0000-0000-0000-000000000a24'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1 (G6c): a SENT bypassing job cannot be cancelled by a client either (cancel is for pending jobs only)',
+  $q$update notification_jobs set status = 'cancelled' where id = '64000000-0000-0000-0000-000000000a24'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-2: a bypassing job cannot be deleted by a client',
+  $q$delete from notification_jobs where id = '64000000-0000-0000-0000-000000000a24'$q$,
   array['42501']
 );
 reset role;
@@ -788,6 +876,24 @@ select pg_temp.expect_error(
       '{"incidentId":"64000000-0000-0000-0000-00000000c0a1","quietHoursBypass":true,"recipients":["r1"]}'::jsonb)$q$,
   array['42501', '23514']
 );
+select pg_temp.expect_error(
+  'NEW-1: ... and still cannot send a message.published bypass job (not an incident event)',
+  $q$insert into notification_jobs (facility_id, event_type, payload_jsonb) values
+     ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
+      '{"messageId":"64000000-0000-0000-0000-0000000000fe","incidentId":"64000000-0000-0000-0000-00000000c0a1","quietHoursBypass":true}'::jsonb)$q$,
+  array['42501']
+);
+reset role;
+-- A bypassing job that is still pending can be cancelled by a publisher (the one change a
+-- client keeps): 0058's pending incident job from the reviewer above.
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+select pg_temp.expect_rows(
+  'NEW-1: a pending bypassing job can still be cancelled by a client',
+  $q$update notification_jobs set status = 'cancelled' where event_type = 'incident.escalated' and status = 'pending'
+     and payload_jsonb ->> 'escalationId' = 'e1' and payload_jsonb ->> 'quietHoursBypass' = 'true'$q$,
+  1
+);
 reset role;
 
 -- The service role (no JWT claims) is untouched: it writes message.emergency / bypass
@@ -812,7 +918,241 @@ select pg_temp.expect_error(
      ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.emergency', '{"messageId":"64000000-0000-0000-0000-0000000000f5"}'::jsonb)$q$,
   array['23505']
 );
+-- NEW-2: the delete trigger hands OLD back for a non-client session, so the owner's delete
+-- is not silently swallowed (a BEFORE DELETE trigger returning NEW would cancel it).
 delete from notification_jobs where id = '64000000-0000-0000-0000-000000000a23';
+do $$
+begin
+  if exists (select 1 from notification_jobs where id = '64000000-0000-0000-0000-000000000a23') then
+    raise exception 'CE FAIL: NEW-2 the delete guard swallowed a non-client delete';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4b. NEW-1: publish_urgent_message() -- the urgent publish is one definer call. It
+-- re-checks the permission, derives the recipients from the message's own audience (a
+-- soft-deleted former employee excluded), takes the channels from the urgent mapping and
+-- the title from the subject, sends no body, bypasses quiet hours, and happens once.
+-- ---------------------------------------------------------------------------
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a3');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-1: a reader cannot publish an urgent message',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f201')$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1: nor through the internal function directly',
+  $q$select internal.publish_urgent_message('64000000-0000-0000-0000-00000000f201')$q$,
+  array['42501']
+);
+reset role;
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a4');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-1: another facility''s publisher cannot publish facility A''s urgent message',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f201')$q$,
+  array['42501']
+);
+reset role;
+select set_config('request.jwt.claims', '', true);
+select pg_temp.expect_error(
+  'NEW-1: publish_urgent_message needs a signed-in person',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f201')$q$,
+  array['28000']
+);
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-1: an unknown message is a 404',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f2ee')$q$,
+  array['PT404']
+);
+select pg_temp.expect_error(
+  'NEW-1: an ordinary (non-urgent) draft is refused: only urgent messages take the bypass',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f203')$q$,
+  array['PT409']
+);
+select pg_temp.expect_error(
+  'NEW-1: an emergency draft is refused: it goes through the approval flow',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-0000000000f8')$q$,
+  array['PT409']
+);
+select pg_temp.expect_error(
+  'NEW-1: an already-published urgent message is refused (no repeat page)',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-0000000000fe')$q$,
+  array['PT409']
+);
+select pg_temp.expect_error(
+  'NEW-1: a required-ack urgent message already past due is refused before anything is written',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f204')$q$,
+  array['PT400']
+);
+reset role;
+do $$
+begin
+  if exists (select 1 from messages where id in ('64000000-0000-0000-0000-00000000f203', '64000000-0000-0000-0000-00000000f204', '64000000-0000-0000-0000-0000000000f8') and published_at is not null)
+     or exists (select 1 from notification_jobs where payload_jsonb ->> 'messageId' in
+                ('64000000-0000-0000-0000-00000000f203', '64000000-0000-0000-0000-00000000f204', '64000000-0000-0000-0000-0000000000f8')) then
+    raise exception 'CE FAIL: a refused urgent publish left a published message or a job behind';
+  end if;
+end;
+$$;
+
+-- The definer path succeeds for the publisher.
+create temp table ce_urgent (r jsonb);
+grant all on ce_urgent to authenticated;
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+insert into ce_urgent select public.publish_urgent_message('64000000-0000-0000-0000-00000000f201');
+reset role;
+do $$
+declare
+  v_job notification_jobs%rowtype;
+  v_result jsonb;
+begin
+  select r into v_result from ce_urgent;
+  if (v_result ->> 'recipientCount')::int <> 1 or (v_result ->> 'quietHoursBypass')::boolean is not true
+     or v_result -> 'channels' <> '["in_app","push"]'::jsonb or v_result ->> 'publishedAt' is null then
+    raise exception 'CE FAIL: unexpected urgent publish result %', v_result;
+  end if;
+  if (select published_at from messages where id = '64000000-0000-0000-0000-00000000f201') is null then
+    raise exception 'CE FAIL: the urgent message was not published';
+  end if;
+  if (select count(*) from notification_jobs where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201') <> 1 then
+    raise exception 'CE FAIL: expected exactly one job for the urgent message';
+  end if;
+  select * into v_job from notification_jobs where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201';
+  if v_job.event_type <> 'message.published' or v_job.status <> 'pending'
+     or v_job.facility_id <> '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+     or (v_job.payload_jsonb ->> 'quietHoursBypass') <> 'true'
+     or v_job.payload_jsonb -> 'channels' <> '["in_app","push"]'::jsonb
+     or v_job.payload_jsonb -> 'recipients' <> '["64000000-0000-0000-0000-0000000000e3"]'::jsonb
+     or v_job.payload_jsonb ->> 'title' <> 'Pool closed'
+     or v_job.payload_jsonb ? 'body'
+     or v_job.payload_jsonb ->> 'priority' <> 'urgent'
+     or v_job.dedupe_key is not null then
+    raise exception 'CE FAIL: the urgent publish job is not the server-derived one: %', v_job.payload_jsonb;
+  end if;
+end;
+$$;
+
+-- Once, per message.
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-1: the same urgent message cannot be published twice',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f201')$q$,
+  array['PT409']
+);
+-- ...and the client still cannot write its own bypassing job for it (G3 / G6d shapes).
+select pg_temp.expect_error(
+  'NEW-1 (G3): a direct bypassing job for the now-published urgent message is rejected',
+  $q$insert into notification_jobs (facility_id, event_type, payload_jsonb) values
+     ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
+      '{"messageId":"64000000-0000-0000-0000-00000000f201","quietHoursBypass":true,"channels":["in_app","push","sms","email"],"recipients":["64000000-0000-0000-0000-0000000000e2"],"title":"EMERGENCY: forged"}'::jsonb)$q$,
+  array['42501']
+);
+-- A bypassing job is not editable by a client while pending, beyond a cancel.
+select pg_temp.expect_error(
+  'NEW-1: the bypassing job cannot be marked sent by a client',
+  $q$update notification_jobs set status = 'sent' where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1: nor rescheduled',
+  $q$update notification_jobs set scheduled_for = now() + interval '1 minute' where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-2: nor deleted',
+  $q$delete from notification_jobs where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  array['42501']
+);
+reset role;
+
+-- The worker (service role) marks it sent; its status writes are untouched.
+select set_config('request.jwt.claims', '', true);
+select pg_temp.expect_rows(
+  'NEW-1: the service role (the worker) marks the urgent publish job sent',
+  $q$update notification_jobs set status = 'sent', attempts = attempts + 1, updated_at = now()
+     where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  1
+);
+select pg_temp.expect_error(
+  'NEW-1: one bypassing publish job per message, even for the service role',
+  $q$insert into notification_jobs (facility_id, event_type, payload_jsonb) values
+     ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
+      '{"messageId":"64000000-0000-0000-0000-00000000f201","quietHoursBypass":true,"recipients":["x"]}'::jsonb)$q$,
+  array['23505']
+);
+-- The cancel-and-repeat chain (G6c, G6d): after the worker sent it, the publisher can neither
+-- cancel the sent job nor write a fresh one.
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-1 (G6c): the publisher cannot cancel the SENT bypassing job',
+  $q$update notification_jobs set status = 'cancelled' where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1: nor re-arm it',
+  $q$update notification_jobs set status = 'pending' where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f201'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-1 (G6d): so no fresh bypassing job for the same message can follow',
+  $q$insert into notification_jobs (facility_id, event_type, payload_jsonb) values
+     ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'message.published',
+      '{"messageId":"64000000-0000-0000-0000-00000000f201","quietHoursBypass":true,"channels":["push","email"],"recipients":["64000000-0000-0000-0000-0000000000e2"],"title":"EMERGENCY again"}'::jsonb)$q$,
+  array['42501']
+);
+reset role;
+
+-- NEW-3 through the same function: the audience of f202 is the department (a live member,
+-- a soft-deleted former member) plus the publisher role (two users, one with two employee
+-- rows): three people, not five.
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a2');
+set local role authenticated;
+select pg_temp.expect_rows(
+  'NEW-3: publishing the audience probe',
+  $q$select public.publish_urgent_message('64000000-0000-0000-0000-00000000f202')$q$,
+  1
+);
+reset role;
+do $$
+declare
+  v_job notification_jobs%rowtype;
+begin
+  select * into v_job from notification_jobs where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-00000000f202';
+  if v_job.payload_jsonb -> 'recipients' <> '["64000000-0000-0000-0000-0000000000e1","64000000-0000-0000-0000-0000000000e2","64000000-0000-0000-0000-0000000000e3"]'::jsonb then
+    raise exception 'CE FAIL: NEW-3 the urgent audience over-delivers: %', v_job.payload_jsonb -> 'recipients';
+  end if;
+end;
+$$;
+
+-- NEW-1 + 0062: a NULL-key job written the way 3D's definer functions write it (no dedupe
+-- key, no bypass) is untouched by both the client guard and the dedupe trigger.
+select set_config('request.jwt.claims', '', true);
+insert into notification_jobs (id, facility_id, event_type, status, payload_jsonb) values
+  ('64000000-0000-0000-0000-000000000a25', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'schedule.published', 'pending',
+   '{"recipients":["64000000-0000-0000-0000-0000000000e3"],"channels":["in_app"]}'::jsonb);
+do $$
+begin
+  if (select dedupe_key from notification_jobs where id = '64000000-0000-0000-0000-000000000a25') is not null then
+    raise exception 'CE FAIL: a NULL dedupe key was rewritten';
+  end if;
+end;
+$$;
+update notification_jobs set status = 'sent' where id = '64000000-0000-0000-0000-000000000a25';
+do $$
+begin
+  if (select dedupe_key from notification_jobs where id = '64000000-0000-0000-0000-000000000a25') is not null then
+    raise exception 'CE FAIL: a worker status write re-keyed a NULL-key job';
+  end if;
+end;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 5. CM-13: the launch ledger -- requests.
@@ -1230,7 +1570,65 @@ select pg_temp.expect_error(
   $q$update notification_jobs set scheduled_for = now() + interval '1 hour', attempts = 0 where event_type = 'message.emergency'$q$,
   array['42501']
 );
+-- NEW-2: nor silenced. A single publisher (the requester included) can neither cancel the
+-- approved broadcast (A14b) nor delete it, which would also cascade its deliveries away (A13).
+select pg_temp.expect_error(
+  'NEW-2 (A14b): the requester cannot cancel the approved emergency job',
+  $q$update notification_jobs set status = 'cancelled' where event_type = 'message.emergency'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-2: nor change its status in any other way',
+  $q$update notification_jobs set status = 'failed' where event_type = 'message.emergency'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-2 (A13): the requester cannot delete the emergency job',
+  $q$delete from notification_jobs where event_type = 'message.emergency'$q$,
+  array['42501']
+);
 reset role;
+-- The worker (service role) still drives the job's status, and the guard also holds after it
+-- sent (a delete would cascade the delivery record).
+select set_config('request.jwt.claims', '', true);
+update notification_jobs set status = 'sent', attempts = 1 where event_type = 'message.emergency';
+insert into notification_deliveries (facility_id, job_id, employee_id, channel, status)
+  select facility_id, id, '64000000-0000-0000-0000-0000000000e2', 'in_app', 'sent' from notification_jobs where event_type = 'message.emergency';
+select pg_temp.as_user('64000000-0000-0000-0000-0000000000a1');
+set local role authenticated;
+select pg_temp.expect_error(
+  'NEW-2 (A13b): a sent emergency job and its deliveries cannot be deleted by a client',
+  $q$delete from notification_jobs where event_type = 'message.emergency'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'NEW-2: nor cancelled after it was sent',
+  $q$update notification_jobs set status = 'cancelled' where event_type = 'message.emergency'$q$,
+  array['42501']
+);
+reset role;
+do $$
+begin
+  if (select count(*) from notification_jobs where event_type = 'message.emergency') <> 1
+     or (select count(*) from notification_deliveries d join notification_jobs j on j.id = d.job_id where j.event_type = 'message.emergency') <> 1 then
+    raise exception 'CE FAIL: NEW-2 the emergency job or its delivery record was lost';
+  end if;
+  -- NEW-2: the lifecycle of the launch is in the audit trail, attributed to the right people.
+  if (select count(*) from audit_events where entity_table = 'emergency_alert_launches'
+        and entity_id = '64000000-0000-0000-0000-000000000b01' and event_type = 'emergency.launch_requested'
+        and actor_user_id = '64000000-0000-0000-0000-0000000000a1') <> 1
+     or (select count(*) from audit_events where entity_table = 'emergency_alert_launches'
+           and entity_id = '64000000-0000-0000-0000-000000000b01' and event_type = 'emergency.launch_approved'
+           and actor_user_id = '64000000-0000-0000-0000-0000000000a2') <> 1
+     or (select count(*) from audit_events where entity_table = 'emergency_alert_launches'
+           and entity_id = '64000000-0000-0000-0000-000000000b01' and event_type = 'emergency.launch_launched'
+           and actor_user_id = '64000000-0000-0000-0000-0000000000a2'
+           and (event_payload ->> 'recipientCount')::int = 2) <> 1 then
+    raise exception 'CE FAIL: NEW-2 the emergency launch lifecycle is not in audit_events: %',
+      (select jsonb_agg(event_type || ':' || coalesce(actor_user_id::text, '-')) from audit_events where entity_table = 'emergency_alert_launches');
+  end if;
+end;
+$$;
 
 select set_config('request.jwt.claims', '', true);
 -- M-4: even for the owner the foreign keys restrict.
@@ -1819,6 +2217,8 @@ insert into shift_assignments (facility_id, shift_id, employee_id, status) value
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c1', '64000000-0000-0000-0000-0000000000e1', 'approved'),
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c1', '64000000-0000-0000-0000-0000000000e2', 'pending'),
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c1', '64000000-0000-0000-0000-0000000000e5', 'declined'),
+  -- NEW-3: a soft-deleted employee still holding an approved assignment is not paged
+  ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c1', '64000000-0000-0000-0000-0000000000ea', 'approved'),
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c2', '64000000-0000-0000-0000-0000000000e3', 'approved'),
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c3', '64000000-0000-0000-0000-0000000000e9', 'approved'),
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000005c4', '64000000-0000-0000-0000-0000000000e5', 'approved');
@@ -1846,7 +2246,11 @@ select pg_temp.expect_audience('employee audience', array['e5']);
 
 insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'department', '64000000-0000-0000-0000-00000000d001');
-select pg_temp.expect_audience('department audience', array['e3']);
+select pg_temp.expect_audience('department audience (NEW-3: the soft-deleted former member is not a recipient)', array['e3']);
+
+insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
+  ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'employee', '64000000-0000-0000-0000-0000000000ea');
+select pg_temp.expect_audience('NEW-3: naming a soft-deleted employee directly reaches nobody', array[]::text[]);
 
 insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'department', null);
@@ -1858,7 +2262,12 @@ select pg_temp.expect_audience('role audience (reader role)', array['e3']);
 
 insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'role', '64000000-0000-0000-0000-0000000000d1');
-select pg_temp.expect_audience('role audience (publisher role: both employee rows of publisher one)', array['e1', 'e2', 'e9']);
+select pg_temp.expect_audience('NEW-3: role audience (publisher role: publisher one''s two employee rows count once, the earliest)', array['e1', 'e2']);
+
+insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
+  ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'department', '64000000-0000-0000-0000-00000000d001'),
+  ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'role', '64000000-0000-0000-0000-0000000000d1');
+select pg_temp.expect_audience('NEW-3 (A10): department + role = 3 people (not 5): a soft-deleted member out, one user''s two rows once', array['e1', 'e2', 'e3']);
 
 insert into message_audiences (facility_id, message_id, audience_type, audience_ref_id) values
   ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000f9', 'shift', '64000000-0000-0000-0000-0000000005c1');
@@ -1947,6 +2356,49 @@ begin
   end if;
 end;
 $$;
+-- M-5 residual: once published, neither column can be moved to bring the ladder forward.
+select pg_temp.expect_error(
+  'M-5 (M5b): a publisher cannot move ack_due_at into the past after publishing',
+  $q$update messages set ack_due_at = now() - interval '5 days' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  array['23514']
+);
+select pg_temp.expect_error(
+  'M-5 (M5c): nor backdate published_at (it is frozen once set)',
+  $q$update messages set published_at = now() - interval '6 days' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'M-5: nor move it later, or clear it',
+  $q$update messages set published_at = now() + interval '1 hour' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'M-5: nor set both at once so the due time still follows the (new) publish time',
+  $q$update messages set published_at = now() - interval '9 days', ack_due_at = now() - interval '8 days' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  array['42501']
+);
+do $$
+begin
+  if (select ack_next_escalation_at from messages where id = '64000000-0000-0000-0000-0000000000a9')
+     is distinct from (select ack_due_at from messages where id = '64000000-0000-0000-0000-0000000000a9') then
+    raise exception 'CE FAIL: M-5 (M5e) the rejected updates moved the queue time';
+  end if;
+end;
+$$;
+-- A later due time after publishing is an ordinary edit and re-queues the message.
+select pg_temp.expect_rows(
+  'M-5: a publisher can still extend the due time after publishing',
+  $q$update messages set ack_due_at = now() + interval '4 days' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  1
+);
+do $$
+begin
+  if (select ack_next_escalation_at from messages where id = '64000000-0000-0000-0000-0000000000a9')
+     is distinct from (select ack_due_at from messages where id = '64000000-0000-0000-0000-0000000000a9') then
+    raise exception 'CE FAIL: M-5 extending the due time did not re-queue the message';
+  end if;
+end;
+$$;
 -- A due time in the past at publish is refused (the ladder would fire three tiers in a row).
 insert into messages (id, facility_id, channel_id, author_employee_id, subject, body_text, is_required_ack, ack_due_at) values
   ('64000000-0000-0000-0000-0000000000a8', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Past ack', 'x', true, now() - interval '1 day');
@@ -2009,6 +2461,15 @@ do $$
 begin
   if (select ack_next_escalation_at from messages where id = '64000000-0000-0000-0000-0000000000a7') is not null then
     raise exception 'CE FAIL: a fully escalated message must leave the queue';
+  end if;
+end;
+$$;
+
+-- NEW-2: a cancelled launch is in the audit trail too (section 9 cancelled one).
+do $$
+begin
+  if not exists (select 1 from audit_events where entity_table = 'emergency_alert_launches' and event_type = 'emergency.launch_cancelled') then
+    raise exception 'CE FAIL: NEW-2 no emergency.launch_cancelled audit event was written';
   end if;
 end;
 $$;
@@ -2082,6 +2543,16 @@ select pg_temp.expect_rows(
 select pg_temp.expect_rows(
   'M-5: ... and moves a message in the sweep''s queue',
   $q$update messages set ack_next_escalation_at = now() + interval '1 hour' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  1
+);
+select pg_temp.expect_rows(
+  'NEW-2: ... and deletes a job (a delete from a non-client session is not constrained)',
+  $q$delete from notification_jobs where payload_jsonb ->> 'messageId' = '64000000-0000-0000-0000-0000000000f5'$q$,
+  1
+);
+select pg_temp.expect_rows(
+  'M-5: ... and re-dates a published message (the service role is not frozen)',
+  $q$update messages set published_at = now() - interval '1 minute' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
   1
 );
 reset role;

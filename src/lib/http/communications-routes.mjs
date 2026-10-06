@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { authCanAccessFacility, makeGuards } from "./guard.mjs";
 import {
   resolveMessageAudience,
@@ -322,6 +322,32 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             audience.rule_jsonb = nextRule;
           }
         }
+        // NEW-1: an urgent message bypasses quiet hours, so it is never
+        // published by this route's own writes. One call to
+        // public.publish_urgent_message() publishes it and writes its single
+        // bypassing job in one transaction, with the recipients resolved from
+        // the message's audience rows, the channels from the priority mapping
+        // and no caller-supplied copy -- the notification_jobs client guard
+        // (0064) refuses a client-written bypass job. The audience windows were
+        // written above, so the database resolves exactly what this route
+        // would have.
+        if (message.priority === "urgent") {
+          let urgent;
+          try {
+            urgent = await pgRpc(auth.client, "publish_urgent_message", { p_message_id: params.id });
+          } catch (error) {
+            if (error instanceof PostgrestError && [400, 403, 404, 409].includes(error.status)) {
+              return sendJson(response, error.status, { error: error.body?.message ?? "urgent publish rejected" });
+            }
+            throw error;
+          }
+          return sendJson(response, 200, {
+            publishedAt: urgent?.publishedAt ?? null,
+            recipientCount: urgent?.recipientCount ?? 0,
+            unresolvedAudiences: urgent?.unresolvedAudiences ?? 0
+          });
+        }
+
         const publishNow = new Date();
         const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
           shiftWindow,
@@ -340,6 +366,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           { returning: true }
         );
 
+        // Urgent messages left through publish_urgent_message() above, and
+        // emergency ones were refused at the top, so what reaches this write is
+        // a message for which shouldBypassQuietHours() is false: the job never
+        // asks the database for a bypass (which the client guard would refuse).
         const bypassQuietHours = shouldBypassQuietHours(message);
         const route = {
           id: null,

@@ -148,7 +148,10 @@ for (const helper of [
   "internal.approve_emergency_launch",
   "public.approve_emergency_launch",
   "internal.emergency_launch_queue",
-  "public.emergency_launch_queue"
+  "public.emergency_launch_queue",
+  "internal.publish_urgent_message",
+  "public.publish_urgent_message",
+  "fn_emergency_alert_launch_audit"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

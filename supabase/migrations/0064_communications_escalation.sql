@@ -60,12 +60,15 @@
 -- that policy was a way around CM-13's four-eyes rule (H-1).
 -- fn_notification_jobs_client_guard (SECURITY INVOKER, so
 -- current_user is the real session role) closes it for client sessions:
--- no message.emergency job, no quietHoursBypass outside the two sanctioned
--- shapes (0058's high/critical incident rule; an urgent message's own
--- publish job), and no change to an existing row's event type, payload,
--- dedupe key or facility. A SECURITY DEFINER function's own writes run as
--- the function owner and are not client sessions, which is how
--- approve_emergency_launch() enqueues the one emergency job.
+-- no message.emergency job, no quietHoursBypass except 0058's own
+-- high/critical incident rule (an urgent message's quiet-hours-bypassing
+-- publish job is written by publish_urgent_message(), never by the client,
+-- NEW-1), no change to an existing row's event type, payload, dedupe key or
+-- facility, and no client DELETE (NEW-2: a delete would silence an approved
+-- broadcast and cascade its delivery record away). A SECURITY DEFINER
+-- function's own writes run as the function owner and are not client
+-- sessions, which is how approve_emergency_launch() enqueues the one
+-- emergency job and publish_urgent_message() the one urgent publish job.
 --
 -- CM-13 -- emergency mode:
 --   * emergency_alert_launches is the approval ledger (one row per message):
@@ -228,16 +231,34 @@ begin
 
   -- Guard 2: an acknowledgement due time must lie after the moment the message
   -- goes out, or the ladder would fire reminder, supervisor and manager tiers
-  -- on three consecutive passes. Checked for client sessions on the transition
-  -- into published (the publish route answers a clean 400 first).
+  -- on three consecutive passes. For client sessions this is checked on the
+  -- transition into published AND on any client change of either column
+  -- afterwards (a publisher could otherwise move ack_due_at, or backdate
+  -- published_at, into the past once the message is out). The publish route
+  -- answers a clean 400 first.
   if auth.uid() is not null
      and new.is_required_ack
      and new.published_at is not null
      and new.ack_due_at is not null
-     and (tg_op = 'INSERT' or old.published_at is null)
+     and (tg_op = 'INSERT'
+          or old.published_at is null
+          or new.ack_due_at is distinct from old.ack_due_at
+          or new.published_at is distinct from old.published_at)
      and new.ack_due_at <= new.published_at then
     raise exception 'ack_due_at must be later than the time the message is published'
       using errcode = 'check_violation';
+  end if;
+
+  -- Guard 3: once a message is published its publish time is frozen for client
+  -- sessions (the ladder anchors on it); the service role is unaffected. The
+  -- transition INTO published (old.published_at null) is what the publish
+  -- route and the definer publish functions perform.
+  if auth.uid() is not null
+     and tg_op = 'UPDATE'
+     and old.published_at is not null
+     and new.published_at is distinct from old.published_at then
+    raise exception 'published_at cannot be changed once a message is published'
+      using errcode = '42501';
   end if;
   return new;
 end;
@@ -378,9 +399,23 @@ language plpgsql
 set search_path = public
 as $$
 begin
-  -- Guard 1: only client sessions are constrained here.
+  -- Guard 1: only client sessions are constrained here. (A BEFORE DELETE
+  -- trigger must hand back OLD, or the delete is silently skipped.)
   if current_user not in ('authenticated', 'anon') then
+    if tg_op = 'DELETE' then
+      return old;
+    end if;
     return new;
+  end if;
+
+  -- Guard 6 (NEW-2): a client session never deletes a notification job. No
+  -- route does; 0006's FOR ALL policy still grants it, and a publisher could
+  -- otherwise silence an approved emergency broadcast before the worker drains
+  -- it, or erase a sent job and (through the notification_deliveries cascade)
+  -- its delivery record.
+  if tg_op = 'DELETE' then
+    raise exception 'notification jobs cannot be deleted from a client session'
+      using errcode = '42501';
   end if;
 
   if tg_op = 'INSERT' then
@@ -391,45 +426,27 @@ begin
         using errcode = '42501';
     end if;
 
-    -- Guard 3: quietHoursBypass is accepted from a client in two shapes only:
+    -- Guard 3: quietHoursBypass is accepted from a client in ONE shape only:
     -- 0058's INSERT policy predicate (an incident actor -- manage, review or
     -- escalate -- writing an incident event for a high/critical incident in
-    -- this very facility), and the publish job of an already-published, same-facility,
-    -- urgent message that has no such job yet (CM-03's urgent publish).
+    -- this very facility). NEW-1: the urgent message's publish job used to be
+    -- a second client-accepted shape, which left channels, recipients and copy
+    -- to the caller and let the job be cancelled and written again; it is now
+    -- written by publish_urgent_message() (a definer function, not a client
+    -- session), which derives all of that on the server.
     if coalesce(new.payload_jsonb ->> 'quietHoursBypass', 'false') = 'true' then
       if not (
-        (
-          new.event_type in ('incident.submitted', 'incident.escalated', 'incident.sla_breached')
-          and (
-            internal.has_permission(auth.uid(), new.facility_id, 'incidents.manage')
-            or internal.has_permission(auth.uid(), new.facility_id, 'incidents.review')
-            or internal.has_permission(auth.uid(), new.facility_id, 'incidents.escalate')
-          )
-          and exists (
-            select 1 from incident_reports r
-            where r.id::text = new.payload_jsonb ->> 'incidentId'
-              and r.facility_id = new.facility_id
-              and r.severity in ('high', 'critical')
-          )
+        new.event_type in ('incident.submitted', 'incident.escalated', 'incident.sla_breached')
+        and (
+          internal.has_permission(auth.uid(), new.facility_id, 'incidents.manage')
+          or internal.has_permission(auth.uid(), new.facility_id, 'incidents.review')
+          or internal.has_permission(auth.uid(), new.facility_id, 'incidents.escalate')
         )
-        or (
-          new.event_type = 'message.published'
-          and exists (
-            select 1 from messages m
-            where m.id::text = new.payload_jsonb ->> 'messageId'
-              and m.facility_id = new.facility_id
-              and m.priority = 'urgent'
-              and m.published_at is not null
-              and m.deleted_at is null
-          )
-          and not exists (
-            select 1 from notification_jobs j
-            where j.event_type = 'message.published'
-              and j.facility_id = new.facility_id
-              and j.payload_jsonb ->> 'messageId' = new.payload_jsonb ->> 'messageId'
-              and j.payload_jsonb ->> 'quietHoursBypass' = 'true'
-              and j.status <> 'cancelled'
-          )
+        and exists (
+          select 1 from incident_reports r
+          where r.id::text = new.payload_jsonb ->> 'incidentId'
+            and r.facility_id = new.facility_id
+            and r.severity in ('high', 'critical')
         )
       ) then
         raise exception 'quietHoursBypass is not allowed on this notification job'
@@ -452,13 +469,19 @@ begin
   end if;
 
   -- Guard 5: an emergency or quiet-hours-bypassing job cannot be re-armed (a
-  -- status reset would re-broadcast it); the only change a client may make to
-  -- one is to cancel it.
-  if old.event_type = 'message.emergency'
-     or coalesce(old.payload_jsonb ->> 'quietHoursBypass', 'false') = 'true' then
+  -- status reset would re-broadcast it). NEW-2: an approved emergency
+  -- broadcast cannot be touched by a client at all -- not even cancelled, or a
+  -- single publisher could silence what a second person approved. A bypassing
+  -- incident job may only be cancelled, and only while it is still pending
+  -- (cancelling a job the worker already sent is not a client's business).
+  if old.event_type = 'message.emergency' then
+    raise exception 'a message.emergency notification job cannot be changed from a client session'
+      using errcode = '42501';
+  end if;
+  if coalesce(old.payload_jsonb ->> 'quietHoursBypass', 'false') = 'true' then
     if (to_jsonb(new) - 'status' - 'updated_at') is distinct from (to_jsonb(old) - 'status' - 'updated_at')
-       or (new.status is distinct from old.status and new.status <> 'cancelled') then
-      raise exception 'an emergency or quiet-hours-bypassing notification job can only be cancelled'
+       or (new.status is distinct from old.status and (new.status <> 'cancelled' or old.status <> 'pending')) then
+      raise exception 'a quiet-hours-bypassing notification job can only be cancelled, and only while it is pending'
         using errcode = '42501';
     end if;
   end if;
@@ -468,7 +491,7 @@ $$;
 
 drop trigger if exists notification_jobs_client_guard on notification_jobs;
 create trigger notification_jobs_client_guard
-  before insert or update on notification_jobs
+  before insert or update or delete on notification_jobs
   for each row execute function fn_notification_jobs_client_guard();
 
 revoke execute on function fn_notification_jobs_client_guard() from public, authenticated;
@@ -485,6 +508,23 @@ $$;
 create unique index if not exists notification_jobs_emergency_message_uidx
   on notification_jobs ((payload_jsonb ->> 'messageId'))
   where event_type = 'message.emergency';
+
+-- NEW-1: exactly one quiet-hours-bypassing publish job per message, whoever
+-- writes it (publish_urgent_message() in section 5c is the only writer a
+-- publisher can reach). Created defensively: a database that already holds two
+-- such rows for one message from before this slice keeps the in-function check
+-- (publish_urgent_message() refuses to send a second one) instead of failing
+-- the whole migration.
+do $$
+begin
+  create unique index if not exists notification_jobs_urgent_publish_message_uidx
+    on notification_jobs ((payload_jsonb ->> 'messageId'))
+    where event_type = 'message.published'
+      and payload_jsonb ->> 'quietHoursBypass' = 'true';
+exception when unique_violation then
+  raise warning 'notification_jobs_urgent_publish_message_uidx not created: duplicate urgent publish jobs already exist';
+end
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 5. emergency_alert_launches -- the approval ledger (CM-13).
@@ -626,6 +666,9 @@ begin
 end;
 $$;
 
+-- Generic over the message: both approve_emergency_launch() (CM-13) and
+-- publish_urgent_message() (NEW-1) resolve their recipients here, so a
+-- publisher never chooses who a quiet-hours-bypassing job pages.
 create or replace function internal.fn_emergency_audience(p_message_id uuid, p_at timestamptz)
 returns jsonb
 language plpgsql
@@ -653,8 +696,14 @@ begin
       and a.facility_id = v_facility
       and a.deleted_at is null
   ),
+  -- NEW-3: the roster is the live employees of the facility. A soft-deleted
+  -- (former) employee is never a recipient, however the audience reaches them
+  -- (department, role, a named employee or a shift assignment); the filter on
+  -- `emp` applies to every branch below through the final exists().
   emp as (
-    select e.id, e.department_id, e.user_id from employees e where e.facility_id = v_facility
+    select e.id, e.department_id, e.user_id, e.created_at
+      from employees e
+     where e.facility_id = v_facility and e.deleted_at is null
   ),
   picked as (
     select a.audience_ref_id as employee_id
@@ -665,11 +714,18 @@ begin
       from aud a join emp e on e.department_id = a.audience_ref_id
      where a.audience_type = 'department' and a.audience_ref_id is not null
     union
-    select e.id
-      from aud a
-      join memberships m on m.facility_id = v_facility and m.role_id = a.audience_ref_id and m.status = 'active'
-      join emp e on e.user_id = m.user_id
-     where a.audience_type = 'role' and a.audience_ref_id is not null
+    -- NEW-3: one employee row per person. A user holding two employee rows in
+    -- the facility is one recipient of a role audience, not two (the earliest
+    -- row, the one approve_emergency_launch() also attributes to).
+    select r.id
+      from (
+        select distinct on (m.user_id) e.id
+          from aud a
+          join memberships m on m.facility_id = v_facility and m.role_id = a.audience_ref_id and m.status = 'active'
+          join emp e on e.user_id = m.user_id
+         where a.audience_type = 'role' and a.audience_ref_id is not null
+         order by m.user_id, e.created_at, e.id
+      ) r
     union
     select sa.employee_id
       from shift_assignments sa
@@ -984,6 +1040,74 @@ begin
 end
 $$;
 
+-- NEW-2: the launch's lifecycle is written to the append-only audit trail
+-- (audit_events, 0010/0013: no client INSERT, no UPDATE/DELETE), the same
+-- AFTER-trigger shape 0033 uses for report submissions. SECURITY DEFINER so the
+-- row lands whoever the session is; the actor is the JWT subject when it names
+-- an app user (a definer path such as approve_emergency_launch() keeps the
+-- caller's JWT, so the approval and the launch are attributed to the approver).
+create or replace function fn_emergency_alert_launch_audit()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_actor uuid := auth.uid();
+  v_event text;
+begin
+  if tg_op = 'INSERT' then
+    v_event := 'emergency.launch_requested';
+  elsif new.status is distinct from old.status then
+    v_event := case new.status
+      when 'approved' then 'emergency.launch_approved'
+      when 'launched' then 'emergency.launch_launched'
+      when 'cancelled' then 'emergency.launch_cancelled'
+      else null
+    end;
+  end if;
+  if v_event is null then
+    return new;
+  end if;
+
+  if v_actor is not null and not exists (select 1 from app_users where id = v_actor) then
+    v_actor := null;
+  end if;
+
+  insert into audit_events (facility_id, actor_user_id, event_type, entity_table, entity_id, event_payload)
+  values (
+    new.facility_id,
+    v_actor,
+    v_event,
+    'emergency_alert_launches',
+    new.id,
+    jsonb_build_object(
+      'messageId', new.message_id,
+      'status', new.status,
+      'requestedByEmployeeId', new.requested_by_employee_id,
+      'approvedByEmployeeId', new.approved_by_employee_id,
+      'recipientCount', new.recipient_count
+    )
+  );
+  return new;
+end;
+$$;
+
+drop trigger if exists emergency_alert_launches_audit on emergency_alert_launches;
+create trigger emergency_alert_launches_audit
+  after insert or update on emergency_alert_launches
+  for each row execute function fn_emergency_alert_launch_audit();
+
+revoke execute on function fn_emergency_alert_launch_audit() from public, authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_emergency_alert_launch_audit() from anon;
+  end if;
+end
+$$;
+
 drop policy if exists "communication publishers can read emergency launches" on emergency_alert_launches;
 create policy "communication publishers can read emergency launches" on emergency_alert_launches
   for select
@@ -1284,6 +1408,145 @@ begin
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function public.approve_emergency_launch(uuid) to service_role;
     grant execute on function public.emergency_launch_queue(uuid, text) to service_role;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 5c. publish_urgent_message (NEW-1): the ONE place an urgent message is
+-- published together with its quiet-hours-bypassing job. The notification_jobs
+-- client guard no longer accepts a client-written message.published bypass job
+-- (its old "urgent-publish exception" left channels, recipients and copy to
+-- the caller, needed no second approver and could be repeated after cancelling
+-- the sent job). Same shape as approve_emergency_launch(): SECURITY DEFINER,
+-- re-checks the caller's own communications.publish in the message's facility,
+-- takes only the message id, and derives everything it writes -- the
+-- recipients from the message's own audience rows (the resolver the emergency
+-- flow uses), the channels from the constant below (kept equal to
+-- channelsForPriority('urgent') in src/lib/communications.mjs by a structural
+-- test), the title from the message's subject, bypass true -- in one
+-- transaction, once per message (the message row lock, the in-function check
+-- and notification_jobs_urgent_publish_message_uidx). Only an urgent,
+-- unpublished, non-deleted message qualifies; failures carry PostgREST's PTnnn
+-- status codes. Non-urgent messages never get a bypass job: the ordinary
+-- publish route keeps writing their (bypass false) job itself.
+-- ---------------------------------------------------------------------------
+create or replace function internal.publish_urgent_message(p_message_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_actor uuid := auth.uid();
+  v_facility uuid;
+  v_message messages%rowtype;
+  v_now timestamptz := now();
+  v_resolved jsonb;
+  v_count integer;
+begin
+  if v_actor is null then
+    raise exception 'publish_urgent_message: authentication required'
+      using errcode = '28000';
+  end if;
+
+  select facility_id into v_facility from messages where id = p_message_id;
+  if not found then
+    raise exception 'message not found' using errcode = 'PT404';
+  end if;
+  if not internal.has_permission(v_actor, v_facility, 'communications.publish') then
+    raise exception 'publish_urgent_message: missing permission: communications.publish'
+      using errcode = '42501';
+  end if;
+
+  -- Serialize with every other writer of this message (a second publish, an
+  -- edit, a soft delete) before reading the state the decision depends on.
+  select * into v_message from messages where id = p_message_id for update;
+  if not found or v_message.facility_id <> v_facility or v_message.deleted_at is not null then
+    raise exception 'message not found' using errcode = 'PT404';
+  end if;
+  if v_message.published_at is not null then
+    raise exception 'message already published' using errcode = 'PT409';
+  end if;
+  if v_message.priority <> 'urgent' then
+    raise exception 'only a message with priority ''urgent'' is published through publish_urgent_message'
+      using errcode = 'PT409';
+  end if;
+  if v_message.is_required_ack and v_message.ack_due_at is not null and v_message.ack_due_at <= v_now then
+    raise exception 'ack_due_at must be later than the time the message is published'
+      using errcode = 'PT400';
+  end if;
+  if exists (
+    select 1 from notification_jobs j
+     where j.event_type = 'message.published'
+       and j.payload_jsonb ->> 'messageId' = p_message_id::text
+       and j.payload_jsonb ->> 'quietHoursBypass' = 'true'
+  ) then
+    raise exception 'an urgent publish job already exists for this message' using errcode = 'PT409';
+  end if;
+
+  v_resolved := internal.fn_emergency_audience(p_message_id, v_now);
+  v_count := jsonb_array_length(v_resolved -> 'recipients');
+
+  update messages
+     set published_at = v_now, updated_at = v_now
+   where id = p_message_id and published_at is null;
+
+  begin
+    insert into notification_jobs (facility_id, event_type, status, scheduled_for, payload_jsonb)
+    values (
+      v_facility,
+      'message.published',
+      'pending',
+      v_now,
+      jsonb_build_object(
+        'route_id', null,
+        'priority', 'urgent',
+        'channels', jsonb_build_array('in_app', 'push'),
+        'recipients', v_resolved -> 'recipients',
+        'messageId', p_message_id,
+        'quietHoursBypass', true,
+        'title', left(v_message.subject, 200)
+      )
+    );
+  exception when unique_violation then
+    raise exception 'an urgent publish job already exists for this message' using errcode = 'PT409';
+  end;
+
+  return jsonb_build_object(
+    'publishedAt', v_now,
+    'recipientCount', v_count,
+    'channels', jsonb_build_array('in_app', 'push'),
+    'quietHoursBypass', true,
+    'unresolvedAudiences', (v_resolved -> 'unresolved')
+  );
+end;
+$$;
+
+revoke execute on function internal.publish_urgent_message(uuid) from public;
+grant execute on function internal.publish_urgent_message(uuid) to authenticated;
+
+create or replace function public.publish_urgent_message(p_message_id uuid)
+returns jsonb
+language sql
+security invoker
+set search_path = public
+as $$
+  select internal.publish_urgent_message(p_message_id);
+$$;
+
+revoke execute on function public.publish_urgent_message(uuid) from public;
+grant execute on function public.publish_urgent_message(uuid) to authenticated;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function internal.publish_urgent_message(uuid) from anon;
+    revoke execute on function public.publish_urgent_message(uuid) from anon;
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function internal.publish_urgent_message(uuid) to service_role;
+    grant execute on function public.publish_urgent_message(uuid) to service_role;
   end if;
 end
 $$;
