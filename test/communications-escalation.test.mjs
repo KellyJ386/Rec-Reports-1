@@ -10,7 +10,13 @@ import {
   summarizeEmergencyResponses,
   isEmergencyResponse,
   summarizeInbox,
-  shouldBypassQuietHours
+  shouldBypassQuietHours,
+  shouldBypassQuietHoursForEscalation,
+  ackEscalationAnchor,
+  ackEscalationNextDueAt,
+  serializeShiftWindow,
+  normalizeShiftWindow,
+  audienceShiftWindow
 } from "../src/lib/communications.mjs";
 import { getDefinition, validateSettingValue } from "../src/lib/settings-registry.mjs";
 
@@ -223,4 +229,73 @@ test("summarizeInbox on an empty inbox is all zeros", () => {
     pendingAcks: { count: 0, overdueCount: 0, nextDueAt: null },
     latestEmergency: null
   });
+});
+
+// --- L-1: the ladder is anchored on the later of the due time and the publish time -------------
+
+test("L-1: a due time before the publish time anchors the ladder on the publish time", () => {
+  const published = "2026-08-12T12:00:00Z";
+  const stale = message({ ack_due_at: "2026-08-01T00:00:00Z", published_at: published });
+  assert.equal(ackEscalationAnchor(stale).toISOString(), "2026-08-12T12:00:00.000Z");
+  const publishedMs = new Date(published).getTime();
+  // Without the anchor all three tiers would be due at once, because the stale due time is eleven days old.
+  assert.equal(ackEscalationDueLevel(stale, new Date(publishedMs), buildAckEscalationLadder()), 1);
+  assert.equal(ackEscalationDueLevel(stale, new Date(publishedMs + 23 * H), buildAckEscalationLadder()), 1);
+  assert.equal(ackEscalationDueLevel(stale, new Date(publishedMs + 24 * H), buildAckEscalationLadder()), 2);
+  assert.equal(ackEscalationDueLevel(stale, new Date(publishedMs - 1), buildAckEscalationLadder()), 0, "never before the publish time");
+  assert.equal(nextAckEscalationStep(stale, new Date(publishedMs + H)).level, 1);
+  // A normal message (due after publish) is unchanged.
+  assert.equal(ackEscalationAnchor(message()).toISOString(), "2026-08-10T12:00:00.000Z");
+  // Not required / unpublished / no due time: no anchor.
+  assert.equal(ackEscalationAnchor(message({ is_required_ack: false })), null);
+  assert.equal(ackEscalationAnchor(message({ published_at: null })), null);
+  assert.equal(ackEscalationAnchor(message({ ack_due_at: null })), null);
+});
+
+test("L-1: only an EMERGENCY message's escalation tiers bypass quiet hours; an urgent publish still does", () => {
+  for (const priority of ["low", "normal", "urgent"]) {
+    assert.equal(shouldBypassQuietHoursForEscalation({ priority }), false, priority);
+  }
+  assert.equal(shouldBypassQuietHoursForEscalation({ priority: "emergency" }), true);
+  assert.equal(shouldBypassQuietHoursForEscalation(null), false);
+  // CM-03's publish-time rule is untouched.
+  assert.equal(shouldBypassQuietHours({ priority: "urgent" }), true);
+  assert.equal(shouldBypassQuietHours({ priority: "emergency" }), true);
+  assert.equal(shouldBypassQuietHours({ priority: "normal" }), false);
+});
+
+// --- M-5: when does the sweep next need to look at a message? ------------------------------------
+
+test("M-5: ackEscalationNextDueAt is when the tier AFTER the recorded level comes due", () => {
+  const ladder = buildAckEscalationLadder();
+  assert.equal(ackEscalationNextDueAt(message(), ladder).toISOString(), at(0).toISOString());
+  assert.equal(ackEscalationNextDueAt(message({ ack_escalation_level: 1 }), ladder).toISOString(), at(24).toISOString());
+  assert.equal(ackEscalationNextDueAt(message({ ack_escalation_level: 2 }), ladder).toISOString(), at(48).toISOString());
+  assert.equal(ackEscalationNextDueAt(message({ ack_escalation_level: 3 }), ladder), null, "a fully escalated message leaves the queue");
+  // Right after claiming level N the sweep asks for level N's successor explicitly.
+  assert.equal(ackEscalationNextDueAt(message(), ladder, 1).toISOString(), at(24).toISOString());
+  assert.equal(ackEscalationNextDueAt(message(), ladder, 3), null);
+  // Per-facility offsets move it; the publish-time anchor applies.
+  const custom = buildAckEscalationLadder({ "communications.ackReminderAfterHours": 5, "communications.ackSupervisorAfterHours": 10 });
+  assert.equal(ackEscalationNextDueAt(message(), custom).toISOString(), at(5).toISOString());
+  assert.equal(ackEscalationNextDueAt(message({ is_required_ack: false }), ladder), null);
+});
+
+// --- L-4: the publish-time shift window is persisted in a form every reader resolves ---------------
+
+test("L-4: serializeShiftWindow produces the rule.window shape the shared resolver reads back", () => {
+  assert.deepEqual(serializeShiftWindow("current"), { kind: "current" });
+  assert.deepEqual(serializeShiftWindow(" NEXT "), { kind: "next" });
+  assert.deepEqual(serializeShiftWindow({ kind: "next" }), { kind: "next" });
+  const range = serializeShiftWindow({ from: "2026-08-10T00:00:00Z", to: "2026-08-12T00:00:00Z" });
+  assert.deepEqual(range, { kind: "range", from: "2026-08-10T00:00:00.000Z", to: "2026-08-12T00:00:00.000Z" });
+  // JSON round trip: what is stored resolves to the same window.
+  const stored = JSON.parse(JSON.stringify({ window: range }));
+  assert.deepEqual(normalizeShiftWindow(stored.window), normalizeShiftWindow({ from: "2026-08-10T00:00:00Z", to: "2026-08-12T00:00:00Z" }));
+  assert.deepEqual(audienceShiftWindow({ audience_type: "shift", audience_ref_id: null, rule_jsonb: stored }), normalizeShiftWindow(stored.window));
+  // Malformed windows are not serialized (null, never "everybody").
+  assert.equal(serializeShiftWindow(null), null);
+  assert.equal(serializeShiftWindow("sometime"), null);
+  assert.equal(serializeShiftWindow({ from: "2026-08-10", to: "2026-01-01" }), null);
+  assert.equal(serializeShiftWindow({ from: "2026-01-01T00:00:00Z", to: "2026-06-01T00:00:00Z" }), null, "longer than 31 days");
 });

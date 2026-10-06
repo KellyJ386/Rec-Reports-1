@@ -13,23 +13,30 @@
 //      routes; the ordinary publish route refuses emergency messages).
 //   2. POST .../emergency-launch (communications.publish) records the request
 //      in emergency_alert_launches (status pending_approval), attributed to
-//      the caller's own employee.
+//      the caller's own employee. From that moment the message and its
+//      audience are frozen for client sessions, and the database pins a hash
+//      of its subject, body, channel and audience to the request.
 //   3. POST .../emergency-approve (communications.publish) is the approval
-//      step: a second publisher by default (the tenant setting
-//      communications.emergencyRequiresSecondApprover, enforced by
-//      fn_emergency_alert_launch_guard in the database). The approver's call
-//      then publishes the message and enqueues ONE notification_jobs row on
-//      every channel with quietHoursBypass = true -- the only place a
-//      client-originated job gets that flag, and only after the launch is
-//      approved. (The pre-existing communications.publish policy on
-//      notification_jobs, 0006, is untouched; see the 0064 header.)
+//      step, and it is ONE call to public.approve_emergency_launch(): a
+//      SECURITY DEFINER function that re-checks the caller's permission,
+//      approves the launch (a different PERSON than the requester by default,
+//      the tenant setting communications.emergencyRequiresSecondApprover),
+//      checks the content hash, derives the recipients from the message's own
+//      audience rows, publishes the message, enqueues the single
+//      message.emergency job (every channel, quiet hours bypassed) and stamps
+//      the launch `launched` with the recipient count -- in one transaction.
+//      This route writes no job, no message and no launch row itself: a client
+//      session cannot (0064's notification_jobs, launch and message guards
+//      refuse it), so the four-eyes rule cannot be walked around with a raw
+//      PostgREST call either. The approval queue (GET .../emergency-launches)
+//      is the same database's view: it carries the message body and the number
+//      of people the audience resolves to right now.
 //   4. Employees answer with POST /messages/:id/emergency-response -- their
 //      OWN employee row only, never an id from the body.
 //   5. Publishers read the roll-up (per message, and facility-wide).
-import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { authCanAccessFacility, makeGuards } from "./guard.mjs";
 import {
-  EMERGENCY_CHANNELS,
   EMERGENCY_RESPONSES,
   INBOX_WINDOW_DAYS,
   isEmergencyResponse,
@@ -48,7 +55,6 @@ const AUDIENCE_COLUMNS = "id,facility_id,message_id,audience_type,audience_ref_i
 const LAUNCH_COLUMNS =
   "id,facility_id,message_id,requested_by_employee_id,requested_at,approved_by_employee_id,approved_at,status,launched_at,recipient_count,created_at,updated_at";
 const RESPONSE_COLUMNS = "id,facility_id,message_id,employee_id,response,note,responded_at";
-const EMERGENCY_BODY_LIMIT = 500;
 const ROLLUP_WINDOW_DAYS = 30;
 const ROLLUP_MESSAGE_LIMIT = 50;
 const INBOX_MESSAGE_LIMIT = 200;
@@ -153,6 +159,10 @@ export function registerCommunicationsEscalationRoutes(router, { authenticate, s
   );
 
   // --- Approval + broadcast (CM-13) -----------------------------------------
+  // One database call does everything (see the header). The route only
+  // authenticates, checks the path, and translates the function's refusals
+  // (PostgREST carries its PTnnn codes as the HTTP status) into clean
+  // responses.
   router.register(
     "POST",
     "/facilities/:facilityId/messages/:id/emergency-approve",
@@ -164,132 +174,26 @@ export function registerCommunicationsEscalationRoutes(router, { authenticate, s
 
         const message = await loadFacilityMessage(auth.client, params.facilityId, params.id);
         if (!message) return sendJson(response, 404, { error: "message not found" });
-        const launch = await loadLaunch(auth.client, message.id);
-        if (!launch || launch.facility_id !== params.facilityId) {
-          return sendJson(response, 404, { error: "no emergency launch has been requested for this message" });
-        }
-        if (launch.status === "launched") return sendJson(response, 409, { error: "emergency already launched" });
-        if (launch.status === "cancelled") return sendJson(response, 409, { error: "emergency launch was cancelled" });
-        if (message.published_at) return sendJson(response, 409, { error: "message already published" });
-        if (message.priority !== "emergency") {
-          return sendJson(response, 409, { error: "only a message with priority 'emergency' can be launched as an emergency" });
-        }
 
-        // The channel must still be emergency-enabled at approval time (an admin
-        // may have switched it off since the request was made).
-        const channels = await pgSelect(auth.client, "communication_channels", {
-          filters: { id: message.channel_id, facility_id: params.facilityId },
-          select: "id,emergency_enabled",
-          limit: 1
-        });
-        if ((channels ?? [])[0]?.emergency_enabled !== true) {
-          return sendJson(response, 409, { error: "the message channel is not emergency-enabled" });
-        }
-
-        const employeeId = await loadCallerEmployeeId(auth.client, params.facilityId, auth.claims.sub);
-        if (!employeeId) return sendJson(response, 403, { error: "no employee record for this facility" });
-
-        // Resolve the audience BEFORE any state change: an emergency that
-        // would reach nobody is refused without consuming the approval.
-        const publishNow = new Date();
-        const { recipients, unresolvedAudiences } = await resolveAudience(auth.client, message, { now: publishNow });
-        if (recipients.length === 0) {
-          return sendJson(response, 409, { error: "the message audience resolves to no recipients", unresolvedAudiences });
-        }
-
-        // The approval itself. The database guard also rejects an approver who
-        // is the requester when the tenant requires a second approver (the
-        // 42501 surfaces as a 403 through withAuth), so this holds even for a
-        // caller who never reaches this route.
-        if (launch.status === "pending_approval") {
-          const approved = await pgUpdate(
-            auth.client,
-            "emergency_alert_launches",
-            { id: launch.id, status: "pending_approval" },
-            { status: "approved", approved_by_employee_id: employeeId },
-            { returning: true }
-          );
-          if (!Array.isArray(approved) || approved.length === 0) {
-            return sendJson(response, 409, { error: "emergency launch is no longer pending approval" });
-          }
-        }
-
-        // Publish the message (the 0064 messages trigger requires the
-        // approved launch row just written), compare-and-set on it still
-        // being a draft so a concurrent approve cannot publish twice.
-        const publishedAt = publishNow.toISOString();
-        const published = await pgUpdate(
-          auth.client,
-          "messages",
-          { id: message.id },
-          { published_at: publishedAt, updated_at: publishedAt },
-          { returning: true, extra: { published_at: "is.null" } }
-        );
-        if (!Array.isArray(published) || published.length === 0) {
-          return sendJson(response, 409, { error: "message already published" });
-        }
-
-        // Enqueue the broadcast. quietHoursBypass is stamped here, server-side,
-        // after every gate above -- never from the request body. If the insert
-        // fails, the publish stamp is rolled back (compare-and-set on the exact
-        // value written) so the approved launch can simply be retried.
-        const job = {
-          facility_id: params.facilityId,
-          event_type: "message.emergency",
-          status: "pending",
-          scheduled_for: publishedAt,
-          payload_jsonb: {
-            route_id: null,
-            priority: "emergency",
-            channels: [...EMERGENCY_CHANNELS],
-            recipients,
-            messageId: message.id,
-            quietHoursBypass: true,
-            emergency: true,
-            title: `EMERGENCY: ${String(message.subject ?? "").slice(0, 200)}`,
-            body: String(message.body_text ?? "").slice(0, EMERGENCY_BODY_LIMIT)
-          }
-        };
+        let result;
         try {
-          await pgInsert(auth.client, "notification_jobs", [job], { returning: true });
+          result = await pgRpc(auth.client, "approve_emergency_launch", { p_message_id: message.id });
         } catch (error) {
-          try {
-            await pgUpdate(
-              auth.client,
-              "messages",
-              { id: message.id },
-              { published_at: null, updated_at: new Date().toISOString() },
-              { extra: { published_at: `eq.${publishedAt}` } }
-            );
-          } catch {
-            // The original failure below is the one worth surfacing.
+          if (error instanceof PostgrestError && [400, 403, 404, 409].includes(error.status)) {
+            return sendJson(response, error.status, {
+              error: error.body?.message ?? "emergency approval rejected"
+            });
           }
           throw error;
         }
-
-        let launchRecorded = true;
-        try {
-          await pgUpdate(
-            auth.client,
-            "emergency_alert_launches",
-            { id: launch.id, status: "approved" },
-            { status: "launched", recipient_count: recipients.length },
-            { returning: true }
-          );
-        } catch {
-          // The broadcast is already queued; a failure to stamp the ledger must
-          // not turn a sent alert into an error response.
-          launchRecorded = false;
-        }
-
         return sendJson(response, 200, {
-          launchId: launch.id,
-          status: launchRecorded ? "launched" : "approved",
-          publishedAt,
-          recipientCount: recipients.length,
-          channels: [...EMERGENCY_CHANNELS],
-          quietHoursBypass: true,
-          unresolvedAudiences
+          launchId: result?.launchId ?? null,
+          status: result?.status ?? "launched",
+          publishedAt: result?.publishedAt ?? null,
+          recipientCount: result?.recipientCount ?? 0,
+          channels: result?.channels ?? [],
+          quietHoursBypass: result?.quietHoursBypass === true,
+          unresolvedAudiences: result?.unresolvedAudiences ?? 0
         });
       })
   );
@@ -325,7 +229,12 @@ export function registerCommunicationsEscalationRoutes(router, { authenticate, s
       })
   );
 
-  // Approval queue for the admin console / compose panel.
+  // Approval queue for the compose panel. Served by the database (the
+  // emergency_launch_queue function re-checks communications.publish) so the
+  // approver sees the message BODY and the number of people its audience
+  // resolves to right now -- from the same resolver the approval itself uses --
+  // plus whether the content changed since the request (in which case the
+  // approval will be refused).
   router.register(
     "GET",
     "/facilities/:facilityId/emergency-launches",
@@ -336,15 +245,11 @@ export function registerCommunicationsEscalationRoutes(router, { authenticate, s
         if (status !== null && !["pending_approval", "approved", "launched", "cancelled"].includes(status)) {
           return sendJson(response, 400, { error: "status must be pending_approval, approved, launched or cancelled" });
         }
-        const filters = { facility_id: params.facilityId };
-        if (status) filters.status = status;
-        const rows = await pgSelect(auth.client, "emergency_alert_launches", {
-          filters,
-          select: `${LAUNCH_COLUMNS},messages(subject,priority)`,
-          order: "requested_at.desc",
-          limit: 50
+        const rows = await pgRpc(auth.client, "emergency_launch_queue", {
+          p_facility_id: params.facilityId,
+          p_status: status
         });
-        return sendJson(response, 200, rows ?? []);
+        return sendJson(response, 200, Array.isArray(rows) ? rows : []);
       })
   );
 

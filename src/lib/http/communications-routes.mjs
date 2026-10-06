@@ -5,7 +5,9 @@ import {
   shouldBypassQuietHours,
   channelsForPriority,
   summarizeAckCompliance,
-  normalizeShiftWindow
+  normalizeShiftWindow,
+  serializeShiftWindow,
+  audienceShiftWindow
 } from "../communications.mjs";
 import { loadAudienceResolutionContext, resolutionContextFrom } from "../communications-audience.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
@@ -77,6 +79,21 @@ function groupByMessageId(rows) {
     map.set(row.message_id, list);
   }
   return map;
+}
+
+// M-5 / L-1: a required acknowledgement's due time must be a real date, and a
+// message that is going out must not already be past due -- the escalation
+// ladder would fire its reminder, supervisor and manager tiers on consecutive
+// passes. (0064's messages trigger refuses the same thing for a client write.)
+// Returns an error string, or null.
+function ackDueAtError(ackDueAt, { publishing, now = new Date() } = {}) {
+  if (ackDueAt === undefined || ackDueAt === null || ackDueAt === "") return null;
+  const due = new Date(ackDueAt);
+  if (Number.isNaN(due.getTime())) return "ackDueAt must be a valid date";
+  if (publishing && due.getTime() <= now.getTime()) {
+    return "ackDueAt must be in the future when a message is published";
+  }
+  return null;
 }
 
 // Registers the end-user Communications API routes on a router, using the same
@@ -177,6 +194,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (!channelId) shape.push("channelId is required");
         if (!subject) shape.push("subject is required");
         if (!bodyText) shape.push("bodyText is required");
+        const dueError = ackDueAtError(body.payload.ackDueAt, {
+          publishing: body.payload.publishNow === true && body.payload.isRequiredAck === true
+        });
+        if (dueError) shape.push(dueError);
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
 
@@ -267,6 +288,9 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           });
         }
 
+        const dueError = message.is_required_ack ? ackDueAtError(message.ack_due_at, { publishing: true }) : null;
+        if (dueError) return sendJson(response, 400, { error: dueError });
+
         const audiences = (await pgSelect(auth.client, "message_audiences", {
           filters: { message_id: params.id },
           select: MESSAGE_AUDIENCES_COLUMNS
@@ -279,6 +303,24 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         const shiftWindow = body.payload.shiftWindow ?? null;
         if (shiftWindow !== null && normalizeShiftWindow(shiftWindow) === null) {
           return sendJson(response, 400, { error: "shiftWindow must be 'current', 'next', or { from, to } (at most 31 days)" });
+        }
+        // L-4: the publish-body `shiftWindow` is only a fallback for a ref-less
+        // shift audience that carries no window of its own. Nothing else that
+        // later re-resolves this audience (the escalation sweep, the roll-ups,
+        // the compliance routes) can see the request body, and they treat such
+        // an audience as unresolved -- so the effective window is written into
+        // the audience row BEFORE the message goes out, and the publish fails
+        // (before any side effect) if it cannot be stored.
+        const fallbackWindow = serializeShiftWindow(shiftWindow);
+        if (fallbackWindow) {
+          for (const audience of audiences) {
+            const hasRef = audience.audience_ref_id !== null && audience.audience_ref_id !== undefined;
+            if (audience.audience_type !== "shift" || hasRef || audienceShiftWindow(audience)) continue;
+            const rule = audience.rule_jsonb && typeof audience.rule_jsonb === "object" && !Array.isArray(audience.rule_jsonb) ? audience.rule_jsonb : {};
+            const nextRule = { ...rule, window: fallbackWindow };
+            await pgUpdate(auth.client, "message_audiences", { id: audience.id }, { rule_jsonb: nextRule }, { returning: true });
+            audience.rule_jsonb = nextRule;
+          }
         }
         const publishNow = new Date();
         const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
@@ -743,6 +785,9 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (errors.length > 0) return sendJson(response, 400, { errors });
 
         if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
+        // L-3: marking a channel emergency-capable is an admin decision (0064
+        // refuses the flag to anyone without admin.manage at the database).
+        if (body.payload.emergencyEnabled === true && !requirePerm(auth, params.facilityId, "admin.manage", response)) return;
 
         const row = {
           facility_id: params.facilityId,

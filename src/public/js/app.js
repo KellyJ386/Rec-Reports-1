@@ -79,11 +79,14 @@ import {
   formatComplianceSummary,
   SHIFT_AUDIENCE_MODES,
   isEmergencyCompose,
-  canRespondToEmergency
+  canRespondToEmergency,
+  describeEmergencyLaunch,
+  endOfDayIso
 } from "./comms-compose.mjs";
 import {
   nextPollDelayMs,
   shouldPollOnVisible,
+  shouldStopPolling,
   describeInboxSummary,
   hasEmergencyAlert,
   needsEmergencyResponse,
@@ -712,7 +715,13 @@ const inboxPoller = (function () {
         render(summary, lastSummary);
         lastSummary = summary;
       }
-    } catch {
+    } catch (error) {
+      // L-7: an answer that polling again cannot change (401/403/404) ends the
+      // polling until restart() (sign-in, facility switch); an outage backs off.
+      if (shouldStopPolling(error)) {
+        stop();
+        return;
+      }
       consecutiveFailures += 1;
     }
     if (reschedule && runGeneration === generation) schedule(runGeneration);
@@ -748,7 +757,7 @@ const inboxPoller = (function () {
   document.addEventListener("visibilitychange", () => {
     if (timer === null) return;
     if (document.visibilityState === "visible") {
-      if (shouldPollOnVisible({ lastPolledAt, now: Date.now() })) poll(generation);
+      if (shouldPollOnVisible({ lastPolledAt, now: Date.now(), consecutiveFailures })) poll(generation);
       else schedule(generation);
     } else {
       schedule(generation);
@@ -4319,25 +4328,7 @@ const workOrdersPanel = (function () {
       if (state.createOpen) host.append(buildCreateForm());
     }
 
-    if (state.formNotice) host.append(el("p", { class: "item-subtitle", role: "status", "aria-live": "polite" }, state.formNotice));
     if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
-
-    // CM-13: emergency launch requests waiting for a publisher's approval.
-    if (hasPerm("communications.publish") && state.emergencyLaunches.length > 0) {
-      const approvals = el("div", { class: "emergency-approvals", role: "region", "aria-label": "Emergency launch approvals" });
-      approvals.append(el("h4", {}, "Emergency launches awaiting approval"));
-      for (const launch of state.emergencyLaunches) {
-        const subject = launch.messages && launch.messages.subject ? launch.messages.subject : launch.message_id;
-        const row = el("div", { class: "emergency-approval-row" }, el("strong", {}, subject));
-        const approveBtn = el("button", { type: "button", class: "primary emergency-help-btn" }, "Approve and send");
-        approveBtn.addEventListener("click", () => approveEmergency(launch));
-        const cancelBtn = el("button", { type: "button" }, "Cancel request");
-        cancelBtn.addEventListener("click", () => cancelEmergency(launch));
-        row.append(approveBtn, cancelBtn);
-        approvals.append(row);
-      }
-      host.append(approvals);
-    }
 
     const listWrap = el("div", { class: "module-list" });
     if (state.items.length === 0) {
@@ -5414,10 +5405,14 @@ const commsPanel = (function () {
   // gate before a broadcast that ignores quiet hours and uses every channel;
   // the server (and database) still decide whether this caller may approve.
   async function approveEmergency(launch) {
-    const subject = launch.messages && launch.messages.subject ? launch.messages.subject : "this alert";
-    const confirmed = window.confirm(
-      `Send "${subject}" now? It goes to everyone in its audience on every channel and ignores quiet hours.`
-    );
+    const view = describeEmergencyLaunch(launch);
+    if (!view.canApprove) {
+      state.formError = view.warning || view.recipientLine;
+      render();
+      return;
+    }
+    // The confirmation shows the body and the recipient count, not just the subject.
+    const confirmed = window.confirm(view.confirmText);
     if (!confirmed) return;
     try {
       const result = await apiFetch(`/facilities/${currentFacility}/messages/${launch.message_id}/emergency-approve`, {
@@ -5537,7 +5532,7 @@ const commsPanel = (function () {
     if (f.isRequiredAck) {
       const ackDueInput = el("input", { type: "date" });
       ackDueInput.addEventListener("input", () => {
-        f.ackDueAt = ackDueInput.value ? new Date(ackDueInput.value).toISOString() : "";
+        f.ackDueAt = endOfDayIso(ackDueInput.value);
       });
       wrap.append(el("label", {}, ["Acknowledgement due", ackDueInput]));
     }
@@ -5719,7 +5714,31 @@ const commsPanel = (function () {
       if (state.composeOpen) host.append(buildComposeForm());
     }
 
+    if (state.formNotice) host.append(el("p", { class: "item-subtitle", role: "status", "aria-live": "polite" }, state.formNotice));
     if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
+
+    // CM-13: emergency launch requests waiting for a publisher's approval (M-6:
+    // this block used to sit in the Work Orders panel, which has no such state).
+    // Each entry shows the message body and the number of people it reaches.
+    if (hasPerm("communications.publish") && state.emergencyLaunches.length > 0) {
+      const approvals = el("div", { class: "emergency-approvals", role: "region", "aria-label": "Emergency launch approvals" });
+      approvals.append(el("h4", {}, "Emergency launches awaiting approval"));
+      for (const launch of state.emergencyLaunches) {
+        const view = describeEmergencyLaunch(launch);
+        const row = el("div", { class: "emergency-approval-row" }, el("strong", {}, view.subject));
+        if (view.bodyText) row.append(el("p", { class: "emergency-approval-body" }, view.bodyText));
+        row.append(el("p", { class: "item-subtitle" }, view.recipientLine));
+        if (view.warning) row.append(el("p", { class: "rr-error", role: "alert" }, view.warning));
+        const approveBtn = el("button", { type: "button", class: "primary emergency-help-btn" }, "Approve and send");
+        if (!view.canApprove) approveBtn.disabled = true;
+        approveBtn.addEventListener("click", () => approveEmergency(launch));
+        const cancelBtn = el("button", { type: "button" }, "Cancel request");
+        cancelBtn.addEventListener("click", () => cancelEmergency(launch));
+        row.append(el("div", { class: "emergency-actions" }, [approveBtn, cancelBtn]));
+        approvals.append(row);
+      }
+      host.append(approvals);
+    }
 
     const listWrap = el("div", { class: "module-list" });
     if (state.messages.length === 0) {

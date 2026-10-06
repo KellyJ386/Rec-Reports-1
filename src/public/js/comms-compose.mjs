@@ -8,7 +8,7 @@
 export const MESSAGE_PRIORITIES = ["low", "normal", "urgent", "emergency"];
 export const AUDIENCE_TYPES = ["role", "department", "shift", "employee"];
 
-export function validateComposeInput(fields = {}) {
+export function validateComposeInput(fields = {}, now = new Date()) {
   const errors = {};
   if (!fields.channelId) errors.channelId = "Select a channel.";
   if (!fields.subject || !fields.subject.trim()) errors.subject = "Subject is required.";
@@ -16,8 +16,23 @@ export function validateComposeInput(fields = {}) {
   if (fields.priority && !MESSAGE_PRIORITIES.includes(fields.priority)) errors.priority = "Unknown priority.";
   if (fields.isRequiredAck && fields.ackDueAt && Number.isNaN(new Date(fields.ackDueAt).getTime())) {
     errors.ackDueAt = "Acknowledgement due date is invalid.";
+  } else if (fields.isRequiredAck && fields.ackDueAt && new Date(fields.ackDueAt).getTime() <= new Date(now).getTime()) {
+    // The server refuses to publish a message that is already past its due time (M-5):
+    // the escalation ladder would fire three tiers at once.
+    errors.ackDueAt = "Acknowledgement due date must be in the future.";
   }
   return { valid: Object.keys(errors).length === 0, errors };
+}
+
+// The due value a date input yields (YYYY-MM-DD) as an instant: the END of that
+// day in the viewer's time zone, so "due today" is a time that has not passed
+// yet (new Date("2026-10-07") is midnight UTC, i.e. already in the past for
+// someone choosing today's date). "" for an empty or unparsable input.
+export function endOfDayIso(dateValue) {
+  if (typeof dateValue !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) return "";
+  const [year, month, day] = dateValue.split("-").map(Number);
+  const date = new Date(year, month - 1, day, 23, 59, 59);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
 }
 
 // Shapes the compose form's field state into the JSON body
@@ -159,4 +174,49 @@ export function formatComplianceSummary(compliance) {
   let text = `${acknowledged}/${total} acknowledged`;
   if (overdue > 0) text += `, ${overdue} overdue`;
   return text;
+}
+
+// CM-13 (M-3): what the approver is shown for one pending emergency launch, from
+// a row of GET /facilities/:id/emergency-launches. The decision "do I send this
+// to everyone, ignoring quiet hours" is made on the message BODY and the number
+// of people it reaches, never on the subject alone. `contentChanged` (the
+// message or its audience was edited after the request) disables the approval:
+// the database refuses it anyway, and the approver should say so up front.
+export function describeEmergencyLaunch(launch) {
+  const subject = launch?.messages?.subject || "this alert";
+  const bodyText = String(launch?.messages?.body_text ?? "");
+  const rawCount = launch?.preview?.recipientCount;
+  const recipientCount = Number.isInteger(rawCount) && rawCount >= 0 ? rawCount : null;
+  const unresolvedAudiences = Number(launch?.preview?.unresolvedAudiences ?? 0) || 0;
+  const contentChanged = launch?.contentChanged === true;
+
+  let recipientLine;
+  if (recipientCount === null) recipientLine = "The number of recipients is not known yet.";
+  else if (recipientCount === 0) recipientLine = "Its audience reaches nobody, so it cannot be sent.";
+  else recipientLine = `It will reach ${recipientCount} ${recipientCount === 1 ? "person" : "people"} on every channel and ignores quiet hours.`;
+  if (unresolvedAudiences > 0) {
+    recipientLine += ` ${unresolvedAudiences} shift ${unresolvedAudiences === 1 ? "audience has" : "audiences have"} no window and reach nobody.`;
+  }
+
+  const canApprove = !contentChanged && recipientCount !== 0;
+  const confirmText = [
+    `Send "${subject}" now?`,
+    "",
+    bodyText.length > 500 ? `${bodyText.slice(0, 500)}...` : bodyText,
+    "",
+    recipientLine
+  ].join("\n");
+  return {
+    subject,
+    bodyText,
+    recipientCount,
+    recipientLine,
+    unresolvedAudiences,
+    contentChanged,
+    canApprove,
+    warning: contentChanged
+      ? "This message or its audience changed after the launch was requested. Cancel this request and request a new one."
+      : null,
+    confirmText
+  };
 }

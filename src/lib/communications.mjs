@@ -107,6 +107,18 @@ export function normalizeShiftWindow(spec) {
   return { kind: "range", from, to };
 }
 
+// The JSON shape of a normalized window as it is stored in a message_audiences
+// row's rule_jsonb.window (L-4), so every later reader (the escalation sweep, the
+// roll-ups, the compliance routes) resolves the same window the publish did.
+export function serializeShiftWindow(window) {
+  const normalized = normalizeShiftWindow(window);
+  if (!normalized) return null;
+  if (normalized.kind === "range") {
+    return { kind: "range", from: normalized.from.toISOString(), to: normalized.to.toISOString() };
+  }
+  return { kind: normalized.kind };
+}
+
 function shiftStart(shift) {
   return toDate(shift?.startsAt ?? shift?.starts_at);
 }
@@ -311,6 +323,16 @@ export function shouldBypassQuietHours(message) {
   return message.priority === "emergency" || message.priority === "urgent";
 }
 
+// CM-10 (L-1): the escalation ladder -- reminder, supervisor and manager tiers
+// for an overdue acknowledgement -- bypasses quiet hours for an EMERGENCY
+// message only. An urgent message may bypass them when it is published
+// (shouldBypassQuietHours above), but an overdue acknowledgement is not
+// time-critical, so its follow-ups wait out the facility's quiet hours like
+// any other notification.
+export function shouldBypassQuietHoursForEscalation(message) {
+  return message?.priority === "emergency";
+}
+
 // --- P-1 (CM-09/CM-11): ack/read compliance rollup -------------------------
 
 // Hours after a message's published_at before an unacknowledged recipient
@@ -472,19 +494,44 @@ function messageEscalationLevel(message) {
   return Number.isInteger(raw) && raw >= 0 ? raw : 0;
 }
 
-// Highest tier whose threshold (ack_due_at + afterHours) has passed at `now`.
+// The instant the ladder is anchored on: the message's due time, but never
+// earlier than the moment it was published (L-1: a due time in the past, or
+// one before the publish, must not fire three tiers on consecutive passes).
+// null for a message that is not required-ack, unpublished or has no due time.
+export function ackEscalationAnchor(message) {
+  if (!messageIsRequiredAck(message)) return null;
+  const published = messagePublishedAt(message);
+  const due = messageAckDueAt(message);
+  if (!published || !due) return null;
+  return due.getTime() >= published.getTime() ? due : published;
+}
+
+// Highest tier whose threshold (anchor + afterHours) has passed at `now`.
 // 0 for a message that is not required-ack, unpublished, has no due time, or
 // is not yet past its first threshold.
 export function ackEscalationDueLevel(message, now = new Date(), ladder = buildAckEscalationLadder()) {
-  if (!messageIsRequiredAck(message) || !messagePublishedAt(message)) return 0;
-  const due = messageAckDueAt(message);
+  const anchor = ackEscalationAnchor(message);
   const at = toDate(now);
-  if (!due || !at) return 0;
+  if (!anchor || !at) return 0;
   let level = 0;
   for (const tier of ladder) {
-    if (at.getTime() >= due.getTime() + tier.afterHours * 3_600_000) level = tier.level;
+    if (at.getTime() >= anchor.getTime() + tier.afterHours * 3_600_000) level = tier.level;
   }
   return level;
+}
+
+// M-5: the instant the sweep next needs to look at this message -- when the
+// tier AFTER its recorded level comes due -- or null once the ladder is
+// exhausted. The sweep stores it in messages.ack_next_escalation_at, so a
+// message that is waiting out the gap between tiers leaves the candidate set
+// instead of occupying a slot on every pass.
+export function ackEscalationNextDueAt(message, ladder = buildAckEscalationLadder(), level = null) {
+  const current = level ?? messageEscalationLevel(message);
+  if (current >= MAX_ACK_ESCALATION_LEVEL) return null;
+  const anchor = ackEscalationAnchor(message);
+  const tier = ladder.find((item) => item.level === current + 1);
+  if (!anchor || !tier) return null;
+  return new Date(anchor.getTime() + tier.afterHours * 3_600_000);
 }
 
 // The one tier a sweep should process next for this message, or null. Always

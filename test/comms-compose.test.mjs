@@ -11,7 +11,9 @@ import {
   formatComplianceSummary,
   SHIFT_AUDIENCE_MODES,
   isEmergencyCompose,
-  canRespondToEmergency
+  canRespondToEmergency,
+  describeEmergencyLaunch,
+  endOfDayIso
 } from "../src/public/js/comms-compose.mjs";
 
 test("validateComposeInput requires channel, subject, body", () => {
@@ -279,4 +281,80 @@ test("canRespondToEmergency: a published emergency message the viewer has not an
   assert.equal(canRespondToEmergency({ ...published, published_at: null }, null), false);
   assert.equal(canRespondToEmergency({ ...published, priority: "urgent" }, null), false);
   assert.equal(canRespondToEmergency(null, null), false);
+});
+
+test("M-5: an acknowledgement due date in the past is refused before the server has to", () => {
+  const base = { channelId: "c", subject: "s", bodyText: "b", isRequiredAck: true };
+  const now = new Date("2026-10-06T12:00:00Z");
+  assert.equal(validateComposeInput({ ...base, ackDueAt: "2026-10-05T12:00:00Z" }, now).errors.ackDueAt, "Acknowledgement due date must be in the future.");
+  assert.equal(validateComposeInput({ ...base, ackDueAt: "2026-10-06T12:00:00Z" }, now).valid, false, "due exactly now is not in the future");
+  assert.equal(validateComposeInput({ ...base, ackDueAt: "2026-10-07T12:00:00Z" }, now).valid, true);
+  // Only a REQUIRED acknowledgement has a due date that matters.
+  assert.equal(validateComposeInput({ ...base, isRequiredAck: false, ackDueAt: "2026-10-05T12:00:00Z" }, now).valid, true);
+  // No due date at all is fine.
+  assert.equal(validateComposeInput(base, now).valid, true);
+});
+
+test("endOfDayIso turns a date input into the end of that day, so 'due today' is still in the future", () => {
+  const iso = endOfDayIso("2026-10-07");
+  const parsed = new Date(iso);
+  assert.equal(parsed.getFullYear(), 2026);
+  assert.equal(parsed.getMonth(), 9);
+  assert.equal(parsed.getDate(), 7);
+  assert.equal(parsed.getHours(), 23);
+  assert.equal(parsed.getMinutes(), 59);
+  assert.equal(endOfDayIso(""), "");
+  assert.equal(endOfDayIso("not a date"), "");
+  assert.equal(endOfDayIso("2026-13-45T00:00"), "");
+  assert.equal(endOfDayIso(undefined), "");
+});
+
+const QUEUE_ROW = {
+  id: "l-1",
+  message_id: "m-1",
+  messages: { subject: "Severe weather", priority: "emergency", body_text: "Move indoors now" },
+  preview: { recipientCount: 42, unresolvedAudiences: 0 },
+  contentChanged: false
+};
+
+test("M-3: the approver is shown the body and the recipient count, not just the subject", () => {
+  const view = describeEmergencyLaunch(QUEUE_ROW);
+  assert.equal(view.subject, "Severe weather");
+  assert.equal(view.bodyText, "Move indoors now");
+  assert.equal(view.recipientCount, 42);
+  assert.match(view.recipientLine, /42 people/);
+  assert.match(view.recipientLine, /every channel/);
+  assert.match(view.recipientLine, /quiet hours/);
+  assert.equal(view.canApprove, true);
+  assert.equal(view.warning, null);
+  // The confirmation dialog carries all three.
+  assert.match(view.confirmText, /Severe weather/);
+  assert.match(view.confirmText, /Move indoors now/);
+  assert.match(view.confirmText, /42 people/);
+  assert.equal(describeEmergencyLaunch({ ...QUEUE_ROW, preview: { recipientCount: 1 } }).recipientLine.startsWith("It will reach 1 person "), true);
+});
+
+test("M-3: a launch whose content changed, or that reaches nobody, cannot be approved from the UI", () => {
+  const changed = describeEmergencyLaunch({ ...QUEUE_ROW, contentChanged: true });
+  assert.equal(changed.canApprove, false);
+  assert.match(changed.warning, /changed after the launch was requested/);
+  const nobody = describeEmergencyLaunch({ ...QUEUE_ROW, preview: { recipientCount: 0, unresolvedAudiences: 2 } });
+  assert.equal(nobody.canApprove, false);
+  assert.match(nobody.recipientLine, /reaches nobody/);
+  assert.match(nobody.recipientLine, /2 shift audiences have no window/);
+  // An unknown count is shown as unknown, and does not block (the server decides).
+  const unknown = describeEmergencyLaunch({ ...QUEUE_ROW, preview: null });
+  assert.equal(unknown.recipientCount, null);
+  assert.equal(unknown.canApprove, true);
+  assert.match(unknown.recipientLine, /not known/);
+});
+
+test("describeEmergencyLaunch tolerates a bare row and truncates a long body in the dialog", () => {
+  const bare = describeEmergencyLaunch({ id: "l", message_id: "m" });
+  assert.equal(bare.subject, "this alert");
+  assert.equal(bare.bodyText, "");
+  const long = describeEmergencyLaunch({ ...QUEUE_ROW, messages: { subject: "s", body_text: "x".repeat(900) } });
+  assert.equal(long.bodyText.length, 900);
+  assert.ok(long.confirmText.includes("x".repeat(500) + "..."));
+  assert.ok(!long.confirmText.includes("x".repeat(501)));
 });

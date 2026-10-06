@@ -231,7 +231,9 @@ button.emergency-help-btn { background: var(--rr-danger); border-color: var(--rr
   color: var(--rr-danger-text);
   padding: 12px 16px;
 }
-.emergency-approval-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.emergency-approval-row { display: grid; gap: 8px; }
+.emergency-approval-row p { margin: 0; }
+.emergency-approval-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .panel {
   display: grid;

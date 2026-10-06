@@ -134,10 +134,21 @@ for (const helper of [
   "internal.create_work_order_from_incident",
   "public.create_work_order_from_incident",
   "fn_notification_job_dedupe_key",
+  "fn_notification_jobs_client_guard",
   "fn_messages_guard_ack_escalation",
+  "fn_messages_set_ack_next_escalation",
   "fn_messages_guard_emergency_publish",
+  "fn_messages_guard_emergency_freeze",
+  "fn_messages_guard_emergency_delete",
+  "fn_message_audiences_guard_emergency_freeze",
   "fn_emergency_alert_launch_guard",
-  "fn_emergency_alert_response_guard"
+  "fn_emergency_alert_launches_guard_client",
+  "fn_emergency_alert_response_guard",
+  "fn_communication_channels_guard_emergency_enabled",
+  "internal.approve_emergency_launch",
+  "public.approve_emergency_launch",
+  "internal.emergency_launch_queue",
+  "public.emergency_launch_queue"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

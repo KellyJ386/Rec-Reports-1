@@ -27,10 +27,24 @@ export function nextPollDelayMs({ hidden = false, consecutiveFailures = 0 } = {}
 
 // When a hidden tab becomes visible again: poll right away if the last
 // successful poll is older than the visible cadence, else let the already
-// scheduled timer run.
-export function shouldPollOnVisible({ lastPolledAt = null, now = Date.now() } = {}) {
+// scheduled timer run. While the server is failing (L-7) the backoff is honored
+// instead: toggling the tab must not turn a struggling server's 5-minute
+// backoff into an immediate retry, so the caller just reschedules.
+export function shouldPollOnVisible({ lastPolledAt = null, now = Date.now(), consecutiveFailures = 0 } = {}) {
+  if (Number.isFinite(consecutiveFailures) && consecutiveFailures > 0) return false;
   if (lastPolledAt === null || lastPolledAt === undefined) return true;
   return now - lastPolledAt >= INBOX_POLL_BASE_MS;
+}
+
+// L-7: a failure that polling again cannot fix. 401 (the session is gone),
+// 403 (not a member of this facility / no communications.read any more) and 404
+// (the facility or route does not exist) are answers, not outages: the poller
+// stops until the user signs in again or switches facility, instead of asking
+// every few minutes for as long as the tab is open. Everything else (network
+// errors, 5xx, 429) is retried with backoff.
+export function shouldStopPolling(error) {
+  const status = Number(error?.status);
+  return status === 401 || status === 403 || status === 404;
 }
 
 function plural(count, singular, pluralForm) {
@@ -78,6 +92,11 @@ export function emergencyAlertChanged(previous, next) {
 // The sentence the banner shows after the viewer has answered.
 export function describeEmergencyResponse(response) {
   if (response === "safe") return "You reported that you are safe.";
-  if (response === "need_help") return "You reported that you need help. A supervisor has been told.";
+  // L-5: nothing here notifies anybody -- the answer is recorded and shows on the
+  // roll-up that communications publishers read -- so the text must not promise
+  // that "a supervisor has been told". Someone in danger is pointed at a person.
+  if (response === "need_help") {
+    return "You reported that you need help. Your answer is recorded and visible to the facility's communications publishers; nobody is notified automatically. If you are in danger, call emergency services or find a supervisor now.";
+  }
   return "";
 }

@@ -26,6 +26,7 @@ const DRAFT_EMERGENCY = {
   deleted_at: null
 };
 const PUBLISHED_EMERGENCY = { ...DRAFT_EMERGENCY, published_at: "2026-08-13T12:00:00Z" };
+const PENDING_LAUNCH = { id: "l-1", facility_id: "fac-1", message_id: "msg-e", requested_by_employee_id: "emp-req", status: "pending_approval" };
 const AUDIENCES = [
   { id: "a1", message_id: "msg-e", audience_type: "employee", audience_ref_id: "emp-1" },
   { id: "a2", message_id: "msg-e", audience_type: "employee", audience_ref_id: "emp-2" },
@@ -132,56 +133,43 @@ test("emergency-launch: 201 records the request attributed to the caller's own e
 });
 
 // --- emergency-approve --------------------------------------------------------------
+// H-1b: the route makes ONE call, public.approve_emergency_launch(p_message_id). It
+// writes no message, no launch row and no notification job itself -- a client session
+// cannot (the 0064 guards refuse it), so the approval, the publish, the job and the
+// `launched` stamp are the database function's single transaction.
 
-const PENDING_LAUNCH = { id: "l-1", facility_id: "fac-1", message_id: "msg-e", requested_by_employee_id: "emp-req", status: "pending_approval" };
+const LAUNCHED_RESULT = {
+  launchId: "l-1",
+  status: "launched",
+  publishedAt: "2026-08-13T12:00:00+00:00",
+  recipientCount: 3,
+  channels: ["in_app", "push", "sms", "email"],
+  quietHoursBypass: true,
+  unresolvedAudiences: 0
+};
 
 function approveWorld(extra = {}) {
   return world({
-    "emergency_alert_launches GET": () => [PENDING_LAUNCH],
-    "message_audiences GET": () => AUDIENCES,
-    "emergency_alert_launches PATCH": (url) => [
-      { ...PENDING_LAUNCH, status: url.searchParams.get("status") === "eq.approved" ? "launched" : "approved" }
-    ],
-    "messages PATCH": () => [PUBLISHED_EMERGENCY],
-    "notification_jobs POST": () => [{ id: "job-1" }],
+    "rpc/approve_emergency_launch POST": () => LAUNCHED_RESULT,
     ...extra
   });
 }
 
-test("emergency-approve: 403 for a reader; 400 for a malformed body", async (t) => {
-  stubFetch(t, approveWorld());
+const WRITE_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+test("emergency-approve: 403 for a reader; 400 for a malformed body; 404 for an unknown message", async (t) => {
+  const captured = stubFetch(t, approveWorld());
   assert.equal((await mount({ memberships: READER }).call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {})).status, 403);
   assert.equal(
     (await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", undefined, { raw: "[oops" })).status,
     400
   );
-});
-
-test("emergency-approve: 404 without a launch request; 409 when already launched or cancelled", async (t) => {
-  stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [] }));
+  assert.ok(!captured.some((c) => c.table.startsWith("rpc/")), "no database call for a refused request");
+  stubFetch(t, approveWorld({ "messages GET": () => [] }));
   assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {})).status, 404);
-  stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [{ ...PENDING_LAUNCH, status: "launched" }] }));
-  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {})).status, 409);
-  stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [{ ...PENDING_LAUNCH, status: "cancelled" }] }));
-  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {})).status, 409);
 });
 
-test("emergency-approve: 409 and NO state change when the channel was switched off after the request", async (t) => {
-  const captured = stubFetch(t, approveWorld({ "communication_channels GET": () => [{ id: "ch-em", emergency_enabled: false }] }));
-  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {});
-  assert.equal(result.status, 409);
-  assert.ok(!captured.some((c) => c.method === "PATCH" || c.method === "POST"));
-});
-
-test("emergency-approve: 409 and NO state change when the audience resolves to nobody", async (t) => {
-  const captured = stubFetch(t, approveWorld({ "message_audiences GET": () => [] }));
-  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {});
-  assert.equal(result.status, 409);
-  assert.ok(!captured.some((c) => c.method === "PATCH"), "no approval, publish or job was written");
-  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
-});
-
-test("emergency-approve: approves, publishes, enqueues ONE all-channel quiet-hours-bypassing job, stamps launched", async (t) => {
+test("H-1b: emergency-approve calls the definer function with only the message id and writes nothing itself", async (t) => {
   const captured = stubFetch(t, approveWorld());
   // The body tries to steer the broadcast; none of it may matter.
   const result = await mount({ userId: "user-approver" }).call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {
@@ -195,66 +183,45 @@ test("emergency-approve: approves, publishes, enqueues ONE all-channel quiet-hou
   assert.equal(result.payload.recipientCount, 3);
   assert.equal(result.payload.quietHoursBypass, true);
   assert.deepEqual(result.payload.channels, ["in_app", "push", "sms", "email"]);
+  assert.equal(result.payload.launchId, "l-1");
 
-  const writes = captured.filter((c) => c.method === "PATCH" || c.method === "POST").map((c) => `${c.method} ${c.table}`);
-  assert.deepEqual(writes, [
-    "PATCH emergency_alert_launches",
-    "PATCH messages",
-    "POST notification_jobs",
-    "PATCH emergency_alert_launches"
-  ]);
-
-  const approval = captured.filter((c) => c.table === "emergency_alert_launches" && c.method === "PATCH")[0];
-  assert.equal(approval.url.searchParams.get("id"), "eq.l-1");
-  assert.equal(approval.url.searchParams.get("status"), "eq.pending_approval", "approval is a CAS on the pending state");
-  assert.deepEqual(approval.body, { status: "approved", approved_by_employee_id: "emp-me" });
-
-  const publish = captured.find((c) => c.table === "messages" && c.method === "PATCH");
-  assert.equal(publish.url.searchParams.get("published_at"), "is.null", "publish is a CAS on the draft state");
-  assert.ok(publish.body.published_at);
-
-  const job = captured.find((c) => c.table === "notification_jobs").body[0];
-  assert.equal(job.event_type, "message.emergency");
-  assert.equal(job.facility_id, "fac-1");
-  assert.equal(job.payload_jsonb.quietHoursBypass, true);
-  assert.deepEqual(job.payload_jsonb.channels, ["in_app", "push", "sms", "email"]);
-  assert.deepEqual(job.payload_jsonb.recipients, ["emp-1", "emp-2", "emp-3"]);
-  assert.equal(job.payload_jsonb.messageId, "msg-e");
-  assert.equal(job.dedupe_key, undefined, "no client-controlled dedupe key");
+  const writes = captured.filter((c) => WRITE_METHODS.has(c.method));
+  assert.deepEqual(writes.map((c) => `${c.method} ${c.table}`), ["POST rpc/approve_emergency_launch"]);
+  assert.deepEqual(writes[0].body, { p_message_id: "msg-e" }, "the caller supplies nothing but the message id");
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"), "the route no longer writes jobs");
+  assert.ok(!captured.some((c) => c.table === "messages" && c.method === "PATCH"), "the route no longer publishes the message");
+  assert.ok(!captured.some((c) => c.table === "emergency_alert_launches" && WRITE_METHODS.has(c.method)));
 });
 
-test("emergency-approve: the database's second-approver rule (403 from the launch guard) surfaces as 403 and publishes nothing", async (t) => {
-  const captured = stubFetch(
-    t,
-    approveWorld({
-      "emergency_alert_launches PATCH": () => ({ __status: 403, __body: { code: "42501", message: "a second approver is required" } })
-    })
-  );
-  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {});
-  assert.equal(result.status, 403);
-  assert.ok(!captured.some((c) => c.table === "messages" && c.method === "PATCH"));
-  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+test("emergency-approve: the function's refusals surface with their own status (403 second approver, 409 conflicts, 404)", async (t) => {
+  for (const [status, message] of [
+    [403, "emergency launch: a second approver (a different person than the requester) is required"],
+    [409, "the message content changed since the launch was requested; cancel it and request a new launch"],
+    [409, "the message audience resolves to no recipients"],
+    [409, "emergency already launched"],
+    [409, "the message channel is not emergency-enabled"],
+    [404, "no emergency launch has been requested for this message"]
+  ]) {
+    const captured = stubFetch(
+      t,
+      approveWorld({ "rpc/approve_emergency_launch POST": () => ({ __status: status, __body: { code: `PT${status}`, message } }) })
+    );
+    const result = await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {});
+    assert.equal(result.status, status, message);
+    assert.equal(result.payload.error, message);
+    assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+  }
 });
 
-test("emergency-approve: a failed job insert rolls the publish stamp back (CAS) and the error is not swallowed", async (t) => {
-  const captured = stubFetch(t, approveWorld({ "notification_jobs POST": () => ({ __status: 500 }) }));
+test("emergency-approve: an unexpected database failure is not swallowed", async (t) => {
+  stubFetch(t, approveWorld({ "rpc/approve_emergency_launch POST": () => ({ __status: 500, __body: { message: "boom" } }) }));
   await assert.rejects(() => mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {}));
-  const patches = captured.filter((c) => c.table === "messages" && c.method === "PATCH");
-  assert.equal(patches.length, 2);
-  const revert = patches[1];
-  assert.equal(revert.body.published_at, null);
-  assert.equal(revert.url.searchParams.get("published_at"), `eq.${patches[0].body.published_at}`);
-  // The launch was never marked launched.
-  assert.ok(!captured.some((c) => c.table === "emergency_alert_launches" && c.body?.status === "launched"));
 });
 
-test("emergency-approve: an approved-but-unlaunched launch can be retried without a second approval", async (t) => {
-  const captured = stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [{ ...PENDING_LAUNCH, status: "approved" }] }));
-  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", {});
-  assert.equal(result.status, 200);
-  const launchPatches = captured.filter((c) => c.table === "emergency_alert_launches" && c.method === "PATCH");
-  assert.equal(launchPatches.length, 1);
-  assert.equal(launchPatches[0].body.status, "launched");
+test("emergency-approve: the route is not a way around the freeze either -- it does not edit the message", async (t) => {
+  const captured = stubFetch(t, approveWorld());
+  await mount().call("POST", "/facilities/fac-1/messages/msg-e/emergency-approve", { subject: "EVACUATE", bodyText: "attacker text" });
+  assert.ok(!captured.some((c) => c.table === "messages" && WRITE_METHODS.has(c.method)));
 });
 
 test("the ordinary publish and create routes refuse emergency messages", async (t) => {
@@ -277,29 +244,56 @@ test("the ordinary publish and create routes refuse emergency messages", async (
 // --- emergency-cancel / launches list -------------------------------------------------
 
 test("emergency-cancel: 403, 400, 404, 409 and 200", async (t) => {
-  stubFetch(t, approveWorld({ "emergency_alert_launches PATCH": () => [{ ...PENDING_LAUNCH, status: "cancelled" }] }));
+  const cancelWorld = (extra = {}) =>
+    world({
+      "emergency_alert_launches GET": () => [PENDING_LAUNCH],
+      "emergency_alert_launches PATCH": () => [{ ...PENDING_LAUNCH, status: "cancelled" }],
+      ...extra
+    });
+  const captured = stubFetch(t, cancelWorld());
   const path = "/facilities/fac-1/messages/msg-e/emergency-cancel";
   assert.equal((await mount({ memberships: READER }).call("POST", path, {})).status, 403);
   assert.equal((await mount().call("POST", path, undefined, { raw: "{" })).status, 400);
   const ok = await mount().call("POST", path, {});
   assert.equal(ok.status, 200);
   assert.equal(ok.payload.status, "cancelled");
+  // The cancel is a conditional UPDATE: it can only land while the launch is still open, so it cannot
+  // un-launch an alert the approval function has locked and stamped in the meantime.
+  const patch = captured.find((c) => c.table === "emergency_alert_launches" && c.method === "PATCH");
+  assert.equal(patch.url.searchParams.get("id"), "eq.l-1");
+  assert.equal(patch.url.searchParams.get("status"), "in.(pending_approval,approved)");
 
-  stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [] }));
+  stubFetch(t, cancelWorld({ "emergency_alert_launches GET": () => [] }));
   assert.equal((await mount().call("POST", path, {})).status, 404);
-  stubFetch(t, approveWorld({ "emergency_alert_launches GET": () => [{ ...PENDING_LAUNCH, status: "launched" }] }));
+  stubFetch(t, cancelWorld({ "emergency_alert_launches GET": () => [{ ...PENDING_LAUNCH, status: "launched" }] }));
+  assert.equal((await mount().call("POST", path, {})).status, 409);
+  // Lost the race: the launch was stamped between the read and the UPDATE (0 rows).
+  stubFetch(t, cancelWorld({ "emergency_alert_launches PATCH": () => [] }));
   assert.equal((await mount().call("POST", path, {})).status, 409);
 });
 
-test("GET emergency-launches: 403 for a reader, 400 for a bad status, 200 for a publisher", async (t) => {
-  const captured = stubFetch(t, world({ "emergency_alert_launches GET": () => [PENDING_LAUNCH] }));
+test("GET emergency-launches: 403 for a reader, 400 for a bad status, 200 for a publisher; served by the database queue (body + recipient count)", async (t) => {
+  const QUEUE_ROW = {
+    ...PENDING_LAUNCH,
+    messages: { subject: "Severe weather", priority: "emergency", body_text: "Move indoors now" },
+    preview: { recipientCount: 42, unresolvedAudiences: 0 },
+    contentChanged: false
+  };
+  const captured = stubFetch(t, world({ "rpc/emergency_launch_queue POST": () => [QUEUE_ROW] }));
   assert.equal((await mount({ memberships: READER }).call("GET", "/facilities/fac-1/emergency-launches")).status, 403);
   assert.equal((await mount().call("GET", "/facilities/fac-1/emergency-launches?status=bogus")).status, 400);
   const ok = await mount().call("GET", "/facilities/fac-1/emergency-launches?status=pending_approval");
   assert.equal(ok.status, 200);
   assert.equal(ok.payload.length, 1);
-  const query = captured.filter((c) => c.table === "emergency_alert_launches").at(-1);
-  assert.equal(query.url.searchParams.get("status"), "eq.pending_approval");
+  assert.equal(ok.payload[0].messages.body_text, "Move indoors now", "the approver is shown the body");
+  assert.equal(ok.payload[0].preview.recipientCount, 42, "and the number of people it reaches");
+  const call = captured.filter((c) => c.table === "rpc/emergency_launch_queue").at(-1);
+  assert.deepEqual(call.body, { p_facility_id: "fac-1", p_status: "pending_approval" });
+  assert.ok(!captured.some((c) => c.table === "emergency_alert_launches"), "no direct read of the ledger");
+
+  const all = await mount().call("GET", "/facilities/fac-1/emergency-launches");
+  assert.equal(all.status, 200);
+  assert.deepEqual(captured.filter((c) => c.table === "rpc/emergency_launch_queue").at(-1).body, { p_facility_id: "fac-1", p_status: null });
 });
 
 // --- emergency-response (own response only) -----------------------------------------------
@@ -490,4 +484,140 @@ test("POST /messages/:id/audiences stores a validated shift window rule and reje
   assert.equal(both.status, 400);
   const badPublishWindow = await mount().call("POST", "/facilities/fac-1/messages/msg-e/publish", { shiftWindow: "someday" });
   assert.equal(badPublishWindow.status, 400);
+});
+
+// --- publish route: ack due validation (M-5) and shift window persistence (L-4) -----------------
+
+const ORDINARY = {
+  id: "msg-o",
+  facility_id: "fac-1",
+  channel_id: "ch-1",
+  author_employee_id: "emp-me",
+  subject: "Pool rules",
+  body_text: "Read them",
+  priority: "normal",
+  is_required_ack: true,
+  ack_due_at: new Date(Date.now() + 2 * 24 * 3600 * 1000).toISOString(),
+  published_at: null,
+  deleted_at: null
+};
+
+function publishWorld(extra = {}) {
+  return world({
+    "messages GET": () => [ORDINARY],
+    "messages PATCH": () => [{ ...ORDINARY, published_at: "2026-08-13T12:00:00Z" }],
+    "message_audiences GET": () => [{ id: "a-1", message_id: "msg-o", facility_id: "fac-1", audience_type: "employee", audience_ref_id: "emp-1", rule_jsonb: {} }],
+    "notification_jobs POST": () => [{ id: "job-1" }],
+    ...extra
+  });
+}
+
+test("M-5: publishing a required-ack message whose due time has passed is a 400 and writes nothing", async (t) => {
+  const captured = stubFetch(
+    t,
+    publishWorld({ "messages GET": () => [{ ...ORDINARY, ack_due_at: new Date(Date.now() - 3600 * 1000).toISOString() }] })
+  );
+  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", {});
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /ackDueAt must be in the future/);
+  assert.ok(!captured.some((c) => c.method === "PATCH" || c.table === "notification_jobs"));
+});
+
+test("M-5: a message without required acknowledgement is not held to a due time, and a future due time publishes", async (t) => {
+  stubFetch(t, publishWorld({ "messages GET": () => [{ ...ORDINARY, is_required_ack: false, ack_due_at: "2020-01-01T00:00:00Z" }] }));
+  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", {})).status, 200);
+  stubFetch(t, publishWorld());
+  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", {})).status, 200);
+});
+
+test("M-5: the create route validates ackDueAt (a bad date, and a past one when publishNow)", async (t) => {
+  const captured = stubFetch(t, world({ "messages POST": () => [ORDINARY] }));
+  const base = { channelId: "ch-1", subject: "s", bodyText: "b", isRequiredAck: true };
+  const bad = await mount().call("POST", "/facilities/fac-1/messages", { ...base, ackDueAt: "not a date" });
+  assert.equal(bad.status, 400);
+  assert.match(JSON.stringify(bad.payload), /valid date/);
+  const past = await mount().call("POST", "/facilities/fac-1/messages", {
+    ...base,
+    publishNow: true,
+    ackDueAt: new Date(Date.now() - 1000).toISOString()
+  });
+  assert.equal(past.status, 400);
+  assert.match(JSON.stringify(past.payload), /in the future/);
+  assert.ok(!captured.some((c) => c.table === "messages" && c.method === "POST"));
+  // A draft may carry any valid date (the check that matters is at publish), and a future date with publishNow is fine.
+  assert.equal((await mount().call("POST", "/facilities/fac-1/messages", { ...base, ackDueAt: "2020-01-01T00:00:00Z" })).status, 201);
+  assert.equal(
+    (await mount().call("POST", "/facilities/fac-1/messages", { ...base, publishNow: true, ackDueAt: ORDINARY.ack_due_at })).status,
+    201
+  );
+});
+
+test("L-4: the publish-body shiftWindow is written into every ref-less shift audience's rule BEFORE the message goes out", async (t) => {
+  const audiences = [
+    { id: "a-ref", message_id: "msg-o", facility_id: "fac-1", audience_type: "shift", audience_ref_id: "shift-1", rule_jsonb: {} },
+    { id: "a-bare", message_id: "msg-o", facility_id: "fac-1", audience_type: "shift", audience_ref_id: null, rule_jsonb: { departmentId: "dept-1" } },
+    { id: "a-own", message_id: "msg-o", facility_id: "fac-1", audience_type: "shift", audience_ref_id: null, rule_jsonb: { window: "next" } },
+    { id: "a-emp", message_id: "msg-o", facility_id: "fac-1", audience_type: "employee", audience_ref_id: "emp-1", rule_jsonb: {} }
+  ];
+  const captured = stubFetch(
+    t,
+    publishWorld({
+      "message_audiences GET": () => audiences,
+      "message_audiences PATCH": () => [{}],
+      "schedule_shifts GET": () => [],
+      "shift_assignments GET": () => []
+    })
+  );
+  const result = await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", { shiftWindow: "current" });
+  assert.equal(result.status, 200);
+  const audienceWrites = captured.filter((c) => c.table === "message_audiences" && c.method === "PATCH");
+  assert.equal(audienceWrites.length, 1, "only the bare ref-less shift audience needs the window");
+  assert.equal(audienceWrites[0].url.searchParams.get("id"), "eq.a-bare");
+  assert.deepEqual(audienceWrites[0].body, { rule_jsonb: { departmentId: "dept-1", window: { kind: "current" } } });
+  const firstAudienceWrite = captured.findIndex((c) => c.table === "message_audiences" && c.method === "PATCH");
+  const publish = captured.findIndex((c) => c.table === "messages" && c.method === "PATCH");
+  assert.ok(firstAudienceWrite >= 0 && firstAudienceWrite < publish, "the window is persisted before publishing");
+});
+
+test("L-4: a range window is stored in its ISO form; no fallback window writes nothing; a failed write aborts the publish", async (t) => {
+  const bare = { id: "a-bare", message_id: "msg-o", facility_id: "fac-1", audience_type: "shift", audience_ref_id: null, rule_jsonb: {} };
+  const range = { from: "2026-08-10T00:00:00Z", to: "2026-08-12T00:00:00Z" };
+  const captured = stubFetch(
+    t,
+    publishWorld({ "message_audiences GET": () => [{ ...bare }], "message_audiences PATCH": () => [{}], "schedule_shifts GET": () => [] })
+  );
+  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", { shiftWindow: range })).status, 200);
+  assert.deepEqual(captured.find((c) => c.table === "message_audiences" && c.method === "PATCH").body.rule_jsonb.window, {
+    kind: "range",
+    from: "2026-08-10T00:00:00.000Z",
+    to: "2026-08-12T00:00:00.000Z"
+  });
+
+  const none = stubFetch(t, publishWorld({ "message_audiences GET": () => [{ ...bare }] }));
+  assert.equal((await mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", {})).status, 200);
+  assert.ok(!none.some((c) => c.table === "message_audiences" && c.method === "PATCH"));
+
+  const failing = stubFetch(
+    t,
+    publishWorld({ "message_audiences GET": () => [{ ...bare }], "message_audiences PATCH": () => ({ __status: 500 }) })
+  );
+  await assert.rejects(() => mount().call("POST", "/facilities/fac-1/messages/msg-o/publish", { shiftWindow: "next" }));
+  assert.ok(!failing.some((c) => c.table === "messages" && c.method === "PATCH"), "nothing was published");
+  assert.ok(!failing.some((c) => c.table === "notification_jobs"));
+});
+
+test("L-3: creating an emergency-enabled channel takes admin.manage; an ordinary channel does not", async (t) => {
+  const captured = stubFetch(t, world({ "communication_channels POST": () => [{ id: "ch-new" }] }));
+  const body = { name: "Weather", type: "emergency" };
+  const publisher = await mount().call("POST", "/facilities/fac-1/channels", { ...body, emergencyEnabled: true });
+  assert.equal(publisher.status, 403);
+  assert.match(publisher.payload.error, /admin\.manage/);
+  assert.ok(!captured.some((c) => c.table === "communication_channels" && c.method === "POST"));
+
+  const ordinary = await mount().call("POST", "/facilities/fac-1/channels", { ...body, emergencyEnabled: false });
+  assert.equal(ordinary.status, 201);
+
+  const ADMIN = [{ facilityId: "fac-1", status: "active", permissions: ["communications.read", "communications.publish", "admin.manage"] }];
+  const admin = await mount({ memberships: ADMIN }).call("POST", "/facilities/fac-1/channels", { ...body, emergencyEnabled: true });
+  assert.equal(admin.status, 201);
 });
