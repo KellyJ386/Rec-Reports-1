@@ -296,6 +296,10 @@ on conflict (id) do nothing;
 -- cert.expiring), required-ack escalation (0006 message_acknowledgements
 -- 'overdue' + design 3.3), and training assignment due dates (0007
 -- training_assignments).
+-- TR-11 (Wave 3 3F) adds cert.expired alongside the existing cert.expiring --
+-- the two codes the certification expiry evaluator (training-cert-expiry.mjs)
+-- emits notification_jobs for. Like every other event here, neither gets a
+-- seeded notification_routes row.
 -- IN-20 (Wave 3 3B) adds incident.submitted and incident.sla_breached
 -- alongside the existing incident.escalated -- the three incident-lifecycle
 -- events incidents-routes.mjs/incident-sla-sweep.mjs emit notification_jobs
@@ -312,7 +316,8 @@ insert into notification_events (id, code, severity, module_code, default_channe
   ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
   ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb),
   ('00000000-0000-0000-0000-000000003308', 'incident.submitted', 'info', 'incidents', '["in_app"]'::jsonb),
-  ('00000000-0000-0000-0000-000000003309', 'incident.sla_breached', 'critical', 'incidents', '["in_app","email"]'::jsonb)
+  ('00000000-0000-0000-0000-000000003309', 'incident.sla_breached', 'critical', 'incidents', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003310', 'cert.expired', 'critical', 'training', '["in_app","email"]'::jsonb)
 on conflict (code) do nothing;
 
 -- Subscription plans (0018). feature_entitlements_jsonb names the entitlement

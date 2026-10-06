@@ -492,6 +492,12 @@ export function registerTrainingRoutes(
         const shape = [];
         if (!employeeId) shape.push("employeeId is required");
         if (!courseId) shape.push("courseId is required");
+        // TR-09: role_rule / certification_rule assignments belong to the
+        // auto-assignment evaluator (0066's fn_training_assignment_rule_guard
+        // rejects one that does not name a real rule); say so as a 400.
+        if (["role_rule", "certification_rule"].includes(body.payload.sourceType)) {
+          shape.push("sourceType role_rule/certification_rule is reserved for the auto-assignment evaluator");
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
 
@@ -558,6 +564,16 @@ export function registerTrainingRoutes(
           return sendJson(response, 403, { error: "cannot record progress for another employee's training assignment" });
         }
 
+        // TR-07: a quiz module is completed by a passing attempt
+        // (POST /training-assignments/:id/quizzes/:quizId/attempts), never by
+        // a progress write -- 0065's fn_training_progress_quiz_guard enforces
+        // the same rule for every writer; this answers it as a clean 400.
+        if (module.module_type === "quiz" && state === "completed") {
+          return sendJson(response, 400, {
+            error: "a quiz module is completed by passing its quiz, not by recording progress"
+          });
+        }
+
         const row = {
           facility_id: assignment.facility_id,
           assignment_id: assignment.id,
@@ -620,6 +636,12 @@ export function registerTrainingRoutes(
         }
 
         const completionStatus = body.payload.completionStatus ?? "passed";
+        // TR-07: 'waived' is a supervisor override (0065's
+        // fn_training_completion_quiz_guard enforces it for every writer); an
+        // employee cannot waive their own assignment.
+        if (completionStatus === "waived" && !manageGuard.allowed) {
+          return sendJson(response, 403, { error: "only a training manager can waive an assignment" });
+        }
         if (completionStatus === "passed") {
           const [modules, progressRows] = await Promise.all([
             loadModulesForCourse(auth.client, assignment.facility_id, assignment.course_id),

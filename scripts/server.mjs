@@ -27,6 +27,8 @@ import { registerPmPlanRoutes } from "../src/lib/http/pm-plans-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
+import { registerTrainingContentRoutes } from "../src/lib/http/training-content-routes.mjs";
+import { registerTrainingAutomationRoutes } from "../src/lib/http/training-automation-routes.mjs";
 import { registerSearchRoutes } from "../src/lib/http/search-routes.mjs";
 import { registerAuthRoutes } from "../src/lib/http/auth-routes.mjs";
 import { registerMeRoute } from "../src/lib/http/me-route.mjs";
@@ -338,6 +340,11 @@ registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
 registerTrainingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Training content + automation (TR-07..TR-10): quizzes/attempts, video/PDF
+// module content and the course player; certification/role auto-assignment
+// rules and incident-trigger conversion.
+registerTrainingContentRoutes(userRouter, { authenticate, sendJson, readBody });
+registerTrainingAutomationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Global search (P-8): GET /api/v1/search?facilityId=&q= fans out over
 // incidents/work orders/employees/messages, each leg gated on that
 // module's own read permission.

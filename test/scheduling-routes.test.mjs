@@ -1854,3 +1854,133 @@ test("POST publish on an already-published period republishes: skips the transit
   assert.equal(periodPatch.body.publish_version, 4);
   assert.equal(periodPatch.body.status, undefined);
 });
+
+// --- TR-12: expiry-aware publish gate + assignment validation -------------------
+function dateOffsetFromToday(days) {
+  return new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+}
+
+// An 'active'-status row whose expires_at already passed: the case the old
+// gate (status === "active" only) waved through.
+const EXPIRED_BUT_ACTIVE_CERT = { ...EMPLOYEE_CERT, id: "ec-expired", employee_id: "emp-2", expires_at: "2025-01-01" };
+
+function qualificationStub(t, { cert, mode, shiftRows = [SHIFT_REQUIRES_CERT], assignmentRows = [ASSIGNMENT_MISSING_CERT] } = {}) {
+  return stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return shiftRows;
+    if (table === "shift_assignments" && method === "GET") return assignmentRows;
+    if (table === "shift_assignments" && method === "POST") return [{ id: "asg-new" }];
+    if (table === "certification_types") return [CERT_TYPE];
+    if (table === "employee_certifications") return cert ? [cert] : [];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides") {
+      return mode ? [facilityOverride({ "scheduling.certEnforcementMode": mode })] : [];
+    }
+    return [];
+  });
+}
+
+test("POST schedule/validate: an expired cert whose DB status is still 'active' blocks publishing under hard-block (TR-12)", async (t) => {
+  qualificationStub(t, { cert: EXPIRED_BUT_ACTIVE_CERT });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.canPublish, false);
+  assert.equal(result.payload.missingCertifications[0].reason, "expired");
+  assert.equal(result.payload.warnings.length, 0);
+});
+
+test("POST schedule/validate: the same expired cert is only a warning under certEnforcementMode='warning' (TR-12)", async (t) => {
+  qualificationStub(t, { cert: EXPIRED_BUT_ACTIVE_CERT, mode: "warning" });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.canPublish, true);
+  assert.equal(result.payload.warnings.length, 1);
+  assert.equal(result.payload.warnings[0].reason, "expired");
+});
+
+test("POST schedule/validate: a revoked cert blocks, an expiring cert warns without blocking (TR-12)", async (t) => {
+  qualificationStub(t, { cert: { ...EXPIRED_BUT_ACTIVE_CERT, status: "revoked", expires_at: "2030-01-01" } });
+  let { call } = mount({ memberships: READER });
+  let result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.canPublish, false);
+  assert.equal(result.payload.missingCertifications[0].reason, "revoked");
+
+  qualificationStub(t, { cert: { ...EXPIRED_BUT_ACTIVE_CERT, expires_at: dateOffsetFromToday(10) } });
+  ({ call } = mount({ memberships: READER }));
+  result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.canPublish, true);
+  assert.equal(result.payload.expiringCertifications.length, 1);
+  assert.equal(result.payload.warnings.length, 1);
+  assert.equal(result.payload.warnings[0].reason, "expiring");
+});
+
+test("POST publish: an expired cert blocks with 409 and the readiness payload, and an overrideReason publishes through (TR-12)", async (t) => {
+  const stub = (t2) =>
+    stubFetch(t2, (table, method) => {
+      if (table === "schedule_periods") return [REVIEW_PERIOD];
+      if (table === "schedule_shifts") return [PUBLISH_BLOCKING_SHIFT];
+      if (table === "shift_assignments") return [PUBLISH_BLOCKING_ASSIGNMENT];
+      if (table === "certification_types") return [CERT_TYPE];
+      if (table === "employee_certifications") return [EXPIRED_BUT_ACTIVE_CERT];
+      if (table === "schedule_publications" && method === "POST") return [{ id: "pub-1", publish_version: 1 }];
+      return [];
+    });
+  stub(t);
+  let { call } = mount({ memberships: PUBLISHER });
+  let result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish", {});
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.canPublish, false);
+  assert.equal(result.payload.missingCertifications[0].reason, "expired");
+  assert.ok("expiringCertifications" in result.payload);
+
+  stub(t);
+  ({ call } = mount({ memberships: PUBLISHER }));
+  result = await call("POST", "/facilities/fac-1/schedule-periods/per-review/publish", { overrideReason: "covered by a supervisor" });
+  assert.equal(result.status, 200);
+});
+
+test("POST assignments: an employee with an expired required cert is refused with 409 under hard-block, and nothing is written (TR-12)", async (t) => {
+  const captured = qualificationStub(t, { cert: EXPIRED_BUT_ACTIVE_CERT });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-2/assignments", { employeeId: "emp-2" });
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.blockedCertifications.length, 1);
+  assert.equal(result.payload.blockedCertifications[0].reason, "expired");
+  assert.equal(result.payload.certEnforcementMode, "hard-block");
+  assert.equal(captured.some((c) => c.table === "shift_assignments" && c.method === "POST"), false);
+});
+
+test("POST assignments: a missing required cert is refused under hard-block (TR-12)", async (t) => {
+  qualificationStub(t, { cert: null });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-2/assignments", { employeeId: "emp-2" });
+  assert.equal(result.status, 409);
+  assert.equal(result.payload.blockedCertifications[0].reason, "missing");
+});
+
+test("POST assignments: under certEnforcementMode='warning' the assignment is created and the lapse is returned as a warning (TR-12)", async (t) => {
+  const captured = qualificationStub(t, { cert: EXPIRED_BUT_ACTIVE_CERT, mode: "warning" });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-2/assignments", { employeeId: "emp-2" });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.certificationWarnings.length, 1);
+  assert.equal(result.payload.certificationWarnings[0].reason, "expired");
+  assert.ok(captured.some((c) => c.table === "shift_assignments" && c.method === "POST"));
+});
+
+test("POST assignments: a valid required cert assigns cleanly with no warnings property (TR-12)", async (t) => {
+  qualificationStub(t, { cert: { ...EMPLOYEE_CERT, employee_id: "emp-2" } });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-2/assignments", { employeeId: "emp-2" });
+  assert.equal(result.status, 201);
+  assert.equal("certificationWarnings" in result.payload, false);
+});
+
+test("POST assignments: a shift with no required certifications skips the qualification lookups entirely (TR-12)", async (t) => {
+  const captured = qualificationStub(t, { cert: null, shiftRows: [SHIFT] });
+  const { call } = mount({ memberships: MANAGER });
+  const result = await call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-2" });
+  assert.equal(result.status, 201);
+  assert.equal(captured.some((c) => c.table === "employee_certifications"), false);
+});

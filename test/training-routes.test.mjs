@@ -502,7 +502,7 @@ test("POST training-assignments/complete allows 'passed' immediately for a cours
   assert.ok(captured.find((c) => c.table === "training_completions" && c.method === "POST"));
 });
 
-test("POST training-assignments/complete skips the readiness gate entirely for a non-'passed' status", async (t) => {
+test("POST training-assignments/complete skips the readiness gate entirely for a non-'passed' status ('failed'; 'waived' is manager-only since TR-07)", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
     if (table === "employees") return [{ id: "emp-1" }]; // self-complete: matches TRAINING_ASSIGNMENT.employee_id
@@ -511,7 +511,7 @@ test("POST training-assignments/complete skips the readiness gate entirely for a
   });
   const { call } = mount({ memberships: READER, userId: "user-1" });
   const result = await call("POST", "/training-assignments/assign-1/complete", {
-    completionStatus: "waived"
+    completionStatus: "failed"
   });
   assert.equal(result.status, 201);
   // Neither course_modules nor training_progress is even queried for a
@@ -1272,4 +1272,62 @@ test("GET evidence-url 404s when no evidence has been uploaded yet", async (t) =
   const { call } = mount({ memberships: MANAGER });
   const result = await call("GET", "/employee-certifications/cert-1/evidence-url");
   assert.equal(result.status, 404);
+});
+
+// --- TR-07: a quiz module is completed by passing its quiz, never by a progress write ---
+test("POST module progress refuses state='completed' on a quiz module (400) and writes nothing, but still allows in_progress", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "course_modules") return [{ ...MODULE_REQUIRED, module_type: "quiz" }];
+    if (table === "employees") return [{ id: "emp-1" }];
+    if (table === "training_progress" && method === "POST") return [{ id: "progress-1", state: "in_progress" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER, userId: "user-1" });
+  const refused = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", {
+    state: "completed",
+    scorePct: 100
+  });
+  assert.equal(refused.status, 400);
+  assert.match(refused.payload.error, /completed by passing its quiz/);
+  assert.equal(captured.some((c) => c.table === "training_progress" && c.method === "POST"), false);
+
+  const started = await call("POST", "/training-assignments/assign-1/modules/module-1/progress", { state: "in_progress" });
+  assert.equal(started.status, 200);
+  assert.ok(captured.some((c) => c.table === "training_progress" && c.method === "POST"));
+});
+
+test("POST complete: an employee cannot waive their own assignment (403), a training manager can (201) -- TR-07", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "training_assignments") return [TRAINING_ASSIGNMENT];
+    if (table === "employees") return [{ id: "emp-1" }];
+    if (table === "training_completions" && method === "POST") return [{ id: "comp-1", completion_status: "waived" }];
+    return [];
+  });
+  const own = await mount({ memberships: READER, userId: "user-1" }).call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "waived"
+  });
+  assert.equal(own.status, 403);
+  assert.match(own.payload.error, /only a training manager can waive/);
+  assert.equal(captured.some((c) => c.table === "training_completions" && c.method === "POST"), false);
+
+  const manager = await mount({ memberships: MANAGER, userId: "user-9" }).call("POST", "/training-assignments/assign-1/complete", {
+    completionStatus: "waived"
+  });
+  assert.equal(manager.status, 201);
+  assert.equal(captured.find((c) => c.table === "training_completions" && c.method === "POST").body[0].completion_status, "waived");
+});
+
+test("POST training-assignments refuses the evaluator-owned source types (400) before any write -- TR-09", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGER, userId: "user-9" });
+  for (const sourceType of ["role_rule", "certification_rule"]) {
+    const result = await call("POST", "/facilities/fac-1/training-assignments", {
+      employeeId: "emp-1",
+      courseId: "course-1",
+      sourceType
+    });
+    assert.equal(result.status, 400, sourceType);
+  }
+  assert.equal(captured.some((c) => c.table === "training_assignments" && c.method === "POST"), false);
 });

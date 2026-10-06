@@ -35,6 +35,8 @@ import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { processReportPdfJobs } from "../report-pdf-worker.mjs";
 import { scanWorkOrderSla } from "../work-order-sla-scan.mjs";
+import { runTrainingAutoAssign } from "../training-auto-assign.mjs";
+import { scanCertificationExpiry } from "../training-cert-expiry.mjs";
 import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
@@ -214,6 +216,15 @@ async function handleDrain(request, response, { env }, sendJson) {
   // generatePmWorkOrders already issues. Revisit by threading a
   // makeConfigLoader(client) through if/when that's needed.
   const pmGeneration = await generatePmWorkOrders(client, { now, limit, config: {} });
+  // TR-09 / TR-11: the two training evaluators on the same drain cadence and
+  // service-role client. Both resolve each facility's own training settings
+  // (training.autoAssignEnabled, training.certExpiryLeadDays, ...) through
+  // makeConfigLoader, degrade to registry defaults on a lookup failure, and
+  // isolate per-rule / per-certification failures internally (a failure after
+  // a claim reverts the claim), so a single bad row cannot turn a healthy
+  // drain into a 500.
+  const trainingAutoAssign = await runTrainingAutoAssign(client, { now, limit });
+  const trainingCertExpiry = await scanCertificationExpiry(client, { now });
 
   sendJson(response, 200, {
     ...summary,
@@ -223,7 +234,9 @@ async function handleDrain(request, response, { env }, sendJson) {
     authThrottleSwept: authThrottleSwept.deleted,
     incidentSla,
     workOrderSla,
-    pmGeneration
+    pmGeneration,
+    trainingAutoAssign,
+    trainingCertExpiry
   });
 }
 

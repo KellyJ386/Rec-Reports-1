@@ -311,6 +311,56 @@ export const settingsRegistry = Object.freeze(
       default: 30, // training.mjs:6 renewalWindowDays ?? 30
       validation: { min: 1, max: 365 },
       permission: "admin.manage"
+    },
+    {
+      key: "training.certExpiryNotifyEnabled",
+      module: "training",
+      label: "Send certification expiry notifications",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: true, // TR-11: the expiry evaluator (training-cert-expiry.mjs) enqueues cert.expiring/cert.expired jobs
+      validation: {},
+      permission: "admin.manage"
+    },
+    {
+      key: "training.certExpiryLeadDays",
+      module: "training",
+      label: "Certification expiry notice lead times (days, comma separated)",
+      dataType: "string",
+      scopes: ["organization", "facility"],
+      default: "30,14,7", // TR-11: one notice as each lead time is reached (largest first)
+      validation: { pattern: "^[1-9][0-9]{0,2}(,[1-9][0-9]{0,2}){0,5}$" },
+      permission: "admin.manage"
+    },
+    {
+      key: "training.autoAssignEnabled",
+      module: "training",
+      label: "Auto-assign training from certification and role rules",
+      dataType: "boolean",
+      scopes: ["organization", "facility"],
+      default: true, // TR-09: training-auto-assign.mjs skips a facility that switches this off
+      validation: {},
+      permission: "admin.manage"
+    },
+    {
+      key: "training.autoAssignDueDays",
+      module: "training",
+      label: "Default due date for auto-assigned training (days)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 30, // TR-09: used when a rule carries no due_days of its own
+      validation: { min: 1, max: 365 },
+      permission: "admin.manage"
+    },
+    {
+      key: "training.quizDefaultPassPct",
+      module: "training",
+      label: "Default quiz pass score (percent)",
+      dataType: "integer",
+      scopes: ["organization", "facility"],
+      default: 80, // TR-07: pass_score_pct a new quiz starts with (0065 column default)
+      validation: { min: 1, max: 100 },
+      permission: "admin.manage"
     }
   ].map((definition) => Object.freeze({ ...definition, validation: Object.freeze({ ...definition.validation }) }))
 );

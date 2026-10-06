@@ -93,3 +93,33 @@ test("effectiveConfig and configValue flatten to plain key/value with defaults",
   assert.equal(configValue({}, "workOrders.defaultPriority"), "medium");
   assert.equal(configValue({ "workOrders.defaultPriority": "urgent" }, "workOrders.defaultPriority"), "urgent");
 });
+
+// --- Slice 3F: training keys (TR-07/TR-09/TR-11) --------------------------------
+test("the training block carries the five 3F keys contiguously after recertWindowDays", () => {
+  const keys = settingsForModule("training").map((definition) => definition.key);
+  assert.deepEqual(keys, [
+    "training.recertWindowDays",
+    "training.certExpiryNotifyEnabled",
+    "training.certExpiryLeadDays",
+    "training.autoAssignEnabled",
+    "training.autoAssignDueDays",
+    "training.quizDefaultPassPct"
+  ]);
+});
+
+test("training.certExpiryLeadDays accepts a comma-separated list of 1-3 digit day counts only", () => {
+  for (const good of ["30", "30,14,7", "90,60,30,14,7,1"]) {
+    assert.equal(validateSettingValue("training.certExpiryLeadDays", good).valid, true, good);
+  }
+  for (const bad of ["", "0", "30,", ",30", "30;14", "abc", "1000", "30, 14", "1,2,3,4,5,6,7"]) {
+    assert.equal(validateSettingValue("training.certExpiryLeadDays", bad).valid, false, bad);
+  }
+});
+
+test("training.quizDefaultPassPct and autoAssignDueDays are bounded integers", () => {
+  assert.equal(validateSettingValue("training.quizDefaultPassPct", 80).valid, true);
+  assert.equal(validateSettingValue("training.quizDefaultPassPct", 0).valid, false);
+  assert.equal(validateSettingValue("training.quizDefaultPassPct", 101).valid, false);
+  assert.equal(validateSettingValue("training.autoAssignDueDays", 365).valid, true);
+  assert.equal(validateSettingValue("training.autoAssignDueDays", 366).valid, false);
+});

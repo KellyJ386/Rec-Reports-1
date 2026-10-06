@@ -73,7 +73,7 @@ function declaredContentLength(request) {
 // encodings have none at all). Shaped exactly like scripts/server.mjs's
 // readBody (data/end/error events, destroy-on-overflow) but returns a
 // Buffer instead of a utf8 string, since attachment bytes are never JSON.
-function readRawBody(request, maxBytes) {
+export function readRawBody(request, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let received = 0;
