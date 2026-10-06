@@ -165,7 +165,7 @@ create or replace function fn_messages_guard_ack_escalation()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: ack_escalation_level / ack_escalated_at / ack_next_escalation_at
@@ -176,6 +176,23 @@ begin
   -- pushed out. (fn_messages_set_ack_next_escalation, which sorts after this
   -- trigger, maintains the queue column itself when publish data changes.)
   if auth.uid() is not null then
+    -- A client may only publish "now": a backdated published_at would put the
+    -- first escalation check in the past, and a past ack_due_at set after the
+    -- fact would do the same.
+    if new.published_at is not null
+       and (tg_op = 'INSERT' or old.published_at is distinct from new.published_at)
+       and (new.published_at > now() + interval '10 minutes'
+            or new.published_at < now() - interval '10 minutes') then
+      raise exception 'published_at must be the time the message is published'
+        using errcode = '42501';
+    end if;
+    if new.is_required_ack and new.ack_due_at is not null
+       and (tg_op = 'INSERT' or old.ack_due_at is distinct from new.ack_due_at)
+       and new.published_at is not null
+       and new.ack_due_at <= now() then
+      raise exception 'ack_due_at must be later than the current time'
+        using errcode = '23514';
+    end if;
     if tg_op = 'INSERT' then
       if new.ack_escalation_level <> 0
          or new.ack_escalated_at is not null
@@ -205,7 +222,7 @@ create or replace function fn_messages_set_ack_next_escalation()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: a published, required-ack message with a due time is due for the
@@ -317,7 +334,7 @@ create or replace function fn_notification_job_dedupe_key()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 3 (0064, M-1): an UPDATE that touches nothing the key is derived
@@ -396,7 +413,7 @@ $$;
 create or replace function fn_notification_jobs_client_guard()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: only client sessions are constrained here. (A BEFORE DELETE
@@ -570,7 +587,7 @@ returns boolean
 language plpgsql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_value jsonb;
@@ -619,7 +636,7 @@ create or replace function internal.fn_emergency_window(p_rule jsonb)
 returns jsonb
 language plpgsql
 stable
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_spec jsonb;
@@ -674,7 +691,7 @@ returns jsonb
 language plpgsql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_facility uuid;
@@ -785,7 +802,7 @@ returns text
 language sql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select encode(
     sha256(convert_to(
@@ -821,7 +838,7 @@ create or replace function fn_emergency_alert_launch_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1001,7 +1018,7 @@ $$;
 create or replace function fn_emergency_alert_launches_guard_client()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: only client sessions (see the notification_jobs guard above).
@@ -1050,7 +1067,7 @@ create or replace function fn_emergency_alert_launch_audit()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1154,7 +1171,7 @@ create or replace function internal.approve_emergency_launch(p_message_id uuid)
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1308,7 +1325,7 @@ returns jsonb
 language plpgsql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1377,7 +1394,7 @@ create or replace function public.approve_emergency_launch(p_message_id uuid)
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.approve_emergency_launch(p_message_id);
 $$;
@@ -1389,7 +1406,7 @@ create or replace function public.emergency_launch_queue(
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.emergency_launch_queue(p_facility_id, p_status);
 $$;
@@ -1435,7 +1452,7 @@ create or replace function internal.publish_urgent_message(p_message_id uuid)
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1506,6 +1523,7 @@ begin
         'recipients', v_resolved -> 'recipients',
         'messageId', p_message_id,
         'quietHoursBypass', true,
+        'publishedBy', v_actor,
         'title', left(v_message.subject, 200)
       )
     );
@@ -1530,7 +1548,7 @@ create or replace function public.publish_urgent_message(p_message_id uuid)
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.publish_urgent_message(p_message_id);
 $$;
@@ -1561,7 +1579,7 @@ create or replace function fn_messages_guard_emergency_publish()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: the transition INTO "published emergency message" (an INSERT that
@@ -1605,7 +1623,7 @@ create trigger messages_guard_emergency_publish
 create or replace function fn_messages_guard_emergency_freeze()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_frozen boolean;
@@ -1654,7 +1672,7 @@ create trigger messages_guard_emergency_freeze
 create or replace function fn_messages_guard_emergency_delete()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: only client sessions.
@@ -1681,7 +1699,7 @@ create trigger messages_guard_emergency_delete
 create or replace function fn_message_audiences_guard_emergency_freeze()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: only client sessions.
@@ -1752,7 +1770,7 @@ create or replace function fn_emergency_alert_response_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1882,7 +1900,7 @@ create policy "employees can update their own emergency responses" on emergency_
 create or replace function fn_communication_channels_guard_emergency_enabled()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   -- Guard 1: only client sessions; the service role and definer paths are the

@@ -220,6 +220,15 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           });
         }
 
+        // An urgent message is published through publish_urgent_message (which
+        // also creates its page); the legacy shortcut would publish it with no
+        // notification job and leave it unpageable.
+        if (body.payload.priority === "urgent" && body.payload.publishNow === true) {
+          return sendJson(response, 409, {
+            error: "urgent messages are published through the publish endpoint"
+          });
+        }
+
         const row = {
           facility_id: params.facilityId,
           channel_id: channelId,

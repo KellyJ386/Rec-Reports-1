@@ -389,8 +389,8 @@ begin
     'internal.fn_emergency_content_hash(uuid)'
   ] loop
     if not (select prosecdef from pg_proc where oid = v_table::regprocedure)
-       or not exists (select 1 from pg_proc where oid = v_table::regprocedure and 'search_path=public' = any (proconfig)) then
-      raise exception 'CE FAIL: % must be SECURITY DEFINER with search_path = public', v_table;
+       or not exists (select 1 from pg_proc where oid = v_table::regprocedure and 'search_path=public, pg_temp' = any (proconfig)) then
+      raise exception 'CE FAIL: % must be SECURITY DEFINER with search_path = public, pg_temp', v_table;
     end if;
   end loop;
   -- The one-shot function locks the launch row (serializes with cancel) and the
@@ -432,8 +432,8 @@ begin
     raise exception 'CE FAIL: anon can execute publish_urgent_message';
   end if;
   if not (select prosecdef from pg_proc where oid = 'internal.publish_urgent_message(uuid)'::regprocedure)
-     or not exists (select 1 from pg_proc where oid = 'internal.publish_urgent_message(uuid)'::regprocedure and 'search_path=public' = any (proconfig)) then
-    raise exception 'CE FAIL: internal.publish_urgent_message must be SECURITY DEFINER with search_path = public';
+     or not exists (select 1 from pg_proc where oid = 'internal.publish_urgent_message(uuid)'::regprocedure and 'search_path=public, pg_temp' = any (proconfig)) then
+    raise exception 'CE FAIL: internal.publish_urgent_message must be SECURITY DEFINER with search_path = public, pg_temp';
   end if;
   if (select prosecdef from pg_proc where oid = 'public.publish_urgent_message(uuid)'::regprocedure) then
     raise exception 'CE FAIL: the public publish_urgent_message wrapper must be SECURITY INVOKER';
@@ -2365,6 +2365,20 @@ select pg_temp.expect_error(
 select pg_temp.expect_error(
   'M-5 (M5c): nor backdate published_at (it is frozen once set)',
   $q$update messages set published_at = now() - interval '6 days' where id = '64000000-0000-0000-0000-0000000000a9'$q$,
+  array['42501']
+);
+-- Round-3 residual: a draft cannot be published with a backdated time, nor
+-- inserted already published in the past.
+insert into messages (id, facility_id, channel_id, author_employee_id, subject, body_text)
+values ('64000000-0000-0000-0000-0000000000b9', '64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Backdate draft', 'x');
+select pg_temp.expect_error(
+  'M-5 (M5j): publishing cannot backdate published_at',
+  $q$update messages set published_at = now() - interval '5 days' where id = '64000000-0000-0000-0000-0000000000b9'$q$,
+  array['42501']
+);
+select pg_temp.expect_error(
+  'M-5 (M5k): inserting an already-published row cannot backdate it',
+  $q$insert into messages (facility_id, channel_id, author_employee_id, subject, body_text, published_at) values ('64aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '64000000-0000-0000-0000-0000000000c2', '64000000-0000-0000-0000-0000000000e1', 'Backdated', 'x', now() - interval '5 days')$q$,
   array['42501']
 );
 select pg_temp.expect_error(
