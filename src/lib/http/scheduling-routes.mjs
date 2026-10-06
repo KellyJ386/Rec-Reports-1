@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { makeGuards } from "./guard.mjs";
 import {
   summarizeScheduleReadiness,
@@ -31,6 +31,9 @@ const SHIFT_TEMPLATE_COLUMNS =
   "id,facility_id,department_id,role_code,recurrence_rule,start_time_local,end_time_local,days_of_week,required_certification_ids,active,created_at,updated_at";
 const EMPLOYEE_COLUMNS =
   "id,facility_id,department_id,user_id,employee_no,first_name,last_name,status,created_at,updated_at";
+const AVAILABILITY_COLUMNS =
+  "id,facility_id,employee_id,weekday,available_start_local,available_end_local,unavailable,effective_from,effective_to,deleted_at";
+const TIME_OFF_WINDOW_COLUMNS = "id,facility_id,employee_id,starts_at,ends_at,request_type,status";
 const PUBLICATION_COLUMNS =
   "id,facility_id,schedule_period_id,publish_version,published_at,published_by,change_summary";
 const PERIOD_STATUS_VALUES = ["draft", "review", "published", "archived"];
@@ -49,6 +52,43 @@ const ASSIGNMENT_LIST_DEFAULT_LIMIT = 50;
 const ASSIGNMENT_LIST_MAX_LIMIT = 200;
 const SCHEDULING_MODULE_CODE = "scheduling";
 const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE);
+
+// --- Effective scheduling config (mirrors admin-routes.mjs GET
+// /facilities/:facilityId/modules/:moduleCode/config resolution: org layer
+// from organization_module_settings, facility layer from
+// facility_module_overrides, facility overrides winning over org winning
+// over the registry default). Module scope (and exported) since Wave 3 3D so
+// scheduling-self-service-routes.mjs reads the same live settings. ----------
+// Selects timezone alongside organization_id so the SC-03 generate route can
+// reuse this same lookup for expandTemplates' DST-safe local->UTC conversion
+// instead of issuing a second facilities query.
+export async function loadFacilityOrgId(client, facilityId) {
+  const rows = await pgSelect(client, "facilities", {
+    filters: { id: facilityId },
+    select: "id,organization_id,timezone",
+    limit: 1
+  });
+  return (rows ?? [])[0] ?? null;
+}
+
+// Resolve the facility's effective scheduling config (flat key -> value map,
+// registry defaults filled in) so summarizeScheduleReadiness's
+// conflictCheckEnabled/certEnforcementMode and the 3D time-off / claim-window
+// modes reflect live admin settings instead of the hard-coded defaults.
+//
+// The two layers come from get_scheduling_config_layers (0062), a definer
+// function that serves ONLY the `scheduling.*` keys to any member of the
+// facility. Reading organization_module_settings / facility_module_overrides
+// through the caller's own client would return nothing for everyone without
+// admin.manage, silently turning a hard-block mode into its default. An RPC
+// failure is NOT swallowed (it propagates like any other failed read), so a
+// broken lookup can never quietly fall back to the permissive defaults.
+export async function loadSchedulingConfig(client, facilityId) {
+  const layers = await pgRpc(client, "get_scheduling_config_layers", { p_facility_id: facilityId });
+  const orgLayer = layers && typeof layers.orgLayer === "object" && layers.orgLayer ? layers.orgLayer : {};
+  const facilityLayer = layers && typeof layers.facilityLayer === "object" && layers.facilityLayer ? layers.facilityLayer : {};
+  return effectiveConfig({ orgLayer, facilityLayer, definitions: SCHEDULING_SETTING_DEFINITIONS });
+}
 
 // Registers the end-user Scheduling API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
@@ -90,32 +130,6 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     return (rows ?? [])[0] ?? null;
   }
 
-  // --- Effective scheduling config (mirrors admin-routes.mjs GET
-  // /facilities/:facilityId/modules/:moduleCode/config resolution: org layer
-  // from organization_module_settings, facility layer from
-  // facility_module_overrides, facility overrides winning over org winning
-  // over the registry default) ------------------------------------------------
-  async function loadModuleByCode(client, code) {
-    const rows = await pgSelect(client, "modules", {
-      filters: { code },
-      select: "id,code",
-      limit: 1
-    });
-    return (rows ?? [])[0] ?? null;
-  }
-
-  // Selects timezone alongside organization_id so the SC-03 generate route can
-  // reuse this same lookup for expandTemplates' DST-safe local->UTC conversion
-  // instead of issuing a second facilities query.
-  async function loadFacilityOrgId(client, facilityId) {
-    const rows = await pgSelect(client, "facilities", {
-      filters: { id: facilityId },
-      select: "id,organization_id,timezone",
-      limit: 1
-    });
-    return (rows ?? [])[0] ?? null;
-  }
-
   async function loadAssignment(client, assignmentId) {
     const rows = await pgSelect(client, "shift_assignments", {
       filters: { id: assignmentId },
@@ -123,37 +137,6 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
-  }
-
-  // Resolve the facility's effective scheduling config (flat key -> value map,
-  // registry defaults filled in) so summarizeScheduleReadiness's
-  // conflictCheckEnabled/certEnforcementMode reflect live admin settings
-  // instead of the hard-coded defaults. Any lookup failure (module row
-  // missing, facility missing) degrades to {} -- summarizeScheduleReadiness's
-  // configValue() already falls back to registry defaults for an empty map, so
-  // this stays backward compatible rather than failing the request.
-  async function loadSchedulingConfig(client, facilityId) {
-    const module = await loadModuleByCode(client, SCHEDULING_MODULE_CODE);
-    if (!module) return {};
-    const facility = await loadFacilityOrgId(client, facilityId);
-
-    let orgLayer = {};
-    if (facility?.organization_id) {
-      const orgRows = await pgSelect(client, "organization_module_settings", {
-        filters: { organization_id: facility.organization_id, module_id: module.id },
-        select: "config_jsonb",
-        limit: 1
-      });
-      orgLayer = (orgRows ?? [])[0]?.config_jsonb ?? {};
-    }
-    const facRows = await pgSelect(client, "facility_module_overrides", {
-      filters: { facility_id: facilityId, module_id: module.id },
-      select: "config_patch_jsonb",
-      limit: 1
-    });
-    const facilityLayer = (facRows ?? [])[0]?.config_patch_jsonb ?? {};
-
-    return effectiveConfig({ orgLayer, facilityLayer, definitions: SCHEDULING_SETTING_DEFINITIONS });
   }
 
   // Adapts a raw schedule_shifts/shift_assignments row into buildChangeSummary's
@@ -201,7 +184,17 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     // it is loaded facility-wide and scoped to the period implicitly below
     // via shiftById (an assignment whose shift fell outside the period-
     // scoped shifts query is dropped as "orphaned").
-    const [shiftsRows, assignmentsRows, certsRows, certTypesRows, config, roleRequirementRows] = await Promise.all([
+    const [
+      shiftsRows,
+      assignmentsRows,
+      certsRows,
+      certTypesRows,
+      config,
+      roleRequirementRows,
+      availabilityRows,
+      timeOffRows,
+      facilityRow
+    ] = await Promise.all([
       pgSelect(client, "schedule_shifts", {
         filters: shiftFilters,
         select: SHIFT_COLUMNS
@@ -222,7 +215,23 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       pgSelect(client, "certification_role_requirements", {
         filters: { facility_id: facilityId },
         select: ROLE_REQUIREMENT_COLUMNS
-      })
+      }),
+      // SC-13/SC-14 (Wave 3 3D): availability rules and pending/approved
+      // time off feed the readiness result as advisory warnings. Both are
+      // RLS-scoped to what the caller may read (a schedule.read holder reads
+      // all availability; time off needs schedule.manage or the approve
+      // code) -- an unreadable table simply contributes no rows.
+      pgSelect(client, "employee_availability", {
+        filters: { facility_id: facilityId },
+        select: AVAILABILITY_COLUMNS,
+        extra: { deleted_at: "is.null" }
+      }),
+      pgSelect(client, "time_off_requests", {
+        filters: { facility_id: facilityId, status: { in: ["pending", "approved"] } },
+        select: TIME_OFF_WINDOW_COLUMNS,
+        extra: { deleted_at: "is.null" }
+      }),
+      loadFacilityOrgId(client, facilityId)
     ]);
 
     const shifts = shiftsRows ?? [];
@@ -267,9 +276,14 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       shiftById.set(shift.id, shift);
     }
 
-    // Transform assignments to domain shape: employeeId, shiftId, startsAt, endsAt, requiredCertificationCodes.
+    // Transform assignments to domain shape: employeeId, shiftId, shiftDate,
+    // startsAt, endsAt, requiredCertificationCodes. Only LIVE assignments
+    // (pending/approved) count: a cancelled or declined assignment -- e.g. the
+    // old leg of an approved swap (0062) -- no longer occupies the employee's
+    // calendar and must not read as a double booking.
     const domainAssignments = [];
     for (const assignment of assignments) {
+      if (!ACTIVE_ASSIGNMENT_STATUSES.includes(assignment.status)) continue;
       const shift = shiftById.get(assignment.shift_id);
       if (!shift) continue; // Orphaned assignment, skip.
       const requiredCodes = [];
@@ -280,6 +294,7 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       domainAssignments.push({
         employeeId: assignment.employee_id,
         shiftId: assignment.shift_id,
+        shiftDate: shift.shift_date,
         startsAt: shift.starts_at,
         endsAt: shift.ends_at,
         requiredCertificationCodes: requiredCodes
@@ -290,7 +305,16 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     // internally (gated on config's conflictCheckEnabled), so a separate
     // findDoubleBookings call here would just duplicate that work.
     const readiness = summarizeScheduleReadiness(domainAssignments, certificationsByEmployee, config, {
-      roleRequirements
+      roleRequirements,
+      availabilityRows: availabilityRows ?? [],
+      timeOffWindows: (timeOffRows ?? []).map((row) => ({
+        id: row.id,
+        employeeId: row.employee_id,
+        startsAt: row.starts_at,
+        endsAt: row.ends_at,
+        status: row.status
+      })),
+      timeZone: facilityRow?.timezone ?? "UTC"
     });
 
     // Assignments actually inside this period's shifts (the same "orphaned
@@ -921,6 +945,11 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           return sendJson(response, 201, (rows ?? [])[0] ?? null);
         } catch (err) {
           if (err instanceof PostgrestError && err.status === 409) {
+            // PT409 is the database's own conflict rule (e.g. approved time
+            // off in hard-block mode); anything else is the unique key.
+            if (String(err.body?.code ?? "") === "PT409" && typeof err.body?.message === "string") {
+              return sendJson(response, 409, { error: err.body.message });
+            }
             return sendJson(response, 409, {
               error: "employee is already assigned to this shift with this assignment type"
             });
@@ -985,7 +1014,8 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
   // facility's live scheduling config, and any per-requirement cert-policy
   // overrides, then calling summarizeScheduleReadiness (via the
   // computeScheduleReadiness helper shared with the publish route below).
-  // Returns the domain-lib result: { canPublish, doubleBookings, missingCertifications, warnings, certEnforcementMode }
+  // Returns the domain-lib result: { canPublish, doubleBookings, missingCertifications, warnings,
+  // timeOffConflicts, availabilityConflicts, certEnforcementMode }
   router.register(
     "POST",
     "/facilities/:facilityId/schedule/validate",
@@ -1005,6 +1035,8 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           doubleBookings: readiness.doubleBookings,
           missingCertifications: readiness.missingCertifications,
           warnings: readiness.warnings,
+          timeOffConflicts: readiness.timeOffConflicts,
+          availabilityConflicts: readiness.availabilityConflicts,
           certEnforcementMode: readiness.certEnforcementMode
         });
       })
@@ -1081,6 +1113,8 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
             doubleBookings: readiness.doubleBookings,
             missingCertifications: readiness.missingCertifications,
             warnings: readiness.warnings,
+            timeOffConflicts: readiness.timeOffConflicts,
+            availabilityConflicts: readiness.availabilityConflicts,
             certEnforcementMode: readiness.certEnforcementMode
           });
         }

@@ -44,7 +44,21 @@ export function findMissingCertifications(assignments, certificationsByEmployee)
 // warning, while 'hard-block' ones still block. With no roleRequirements the
 // single registry certEnforcementMode governs every missing cert (Phase 5
 // behavior, fully backward compatible).
-export function summarizeScheduleReadiness(assignments, certificationsByEmployee, config = {}, { roleRequirements } = {}) {
+//
+// SC-13/SC-14 (Wave 3 3D): the optional `availabilityRows` (employee_availability
+// rows), `timeOffWindows` (time_off_requests rows) and `timeZone` (the
+// facility's IANA zone) add two more result arrays. `availabilityConflicts`
+// are always non-blocking warnings; `timeOffConflicts` carry a per-entry
+// severity -- an APPROVED overlap is 'blocking' (and so withholds canPublish)
+// only when scheduling.timeOffConflictMode is 'hard-block', a pending overlap
+// is always a 'warning'. Both need `shiftDate` (and startsAt/endsAt) on the
+// assignment entries; omit the options and both arrays are simply empty.
+export function summarizeScheduleReadiness(
+  assignments,
+  certificationsByEmployee,
+  config = {},
+  { roleRequirements, availabilityRows, timeOffWindows, timeZone } = {}
+) {
   const conflictCheckEnabled = configValue(config, "scheduling.conflictCheckEnabled");
   const certEnforcementMode = configValue(config, "scheduling.certEnforcementMode");
 
@@ -70,11 +84,21 @@ export function summarizeScheduleReadiness(assignments, certificationsByEmployee
     else blocking.push(missing);
   }
 
+  const timeOffConflicts = findTimeOffConflicts(assignments, timeOffWindows ?? [], {
+    mode: configValue(config, "scheduling.timeOffConflictMode")
+  });
+  const availabilityConflicts = findAvailabilityConflicts(assignments, availabilityRows ?? [], timeZone ?? "UTC");
+
   return {
-    canPublish: doubleBookings.length === 0 && blocking.length === 0,
+    canPublish:
+      doubleBookings.length === 0 &&
+      blocking.length === 0 &&
+      !timeOffConflicts.some((conflict) => conflict.severity === "blocking"),
     doubleBookings,
     missingCertifications,
     warnings,
+    timeOffConflicts,
+    availabilityConflicts,
     certEnforcementMode
   };
 }
@@ -451,4 +475,661 @@ export function buildChangeSummary(previousShifts, currentShifts, previousAssign
     shifts: diffRowsById(previousShifts, currentShifts, SHIFT_DIFF_FIELDS),
     assignments: diffRowsById(previousAssignments, currentAssignments, ASSIGNMENT_DIFF_FIELDS)
   };
+}
+
+// ===========================================================================
+// Self-service requests, availability and atomic-approval planning (Wave 3
+// Slice 3D, SC-10 .. SC-16). Everything below is pure: the route layer loads
+// rows and passes them in, and the authoritative decision still happens in
+// the 0062 decide_* RPCs -- these functions exist to pre-validate (so a
+// caller gets a structured 409 instead of an RPC error string) and to
+// describe exactly what an approval will do, mirroring the SQL one-to-one
+// (supabase/migrations/0062_scheduling_self_service.sql,
+// internal.fn_assignment_blockers and the decide_* bodies).
+// ===========================================================================
+
+export const REQUEST_KINDS = Object.freeze(["open_shift_claim", "shift_swap", "time_off"]);
+export const CLAIM_STATUSES = Object.freeze(["pending", "approved", "denied", "withdrawn"]);
+export const SWAP_STATUSES = Object.freeze(["pending", "approved", "denied", "cancelled", "expired"]);
+export const SWAP_TYPES = Object.freeze(["direct", "drop_pickup"]);
+export const TIME_OFF_STATUSES = Object.freeze(["pending", "approved", "denied", "cancelled"]);
+export const TIME_OFF_TYPES = Object.freeze(["vacation", "sick", "unpaid", "other"]);
+export const REQUEST_DECISIONS = Object.freeze(["approve", "deny"]);
+
+// Mirrors the BEFORE UPDATE guard triggers (0062 Guard 8 / 6 / 5): pending is
+// the only live state, except an approved time-off request the employee may
+// still cancel before it starts. Same-status "transitions" are not legal.
+const REQUEST_TRANSITIONS = {
+  open_shift_claim: {
+    pending: new Set(["approved", "denied", "withdrawn"]),
+    approved: new Set(),
+    denied: new Set(),
+    withdrawn: new Set()
+  },
+  shift_swap: {
+    pending: new Set(["approved", "denied", "cancelled", "expired"]),
+    approved: new Set(),
+    denied: new Set(),
+    cancelled: new Set(),
+    expired: new Set()
+  },
+  time_off: {
+    pending: new Set(["approved", "denied", "cancelled"]),
+    approved: new Set(["cancelled"]),
+    denied: new Set(),
+    cancelled: new Set()
+  }
+};
+
+export function canTransitionRequest(kind, from, to) {
+  const allowed = REQUEST_TRANSITIONS[kind]?.[from];
+  if (!allowed) return false;
+  return allowed.has(to);
+}
+
+const MAX_REASON_LENGTH = 1000;
+
+// Validates a decision body ({ decision: 'approve'|'deny', reason }). A denial
+// always needs a non-blank reason (design 5.2: "denial reason required for
+// auditability"); the cleaned values are returned so the route passes exactly
+// what was validated to the RPC.
+export function validateDecisionInput(input) {
+  const errors = [];
+  const decision = typeof input?.decision === "string" ? input.decision.trim().toLowerCase() : "";
+  const reasonText = typeof input?.reason === "string" ? input.reason.trim() : "";
+  if (!REQUEST_DECISIONS.includes(decision)) {
+    errors.push(`decision must be one of ${REQUEST_DECISIONS.join(", ")}`);
+  }
+  if (input?.reason !== undefined && input?.reason !== null && typeof input.reason !== "string") {
+    errors.push("reason must be a string");
+  }
+  if (decision === "deny" && !reasonText) errors.push("a denial requires a reason");
+  if (reasonText.length > MAX_REASON_LENGTH) errors.push(`reason must be at most ${MAX_REASON_LENGTH} characters`);
+  return { valid: errors.length === 0, errors, decision, reason: reasonText || null };
+}
+
+// scheduling.openShiftClaimWindowHours: a shift is claimable until
+// `windowHours` after it was opened (schedule_shifts.opened_at, stamped
+// server-side by 0062's trigger). A missing/invalid openedAt is treated as
+// "window unknown -> open" here; the DB guard (Guard 4) is the authority.
+export function isClaimWindowOpen({ openedAt, now = new Date(), windowHours }) {
+  const hours = Number(windowHours);
+  if (!Number.isFinite(hours) || hours <= 0) return false;
+  if (openedAt === null || openedAt === undefined) return true;
+  const opened = new Date(openedAt).getTime();
+  if (!Number.isFinite(opened)) return true;
+  return new Date(now).getTime() <= opened + hours * 3600 * 1000;
+}
+
+// Certification codes each employee holds ON `dateStr`: status 'active', not
+// soft-deleted, and not expired before the shift date (the SQL mirror checks
+// `expires_at >= shift_date`). Rows are employee_certifications; types are
+// certification_types (id -> code).
+export function certificationsHeldOn(employeeCertRows, certTypeRows, dateStr) {
+  const codeById = new Map((certTypeRows ?? []).map((type) => [type.id, type.code]));
+  const held = {};
+  for (const row of employeeCertRows ?? []) {
+    if (row.status !== "active" || row.deleted_at) continue;
+    if (row.expires_at && dateStr && String(row.expires_at).slice(0, 10) < dateStr) continue;
+    const code = codeById.get(row.certification_type_id);
+    if (!code) continue;
+    (held[row.employee_id] ??= []).push(code);
+  }
+  return held;
+}
+
+function windowOf(entry) {
+  return {
+    startsAt: entry.startsAt ?? entry.starts_at,
+    endsAt: entry.endsAt ?? entry.ends_at
+  };
+}
+
+// Approved/pending time off overlapping an assignment. `mode` is
+// scheduling.timeOffConflictMode: an APPROVED overlap is 'blocking' in
+// 'hard-block' mode and a 'warning' otherwise; a PENDING overlap is always a
+// 'warning'. Cancelled/denied requests never conflict. Boundaries are
+// exclusive (shiftsOverlap): time off that ends exactly when a shift starts
+// does not conflict.
+export function findTimeOffConflicts(assignments, timeOffWindows, { mode = "warning" } = {}) {
+  const conflicts = [];
+  for (const assignment of assignments ?? []) {
+    for (const window of timeOffWindows ?? []) {
+      const employeeId = window.employeeId ?? window.employee_id;
+      if (employeeId !== assignment.employeeId) continue;
+      if (window.status !== "approved" && window.status !== "pending") continue;
+      if (!shiftsOverlap(windowOf(assignment), windowOf(window))) continue;
+      conflicts.push({
+        employeeId,
+        shiftId: assignment.shiftId,
+        timeOffRequestId: window.id ?? null,
+        status: window.status,
+        severity: window.status === "approved" && mode === "hard-block" ? "blocking" : "warning"
+      });
+    }
+  }
+  return conflicts;
+}
+
+function timeOfDay(value) {
+  if (typeof value !== "string") return null;
+  const match = /^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/.exec(value);
+  return match ? `${match[1]}:${match[2]}` : null;
+}
+
+// Availability warnings. For each assignment (needs shiftDate/startsAt/
+// endsAt), the employee's rule for that calendar weekday that is effective on
+// the shift date (latest effective_from wins; soft-deleted rows ignored) is
+// consulted: an `unavailable` rule always conflicts; a rule with a window
+// conflicts when the shift does not fit inside [start, end] of that local day
+// in `timeZone` (a shift that runs past midnight cannot fit a same-day
+// window). No rule = no constraint. Availability is advisory -- these are
+// warnings, never blockers.
+export function findAvailabilityConflicts(assignments, availabilityRows, timeZone = "UTC") {
+  const conflicts = [];
+  const rows = (availabilityRows ?? []).filter((row) => !row.deleted_at);
+  for (const assignment of assignments ?? []) {
+    if (!assignment.shiftDate) continue;
+    const weekday = weekdayOfDateOnly(assignment.shiftDate);
+    const rule = rows
+      .filter(
+        (row) =>
+          row.employee_id === assignment.employeeId &&
+          Number(row.weekday) === weekday &&
+          String(row.effective_from).slice(0, 10) <= assignment.shiftDate &&
+          (!row.effective_to || String(row.effective_to).slice(0, 10) >= assignment.shiftDate)
+      )
+      .sort((a, b) => String(b.effective_from).localeCompare(String(a.effective_from)))[0];
+    if (!rule) continue;
+    if (rule.unavailable) {
+      conflicts.push({ employeeId: assignment.employeeId, shiftId: assignment.shiftId, reason: "unavailable", weekday });
+      continue;
+    }
+    const start = timeOfDay(rule.available_start_local);
+    const end = timeOfDay(rule.available_end_local);
+    if (!start || !end) continue;
+    const windowStart = zonedTimeToUtcMs(assignment.shiftDate, start, timeZone);
+    const windowEnd = zonedTimeToUtcMs(assignment.shiftDate, end, timeZone);
+    const shiftStart = new Date(assignment.startsAt).getTime();
+    const shiftEnd = new Date(assignment.endsAt).getTime();
+    if (shiftStart < windowStart || shiftEnd > windowEnd) {
+      conflicts.push({ employeeId: assignment.employeeId, shiftId: assignment.shiftId, reason: "outside_window", weekday });
+    }
+  }
+  return conflicts;
+}
+
+function shiftToWindow(shift) {
+  return {
+    id: shift.id,
+    shiftDate: shift.shift_date ?? shift.shiftDate,
+    startsAt: shift.starts_at ?? shift.startsAt,
+    endsAt: shift.ends_at ?? shift.endsAt
+  };
+}
+
+// "May this employee work this shift right now" -- the JS twin of
+// internal.fn_assignment_blockers. Wires findMissingCertifications,
+// shiftsOverlap, findTimeOffConflicts and findAvailabilityConflicts:
+//   * blocking: a missing certification (unless scheduling.certEnforcementMode
+//     is 'warning'), an overlapping live assignment (unless
+//     scheduling.conflictCheckEnabled is false), already assigned to this very
+//     shift, approved time off in 'hard-block' mode;
+//   * warnings: everything else, incl. availability.
+// `employeeAssignments` are the employee's live assignments joined to their
+// shifts ({ assignmentId, shiftId, startsAt, endsAt, status });
+// `ignoreAssignmentIds` are the assignments the same decision is about to
+// cancel (a swap's two legs). Per-requirement cert-policy overrides are
+// deliberately NOT applied -- the SQL authority reads only the facility-wide
+// mode, and the two must agree.
+export function checkAssignmentEligibility({
+  employeeId,
+  shift,
+  requiredCertificationCodes = [],
+  certificationsByEmployee = {},
+  employeeAssignments = [],
+  ignoreAssignmentIds = [],
+  timeOffWindows = [],
+  availabilityRows = [],
+  timeZone = "UTC",
+  config = {}
+} = {}) {
+  const target = shiftToWindow(shift);
+  const blocking = [];
+  const warnings = [];
+
+  const certMode = configValue(config, "scheduling.certEnforcementMode");
+  const missing = findMissingCertifications(
+    [{ employeeId, shiftId: target.id, requiredCertificationCodes }],
+    certificationsByEmployee
+  );
+  for (const entry of missing) {
+    (certMode === "warning" ? warnings : blocking).push({ code: "missing_certification", ...entry });
+  }
+
+  const conflictCheckEnabled = configValue(config, "scheduling.conflictCheckEnabled") !== false;
+  const ignored = new Set(ignoreAssignmentIds);
+  for (const other of employeeAssignments) {
+    if (ignored.has(other.assignmentId)) continue;
+    if (other.status && !["pending", "approved"].includes(other.status)) continue;
+    if (other.shiftId === target.id) {
+      blocking.push({ code: "already_assigned", employeeId, assignmentId: other.assignmentId, shiftIds: [other.shiftId, target.id] });
+    } else if (conflictCheckEnabled && shiftsOverlap(windowOf(other), target)) {
+      blocking.push({ code: "overlap", employeeId, assignmentId: other.assignmentId, shiftIds: [other.shiftId, target.id] });
+    }
+  }
+
+  const probe = [{ employeeId, shiftId: target.id, shiftDate: target.shiftDate, startsAt: target.startsAt, endsAt: target.endsAt }];
+  for (const conflict of findTimeOffConflicts(probe, timeOffWindows, { mode: configValue(config, "scheduling.timeOffConflictMode") })) {
+    const entry = {
+      code: conflict.status === "approved" ? "time_off" : "time_off_pending",
+      employeeId,
+      shiftId: target.id,
+      timeOffRequestId: conflict.timeOffRequestId
+    };
+    (conflict.severity === "blocking" ? blocking : warnings).push(entry);
+  }
+  for (const conflict of findAvailabilityConflicts(probe, availabilityRows, timeZone)) {
+    warnings.push({
+      code: conflict.reason === "unavailable" ? "unavailable" : "outside_availability",
+      employeeId,
+      shiftId: target.id
+    });
+  }
+
+  return { ok: blocking.length === 0, blocking, warnings };
+}
+
+// What approving an open-shift claim will do (SC-11), as a pure plan:
+// `allowed` only when the claim is still pending, the shift is still open and
+// unstarted and the claimant passes `eligibility` (the checkAssignmentEligibility
+// result the caller computed for this claimant and shift). On approval the
+// winner is assigned, the shift becomes 'assigned' and every OTHER pending
+// claim on the shift is denied -- ordered by created_at then id so the list is
+// deterministic. Mirrors decide_open_shift_claim's re-validation order.
+export function resolveClaim({ claim, siblingClaims = [], shift, now = new Date(), eligibility = { ok: true, blocking: [], warnings: [] } }) {
+  const reasons = [];
+  if (!claim || claim.claim_status !== "pending") reasons.push("claim_not_pending");
+  if (!shift || shift.deleted_at) {
+    reasons.push("shift_missing");
+  } else {
+    if (shift.status !== "open") reasons.push("shift_not_open");
+    if (new Date(shift.starts_at).getTime() <= new Date(now).getTime()) reasons.push("shift_started");
+  }
+  if (reasons.length === 0 && !eligibility.ok) reasons.push("claimant_ineligible");
+
+  const allowed = reasons.length === 0;
+  const denyClaimIds = (siblingClaims ?? [])
+    .filter((sibling) => sibling.id !== claim?.id && sibling.shift_id === claim?.shift_id && sibling.claim_status === "pending")
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id)))
+    .map((sibling) => sibling.id);
+
+  return {
+    allowed,
+    reasons,
+    blocking: eligibility.blocking ?? [],
+    warnings: eligibility.warnings ?? [],
+    assign: allowed ? { employeeId: claim.claimant_employee_id, shiftId: claim.shift_id, assignmentType: "primary" } : null,
+    shiftStatusAfter: allowed ? "assigned" : (shift?.status ?? null),
+    denyClaimIds: allowed ? denyClaimIds : []
+  };
+}
+
+const LIVE_ASSIGNMENT_STATUSES = ["pending", "approved"];
+
+function assignmentIsLive(assignment, expectedEmployeeId) {
+  return (
+    Boolean(assignment) &&
+    !assignment.deleted_at &&
+    LIVE_ASSIGNMENT_STATUSES.includes(assignment.status) &&
+    assignment.employee_id === expectedEmployeeId
+  );
+}
+
+function shiftIsLive(shift, now) {
+  return (
+    Boolean(shift) &&
+    !shift.deleted_at &&
+    shift.status !== "cancelled" &&
+    new Date(shift.starts_at).getTime() > new Date(now).getTime()
+  );
+}
+
+// What approving a swap will do (SC-12). `stale` is true when either leg is
+// no longer exactly what the request named (assignment reassigned/cancelled,
+// shift cancelled or started) -- the route answers 409 and a manager can only
+// deny. `checkEligibility(employeeId, shift, ignoreAssignmentIds)` returns a
+// checkAssignmentEligibility-shaped result for the INCOMING employee on the
+// shift they would take; both legs are ignored in each overlap test (the swap
+// removes them). A drop_pickup with no named target simply cancels the
+// offered assignment and reopens the shift.
+export function planSwap({
+  swap,
+  offeredAssignment,
+  offeredShift,
+  requestedAssignment = null,
+  requestedShift = null,
+  now = new Date(),
+  checkEligibility
+}) {
+  const reasons = [];
+  if (!swap || swap.status !== "pending") reasons.push("swap_not_pending");
+
+  let stale = false;
+  if (!assignmentIsLive(offeredAssignment, swap?.requester_employee_id) || !shiftIsLive(offeredShift, now)) {
+    stale = true;
+    reasons.push("offered_assignment_changed");
+  }
+  const direct = swap?.swap_type === "direct";
+  if (direct && (!assignmentIsLive(requestedAssignment, swap.target_employee_id) || !shiftIsLive(requestedShift, now))) {
+    stale = true;
+    reasons.push("requested_assignment_changed");
+  }
+  if (reasons.length > 0) {
+    return {
+      allowed: false,
+      stale,
+      reasons,
+      blocking: [],
+      warnings: [],
+      cancelAssignmentIds: [],
+      assign: [],
+      reopenShiftId: null
+    };
+  }
+
+  const ignoreIds = [offeredAssignment.id, ...(direct ? [requestedAssignment.id] : [])];
+  const blocking = [];
+  const warnings = [];
+  const assign = [];
+  if (swap.target_employee_id) {
+    const result = checkEligibility(swap.target_employee_id, offeredShift, ignoreIds);
+    blocking.push(...result.blocking);
+    warnings.push(...result.warnings);
+    assign.push({ employeeId: swap.target_employee_id, shiftId: offeredShift.id, assignmentType: offeredAssignment.assignment_type ?? "primary" });
+  }
+  if (direct) {
+    const result = checkEligibility(swap.requester_employee_id, requestedShift, ignoreIds);
+    blocking.push(...result.blocking);
+    warnings.push(...result.warnings);
+    assign.push({ employeeId: swap.requester_employee_id, shiftId: requestedShift.id, assignmentType: requestedAssignment.assignment_type ?? "primary" });
+  }
+
+  return {
+    allowed: blocking.length === 0,
+    stale: false,
+    reasons: blocking.length === 0 ? [] : ["participant_ineligible"],
+    blocking,
+    warnings,
+    cancelAssignmentIds: ignoreIds,
+    assign,
+    reopenShiftId: swap.target_employee_id ? null : offeredShift.id
+  };
+}
+
+// --- Time-off + availability input validation (SC-13/SC-14) -----------------
+const MAX_TIME_OFF_DAYS = 366;
+
+export function validateTimeOffInput(input, { now = new Date() } = {}) {
+  const errors = [];
+  const startsAt = new Date(input?.startsAt);
+  const endsAt = new Date(input?.endsAt);
+  if (typeof input?.startsAt !== "string" || Number.isNaN(startsAt.getTime())) errors.push("startsAt must be an ISO date-time");
+  if (typeof input?.endsAt !== "string" || Number.isNaN(endsAt.getTime())) errors.push("endsAt must be an ISO date-time");
+  if (errors.length === 0) {
+    if (!(startsAt < endsAt)) errors.push("startsAt must be before endsAt");
+    else if (endsAt.getTime() - startsAt.getTime() > MAX_TIME_OFF_DAYS * 86400000) {
+      errors.push(`a time-off request may span at most ${MAX_TIME_OFF_DAYS} days`);
+    }
+    if (endsAt <= new Date(now)) errors.push("the requested window has already ended");
+  }
+  const requestType = input?.requestType ?? "other";
+  if (!TIME_OFF_TYPES.includes(requestType)) errors.push(`requestType must be one of ${TIME_OFF_TYPES.join(", ")}`);
+  if (input?.reason !== undefined && input?.reason !== null) {
+    if (typeof input.reason !== "string") errors.push("reason must be a string");
+    else if (input.reason.length > MAX_REASON_LENGTH) errors.push(`reason must be at most ${MAX_REASON_LENGTH} characters`);
+  }
+  return {
+    valid: errors.length === 0,
+    errors,
+    value: errors.length === 0
+      ? {
+          startsAt: startsAt.toISOString(),
+          endsAt: endsAt.toISOString(),
+          requestType,
+          reason: typeof input?.reason === "string" && input.reason.trim() ? input.reason.trim() : null
+        }
+      : null
+  };
+}
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+function isCalendarDate(value) {
+  if (typeof value !== "string" || !DATE_ONLY.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+// PUT /me/availability body: { effectiveFrom?: 'YYYY-MM-DD', effectiveTo?:
+// 'YYYY-MM-DD'|null, days: [{ weekday: 0-6, unavailable?: boolean,
+// availableStart?: 'HH:MM', availableEnd?: 'HH:MM' }] }. One entry per weekday
+// (a duplicate weekday is rejected). A day is either unavailable, a window
+// (both times, start before end) or an explicit "available all day" (no
+// times). Returns DB-shaped rows minus the server-owned facility/employee.
+export function validateAvailabilityInput(input, { today = new Date().toISOString().slice(0, 10) } = {}) {
+  const errors = [];
+  const effectiveFrom = input?.effectiveFrom ?? today;
+  const effectiveTo = input?.effectiveTo ?? null;
+  if (!isCalendarDate(effectiveFrom)) errors.push("effectiveFrom must be a YYYY-MM-DD date");
+  if (effectiveTo !== null && !isCalendarDate(effectiveTo)) errors.push("effectiveTo must be a YYYY-MM-DD date or null");
+  if (isCalendarDate(effectiveFrom) && effectiveTo !== null && isCalendarDate(effectiveTo) && effectiveTo < effectiveFrom) {
+    errors.push("effectiveTo must not be before effectiveFrom");
+  }
+  const days = input?.days;
+  const rows = [];
+  if (!Array.isArray(days) || days.length === 0) {
+    errors.push("days must be a non-empty array");
+  } else if (days.length > 7) {
+    errors.push("days may hold at most 7 entries");
+  } else {
+    const seen = new Set();
+    days.forEach((day, index) => {
+      const label = `days[${index}]`;
+      if (!Number.isInteger(day?.weekday) || day.weekday < 0 || day.weekday > 6) {
+        errors.push(`${label}.weekday must be an integer between 0 and 6`);
+        return;
+      }
+      if (seen.has(day.weekday)) errors.push(`${label}.weekday ${day.weekday} appears more than once`);
+      seen.add(day.weekday);
+      const unavailable = day.unavailable === true;
+      const start = day.availableStart ?? null;
+      const end = day.availableEnd ?? null;
+      if (unavailable) {
+        if (start !== null || end !== null) errors.push(`${label}: an unavailable day carries no times`);
+      } else if (start !== null || end !== null) {
+        const a = timeOfDay(start);
+        const b = timeOfDay(end);
+        if (!a || !b) errors.push(`${label}: availableStart and availableEnd must both be HH:MM`);
+        else if (!(a < b)) errors.push(`${label}: availableStart must be before availableEnd`);
+      }
+      rows.push({
+        weekday: day.weekday,
+        unavailable,
+        available_start_local: unavailable ? null : timeOfDay(start),
+        available_end_local: unavailable ? null : timeOfDay(end),
+        effective_from: effectiveFrom,
+        effective_to: effectiveTo
+      });
+    });
+  }
+  return { valid: errors.length === 0, errors, rows: errors.length === 0 ? rows : [] };
+}
+
+// --- Views (SC-15/SC-16) ------------------------------------------------------
+
+// Monday-start week containing `dateStr` -> { weekStartDate, weekEndDate }.
+export function weekRangeFor(dateStr) {
+  const weekday = weekdayOfDateOnly(dateStr); // 0 Sun .. 6 Sat
+  const diffToMonday = weekday === 0 ? -6 : 1 - weekday;
+  const weekStartDate = addDaysToDateOnly(dateStr, diffToMonday);
+  return { weekStartDate, weekEndDate: addDaysToDateOnly(weekStartDate, 6) };
+}
+
+export function isValidDateOnly(value) {
+  return isCalendarDate(value);
+}
+
+// GET /me/schedule body. SELF-SCOPING IS THE POINT: only assignments owned by
+// `employeeId`, only in PUBLISHED periods, only live statuses, only shifts
+// inside the requested week -- regardless of what the caller's reads happened
+// to return (a schedule.read holder's query sees everything). Open shifts are
+// the published, still-open, unstarted shifts of the week with a computed
+// claimable flag; the caller's own requests ride along.
+export function buildMySchedule({
+  employeeId,
+  weekStartDate,
+  periods = [],
+  shifts = [],
+  assignments = [],
+  claims = [],
+  swaps = [],
+  incomingSwaps = [],
+  timeOff = [],
+  now = new Date(),
+  claimWindowHours = 48
+}) {
+  const weekEndDate = addDaysToDateOnly(weekStartDate, 6);
+  const publishedPeriodIds = new Set(
+    periods.filter((period) => period.status === "published" && !period.deleted_at).map((period) => period.id)
+  );
+  const inWeek = (shift) =>
+    publishedPeriodIds.has(shift.schedule_period_id) &&
+    !shift.deleted_at &&
+    shift.shift_date >= weekStartDate &&
+    shift.shift_date <= weekEndDate;
+  const weekShifts = shifts.filter(inWeek);
+  const shiftById = new Map(weekShifts.map((shift) => [shift.id, shift]));
+
+  const mine = assignments
+    .filter(
+      (assignment) =>
+        assignment.employee_id === employeeId &&
+        !assignment.deleted_at &&
+        LIVE_ASSIGNMENT_STATUSES.includes(assignment.status) &&
+        shiftById.has(assignment.shift_id)
+    )
+    .map((assignment) => ({ assignment, shift: shiftById.get(assignment.shift_id) }))
+    .sort((a, b) => new Date(a.shift.starts_at) - new Date(b.shift.starts_at));
+
+  const myClaims = claims.filter((claim) => claim.claimant_employee_id === employeeId && !claim.deleted_at);
+  const claimedShiftIds = new Set(myClaims.filter((claim) => claim.claim_status === "pending").map((claim) => claim.shift_id));
+  const heldShiftIds = new Set(mine.map((entry) => entry.shift.id));
+  const openShifts = weekShifts
+    .filter((shift) => shift.status === "open" && new Date(shift.starts_at).getTime() > new Date(now).getTime())
+    .map((shift) => ({
+      shift,
+      claimed: claimedShiftIds.has(shift.id),
+      claimable:
+        !claimedShiftIds.has(shift.id) &&
+        !heldShiftIds.has(shift.id) &&
+        isClaimWindowOpen({ openedAt: shift.opened_at ?? shift.updated_at, now, windowHours: claimWindowHours })
+    }))
+    .sort((a, b) => new Date(a.shift.starts_at) - new Date(b.shift.starts_at));
+
+  return {
+    employeeId,
+    weekStartDate,
+    weekEndDate,
+    assignments: mine,
+    openShifts,
+    claims: myClaims,
+    swaps: swaps.filter((swap) => swap.requester_employee_id === employeeId && !swap.deleted_at),
+    // Requests that NAME this employee and still wait for their answer.
+    incomingSwaps: incomingSwaps.filter(
+      (swap) =>
+        swap.target_employee_id === employeeId &&
+        swap.requester_employee_id !== employeeId &&
+        swap.status === "pending" &&
+        !swap.deleted_at &&
+        !swap.target_accepted_at &&
+        !swap.target_declined_at
+    ),
+    timeOff: timeOff.filter((request) => request.employee_id === employeeId && !request.deleted_at)
+  };
+}
+
+export const APPROVAL_TYPES = Object.freeze(["claims", "swaps", "time_off"]);
+
+// Normalises the three request kinds into one queue for GET
+// /facilities/:id/approvals. Each item carries just enough context for the
+// manager panel (who, which shift(s), when) -- names/shifts come from the
+// rows the route loaded, never from the request body.
+export function buildApprovalItems({ claims = [], swaps = [], timeOff = [], employees = [], shifts = [], assignments = [] }) {
+  const employeeById = new Map(employees.map((employee) => [employee.id, employee]));
+  const shiftById = new Map(shifts.map((shift) => [shift.id, shift]));
+  const assignmentById = new Map(assignments.map((assignment) => [assignment.id, assignment]));
+  const nameOf = (id) => {
+    const employee = employeeById.get(id);
+    return employee ? `${employee.first_name} ${employee.last_name}`.trim() : null;
+  };
+  const shiftSummary = (shift) =>
+    shift
+      ? { id: shift.id, roleCode: shift.role_code, shiftDate: shift.shift_date, startsAt: shift.starts_at, endsAt: shift.ends_at }
+      : null;
+
+  const items = [];
+  for (const claim of claims) {
+    items.push({
+      type: "claims",
+      id: claim.id,
+      status: claim.claim_status,
+      employeeId: claim.claimant_employee_id,
+      employeeName: nameOf(claim.claimant_employee_id),
+      shift: shiftSummary(shiftById.get(claim.shift_id)),
+      reason: null,
+      decisionReason: claim.decision_reason ?? null,
+      createdAt: claim.created_at,
+      decidedAt: claim.decided_at ?? null
+    });
+  }
+  for (const swap of swaps) {
+    const offered = assignmentById.get(swap.offered_assignment_id);
+    const requested = swap.requested_assignment_id ? assignmentById.get(swap.requested_assignment_id) : null;
+    items.push({
+      type: "swaps",
+      id: swap.id,
+      status: swap.status,
+      swapType: swap.swap_type,
+      employeeId: swap.requester_employee_id,
+      employeeName: nameOf(swap.requester_employee_id),
+      targetEmployeeId: swap.target_employee_id ?? null,
+      targetEmployeeName: swap.target_employee_id ? nameOf(swap.target_employee_id) : null,
+      targetAcceptedAt: swap.target_accepted_at ?? null,
+      awaitingTarget: Boolean(swap.target_employee_id) && !swap.target_accepted_at && swap.status === "pending",
+      shift: shiftSummary(offered ? shiftById.get(offered.shift_id) : null),
+      requestedShift: shiftSummary(requested ? shiftById.get(requested.shift_id) : null),
+      reason: swap.reason ?? null,
+      decisionReason: swap.decision_reason ?? null,
+      createdAt: swap.created_at,
+      decidedAt: swap.decided_at ?? null
+    });
+  }
+  for (const request of timeOff) {
+    items.push({
+      type: "time_off",
+      id: request.id,
+      status: request.status,
+      requestType: request.request_type,
+      employeeId: request.employee_id,
+      employeeName: nameOf(request.employee_id),
+      startsAt: request.starts_at,
+      endsAt: request.ends_at,
+      reason: request.reason ?? null,
+      decisionReason: request.decision_notes ?? null,
+      createdAt: request.created_at,
+      decidedAt: request.decided_at ?? null
+    });
+  }
+  return items.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || String(a.id).localeCompare(String(b.id)));
 }

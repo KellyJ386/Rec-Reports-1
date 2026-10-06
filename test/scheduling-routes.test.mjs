@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRouter } from "../src/lib/http/router.mjs";
-import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
+import { registerSchedulingRoutes, loadSchedulingConfig } from "../src/lib/http/scheduling-routes.mjs";
 import { createClient } from "../src/lib/supabase-rest.mjs";
 
 const READER = [{ facilityId: "fac-1", status: "active", permissions: ["schedule.read"] }];
@@ -165,6 +165,24 @@ function errorResponse(status, body = {}) {
   return { __stubStatus: status, __stubBody: body };
 }
 
+// The two settings tables are readable only with admin.manage, so a direct
+// read by an ordinary caller answers with ZERO rows (RLS filters, it does not
+// error). The BFF therefore resolves scheduling settings through the
+// get_scheduling_config_layers definer RPC (0062), which this stub emulates by
+// reading the fixtures a test registers under those two table names. A route
+// that read the tables directly would see nothing here, exactly as in production.
+const ADMIN_ONLY_SETTINGS_TABLES = ["organization_module_settings", "facility_module_overrides"];
+function emulateSchedulingConfigLayers(respond, parsed) {
+  const orgRows = respond("organization_module_settings", "GET", parsed) ?? [];
+  const facilityRows = respond("facility_module_overrides", "GET", parsed) ?? [];
+  const onlyScheduling = (layer) =>
+    Object.fromEntries(Object.entries(layer ?? {}).filter(([key]) => key.startsWith("scheduling.")));
+  return {
+    orgLayer: onlyScheduling(orgRows[0]?.config_jsonb),
+    facilityLayer: onlyScheduling(facilityRows[0]?.config_patch_jsonb)
+  };
+}
+
 function stubFetch(t, respond) {
   const captured = [];
   const original = globalThis.fetch;
@@ -173,7 +191,14 @@ function stubFetch(t, respond) {
     const table = parsed.pathname.replace("/rest/v1/", "");
     const method = init.method;
     captured.push({ table, method, url: parsed, body: init.body ? JSON.parse(init.body) : null });
-    const data = respond(table, method, parsed) ?? [];
+    let data;
+    if (table === "rpc/get_scheduling_config_layers") {
+      // A test may answer the RPC itself (e.g. with errorResponse); otherwise emulate the definer.
+      const explicit = respond(table, method, parsed);
+      data = explicit && !Array.isArray(explicit) ? explicit : emulateSchedulingConfigLayers(respond, parsed);
+    }
+    else if (ADMIN_ONLY_SETTINGS_TABLES.includes(table)) data = [];
+    else data = respond(table, method, parsed) ?? [];
     if (data && typeof data === "object" && "__stubStatus" in data) {
       return { ok: data.__stubStatus < 400, status: data.__stubStatus, text: async () => JSON.stringify(data.__stubBody) };
     }
@@ -1853,4 +1878,165 @@ test("POST publish on an already-published period republishes: skips the transit
   // but does not need to (and per the captured body, does not) resend status.
   assert.equal(periodPatch.body.publish_version, 4);
   assert.equal(periodPatch.body.status, undefined);
+});
+
+// --- Wave 3 3D (SC-13/SC-14): availability + time-off feed the validate payload ---
+
+test("POST schedule/validate adds availabilityConflicts as non-blocking warnings (facility timezone applied)", async (t) => {
+  // SHIFT is 2026-07-18 (a Saturday = weekday 6) 08:00Z-16:00Z. In
+  // America/New_York (UTC-4) that is 04:00-12:00, outside a 08:00-18:00 rule.
+  const captured = stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments") return [ASSIGNMENT];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [{ ...FACILITY_ROW, timezone: "America/New_York" }];
+    if (table === "employee_availability") {
+      return [
+        {
+          id: "av-1",
+          employee_id: "emp-1",
+          weekday: 6,
+          unavailable: false,
+          available_start_local: "08:00:00",
+          available_end_local: "18:00:00",
+          effective_from: "2026-01-01",
+          effective_to: null
+        }
+      ];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.availabilityConflicts.length, 1);
+  assert.equal(result.payload.availabilityConflicts[0].reason, "outside_window");
+  assert.equal(result.payload.canPublish, true);
+  const availabilityQuery = captured.find((entry) => entry.table === "employee_availability");
+  assert.equal(availabilityQuery.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(availabilityQuery.url.searchParams.get("deleted_at"), "is.null");
+});
+
+test("POST schedule/validate surfaces approved time off per scheduling.timeOffConflictMode", async (t) => {
+  const timeOff = {
+    id: "to-1",
+    employee_id: "emp-1",
+    starts_at: "2026-07-18T00:00:00Z",
+    ends_at: "2026-07-19T00:00:00Z",
+    request_type: "vacation",
+    status: "approved"
+  };
+  const responder = (mode) => (table) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments") return [ASSIGNMENT];
+    if (table === "time_off_requests") return [timeOff];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides" && mode) return [facilityOverride({ "scheduling.timeOffConflictMode": mode })];
+    return [];
+  };
+  stubFetch(t, responder(null));
+  const byDefault = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(byDefault.payload.timeOffConflicts.length, 1);
+  assert.equal(byDefault.payload.timeOffConflicts[0].severity, "warning");
+  assert.equal(byDefault.payload.canPublish, true);
+
+  stubFetch(t, responder("hard-block"));
+  const hard = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(hard.payload.timeOffConflicts[0].severity, "blocking");
+  assert.equal(hard.payload.canPublish, false);
+});
+
+test("POST schedule/validate ignores cancelled assignments (e.g. the old leg of an approved swap)", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT_OVERLAP_A, SHIFT_OVERLAP_B];
+    if (table === "shift_assignments") return [ASSIGNMENT_OVERLAP_A, { ...ASSIGNMENT_OVERLAP_B, status: "cancelled" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const result = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.doubleBookings.length, 0);
+  assert.equal(result.payload.canPublish, true);
+});
+
+test("POST schedule/validate: a cancelled assignment's missing cert no longer blocks publishing", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT_REQUIRES_CERT];
+    if (table === "shift_assignments") return [{ ...ASSIGNMENT_MISSING_CERT, status: "cancelled" }];
+    if (table === "certification_types") return [CERT_TYPE];
+    return [];
+  });
+  const result = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.missingCertifications.length, 0);
+  assert.equal(result.payload.canPublish, true);
+});
+
+// --- Review fixes: settings via the definer RPC, DB conflict rule on assignments ---
+
+test("loadSchedulingConfig resolves settings through get_scheduling_config_layers, never the admin-only tables, and does not swallow an RPC failure", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "organization_module_settings") return [{ config_jsonb: { "scheduling.certEnforcementMode": "warning" } }];
+    if (table === "facility_module_overrides") {
+      return [facilityOverride({ "scheduling.timeOffConflictMode": "hard-block", "scheduling.certEnforcementMode": "hard-block" })];
+    }
+    return [];
+  });
+  const client = createClient({ url: "https://example.supabase.co", key: "service-key" });
+  const config = await loadSchedulingConfig(client, "fac-1");
+  // Facility layer wins over the org layer; both came from the one RPC.
+  assert.equal(config["scheduling.timeOffConflictMode"], "hard-block");
+  assert.equal(config["scheduling.certEnforcementMode"], "hard-block");
+  assert.deepEqual(captured.map((entry) => entry.table), ["rpc/get_scheduling_config_layers"]);
+  assert.deepEqual(captured[0].body, { p_facility_id: "fac-1" });
+
+  // No rows at all -> registry defaults (the permissive default for time off).
+  stubFetch(t, () => []);
+  const defaults = await loadSchedulingConfig(client, "fac-1");
+  assert.equal(defaults["scheduling.timeOffConflictMode"], "warning");
+
+  // A failed lookup is an error, not a silent fall back to the defaults.
+  stubFetch(t, (table) => (table === "rpc/get_scheduling_config_layers" ? errorResponse(500, { code: "XX000", message: "boom" }) : []));
+  await assert.rejects(() => loadSchedulingConfig(client, "fac-1"));
+});
+
+test("POST schedule/validate for a schedule.read caller without admin.manage still applies the facility's hard-block time-off mode", async (t) => {
+  const timeOff = {
+    id: "to-1",
+    employee_id: "emp-1",
+    starts_at: "2026-07-18T00:00:00Z",
+    ends_at: "2026-07-19T00:00:00Z",
+    request_type: "vacation",
+    status: "approved"
+  };
+  const captured = stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments") return [ASSIGNMENT];
+    if (table === "time_off_requests") return [timeOff];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides") return [facilityOverride({ "scheduling.timeOffConflictMode": "hard-block" })];
+    return [];
+  });
+  const result = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.timeOffConflicts[0].severity, "blocking");
+  assert.equal(result.payload.canPublish, false);
+  assert.ok(!captured.some((entry) => ["facility_module_overrides", "organization_module_settings", "modules"].includes(entry.table)));
+});
+
+test("POST assignments relays the database's own conflict rule (hard-block time off) instead of the unique-key message", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments" && method === "GET") return [];
+    if (table === "shift_assignments" && method === "POST") {
+      return errorResponse(409, {
+        code: "PT409",
+        message: "shift_assignments: the employee has approved time off during this shift (scheduling.timeOffConflictMode is hard-block)."
+      });
+    }
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const result = await mount({ memberships: MANAGER }).call("POST", "/facilities/fac-1/shifts/shift-1/assignments", { employeeId: "emp-1" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /approved time off/);
 });

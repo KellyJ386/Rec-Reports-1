@@ -114,7 +114,7 @@ test("permissions catalog includes the nine DR-05/IN-01 governance codes", () =>
 test("permissions catalog includes schedule.publish, separate from schedule.manage", () => {
   assert.ok(permissions.includes("schedule.publish"));
   assert.ok(permissions.includes("schedule.manage"));
-  assert.equal(permissions.length, 26);
+  assert.equal(permissions.length, 29);
 });
 
 test("hasDepartmentPermission grants facility-wide memberships every department", () => {

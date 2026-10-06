@@ -119,6 +119,21 @@ export const settingsRegistry = Object.freeze(
       validation: { min: 1, max: 336 },
       permission: "admin.manage"
     },
+    {
+      // SC-13 (Wave 3 3D): how APPROVED time off that overlaps a live
+      // assignment is treated -- by the schedule validation feed (blocks
+      // publish when 'hard-block') and by the swap/claim/time-off decision
+      // RPCs (0062's internal.fn_assignment_blockers reads this key
+      // server-side). Pending time off is always only a warning.
+      key: "scheduling.timeOffConflictMode",
+      module: "scheduling",
+      label: "Approved time-off conflicts",
+      dataType: "enum",
+      scopes: ["organization", "facility"],
+      default: "warning",
+      validation: { values: ["hard-block", "warning"] },
+      permission: "admin.manage"
+    },
 
     // --- Incidents (module code: incidents) --------------------------------
     {

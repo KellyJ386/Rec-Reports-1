@@ -10,6 +10,16 @@ export const permissions = Object.freeze([
   // (SC-07), gated separately so a facility can grant day-to-day scheduling
   // without also granting the ability to publish.
   "schedule.publish",
+  // Wave 3 Slice 3D (SC-10, 0062_scheduling_self_service.sql): the three
+  // self-service approval surfaces, each its own governance code so a facility
+  // can delegate e.g. time-off approval without handing out schedule.manage.
+  // schedule.manage ALSO satisfies swap and open-shift approvals (it already
+  // confers direct assignment authority) but does NOT satisfy time-off
+  // approval. Enforced in RLS (the approver SELECT policies) and inside the
+  // decide_* RPCs, which re-check the caller themselves.
+  "schedule.approve.swaps",
+  "schedule.approve.time_off",
+  "schedule.manage.open_shifts",
   "training.read",
   "training.manage",
   "incidents.read",
