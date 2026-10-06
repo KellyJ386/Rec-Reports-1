@@ -50,6 +50,26 @@ const ASSIGNMENT_LIST_MAX_LIMIT = 200;
 const SCHEDULING_MODULE_CODE = "scheduling";
 const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE);
 
+// TR-12: adapts employee_certifications rows (+ their certification_types, for
+// the code and renewal window) into classifyCertificationRecords's input:
+// { [employeeId]: [{ code, status, expiresAt, renewalWindowDays }] }. Rows whose
+// type is unknown are dropped, and soft-deleted rows are never loaded (RLS).
+function buildCertificationRecords(certs, certTypes) {
+  const typeById = new Map((certTypes ?? []).map((type) => [type.id, type]));
+  const records = {};
+  for (const cert of certs ?? []) {
+    const type = typeById.get(cert.certification_type_id);
+    if (!type) continue;
+    (records[cert.employee_id] ??= []).push({
+      code: type.code,
+      status: cert.status,
+      expiresAt: cert.expires_at,
+      renewalWindowDays: type.renewal_window_days
+    });
+  }
+  return records;
+}
+
 // Registers the end-user Scheduling API routes on a router, using the same
 // injected-primitives shape as the admin route modules:
 //   authenticate(request, env) -> { claims, client, memberships, error }
@@ -261,6 +281,13 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       certificationsByEmployee[cert.employee_id].push(code);
     }
 
+    // TR-12: the expiry-aware view of the same rows (every DB status, with
+    // expires_at and the type's renewal window) -- summarizeScheduleReadiness
+    // classifies it through certificationStatus/certificationBlocksSchedule so
+    // an expired or revoked credential no longer satisfies a shift's
+    // requirement even though its DB status may still read 'active'.
+    const certificationRecords = buildCertificationRecords(certs, certTypes);
+
     // Build a map from shift ID to shift for easy lookup.
     const shiftById = new Map();
     for (const shift of shifts) {
@@ -290,7 +317,8 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
     // internally (gated on config's conflictCheckEnabled), so a separate
     // findDoubleBookings call here would just duplicate that work.
     const readiness = summarizeScheduleReadiness(domainAssignments, certificationsByEmployee, config, {
-      roleRequirements
+      roleRequirements,
+      certificationRecords
     });
 
     // Assignments actually inside this period's shifts (the same "orphaned
@@ -303,6 +331,56 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
       shiftRows: shifts,
       assignmentRows: periodAssignmentRows
     };
+  }
+
+  // TR-12 assignment validation: runs the SAME expiry-aware readiness logic
+  // the publish gate uses (summarizeScheduleReadiness over classified
+  // certificationRecords) for ONE prospective assignment, so a shift that
+  // requires a credential the employee lacks (missing, expired, revoked) is
+  // refused at assignment time under the 'hard-block' enforcement mode and
+  // only warned about under 'warning' -- the identical per-requirement mode
+  // resolution (certification_role_requirements.enforcement_mode over the
+  // scheduling.certEnforcementMode registry setting) as publish.
+  async function evaluateAssignmentQualifications(client, facilityId, { shift, employeeId, config }) {
+    const requiredIds = shift.required_certification_ids ?? [];
+    if (requiredIds.length === 0) return { blocking: [], warnings: [], readiness: null };
+
+    const [certTypesRows, certRows, requirementRows] = await Promise.all([
+      pgSelect(client, "certification_types", { filters: { facility_id: facilityId }, select: CERT_TYPE_COLUMNS }),
+      pgSelect(client, "employee_certifications", {
+        filters: { facility_id: facilityId, employee_id: employeeId },
+        select: EMPLOYEE_CERT_COLUMNS
+      }),
+      pgSelect(client, "certification_role_requirements", {
+        filters: { facility_id: facilityId },
+        select: ROLE_REQUIREMENT_COLUMNS
+      })
+    ]);
+    const certTypes = certTypesRows ?? [];
+    const codeById = new Map(certTypes.map((type) => [type.id, type.code]));
+    const requiredCodes = requiredIds.map((id) => codeById.get(id)).filter(Boolean);
+    const roleRequirements = (requirementRows ?? [])
+      .filter((requirement) => requirement.active !== false && codeById.has(requirement.certification_type_id))
+      .map((requirement) => ({
+        certificationCode: codeById.get(requirement.certification_type_id),
+        enforcement_mode: requirement.enforcement_mode
+      }));
+
+    const readiness = summarizeScheduleReadiness(
+      [
+        {
+          employeeId,
+          shiftId: shift.id,
+          startsAt: shift.starts_at,
+          endsAt: shift.ends_at,
+          requiredCertificationCodes: requiredCodes
+        }
+      ],
+      {},
+      config,
+      { roleRequirements, certificationRecords: buildCertificationRecords(certRows, certTypes) }
+    );
+    return { blocking: readiness.blockingCertifications, warnings: readiness.warnings, readiness };
   }
 
   // --- Schedule Periods -------------------------------------------------------
@@ -909,6 +987,24 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           }
         }
 
+        // TR-12: qualification gate. A hard-block failure (missing, expired
+        // or revoked required credential) refuses the assignment outright; a
+        // warning-mode failure or an expiring credential is returned
+        // alongside the created row as `certificationWarnings`.
+        const gate = await evaluateAssignmentQualifications(auth.client, params.facilityId, {
+          shift,
+          employeeId,
+          config
+        });
+        if (gate.blocking.length > 0) {
+          return sendJson(response, 409, {
+            error: "employee does not hold a valid certification required for this shift",
+            blockedCertifications: gate.blocking,
+            warnings: gate.warnings,
+            certEnforcementMode: gate.readiness.certEnforcementMode
+          });
+        }
+
         const row = {
           facility_id: params.facilityId,
           shift_id: params.shiftId,
@@ -918,7 +1014,12 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
         };
         try {
           const rows = await pgInsert(auth.client, "shift_assignments", [row], { returning: true });
-          return sendJson(response, 201, (rows ?? [])[0] ?? null);
+          const created = (rows ?? [])[0] ?? null;
+          return sendJson(
+            response,
+            201,
+            created && gate.warnings.length > 0 ? { ...created, certificationWarnings: gate.warnings } : created
+          );
         } catch (err) {
           if (err instanceof PostgrestError && err.status === 409) {
             return sendJson(response, 409, {
@@ -1004,6 +1105,7 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           canPublish: readiness.canPublish,
           doubleBookings: readiness.doubleBookings,
           missingCertifications: readiness.missingCertifications,
+          expiringCertifications: readiness.expiringCertifications,
           warnings: readiness.warnings,
           certEnforcementMode: readiness.certEnforcementMode
         });
@@ -1080,6 +1182,7 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
             canPublish: readiness.canPublish,
             doubleBookings: readiness.doubleBookings,
             missingCertifications: readiness.missingCertifications,
+            expiringCertifications: readiness.expiringCertifications,
             warnings: readiness.warnings,
             certEnforcementMode: readiness.certEnforcementMode
           });

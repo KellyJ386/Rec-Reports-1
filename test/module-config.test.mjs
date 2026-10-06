@@ -200,3 +200,43 @@ test("makeConfigLoader: distinct facility/module keys are looked up independentl
 
   assert.equal(calls.filter((t) => t === "modules").length, 2);
 });
+
+// --- Slice 3F: the training block (TR-07/TR-09/TR-11) ---------------------------
+const MODULE_TRAINING = { id: "mod-training", code: "training" };
+
+test("loadModuleConfig: the training module resolves its registry defaults", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "modules") return [MODULE_TRAINING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+
+  const config = await loadModuleConfig({ client: client(), facilityId: "fac-1", moduleCode: "training" });
+  assert.equal(config["training.recertWindowDays"], 30);
+  assert.equal(config["training.certExpiryNotifyEnabled"], true);
+  assert.equal(config["training.certExpiryLeadDays"], "30,14,7");
+  assert.equal(config["training.autoAssignEnabled"], true);
+  assert.equal(config["training.autoAssignDueDays"], 30);
+  assert.equal(config["training.quizDefaultPassPct"], 80);
+});
+
+test("loadModuleConfig: facility overrides win for the training lead times and auto-assignment switch", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "modules") return [MODULE_TRAINING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "organization_module_settings") {
+      return [orgSetting({ "training.certExpiryLeadDays": "60,30", "training.quizDefaultPassPct": 70 })];
+    }
+    if (table === "facility_module_overrides") {
+      return [facilityOverride({ "training.certExpiryLeadDays": "21,3", "training.autoAssignEnabled": false })];
+    }
+    return [];
+  });
+
+  const config = await loadModuleConfig({ client: client(), facilityId: "fac-1", moduleCode: "training" });
+  assert.equal(config["training.certExpiryLeadDays"], "21,3");
+  assert.equal(config["training.autoAssignEnabled"], false);
+  assert.equal(config["training.quizDefaultPassPct"], 70);
+  // Scheduling keys never leak into the training module's config.
+  assert.equal("scheduling.certEnforcementMode" in config, false);
+});

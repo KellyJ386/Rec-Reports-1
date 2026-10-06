@@ -1,5 +1,6 @@
 import { configValue } from "./settings-registry.mjs";
 import { effectiveEnforcementMode } from "./admin/cert-policy.mjs";
+import { certificationBlocksSchedule, certificationStatus } from "./training.mjs";
 
 export function shiftsOverlap(first, second) {
   return new Date(first.startsAt) < new Date(second.endsAt) && new Date(second.startsAt) < new Date(first.endsAt);
@@ -44,12 +45,36 @@ export function findMissingCertifications(assignments, certificationsByEmployee)
 // warning, while 'hard-block' ones still block. With no roleRequirements the
 // single registry certEnforcementMode governs every missing cert (Phase 5
 // behavior, fully backward compatible).
-export function summarizeScheduleReadiness(assignments, certificationsByEmployee, config = {}, { roleRequirements } = {}) {
+//
+// TR-12: the optional `certificationRecords` ({ [employeeId]: [{ code, status,
+// expiresAt, renewalWindowDays }] }, see classifyCertificationRecords at the
+// bottom of this file) makes the gate expiry-aware. When present it REPLACES
+// `certificationsByEmployee` as the "who holds what" source: an expired or
+// revoked credential no longer counts as held (certificationBlocksSchedule),
+// so the shift's requirement is reported in `missingCertifications` with a
+// `reason` ('expired' | 'revoked' | 'missing') and goes through the same
+// per-requirement enforcement mode as any missing cert -- a hard error under
+// 'hard-block', a warning under 'warning'. An `expiring` credential still
+// qualifies but is surfaced as a non-blocking warning in `expiringCertifications`.
+export function summarizeScheduleReadiness(
+  assignments,
+  certificationsByEmployee,
+  config = {},
+  { roleRequirements, certificationRecords, now = new Date() } = {}
+) {
   const conflictCheckEnabled = configValue(config, "scheduling.conflictCheckEnabled");
   const certEnforcementMode = configValue(config, "scheduling.certEnforcementMode");
 
   const doubleBookings = conflictCheckEnabled ? findDoubleBookings(assignments) : [];
-  const missingCertifications = findMissingCertifications(assignments, certificationsByEmployee);
+  const classified = certificationRecords ? classifyCertificationRecords(certificationRecords, now, config) : null;
+  const missingCertifications = findMissingCertifications(
+    assignments,
+    classified ? classified.certificationsByEmployee : certificationsByEmployee
+  ).map((missing) =>
+    classified
+      ? { ...missing, reason: classified.blockedByEmployee[missing.employeeId]?.[missing.certificationCode] ?? "missing" }
+      : missing
+  );
 
   const requirementByCode = new Map();
   for (const requirement of roleRequirements ?? []) {
@@ -70,11 +95,16 @@ export function summarizeScheduleReadiness(assignments, certificationsByEmployee
     else blocking.push(missing);
   }
 
+  const expiringCertifications = classified ? findExpiringCertifications(assignments, classified.expiringByEmployee) : [];
+  warnings.push(...expiringCertifications.map((expiring) => ({ ...expiring, severity: "warning" })));
+
   return {
     canPublish: doubleBookings.length === 0 && blocking.length === 0,
     doubleBookings,
     missingCertifications,
+    blockingCertifications: blocking,
     warnings,
+    expiringCertifications,
     certEnforcementMode
   };
 }
@@ -451,4 +481,65 @@ export function buildChangeSummary(previousShifts, currentShifts, previousAssign
     shifts: diffRowsById(previousShifts, currentShifts, SHIFT_DIFF_FIELDS),
     assignments: diffRowsById(previousAssignments, currentAssignments, ASSIGNMENT_DIFF_FIELDS)
   };
+}
+
+// --- Qualification gate hardening (TR-12) -------------------------------------
+// The scheduling gate used to treat any employee_certifications row with
+// status = 'active' as held, whatever its expires_at said (nothing flips the
+// status when a credential lapses), and certificationBlocksSchedule /
+// certificationStatus (training.mjs) were never consulted. These two helpers
+// route the gate through the same expiry logic the wallet and the cert-gaps
+// report use, so there is exactly one definition of "expired"/"expiring".
+//
+// `certificationRecords` is { [employeeId]: [{ code, status, expiresAt,
+// renewalWindowDays }] } -- one entry per certification the employee holds a
+// row for (any DB status). Returns:
+//   certificationsByEmployee  { [employeeId]: [code] } -- credentials that do
+//                             NOT block (active or expiring); the shape
+//                             findMissingCertifications already consumes
+//   blockedByEmployee         { [employeeId]: { [code]: 'expired'|'revoked' } }
+//   expiringByEmployee        { [employeeId]: { [code]: expiresAt } }
+// When an employee has several rows for one code (a renewal that left the old
+// row behind) the non-blocking one wins.
+export function classifyCertificationRecords(certificationRecords, now = new Date(), config = {}) {
+  const certificationsByEmployee = {};
+  const blockedByEmployee = {};
+  const expiringByEmployee = {};
+  for (const [employeeId, records] of Object.entries(certificationRecords ?? {})) {
+    const held = new Set();
+    const blocked = {};
+    const expiring = {};
+    for (const record of records ?? []) {
+      if (!record?.code) continue;
+      // A row an operator flagged 'expired' stays blocking even when its
+      // expires_at is (still) in the future -- the legacy gate required
+      // status = 'active', and the expiry-aware gate must never be looser.
+      if (record.status === "expired" || certificationBlocksSchedule(record, now, config)) {
+        blocked[record.code] = certificationStatus(record, now, config) === "revoked" ? "revoked" : "expired";
+        continue;
+      }
+      held.add(record.code);
+      if (certificationStatus(record, now, config) === "expiring") expiring[record.code] = record.expiresAt ?? null;
+    }
+    for (const code of held) delete blocked[code];
+    certificationsByEmployee[employeeId] = [...held];
+    blockedByEmployee[employeeId] = blocked;
+    expiringByEmployee[employeeId] = expiring;
+  }
+  return { certificationsByEmployee, blockedByEmployee, expiringByEmployee };
+}
+
+// Required-by-shift credentials that are held but inside their renewal window.
+export function findExpiringCertifications(assignments, expiringByEmployee) {
+  return assignments.flatMap((assignment) =>
+    assignment.requiredCertificationCodes
+      .filter((code) => Object.prototype.hasOwnProperty.call(expiringByEmployee[assignment.employeeId] ?? {}, code))
+      .map((code) => ({
+        employeeId: assignment.employeeId,
+        shiftId: assignment.shiftId,
+        certificationCode: code,
+        expiresAt: expiringByEmployee[assignment.employeeId][code],
+        reason: "expiring"
+      }))
+  );
 }

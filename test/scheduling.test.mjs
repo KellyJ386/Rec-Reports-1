@@ -10,7 +10,9 @@ import {
   shiftNaturalKey,
   canTransitionAssignment,
   ASSIGNMENT_STATUSES,
-  buildChangeSummary
+  buildChangeSummary,
+  classifyCertificationRecords,
+  findExpiringCertifications
 } from "../src/lib/scheduling.mjs";
 
 const assignments = [
@@ -596,4 +598,127 @@ test("buildChangeSummary: a reassignment decomposes into the old assignment chan
 test("buildChangeSummary treats null/undefined previous/current arrays as empty", () => {
   assert.deepEqual(buildChangeSummary(undefined, [SHIFT_A], undefined, []).shifts.added, [SHIFT_A]);
   assert.deepEqual(buildChangeSummary([SHIFT_A], undefined, [], undefined).shifts.removed, [SHIFT_A]);
+});
+
+// --- TR-12: expiry-aware qualification gate -----------------------------------
+const GATE_NOW = new Date("2026-07-06T12:00:00Z");
+const gateShift = [
+  {
+    employeeId: "emp-1",
+    shiftId: "shift-1",
+    startsAt: "2026-07-07T09:00:00Z",
+    endsAt: "2026-07-07T17:00:00Z",
+    requiredCertificationCodes: ["CPR"]
+  }
+];
+const cprRecord = (overrides) => ({ code: "CPR", status: "active", expiresAt: "2027-01-01", renewalWindowDays: 30, ...overrides });
+
+test("classifyCertificationRecords: active holds, expired and revoked block, expiring holds with a warning", () => {
+  const classified = classifyCertificationRecords(
+    {
+      active: [cprRecord()],
+      expired: [cprRecord({ expiresAt: "2026-06-01" })],
+      revoked: [cprRecord({ status: "revoked" })],
+      expiring: [cprRecord({ expiresAt: "2026-07-20" })]
+    },
+    GATE_NOW
+  );
+  assert.deepEqual(classified.certificationsByEmployee.active, ["CPR"]);
+  assert.deepEqual(classified.certificationsByEmployee.expired, []);
+  assert.deepEqual(classified.blockedByEmployee.expired, { CPR: "expired" });
+  assert.deepEqual(classified.blockedByEmployee.revoked, { CPR: "revoked" });
+  assert.deepEqual(classified.certificationsByEmployee.expiring, ["CPR"]);
+  assert.deepEqual(classified.expiringByEmployee.expiring, { CPR: "2026-07-20" });
+});
+
+test("classifyCertificationRecords: a non-blocking duplicate row beats an expired one for the same code", () => {
+  const classified = classifyCertificationRecords(
+    { "emp-1": [cprRecord({ expiresAt: "2025-01-01" }), cprRecord()] },
+    GATE_NOW
+  );
+  assert.deepEqual(classified.certificationsByEmployee["emp-1"], ["CPR"]);
+  assert.deepEqual(classified.blockedByEmployee["emp-1"], {});
+});
+
+test("summarizeScheduleReadiness: an expired cert is a hard error under the default 'hard-block' mode", () => {
+  const summary = summarizeScheduleReadiness(gateShift, {}, {}, {
+    certificationRecords: { "emp-1": [cprRecord({ expiresAt: "2026-06-01" })] },
+    now: GATE_NOW
+  });
+  assert.equal(summary.canPublish, false);
+  assert.equal(summary.missingCertifications.length, 1);
+  assert.equal(summary.missingCertifications[0].reason, "expired");
+  assert.equal(summary.blockingCertifications.length, 1);
+  assert.equal(summary.warnings.length, 0);
+});
+
+test("summarizeScheduleReadiness: an expired cert is only a warning under certEnforcementMode='warning'", () => {
+  const summary = summarizeScheduleReadiness(
+    gateShift,
+    {},
+    { "scheduling.certEnforcementMode": "warning" },
+    { certificationRecords: { "emp-1": [cprRecord({ expiresAt: "2026-06-01" })] }, now: GATE_NOW }
+  );
+  assert.equal(summary.canPublish, true);
+  assert.equal(summary.blockingCertifications.length, 0);
+  assert.equal(summary.warnings.length, 1);
+  assert.equal(summary.warnings[0].reason, "expired");
+});
+
+test("summarizeScheduleReadiness: a revoked cert blocks and a missing cert is reported as 'missing'", () => {
+  const revoked = summarizeScheduleReadiness(gateShift, {}, {}, {
+    certificationRecords: { "emp-1": [cprRecord({ status: "revoked" })] },
+    now: GATE_NOW
+  });
+  assert.equal(revoked.missingCertifications[0].reason, "revoked");
+  assert.equal(revoked.canPublish, false);
+
+  const missing = summarizeScheduleReadiness(gateShift, {}, {}, { certificationRecords: {}, now: GATE_NOW });
+  assert.equal(missing.missingCertifications[0].reason, "missing");
+  assert.equal(missing.canPublish, false);
+});
+
+test("summarizeScheduleReadiness: an expiring cert still qualifies but is a non-blocking warning", () => {
+  const summary = summarizeScheduleReadiness(gateShift, {}, {}, {
+    certificationRecords: { "emp-1": [cprRecord({ expiresAt: "2026-07-20" })] },
+    now: GATE_NOW
+  });
+  assert.equal(summary.canPublish, true);
+  assert.equal(summary.missingCertifications.length, 0);
+  assert.equal(summary.expiringCertifications.length, 1);
+  assert.equal(summary.expiringCertifications[0].certificationCode, "CPR");
+  assert.equal(summary.warnings.length, 1);
+  assert.equal(summary.warnings[0].reason, "expiring");
+  assert.equal(summary.warnings[0].severity, "warning");
+});
+
+test("summarizeScheduleReadiness: a per-requirement 'warning' override downgrades an expired cert even when the facility hard-blocks", () => {
+  const summary = summarizeScheduleReadiness(gateShift, {}, { "scheduling.certEnforcementMode": "hard-block" }, {
+    roleRequirements: [{ certificationCode: "CPR", enforcement_mode: "warning" }],
+    certificationRecords: { "emp-1": [cprRecord({ expiresAt: "2026-06-01" })] },
+    now: GATE_NOW
+  });
+  assert.equal(summary.canPublish, true);
+  assert.equal(summary.warnings.length, 1);
+});
+
+test("summarizeScheduleReadiness without certificationRecords keeps the legacy shape and behavior", () => {
+  const summary = summarizeScheduleReadiness(gateShift, { "emp-1": ["CPR"] });
+  assert.equal(summary.canPublish, true);
+  assert.deepEqual(summary.missingCertifications, []);
+  assert.deepEqual(summary.expiringCertifications, []);
+});
+
+test("findExpiringCertifications only reports codes the shift actually requires", () => {
+  const expiring = findExpiringCertifications(gateShift, { "emp-1": { CPR: "2026-07-20", OTHER: "2026-07-21" } });
+  assert.deepEqual(
+    expiring.map((entry) => entry.certificationCode),
+    ["CPR"]
+  );
+});
+
+test("classifyCertificationRecords: a row flagged status='expired' blocks even with a future expiry date (never looser than the legacy gate)", () => {
+  const classified = classifyCertificationRecords({ "emp-1": [cprRecord({ status: "expired" })] }, GATE_NOW);
+  assert.deepEqual(classified.certificationsByEmployee["emp-1"], []);
+  assert.deepEqual(classified.blockedByEmployee["emp-1"], { CPR: "expired" });
 });

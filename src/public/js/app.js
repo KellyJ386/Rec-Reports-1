@@ -59,6 +59,24 @@ import {
   upcomingOccurrences
 } from "./pm-plan-filters.mjs";
 import {
+  nextModuleToResume,
+  moduleStatusLabel,
+  courseProgressSummary,
+  canMarkModuleComplete,
+  canStartQuiz,
+  safeExternalUrl,
+  checklistItems,
+  buildAnswersPayload,
+  validateQuizSelections,
+  quizResultMessage,
+  quizStatusLine,
+  dueLabel,
+  assignmentSourceLabel,
+  describeTriggerTarget,
+  triggerNeedsCoursePick,
+  buildAssignTriggerPayload
+} from "./training-player.mjs";
+import {
   weekBoundsFor,
   bucketShiftsByDay,
   deriveShiftBadges,
@@ -410,6 +428,7 @@ async function loadAllModules() {
   pmPlansPanel.reset();
   schedulePanel.reset();
   commsPanel.reset();
+  trainingPanel.reset();
 
   // P-3: quick actions render synchronously (permission-driven, no fetch of
   // their own) so they're on screen immediately -- above the fold on mobile
@@ -430,7 +449,7 @@ async function loadAllModules() {
       workOrdersPanel.load(),
       pmPlansPanel.load(),
       commsPanel.load(),
-      loadTraining(),
+      trainingPanel.load(),
       loadCertifications()
     ]);
   } catch (error) {
@@ -5369,59 +5388,440 @@ const commsPanel = (function () {
   return { load, reset };
 })();
 
-// Training module
-async function loadTraining() {
-  const container = document.getElementById("training-list");
-  if (!container) return;
+// Training module (TR-01 queue, TR-07 quizzes, TR-08 course player, TR-10
+// pending incident training). Renders into #training-workspace with the el()
+// helper only (no innerHTML): the list view shows the caller's own queue
+// (GET /me/training-assignments) plus, for a training.manage holder, the
+// incident-triggered training still waiting to be assigned; "Open course"
+// switches to the player (GET /training-assignments/:id/player), which lists
+// the modules with a resume marker, opens video/PDF content through a
+// short-lived signed URL, takes quizzes through the server-side scorer, and
+// finishes with the same /complete route the old "Mark complete" button
+// used (now gated server-side on real module progress). Pure decisions live
+// in training-player.mjs.
+const trainingPanel = (function () {
+  const state = {
+    view: "list",
+    assignments: [],
+    courseById: new Map(),
+    pending: [],
+    publishedCourses: [],
+    player: null,
+    playerAssignmentId: null,
+    quiz: null,
+    quizModuleId: null,
+    quizSelections: {},
+    message: "",
+    error: null
+  };
 
-  setLoading(container, true);
-  try {
-    const assignments = await apiFetch(`/facilities/${currentFacility}/training-assignments`);
-    const assignmentsData = assignments || [];
+  function container() {
+    return document.getElementById("training-workspace");
+  }
 
-    if (assignmentsData.length === 0) {
-      container.innerHTML = '<p>No training assignments.</p>';
+  function reset() {
+    state.view = "list";
+    state.assignments = [];
+    state.courseById = new Map();
+    state.pending = [];
+    state.publishedCourses = [];
+    state.player = null;
+    state.playerAssignmentId = null;
+    state.quiz = null;
+    state.quizModuleId = null;
+    state.quizSelections = {};
+    state.message = "";
+    state.error = null;
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    setLoading(host, true);
+    state.error = null;
+    try {
+      state.assignments = (await apiFetch(`/me/training-assignments?facilityId=${encodeURIComponent(currentFacility)}`)) || [];
+    } catch (error) {
+      state.assignments = [];
+      state.error = error.message;
+    }
+    // Course titles are a nicety: an employee without training.read on the
+    // course list still sees their queue, just with a generic title.
+    try {
+      const courses = (await apiFetch(`/facilities/${currentFacility}/courses?status=all`)) || [];
+      state.courseById = new Map(courses.map((course) => [course.id, course]));
+      state.publishedCourses = courses.filter((course) => course.status === "published");
+    } catch {
+      state.courseById = new Map();
+      state.publishedCourses = [];
+    }
+    if (hasPerm("training.manage")) await loadPending();
+    render();
+  }
+
+  async function loadPending() {
+    try {
+      state.pending = (await apiFetch(`/facilities/${currentFacility}/incident-training-triggers?state=pending`)) || [];
+    } catch (error) {
+      state.pending = [];
+      state.error = state.error || error.message;
+    }
+  }
+
+  function courseTitle(courseId) {
+    return state.courseById.get(courseId)?.title || "Training course";
+  }
+
+  async function openPlayer(assignmentId) {
+    state.view = "player";
+    state.playerAssignmentId = assignmentId;
+    state.quiz = null;
+    state.quizModuleId = null;
+    state.quizSelections = {};
+    await refreshPlayer();
+  }
+
+  async function refreshPlayer() {
+    state.error = null;
+    try {
+      state.player = await apiFetch(`/training-assignments/${state.playerAssignmentId}/player`);
+    } catch (error) {
+      state.player = null;
+      state.error = error.message;
+    }
+    render();
+    const heading = container()?.querySelector("[data-training-heading]");
+    if (heading) focusElement(heading);
+  }
+
+  function backToList() {
+    state.view = "list";
+    state.player = null;
+    state.quiz = null;
+    state.quizModuleId = null;
+    state.message = "";
+    render();
+  }
+
+  async function openContent(item) {
+    state.error = null;
+    try {
+      const result = await apiFetch(`/training-content/${item.id}/url`);
+      if (result?.url) window.open(result.url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      state.error = error.message;
+      render();
+    }
+  }
+
+  async function markModuleComplete(module) {
+    state.error = null;
+    try {
+      await apiFetch(`/training-assignments/${state.playerAssignmentId}/modules/${module.id}/progress`, {
+        method: "POST",
+        body: { state: "completed", completedAt: new Date().toISOString() }
+      });
+      state.message = `${module.title} marked complete.`;
+    } catch (error) {
+      state.error = error.message;
+    }
+    await refreshPlayer();
+  }
+
+  async function markStarted(module) {
+    try {
+      await apiFetch(`/training-assignments/${state.playerAssignmentId}/modules/${module.id}/progress`, {
+        method: "POST",
+        body: { state: "in_progress", startedAt: new Date().toISOString() }
+      });
+    } catch {
+      // resume-position bookkeeping only; never blocks opening the content
+    }
+  }
+
+  async function completeCourse() {
+    state.error = null;
+    try {
+      await apiFetch(`/training-assignments/${state.playerAssignmentId}/complete`, {
+        method: "POST",
+        body: { completionStatus: "passed" }
+      });
+      state.message = "Course complete.";
+    } catch (error) {
+      state.error = error.message;
+    }
+    await refreshPlayer();
+  }
+
+  async function startQuiz(module) {
+    state.error = null;
+    try {
+      state.quiz = await apiFetch(`/facilities/${currentFacility}/modules/${module.id}/quiz`);
+      state.quizModuleId = module.id;
+      state.quizSelections = {};
+      state.message = "";
+    } catch (error) {
+      state.error = error.message;
+    }
+    render();
+  }
+
+  async function submitQuiz(module) {
+    const check = validateQuizSelections(state.quiz, state.quizSelections);
+    if (!check.valid) {
+      state.error = check.message || "This quiz has no questions.";
+      render();
       return;
     }
+    state.error = null;
+    try {
+      const result = await apiFetch(`/training-assignments/${state.playerAssignmentId}/quizzes/${state.quiz.id}/attempts`, {
+        method: "POST",
+        body: { answers: buildAnswersPayload(state.quiz, state.quizSelections) }
+      });
+      state.message = quizResultMessage(result);
+      state.quiz = null;
+      state.quizModuleId = null;
+      state.quizSelections = {};
+    } catch (error) {
+      state.error = error.message;
+    }
+    await refreshPlayer();
+  }
 
-    let html = "";
-    for (const assignment of assignmentsData.slice(0, 5)) {
-      html += '<div class="training-card">';
-      html += '<div class="item-title">Training assignment</div>';
-      if (assignment.due_at) {
-        html += `<div class="item-subtitle">Due ${new Date(assignment.due_at).toLocaleDateString()}</div>`;
+  async function assignTrigger(trigger, fields) {
+    state.error = null;
+    try {
+      await apiFetch(`/incident-training-triggers/${trigger.id}/assign`, {
+        method: "POST",
+        body: buildAssignTriggerPayload(fields)
+      });
+      state.message = `Training assigned to ${trigger.employeeName || "the employee"}.`;
+    } catch (error) {
+      state.error = error.message;
+    }
+    await loadPending();
+    render();
+  }
+
+  // --- rendering ---------------------------------------------------------
+  function buildStatus() {
+    // A single polite live region announces results and errors without
+    // moving focus (every action re-renders the whole workspace).
+    const status = el("div", { role: "status", "aria-live": "polite", class: "training-status" });
+    if (state.message) status.append(el("p", {}, state.message));
+    if (state.error) status.append(el("p", { class: "rr-error", role: "alert" }, state.error));
+    return status;
+  }
+
+  function buildAssignmentCard(assignment) {
+    const card = el("div", { class: "training-card" });
+    card.append(el("div", { class: "item-title" }, courseTitle(assignment.course_id)));
+    card.append(el("div", { class: "item-subtitle" }, dueLabel(assignment.due_at)));
+    card.append(el("div", { class: "item-subtitle" }, `${assignmentSourceLabel(assignment.source_type)} - ${assignment.state.replace("_", " ")}`));
+    const open = el(
+      "button",
+      { type: "button", class: "primary training-action-btn", "aria-label": `Open course: ${courseTitle(assignment.course_id)}` },
+      assignment.state === "complete" ? "Review course" : "Open course"
+    );
+    open.addEventListener("click", () => openPlayer(assignment.id));
+    card.append(open);
+    return card;
+  }
+
+  function buildPendingCard(trigger) {
+    const card = el("div", { class: "training-card" });
+    card.append(el("div", { class: "item-title" }, trigger.employeeName || "Employee"));
+    card.append(el("div", { class: "item-subtitle" }, trigger.reason));
+    card.append(el("div", { class: "item-subtitle" }, describeTriggerTarget(trigger)));
+
+    const fields = { courseId: "", dueDate: "" };
+    if (triggerNeedsCoursePick(trigger)) {
+      const select = document.createElement("select");
+      select.append(el("option", { value: "" }, "Choose a course"));
+      for (const course of state.publishedCourses) select.append(el("option", { value: course.id }, course.title));
+      select.addEventListener("change", () => {
+        fields.courseId = select.value;
+      });
+      card.append(el("label", {}, ["Course to assign", select]));
+    }
+    const due = el("input", { type: "date" });
+    due.addEventListener("input", () => {
+      fields.dueDate = due.value;
+    });
+    card.append(el("label", {}, ["Due date (optional)", due]));
+    const assign = el(
+      "button",
+      { type: "button", class: "primary training-action-btn", "aria-label": `Assign training to ${trigger.employeeName || "employee"}` },
+      "Assign training"
+    );
+    assign.addEventListener("click", () => assignTrigger(trigger, fields));
+    card.append(assign);
+    return card;
+  }
+
+  function buildList(host) {
+    host.append(el("h3", { id: "training-my-heading" }, "My training"));
+    const list = el("div", { class: "module-list", "aria-labelledby": "training-my-heading" });
+    if (state.assignments.length === 0) list.append(el("p", {}, "No training assignments."));
+    for (const assignment of state.assignments) list.append(buildAssignmentCard(assignment));
+    host.append(list);
+
+    if (hasPerm("training.manage")) {
+      host.append(el("h3", { id: "training-pending-heading" }, "Incident training waiting to be assigned"));
+      const pending = el("div", { class: "module-list", "aria-labelledby": "training-pending-heading" });
+      if (state.pending.length === 0) pending.append(el("p", {}, "No pending incident training."));
+      for (const trigger of state.pending) pending.append(buildPendingCard(trigger));
+      host.append(pending);
+    }
+  }
+
+  function buildQuizForm(module) {
+    const quiz = state.quiz;
+    const form = el("form", { class: "inline-form training-quiz", "aria-label": `Quiz: ${quiz.title}` });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitQuiz(module);
+    });
+    for (const question of quiz.questions) {
+      const fieldset = el("fieldset", { class: "report-field" });
+      fieldset.append(el("legend", {}, question.prompt));
+      const multiple = question.questionType === "multiple";
+      for (const option of question.options) {
+        const input = el("input", {
+          type: multiple ? "checkbox" : "radio",
+          name: `q-${question.id}`,
+          value: option.id
+        });
+        input.addEventListener("change", () => {
+          const chosen = new Set(multiple ? state.quizSelections[question.id] || [] : []);
+          if (input.checked) chosen.add(option.id);
+          else chosen.delete(option.id);
+          state.quizSelections[question.id] = chosen;
+        });
+        fieldset.append(el("label", { class: "report-field-option" }, [input, option.label]));
       }
-      html += `<button type="button" class="complete-btn primary training-action-btn" data-assignment-id="${escapeHtml(assignment.id)}">Mark complete</button>`;
-      html += '</div>';
+      form.append(fieldset);
+    }
+    form.append(el("button", { type: "submit", class: "primary" }, "Submit answers"));
+    const cancel = el("button", { type: "button" }, "Cancel quiz");
+    cancel.addEventListener("click", () => {
+      state.quiz = null;
+      state.quizModuleId = null;
+      render();
+    });
+    form.append(cancel);
+    return form;
+  }
+
+  function buildModuleCard(module, resumeId) {
+    const card = el("div", { class: "module-item training-module" });
+    const title = el("strong", {}, `${module.orderNo}. ${module.title}`);
+    card.append(title);
+    const meta = [module.moduleType, module.required ? "required" : "optional", moduleStatusLabel(module)];
+    card.append(el("div", { class: "item-subtitle" }, meta.join(" - ")));
+    if (module.id === resumeId) card.append(el("div", { class: "item-subtitle" }, "Resume here"));
+
+    for (const item of module.contentItems) {
+      const open = el(
+        "button",
+        { type: "button", "aria-label": `Open ${item.kind}: ${item.title}` },
+        item.kind === "video" ? `Watch: ${item.title}` : `Read: ${item.title}`
+      );
+      open.addEventListener("click", async () => {
+        await markStarted(module);
+        await openContent(item);
+      });
+      card.append(open);
+    }
+    if (module.moduleType === "sop_link") {
+      const href = safeExternalUrl(module.content?.url);
+      if (href) {
+        card.append(el("a", { href, target: "_blank", rel: "noopener noreferrer", class: "primary" }, "Open linked document"));
+      }
+    }
+    if (module.moduleType === "checklist") {
+      const items = checklistItems(module.content);
+      if (items.length > 0) {
+        const list = el("ul", {});
+        for (const text of items) list.append(el("li", {}, text));
+        card.append(list);
+      }
+    }
+    if (module.quiz) card.append(el("div", { class: "item-subtitle" }, quizStatusLine(module.quiz)));
+
+    const viewer = state.player.viewer;
+    if (canMarkModuleComplete(module, viewer)) {
+      const done = el("button", { type: "button", "aria-label": `Mark module complete: ${module.title}` }, "Mark module complete");
+      done.addEventListener("click", () => markModuleComplete(module));
+      card.append(done);
+    }
+    if (canStartQuiz(module, viewer) && state.quizModuleId !== module.id) {
+      const start = el(
+        "button",
+        { type: "button", class: "primary", "aria-label": `Start quiz: ${module.quiz.title}` },
+        module.quiz.attemptsUsed > 0 ? "Retake quiz" : "Start quiz"
+      );
+      start.addEventListener("click", () => startQuiz(module));
+      card.append(start);
+    }
+    if (state.quizModuleId === module.id && state.quiz) card.append(buildQuizForm(module));
+    return card;
+  }
+
+  function buildPlayer(host) {
+    const back = el("button", { type: "button" }, "Back to my training");
+    back.addEventListener("click", backToList);
+    host.append(back);
+
+    const player = state.player;
+    if (!player) return;
+    const heading = el("h3", { "data-training-heading": "true" }, player.course?.title || "Training course");
+    host.append(heading);
+    const summary = courseProgressSummary(player.modules);
+    host.append(
+      el(
+        "p",
+        { class: "item-subtitle" },
+        `${summary.completed} of ${summary.total} required modules complete (${summary.pct}%) - ${dueLabel(player.assignment.dueAt)}`
+      )
+    );
+    if (player.completion) {
+      host.append(el("p", {}, `Course ${player.completion.completion_status} on ${String(player.completion.completed_at).slice(0, 10)}.`));
     }
 
-    container.innerHTML = html;
+    const resumeId = player.completion ? null : nextModuleToResume(player.modules);
+    const list = el("div", { class: "module-list" });
+    if (player.modules.length === 0) list.append(el("p", {}, "This course has no modules."));
+    for (const module of player.modules) list.append(buildModuleCard(module, resumeId));
+    host.append(list);
 
-    // Wire complete buttons
-    document.querySelectorAll(".complete-btn").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        const assignmentId = e.target.getAttribute("data-assignment-id");
-        await completeTraining(assignmentId);
-      });
-    });
-  } catch (error) {
-    setError(container, error.message);
-  } finally {
-    container.setAttribute("aria-busy", "false");
+    if (!player.completion && player.viewer.isOwner) {
+      if (player.readiness.ready) {
+        const finish = el("button", { type: "button", class: "primary" }, "Mark course complete");
+        finish.addEventListener("click", completeCourse);
+        host.append(finish);
+      } else {
+        const names = player.readiness.outstandingModules.map((module) => module.title || "module").join(", ");
+        host.append(el("p", { class: "item-subtitle" }, `Still to do before this course can be completed: ${names}.`));
+      }
+    }
   }
-}
 
-async function completeTraining(assignmentId) {
-  try {
-    await apiFetch(`/training-assignments/${assignmentId}/complete`, {
-      method: "POST",
-      body: { completionStatus: "passed" }
-    });
-    await loadTraining();
-  } catch (error) {
-    console.error("Failed to mark training complete:", error);
+  function render() {
+    const host = container();
+    if (!host) return;
+    host.textContent = "";
+    host.setAttribute("aria-busy", "false");
+    host.append(buildStatus());
+    if (state.view === "player") buildPlayer(host);
+    else buildList(host);
   }
-}
+
+  return { load, reset };
+})();
 
 // Certification wallet module
 async function loadCertifications() {

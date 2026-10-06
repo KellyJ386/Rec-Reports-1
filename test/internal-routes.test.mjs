@@ -527,3 +527,34 @@ test("drain: generates a due PM work order and folds the summary into the respon
   assert.equal(result.payload.pmGeneration.created, 1);
   assert.deepEqual(result.payload.pmGeneration.errors, []);
 });
+
+// ---------------------------------------------------------------------------
+// TR-09 / TR-11: the drain also runs the training auto-assignment and
+// certification expiry evaluators and folds their summaries into the response
+// under `trainingAutoAssign` / `trainingCertExpiry`.
+// ---------------------------------------------------------------------------
+test("drain: runs the training auto-assignment and cert expiry passes and reports both summaries", async (t) => {
+  const captured = stubFetch(t);
+  const { call } = mount();
+  const result = await call("POST", "/internal/notifications/drain", {
+    env: { ...BASE_ENV, OBSERVABILITY_DSN: undefined },
+    headers: { authorization: "Bearer correct-cron-secret" }
+  });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.trainingAutoAssign, {
+    rulesScanned: 0,
+    rulesEvaluated: 0,
+    skippedDisabled: 0,
+    skippedCourse: 0,
+    candidates: 0,
+    created: 0,
+    deduped: 0,
+    errors: []
+  });
+  assert.equal(result.payload.trainingCertExpiry.scanned, 0);
+  assert.deepEqual(result.payload.trainingCertExpiry.errors, []);
+  // the passes ran on the drain's service-role client, against the real tables
+  assert.ok(captured.postgrest.some((call) => call.table === "training_assignment_rules" && call.method === "GET"));
+  assert.ok(captured.postgrest.some((call) => call.table === "employee_certifications" && call.method === "GET"));
+});
