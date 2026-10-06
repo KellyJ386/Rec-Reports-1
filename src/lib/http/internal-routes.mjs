@@ -30,13 +30,16 @@ import { timingSafeEqual } from "node:crypto";
 import { createClient, pgSelect } from "../supabase-rest.mjs";
 import { drainAll } from "../notifications/worker.mjs";
 import { buildAdaptersFromEnv } from "../notifications/adapters.mjs";
+import { generatePmWorkOrders } from "../pm-generation.mjs";
 import { executeReportWorkflowEvents } from "../report-workflow-executor.mjs";
 import { processReportSubmittedEvents } from "../report-distribution.mjs";
 import { processReportPdfJobs } from "../report-pdf-worker.mjs";
+import { scanWorkOrderSla } from "../work-order-sla-scan.mjs";
 import { createStorageClientFromEnv } from "../storage.mjs";
 import { verifyDbChain } from "../audit.mjs";
 import { reportError } from "../observability.mjs";
 import { sweepAuthThrottle } from "./durable-rate-limit.mjs";
+import { sweepIncidentEscalations } from "../incident-sla-sweep.mjs";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -172,12 +175,55 @@ async function handleDrain(request, response, { env }, sendJson) {
   // sweep failure can never turn a healthy drain into a 500.
   const authThrottleSwept = await sweepAuthThrottle(client, { now: Date.now, dsn: env.OBSERVABILITY_DSN });
 
+  // IN-21: the SLA breach auto-escalation sweep runs in the SAME drain
+  // invocation, on the same service-role client and cadence as every other
+  // sweep above. Never throws on its own notification leg (see
+  // incident-sla-sweep.mjs's notifySlaBreach) -- a broken notification
+  // pipeline can dead-letter a job, but can never fail this route. A
+  // top-level failure here (a genuine PostgREST outage, etc.) is NOT
+  // caught -- same "fail loud, don't look healthy while broken" rationale
+  // as the report workflow/distribution/PDF passes above. No `config` is
+  // threaded in here, same as drainAll's own quiet-hours resolution above
+  // (worker.mjs:518-519) -- both run on the settings-registry's shipped
+  // defaults (incidents.maxEscalationLevel, incidents.escalationSlaHours)
+  // rather than resolving each escalation's own facility's tenant
+  // overrides, matching this drain's existing global-defaults posture.
+  const incidentSla = await sweepIncidentEscalations(client, { now, limit });
+  // WO-16: same drain invocation, same service-role client (a work order's
+  // sla_breached_at can only ever be written by a service-role session --
+  // 0060's DB trigger rejects any authenticated-session write to it -- so
+  // this scan MUST run here, never off an end-user route). M-3 (security
+  // review, wave3-slice-3c): every per-candidate failure inside
+  // scanWorkOrderSla is caught internally (see that module's own header) --
+  // a failure claiming a row is skipped; a failure after a successful claim
+  // reverts the sla_breached_at stamp and is recorded in the returned
+  // summary's `errors` array, so the next pass retries it. Neither shape
+  // ever throws out of scanWorkOrderSla itself, so a broken scan can't turn
+  // a healthy drain into a 500 any more than the other consumers above can.
+  const workOrderSla = await scanWorkOrderSla(client, { now, limit, config: { dsn: env.OBSERVABILITY_DSN } });
+  // WO-19: PM work-order generation, same cadence/service-role client as
+  // every other drain step above. `config` is deliberately the flat,
+  // registry-default-only shape drainAll's own `config` argument already
+  // uses for reports.quietHoursStart/End (src/lib/notifications/worker.mjs)
+  // rather than a per-facility resolved config -- resolving
+  // workOrders.pmHorizonDays per facility inside a cross-tenant batch pass
+  // would need a query per distinct facility_id among the scanned plans
+  // (module-config.mjs's makeConfigLoader exists for exactly that shape but
+  // is not wired in here); until a facility actually needs a non-default
+  // horizon this keeps the drain to the single pm_plans query
+  // generatePmWorkOrders already issues. Revisit by threading a
+  // makeConfigLoader(client) through if/when that's needed.
+  const pmGeneration = await generatePmWorkOrders(client, { now, limit, config: {} });
+
   sendJson(response, 200, {
     ...summary,
     reportWorkflow,
     reportDistribution: reportDistributionSummary,
     reportPdf,
-    authThrottleSwept: authThrottleSwept.deleted
+    authThrottleSwept: authThrottleSwept.deleted,
+    incidentSla,
+    workOrderSla,
+    pmGeneration
   });
 }
 

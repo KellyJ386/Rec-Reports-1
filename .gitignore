@@ -6,3 +6,4 @@ coverage
 dist
 *.tsbuildinfo
 .claude/worktrees/
+*.orig
