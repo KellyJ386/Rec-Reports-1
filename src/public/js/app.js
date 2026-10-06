@@ -76,8 +76,23 @@ import {
   deriveAckState,
   ackedMessageIdsFromRows,
   shouldFetchCompliance,
-  formatComplianceSummary
+  formatComplianceSummary,
+  SHIFT_AUDIENCE_MODES,
+  isEmergencyCompose,
+  canRespondToEmergency,
+  describeEmergencyLaunch,
+  endOfDayIso
 } from "./comms-compose.mjs";
+import {
+  nextPollDelayMs,
+  shouldPollOnVisible,
+  shouldStopPolling,
+  describeInboxSummary,
+  hasEmergencyAlert,
+  needsEmergencyResponse,
+  emergencyAlertChanged,
+  describeEmergencyResponse
+} from "./inbox-poll.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
 import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
 import { sanitizeQuery, groupResults, debounce } from "./search.mjs";
@@ -419,6 +434,8 @@ async function loadAllModules() {
   // requirement; each tile's fetch is still independent of the others (see
   // loadHomeDashboardTiles) and of every panel's own load below.
   renderQuickActions();
+  // CM-16: the polled inbox summary (unread / pending acks / emergency banner).
+  inboxPoller.restart();
 
   try {
     await Promise.all([
@@ -599,6 +616,156 @@ function renderTiles(container, tiles) {
     container.append(card);
   }
 }
+
+// --- Polled inbox summary (CM-16) -----------------------------------------------
+// The zero-dependency default for "live" unread/ack counters and the
+// emergency banner: GET /me/inbox-summary every 30 s (backing off while the
+// tab is hidden or the server is failing -- see inbox-poll.mjs), no
+// websocket/SSE. Rendered into #home-inbox-status (an aria-live="polite"
+// status line) and #home-emergency-banner (role="alert") with el() only.
+const inboxPoller = (function () {
+  let timer = null;
+  let generation = 0;
+  let consecutiveFailures = 0;
+  let lastPolledAt = null;
+  let lastSummary = null;
+  let responding = false;
+
+  function statusEl() {
+    return document.getElementById("home-inbox-status");
+  }
+
+  function bannerEl() {
+    return document.getElementById("home-emergency-banner");
+  }
+
+  function clearTimer() {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function schedule(runGeneration) {
+    clearTimer();
+    const delay = nextPollDelayMs({ hidden: document.visibilityState === "hidden", consecutiveFailures });
+    timer = setTimeout(() => poll(runGeneration), delay);
+  }
+
+  async function respond(summary, answer) {
+    if (responding || !summary.latestEmergency) return;
+    responding = true;
+    try {
+      await apiFetch(`/messages/${summary.latestEmergency.messageId}/emergency-response`, {
+        method: "POST",
+        body: { response: answer }
+      });
+      await poll(generation, { reschedule: false });
+    } catch (error) {
+      const banner = bannerEl();
+      if (banner) banner.append(el("p", { class: "rr-error", role: "alert" }, error.message));
+    } finally {
+      responding = false;
+    }
+  }
+
+  function renderBanner(summary) {
+    const banner = bannerEl();
+    if (!banner) return;
+    banner.textContent = "";
+    if (!hasEmergencyAlert(summary)) {
+      banner.hidden = true;
+      return;
+    }
+    const alert = summary.latestEmergency;
+    banner.hidden = false;
+    banner.append(el("strong", {}, `Emergency alert: ${alert.subject}`));
+    if (alert.bodyText) banner.append(el("p", {}, alert.bodyText));
+    if (needsEmergencyResponse(summary)) {
+      const safeBtn = el("button", { type: "button", class: "primary" }, "I am safe");
+      safeBtn.addEventListener("click", () => respond(summary, "safe"));
+      const helpBtn = el("button", { type: "button", class: "primary emergency-help-btn" }, "I need help");
+      helpBtn.addEventListener("click", () => respond(summary, "need_help"));
+      banner.append(el("div", { class: "emergency-actions" }, [safeBtn, helpBtn]));
+    } else {
+      banner.append(el("p", {}, describeEmergencyResponse(alert.myResponse)));
+    }
+  }
+
+  // Only touches the DOM for what changed: rewriting an aria-live region with
+  // identical text every 30 s would make a screen reader announce it every
+  // time, and rebuilding the role="alert" banner would re-announce the alert.
+  function render(summary, previous) {
+    const status = statusEl();
+    const text = describeInboxSummary(summary);
+    if (status && status.textContent !== text) status.textContent = text;
+    if (emergencyAlertChanged(previous, summary)) renderBanner(summary);
+    const container = document.getElementById("home-inbox");
+    if (container) container.hidden = false;
+  }
+
+  async function poll(runGeneration, { reschedule = true } = {}) {
+    if (runGeneration !== generation || !currentFacility || !getToken()) return;
+    try {
+      const summary = await apiFetch(`/me/inbox-summary?facilityId=${encodeURIComponent(currentFacility)}`);
+      if (runGeneration !== generation) return;
+      if (summary) {
+        consecutiveFailures = 0;
+        lastPolledAt = Date.now();
+        render(summary, lastSummary);
+        lastSummary = summary;
+      }
+    } catch (error) {
+      // L-7: an answer that polling again cannot change (401/403/404) ends the
+      // polling until restart() (sign-in, facility switch); an outage backs off.
+      if (shouldStopPolling(error)) {
+        stop();
+        return;
+      }
+      consecutiveFailures += 1;
+    }
+    if (reschedule && runGeneration === generation) schedule(runGeneration);
+  }
+
+  // Starts (or restarts, e.g. on a facility switch) polling for the current
+  // facility. Only holders of communications.read have an inbox to poll.
+  function restart() {
+    stop();
+    const container = document.getElementById("home-inbox");
+    if (container) container.hidden = true;
+    // Never leave one facility's banner or counts on screen under another.
+    const banner = bannerEl();
+    if (banner) {
+      banner.textContent = "";
+      banner.hidden = true;
+    }
+    const status = statusEl();
+    if (status) status.textContent = "";
+    if (!currentFacility || !hasPerm("communications.read")) return;
+    consecutiveFailures = 0;
+    lastPolledAt = null;
+    lastSummary = null;
+    const runGeneration = generation;
+    poll(runGeneration);
+  }
+
+  function stop() {
+    generation += 1;
+    clearTimer();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (timer === null) return;
+    if (document.visibilityState === "visible") {
+      if (shouldPollOnVisible({ lastPolledAt, now: Date.now(), consecutiveFailures })) poll(generation);
+      else schedule(generation);
+    } else {
+      schedule(generation);
+    }
+  });
+
+  return { restart, stop };
+})();
 
 // P-3: panels are <details>/<summary> disclosures so they can start
 // collapsed on narrow viewports without hiding them from a caller with
@@ -3936,7 +4103,10 @@ const workOrdersPanel = (function () {
     prioritySelect.append(el("option", { value: "" }, "Select priority"));
     for (const priority of WORK_ORDER_PRIORITIES) prioritySelect.append(el("option", { value: priority }, priority));
     prioritySelect.value = f.priority;
-    prioritySelect.addEventListener("change", () => (f.priority = prioritySelect.value));
+    prioritySelect.addEventListener("change", () => {
+      f.priority = prioritySelect.value;
+      render();
+    });
     // WO-13: asset picker, replacing a free-text asset id field with a
     // <select> built from state.assets (assetPickerOptions -- shared with
     // the Assets sub-panel below).
@@ -5020,6 +5190,11 @@ const commsPanel = (function () {
     receiptSentIds: new Set(),
     complianceByMessageId: {},
     complianceCheckedIds: new Set(),
+    emergencyLaunches: [],
+    emergencyResponses: {},
+    rollupByMessageId: {},
+    rollupCheckedIds: new Set(),
+    formNotice: null,
     formError: null
   };
 
@@ -5044,12 +5219,23 @@ const commsPanel = (function () {
       const employees = await apiFetch(`/facilities/${currentFacility}/employees`).catch(() => []);
       state.myEmployeeId = ((employees || []).find((e) => e.user_id === (currentUser && currentUser.id)) || {}).id || null;
       state.channels = (await apiFetch(`/facilities/${currentFacility}/channels`).catch(() => [])) || [];
+      await loadEmergencyLaunches();
       await loadMessagesList();
     } catch (error) {
       renderInlineError(host, error);
     } finally {
       host.setAttribute("aria-busy", "false");
     }
+  }
+
+  // CM-13: pending emergency launch requests awaiting approval (publishers only).
+  async function loadEmergencyLaunches() {
+    if (!hasPerm("communications.publish")) {
+      state.emergencyLaunches = [];
+      return;
+    }
+    state.emergencyLaunches =
+      (await apiFetch(`/facilities/${currentFacility}/emergency-launches?status=pending_approval`).catch(() => [])) || [];
   }
 
   async function loadMessagesList() {
@@ -5079,6 +5265,11 @@ const commsPanel = (function () {
     state.receiptSentIds = new Set();
     state.complianceByMessageId = {};
     state.complianceCheckedIds = new Set();
+    state.emergencyLaunches = [];
+    state.emergencyResponses = {};
+    state.rollupByMessageId = {};
+    state.rollupCheckedIds = new Set();
+    state.formNotice = null;
     const host = container();
     if (host) host.textContent = "";
   }
@@ -5165,6 +5356,17 @@ const commsPanel = (function () {
     state.composeErrors = validation.errors;
     const audienceValidation = validateAudienceRows(state.audienceRows);
     state.audienceError = audienceValidation.valid ? null : audienceValidation.error;
+    // CM-13: an emergency message is requested for launch (a second publisher
+    // approves it), never published directly -- and only on a channel an admin
+    // has marked emergency-enabled.
+    const emergency = isEmergencyCompose(state.composeFields);
+    if (emergency && validation.valid) {
+      const channel = state.channels.find((item) => item.id === state.composeFields.channelId);
+      if (!channel || !channel.emergency_enabled) {
+        state.composeErrors = { channelId: "Emergency messages need an emergency-enabled channel." };
+        validation.valid = false;
+      }
+    }
     if (!validation.valid || !audienceValidation.valid) {
       render();
       return;
@@ -5178,18 +5380,107 @@ const commsPanel = (function () {
       if (audiencePayload.length > 0) {
         await apiFetch(`/messages/${draft.id}/audiences`, { method: "POST", body: audiencePayload });
       }
-      await apiFetch(`/facilities/${currentFacility}/messages/${draft.id}/publish`, { method: "POST" });
+      if (emergency) {
+        await apiFetch(`/facilities/${currentFacility}/messages/${draft.id}/emergency-launch`, { method: "POST", body: {} });
+        state.formNotice = "Emergency launch requested. A publisher must approve it before it is sent.";
+      } else {
+        await apiFetch(`/facilities/${currentFacility}/messages/${draft.id}/publish`, { method: "POST" });
+        state.formNotice = null;
+      }
       state.composeOpen = false;
       state.composeFields = emptyComposeFields();
       state.composeErrors = {};
       state.audienceRows = [{ audienceType: "", audienceRefId: "" }];
       state.audienceError = null;
       state.formError = null;
+      await loadEmergencyLaunches();
       await loadMessagesList();
     } catch (error) {
       state.formError = error.message;
       render();
     }
+  }
+
+  // CM-13: the approval step. window.confirm is the explicit "are you sure"
+  // gate before a broadcast that ignores quiet hours and uses every channel;
+  // the server (and database) still decide whether this caller may approve.
+  async function approveEmergency(launch) {
+    const view = describeEmergencyLaunch(launch);
+    if (!view.canApprove) {
+      state.formError = view.warning || view.recipientLine;
+      render();
+      return;
+    }
+    // The confirmation shows the body and the recipient count, not just the subject.
+    const confirmed = window.confirm(view.confirmText);
+    if (!confirmed) return;
+    try {
+      const result = await apiFetch(`/facilities/${currentFacility}/messages/${launch.message_id}/emergency-approve`, {
+        method: "POST",
+        body: {}
+      });
+      state.formNotice = `Emergency alert sent to ${result.recipientCount} ${result.recipientCount === 1 ? "person" : "people"}.`;
+      state.formError = null;
+      await loadEmergencyLaunches();
+      await loadMessagesList();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  async function cancelEmergency(launch) {
+    try {
+      await apiFetch(`/facilities/${currentFacility}/messages/${launch.message_id}/emergency-cancel`, { method: "POST", body: {} });
+      state.formNotice = "Emergency launch request cancelled.";
+      state.formError = null;
+      await loadEmergencyLaunches();
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  // CM-13: the employee's own "I am safe" / "I need help" (the server records
+  // it against the caller's own employee row; no id is sent).
+  async function respondToEmergency(message, answer) {
+    try {
+      await apiFetch(`/messages/${message.id}/emergency-response`, { method: "POST", body: { response: answer } });
+      state.emergencyResponses[message.id] = answer;
+      state.formError = null;
+      render();
+    } catch (error) {
+      state.formError = error.message;
+      render();
+    }
+  }
+
+  // CM-13: the publisher's safe / need-help / no-response roll-up for each
+  // published emergency message on the page, once per message id per panel
+  // load (same dedup shape as loadComplianceForVisibleMessages).
+  async function loadEmergencyRollups(messages) {
+    if (!hasPerm("communications.publish")) return;
+    const toFetch = messages.filter(
+      (message) => message.priority === "emergency" && message.published_at && !state.rollupCheckedIds.has(message.id)
+    );
+    if (toFetch.length === 0) return;
+    for (const message of toFetch) state.rollupCheckedIds.add(message.id);
+    await Promise.all(
+      toFetch.map((message) =>
+        apiFetch(`/facilities/${currentFacility}/messages/${message.id}/emergency-rollup`)
+          .then((rollup) => {
+            state.rollupByMessageId[message.id] = rollup;
+          })
+          .catch(() => {})
+      )
+    );
+    render();
+  }
+
+  async function refreshRollup(message) {
+    state.rollupCheckedIds.delete(message.id);
+    await loadEmergencyRollups([message]);
   }
 
   function buildComposeForm() {
@@ -5241,7 +5532,7 @@ const commsPanel = (function () {
     if (f.isRequiredAck) {
       const ackDueInput = el("input", { type: "date" });
       ackDueInput.addEventListener("input", () => {
-        f.ackDueAt = ackDueInput.value ? new Date(ackDueInput.value).toISOString() : "";
+        f.ackDueAt = endOfDayIso(ackDueInput.value);
       });
       wrap.append(el("label", {}, ["Acknowledgement due", ackDueInput]));
     }
@@ -5262,21 +5553,58 @@ const commsPanel = (function () {
         if (row.audienceType === type) opt.selected = true;
         typeSelect.append(opt);
       }
-      typeSelect.addEventListener("change", () => (row.audienceType = typeSelect.value));
-      const refInput = el("input", {
-        type: "text",
-        value: row.audienceRefId,
-        placeholder: "Target id",
-        "aria-label": `Audience target id, row ${index + 1}`
+      typeSelect.setAttribute("data-audience-type-row", String(index));
+      typeSelect.addEventListener("change", () => {
+        const wasShift = row.audienceType === "shift";
+        row.audienceType = typeSelect.value;
+        if (row.audienceType !== "shift") row.shiftMode = "id";
+        // A shift row grows a "which shift" selector; rebuild the picker and
+        // put focus back on the control the user was operating.
+        if (wasShift !== (row.audienceType === "shift")) {
+          render();
+          const again = document.querySelector(`[data-audience-type-row="${index}"]`);
+          if (again) again.focus();
+        }
       });
-      refInput.addEventListener("input", () => (row.audienceRefId = refInput.value));
+      rowEl.append(typeSelect);
+
+      // CM-12: a shift row targets one specific shift (by id) or a window of
+      // shifts the server resolves from the schedule at publish time.
+      const windowMode = row.audienceType === "shift" && (row.shiftMode === "current" || row.shiftMode === "next");
+      if (row.audienceType === "shift") {
+        const modeSelect = document.createElement("select");
+        modeSelect.setAttribute("aria-label", `Shift targeting, row ${index + 1}`);
+        const MODE_LABELS = { id: "A specific shift", current: "Everyone on the current shift", next: "Everyone on the next shift" };
+        for (const mode of SHIFT_AUDIENCE_MODES) {
+          const opt = el("option", { value: mode }, MODE_LABELS[mode]);
+          if ((row.shiftMode || "id") === mode) opt.selected = true;
+          modeSelect.append(opt);
+        }
+        modeSelect.addEventListener("change", () => {
+          row.shiftMode = modeSelect.value;
+          render();
+        });
+        rowEl.append(modeSelect);
+      }
+      if (!windowMode) {
+        const refInput = el("input", {
+          type: "text",
+          value: row.audienceRefId,
+          placeholder: "Target id",
+          "aria-label": `Audience target id, row ${index + 1}`
+        });
+        refInput.addEventListener("input", () => (row.audienceRefId = refInput.value));
+        rowEl.append(refInput);
+      } else {
+        rowEl.append(el("span", { class: "item-subtitle" }, "Resolved from the schedule when the message is published."));
+      }
       const removeBtn = el("button", { type: "button" }, "Remove");
       removeBtn.addEventListener("click", () => {
         state.audienceRows.splice(index, 1);
         if (state.audienceRows.length === 0) state.audienceRows.push({ audienceType: "", audienceRefId: "" });
         render();
       });
-      rowEl.append(typeSelect, refInput, removeBtn);
+      rowEl.append(removeBtn);
       audienceWrap.append(rowEl);
     });
     wrap.append(audienceWrap);
@@ -5288,7 +5616,20 @@ const commsPanel = (function () {
     wrap.append(addRowBtn);
     if (state.audienceError) wrap.append(el("p", { class: "rr-error", role: "alert" }, state.audienceError));
 
-    const publishBtn = el("button", { type: "button", class: "primary" }, "Publish message");
+    if (isEmergencyCompose(f)) {
+      wrap.append(
+        el(
+          "p",
+          { class: "item-subtitle", role: "note" },
+          "Emergency messages are not published directly: submitting requests a launch that a publisher must approve. Once approved they go out on every channel and ignore quiet hours."
+        )
+      );
+    }
+    const publishBtn = el(
+      "button",
+      { type: "button", class: "primary" },
+      isEmergencyCompose(f) ? "Request emergency launch" : "Publish message"
+    );
     publishBtn.addEventListener("click", () => composeAndPublish());
     wrap.append(publishBtn);
     return wrap;
@@ -5324,6 +5665,33 @@ const commsPanel = (function () {
     const complianceText = formatComplianceSummary(state.complianceByMessageId[message.id]);
     if (complianceText) card.append(el("div", { class: "item-subtitle" }, complianceText));
 
+    // CM-13: an employee answers a published emergency alert; a publisher
+    // sees the safe / need-help / no-response roll-up.
+    if (message.priority === "emergency" && message.published_at) {
+      const myResponse = state.emergencyResponses[message.id] || null;
+      if (canRespondToEmergency(message, myResponse)) {
+        const safeBtn = el("button", { type: "button", class: "primary" }, "I am safe");
+        safeBtn.addEventListener("click", () => respondToEmergency(message, "safe"));
+        const helpBtn = el("button", { type: "button", class: "primary emergency-help-btn" }, "I need help");
+        helpBtn.addEventListener("click", () => respondToEmergency(message, "need_help"));
+        card.append(el("div", { class: "emergency-actions" }, [safeBtn, helpBtn]));
+      } else if (myResponse) {
+        card.append(el("div", { class: "item-subtitle", role: "status" }, describeEmergencyResponse(myResponse)));
+      }
+      const rollup = state.rollupByMessageId[message.id];
+      if (rollup) {
+        const lines = [`Safe ${rollup.safe} \u00b7 Need help ${rollup.needHelp} \u00b7 No response ${rollup.noResponse}`];
+        const box = el("div", { class: "emergency-rollup", "aria-live": "polite" }, el("div", { class: "item-subtitle" }, lines[0]));
+        for (const person of rollup.needHelpEmployees || []) {
+          box.append(el("div", { class: "item-subtitle" }, `Needs help: ${person.name || person.employeeId}${person.note ? ` -- ${person.note}` : ""}`));
+        }
+        const refreshBtn = el("button", { type: "button" }, "Refresh responses");
+        refreshBtn.addEventListener("click", () => refreshRollup(message));
+        box.append(refreshBtn);
+        card.append(box);
+      }
+    }
+
     return card;
   }
 
@@ -5346,7 +5714,31 @@ const commsPanel = (function () {
       if (state.composeOpen) host.append(buildComposeForm());
     }
 
+    if (state.formNotice) host.append(el("p", { class: "item-subtitle", role: "status", "aria-live": "polite" }, state.formNotice));
     if (state.formError) host.append(el("p", { class: "rr-error", role: "alert" }, state.formError));
+
+    // CM-13: emergency launch requests waiting for a publisher's approval (M-6:
+    // this block used to sit in the Work Orders panel, which has no such state).
+    // Each entry shows the message body and the number of people it reaches.
+    if (hasPerm("communications.publish") && state.emergencyLaunches.length > 0) {
+      const approvals = el("div", { class: "emergency-approvals", role: "region", "aria-label": "Emergency launch approvals" });
+      approvals.append(el("h4", {}, "Emergency launches awaiting approval"));
+      for (const launch of state.emergencyLaunches) {
+        const view = describeEmergencyLaunch(launch);
+        const row = el("div", { class: "emergency-approval-row" }, el("strong", {}, view.subject));
+        if (view.bodyText) row.append(el("p", { class: "emergency-approval-body" }, view.bodyText));
+        row.append(el("p", { class: "item-subtitle" }, view.recipientLine));
+        if (view.warning) row.append(el("p", { class: "rr-error", role: "alert" }, view.warning));
+        const approveBtn = el("button", { type: "button", class: "primary emergency-help-btn" }, "Approve and send");
+        if (!view.canApprove) approveBtn.disabled = true;
+        approveBtn.addEventListener("click", () => approveEmergency(launch));
+        const cancelBtn = el("button", { type: "button" }, "Cancel request");
+        cancelBtn.addEventListener("click", () => cancelEmergency(launch));
+        row.append(el("div", { class: "emergency-actions" }, [approveBtn, cancelBtn]));
+        approvals.append(row);
+      }
+      host.append(approvals);
+    }
 
     const listWrap = el("div", { class: "module-list" });
     if (state.messages.length === 0) {
@@ -5356,6 +5748,7 @@ const commsPanel = (function () {
       markReceiptsForVisibleMessages(pageItems);
       seedAckStateForVisibleMessages(pageItems);
       loadComplianceForVisibleMessages(pageItems);
+      loadEmergencyRollups(pageItems);
       for (const message of pageItems) listWrap.append(buildMessageCard(message));
       const bar = buildPaginationBar(pageInfo, (p) => {
         state.page = p;

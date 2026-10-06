@@ -200,3 +200,41 @@ test("makeConfigLoader: distinct facility/module keys are looked up independentl
 
   assert.equal(calls.filter((t) => t === "modules").length, 2);
 });
+
+// --- Slice 3E: communications escalation ladder + emergency settings ----------------
+
+const MODULE_COMMUNICATIONS = { id: "mod-communications", code: "communications" };
+
+test("loadModuleConfig: communications config reproduces the escalation ladder and emergency defaults", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "modules") return [MODULE_COMMUNICATIONS];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const config = await loadModuleConfig({ client: client(), facilityId: "fac-1", moduleCode: "communications" });
+  assert.equal(config["communications.requireAckDefault"], false);
+  assert.equal(config["communications.ackEscalationEnabled"], true);
+  assert.equal(config["communications.ackReminderAfterHours"], 0);
+  assert.equal(config["communications.ackSupervisorAfterHours"], 24);
+  assert.equal(config["communications.ackManagerAfterHours"], 48);
+  assert.equal(config["communications.emergencyRequiresSecondApprover"], true);
+});
+
+test("loadModuleConfig: a facility override retunes the ladder, an organization setting turns escalation off", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "modules") return [MODULE_COMMUNICATIONS];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "organization_module_settings") {
+      return [orgSetting({ "communications.ackEscalationEnabled": false, "communications.ackSupervisorAfterHours": 12 })];
+    }
+    if (table === "facility_module_overrides") {
+      return [facilityOverride({ "communications.ackSupervisorAfterHours": 6, "communications.emergencyRequiresSecondApprover": false })];
+    }
+    return [];
+  });
+  const config = await loadModuleConfig({ client: client(), facilityId: "fac-1", moduleCode: "communications" });
+  assert.equal(config["communications.ackEscalationEnabled"], false);
+  assert.equal(config["communications.ackSupervisorAfterHours"], 6);
+  assert.equal(config["communications.emergencyRequiresSecondApprover"], false);
+  assert.equal(config["communications.ackManagerAfterHours"], 48);
+});

@@ -1,6 +1,15 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { authCanAccessFacility, makeGuards } from "./guard.mjs";
-import { resolveMessageAudience, shouldBypassQuietHours, channelsForPriority, summarizeAckCompliance } from "../communications.mjs";
+import {
+  resolveMessageAudience,
+  shouldBypassQuietHours,
+  channelsForPriority,
+  summarizeAckCompliance,
+  normalizeShiftWindow,
+  serializeShiftWindow,
+  audienceShiftWindow
+} from "../communications.mjs";
+import { loadAudienceResolutionContext, resolutionContextFrom } from "../communications-audience.mjs";
 import { buildNotificationJob } from "../admin/notifications.mjs";
 
 const READ = "communications.read";
@@ -59,82 +68,6 @@ async function resolveAudienceRefs(client, facilityId, items) {
   return { ok: true };
 }
 
-// P-1: shared by the CM-03 publish route and the compliance routes below --
-// both need to expand a batch of message_audiences rows into the
-// employees/roleAssignments/shiftAssignments context resolveMessageAudience
-// requires. Extracted unchanged from the publish route (see its own doc
-// comment above for the per-query rationale, which still applies here
-// verbatim): the underlying employees/memberships/shift_assignments queries
-// each run at most once no matter how many audience rows are passed in --
-// including audience rows spanning MULTIPLE messages, which is what lets
-// the facility-wide compliance-summary route batch every required-ack
-// message's audience resolution into one call instead of one query set per
-// message.
-async function loadAudienceResolutionContext(client, facilityId, audiences, { shiftWindow = null } = {}) {
-  const resolvableAudiences = [];
-  const unresolvedAudiences = [];
-  for (const audience of audiences) {
-    if (audience.audience_type === "shift" && !shiftWindow) {
-      unresolvedAudiences.push({
-        id: audience.id,
-        audienceType: audience.audience_type,
-        audienceRefId: audience.audience_ref_id,
-        reason: "shiftWindow not supplied"
-      });
-      continue;
-    }
-    resolvableAudiences.push(audience);
-  }
-
-  const needsEmployees = resolvableAudiences.some(
-    (audience) => audience.audience_type === "department" || audience.audience_type === "role"
-  );
-  const roleRefIds = [
-    ...new Set(
-      resolvableAudiences.filter((audience) => audience.audience_type === "role").map((audience) => audience.audience_ref_id)
-    )
-  ];
-  const shiftRefIds = [
-    ...new Set(
-      resolvableAudiences.filter((audience) => audience.audience_type === "shift").map((audience) => audience.audience_ref_id)
-    )
-  ];
-
-  const employees = needsEmployees
-    ? (await pgSelect(client, "employees", {
-        filters: { facility_id: facilityId },
-        select: "id,department_id,user_id"
-      })) ?? []
-    : [];
-
-  let roleAssignments = [];
-  if (roleRefIds.length > 0) {
-    const memberships =
-      (await pgSelect(client, "memberships", {
-        filters: { facility_id: facilityId, role_id: { in: roleRefIds }, status: "active" },
-        select: "user_id,role_id"
-      })) ?? [];
-    const employeeIdByUserId = new Map(employees.map((employee) => [employee.user_id, employee.id]));
-    roleAssignments = memberships
-      .map((membership) => ({
-        role_id: membership.role_id,
-        employee_id: employeeIdByUserId.get(membership.user_id) ?? null
-      }))
-      .filter((assignment) => assignment.employee_id);
-  }
-
-  let shiftAssignments = [];
-  if (shiftRefIds.length > 0) {
-    shiftAssignments =
-      (await pgSelect(client, "shift_assignments", {
-        filters: { facility_id: facilityId, shift_id: { in: shiftRefIds }, status: { in: ["pending", "approved"] } },
-        select: "shift_id,employee_id"
-      })) ?? [];
-  }
-
-  return { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments };
-}
-
 // Groups a list of rows (message_audiences/message_receipts/
 // message_acknowledgements) by their message_id column, for the
 // compliance-summary route's per-message aggregation over a batch-fetched set.
@@ -146,6 +79,21 @@ function groupByMessageId(rows) {
     map.set(row.message_id, list);
   }
   return map;
+}
+
+// M-5 / L-1: a required acknowledgement's due time must be a real date, and a
+// message that is going out must not already be past due -- the escalation
+// ladder would fire its reminder, supervisor and manager tiers on consecutive
+// passes. (0064's messages trigger refuses the same thing for a client write.)
+// Returns an error string, or null.
+function ackDueAtError(ackDueAt, { publishing, now = new Date() } = {}) {
+  if (ackDueAt === undefined || ackDueAt === null || ackDueAt === "") return null;
+  const due = new Date(ackDueAt);
+  if (Number.isNaN(due.getTime())) return "ackDueAt must be a valid date";
+  if (publishing && due.getTime() <= now.getTime()) {
+    return "ackDueAt must be in the future when a message is published";
+  }
+  return null;
 }
 
 // Registers the end-user Communications API routes on a router, using the same
@@ -246,6 +194,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (!channelId) shape.push("channelId is required");
         if (!subject) shape.push("subject is required");
         if (!bodyText) shape.push("bodyText is required");
+        const dueError = ackDueAtError(body.payload.ackDueAt, {
+          publishing: body.payload.publishNow === true && body.payload.isRequiredAck === true
+        });
+        if (dueError) shape.push(dueError);
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
 
@@ -257,6 +209,24 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         const authorEmployeeId = await loadCallerEmployeeId(auth.client, params.facilityId, auth.claims.sub);
         if (!authorEmployeeId) {
           return sendJson(response, 404, { error: "no employee record for this facility" });
+        }
+
+        // CM-13: an emergency message is never published by the create
+        // route's legacy publishNow shortcut -- only through the
+        // emergency-launch approval flow.
+        if (body.payload.priority === "emergency" && body.payload.publishNow === true) {
+          return sendJson(response, 409, {
+            error: "emergency messages must be launched through the emergency-launch approval flow"
+          });
+        }
+
+        // An urgent message is published through publish_urgent_message (which
+        // also creates its page); the legacy shortcut would publish it with no
+        // notification job and leave it unpageable.
+        if (body.payload.priority === "urgent" && body.payload.publishNow === true) {
+          return sendJson(response, 409, {
+            error: "urgent messages are published through the publish endpoint"
+          });
         }
 
         const row = {
@@ -316,22 +286,87 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (message.published_at) {
           return sendJson(response, 409, { error: "message already published" });
         }
+        // CM-13: an emergency message bypasses quiet hours on every channel,
+        // so it never goes out through the ordinary publish flow -- only
+        // through the emergency-launch + approval flow
+        // (communications-escalation-routes.mjs), which 0064's messages
+        // trigger also enforces at the database.
+        if (message.priority === "emergency") {
+          return sendJson(response, 409, {
+            error: "emergency messages must be launched through the emergency-launch approval flow"
+          });
+        }
+
+        const dueError = message.is_required_ack ? ackDueAtError(message.ack_due_at, { publishing: true }) : null;
+        if (dueError) return sendJson(response, 400, { error: dueError });
 
         const audiences = (await pgSelect(auth.client, "message_audiences", {
           filters: { message_id: params.id },
           select: MESSAGE_AUDIENCES_COLUMNS
         })) ?? [];
 
+        // CM-12: `shiftWindow` ("current" | "next" | { from, to }) is the
+        // fallback window for a ref-less shift audience that carries no
+        // rule.window of its own; a specific shift id needs none. A malformed
+        // value is a clean 400 rather than a silently-empty audience.
         const shiftWindow = body.payload.shiftWindow ?? null;
-        const { resolvableAudiences, unresolvedAudiences, employees, roleAssignments, shiftAssignments } =
-          await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, { shiftWindow });
+        if (shiftWindow !== null && normalizeShiftWindow(shiftWindow) === null) {
+          return sendJson(response, 400, { error: "shiftWindow must be 'current', 'next', or { from, to } (at most 31 days)" });
+        }
+        // L-4: the publish-body `shiftWindow` is only a fallback for a ref-less
+        // shift audience that carries no window of its own. Nothing else that
+        // later re-resolves this audience (the escalation sweep, the roll-ups,
+        // the compliance routes) can see the request body, and they treat such
+        // an audience as unresolved -- so the effective window is written into
+        // the audience row BEFORE the message goes out, and the publish fails
+        // (before any side effect) if it cannot be stored.
+        const fallbackWindow = serializeShiftWindow(shiftWindow);
+        if (fallbackWindow) {
+          for (const audience of audiences) {
+            const hasRef = audience.audience_ref_id !== null && audience.audience_ref_id !== undefined;
+            if (audience.audience_type !== "shift" || hasRef || audienceShiftWindow(audience)) continue;
+            const rule = audience.rule_jsonb && typeof audience.rule_jsonb === "object" && !Array.isArray(audience.rule_jsonb) ? audience.rule_jsonb : {};
+            const nextRule = { ...rule, window: fallbackWindow };
+            await pgUpdate(auth.client, "message_audiences", { id: audience.id }, { rule_jsonb: nextRule }, { returning: true });
+            audience.rule_jsonb = nextRule;
+          }
+        }
+        // NEW-1: an urgent message bypasses quiet hours, so it is never
+        // published by this route's own writes. One call to
+        // public.publish_urgent_message() publishes it and writes its single
+        // bypassing job in one transaction, with the recipients resolved from
+        // the message's audience rows, the channels from the priority mapping
+        // and no caller-supplied copy -- the notification_jobs client guard
+        // (0064) refuses a client-written bypass job. The audience windows were
+        // written above, so the database resolves exactly what this route
+        // would have.
+        if (message.priority === "urgent") {
+          let urgent;
+          try {
+            urgent = await pgRpc(auth.client, "publish_urgent_message", { p_message_id: params.id });
+          } catch (error) {
+            if (error instanceof PostgrestError && [400, 403, 404, 409].includes(error.status)) {
+              return sendJson(response, error.status, { error: error.body?.message ?? "urgent publish rejected" });
+            }
+            throw error;
+          }
+          return sendJson(response, 200, {
+            publishedAt: urgent?.publishedAt ?? null,
+            recipientCount: urgent?.recipientCount ?? 0,
+            unresolvedAudiences: urgent?.unresolvedAudiences ?? 0
+          });
+        }
 
-        const recipients = resolveMessageAudience(
-          { audiences: resolvableAudiences },
-          { employees, roleAssignments, shiftAssignments }
-        );
+        const publishNow = new Date();
+        const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
+          shiftWindow,
+          now: publishNow
+        });
+        const { resolvableAudiences, unresolvedAudiences } = loaded;
 
-        const publishedAt = new Date().toISOString();
+        const recipients = resolveMessageAudience({ audiences: resolvableAudiences }, resolutionContextFrom(loaded));
+
+        const publishedAt = publishNow.toISOString();
         await pgUpdate(
           auth.client,
           "messages",
@@ -340,6 +375,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
           { returning: true }
         );
 
+        // Urgent messages left through publish_urgent_message() above, and
+        // emergency ones were refused at the top, so what reaches this write is
+        // a message for which shouldBypassQuietHours() is false: the job never
+        // asks the database for a bypass (which the client guard would refuse).
         const bypassQuietHours = shouldBypassQuietHours(message);
         const route = {
           id: null,
@@ -502,14 +541,15 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             filters: { message_id: params.messageId },
             select: MESSAGE_AUDIENCES_COLUMNS
           })) ?? [];
-        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
-          auth.client,
-          message.facility_id,
-          audiences
-        );
+        // CM-12: shift windows are evaluated at the message's own
+        // published_at, so a re-resolution agrees with the publish snapshot.
+        const publishedAt = message.published_at ? new Date(message.published_at) : new Date();
+        const loaded = await loadAudienceResolutionContext(auth.client, message.facility_id, audiences, {
+          now: publishedAt
+        });
         const audienceEmployeeIds = resolveMessageAudience(
-          { audiences: resolvableAudiences },
-          { employees, roleAssignments, shiftAssignments }
+          { audiences: loaded.resolvableAudiences },
+          resolutionContextFrom(loaded, publishedAt)
         );
 
         const receipts =
@@ -583,12 +623,10 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
             filters: { message_id: { in: requiredMessageIds } },
             select: MESSAGE_AUDIENCES_COLUMNS
           })) ?? [];
-        const { resolvableAudiences, employees, roleAssignments, shiftAssignments } = await loadAudienceResolutionContext(
-          auth.client,
-          params.facilityId,
-          audiences
-        );
-        const audiencesByMessageId = groupByMessageId(resolvableAudiences);
+        const loaded = await loadAudienceResolutionContext(auth.client, params.facilityId, audiences, {
+          anchors: requiredMessages.map((message) => new Date(message.published_at))
+        });
+        const audiencesByMessageId = groupByMessageId(loaded.resolvableAudiences);
 
         const receipts =
           (await pgSelect(auth.client, "message_receipts", {
@@ -608,7 +646,7 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         for (const message of requiredMessages) {
           const audienceEmployeeIds = resolveMessageAudience(
             { audiences: audiencesByMessageId.get(message.id) ?? [] },
-            { employees, roleAssignments, shiftAssignments }
+            resolutionContextFrom(loaded, new Date(message.published_at))
           );
           const summary = summarizeAckCompliance(
             audienceEmployeeIds,
@@ -692,15 +730,55 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         }
         if (errors.length > 0) return sendJson(response, 400, { errors });
 
-        const refCheck = await resolveAudienceRefs(auth.client, message.facility_id, body.payload);
+        // CM-12: a shift audience may carry a window (rule.window) and an
+        // optional department narrowing (rule.departmentId) instead of -- or
+        // alongside -- a specific shift id. The stored rule is rebuilt from
+        // the validated parts only, never the raw client object.
+        const rules = [];
+        const ruleErrors = [];
+        const departmentRefs = [];
+        for (const item of body.payload) {
+          if (item.audienceType !== "shift") {
+            rules.push(item.rule ?? {});
+            continue;
+          }
+          const rule = {};
+          const rawRule = item.rule && typeof item.rule === "object" && !Array.isArray(item.rule) ? item.rule : {};
+          if (rawRule.window !== undefined && rawRule.window !== null) {
+            const window = normalizeShiftWindow(rawRule.window);
+            if (!window) {
+              ruleErrors.push("rule.window must be 'current', 'next', or { from, to } (at most 31 days)");
+            } else {
+              rule.window =
+                window.kind === "range"
+                  ? { kind: "range", from: window.from.toISOString(), to: window.to.toISOString() }
+                  : window.kind;
+            }
+          }
+          if (rawRule.departmentId !== undefined && rawRule.departmentId !== null) {
+            if (typeof rawRule.departmentId !== "string" || rawRule.departmentId.length === 0) {
+              ruleErrors.push("rule.departmentId must be a department id");
+            } else {
+              rule.departmentId = rawRule.departmentId;
+              departmentRefs.push({ audienceType: "department", audienceRefId: rawRule.departmentId });
+            }
+          }
+          if ((item.audienceRefId ?? null) !== null && rule.window !== undefined) {
+            ruleErrors.push("a shift audience takes either a specific shift id or a rule.window, not both");
+          }
+          rules.push(rule);
+        }
+        if (ruleErrors.length > 0) return sendJson(response, 400, { errors: ruleErrors });
+
+        const refCheck = await resolveAudienceRefs(auth.client, message.facility_id, [...body.payload, ...departmentRefs]);
         if (!refCheck.ok) return sendJson(response, 400, { error: refCheck.error });
 
-        const rows = body.payload.map((item) => ({
+        const rows = body.payload.map((item, index) => ({
           facility_id: message.facility_id,
           message_id: params.id,
           audience_type: item.audienceType,
           audience_ref_id: item.audienceRefId ?? null,
-          rule_jsonb: item.rule ?? {}
+          rule_jsonb: rules[index]
         }));
 
         const inserted = await pgInsert(auth.client, "message_audiences", rows, { returning: true });
@@ -746,6 +824,9 @@ export function registerCommunicationRoutes(router, { authenticate, sendJson, re
         if (errors.length > 0) return sendJson(response, 400, { errors });
 
         if (!requirePerm(auth, params.facilityId, PUBLISH, response)) return;
+        // L-3: marking a channel emergency-capable is an admin decision (0064
+        // refuses the flag to anyone without admin.manage at the database).
+        if (body.payload.emergencyEnabled === true && !requirePerm(auth, params.facilityId, "admin.manage", response)) return;
 
         const row = {
           facility_id: params.facilityId,
