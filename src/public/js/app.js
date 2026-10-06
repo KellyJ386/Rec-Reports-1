@@ -78,6 +78,30 @@ import {
   shouldFetchCompliance,
   formatComplianceSummary
 } from "./comms-compose.mjs";
+import {
+  TIME_OFF_TYPES,
+  WEEKDAY_NAMES,
+  approvalDecisionPath,
+  approvalTabsFor,
+  availabilityRowsFromApi,
+  buildAvailabilityPayload,
+  buildSwapPayload,
+  buildTimeOffPayload,
+  canCancelRequest,
+  claimActionState,
+  describeApprovalItem,
+  describeIssue,
+  deriveWorkforceBadges,
+  describeShift,
+  groupAssignmentsByDay,
+  requestStatusBadge,
+  shiftWeek,
+  summarizeDecisionResult,
+  validateAvailabilityForm,
+  validateDenial,
+  validateSwapForm,
+  validateTimeOffForm
+} from "./schedule-self-service.mjs";
 import { resolveInitialFacility } from "./facility-context.mjs";
 import { buildQuickActions, buildTiles, computeTodayShiftsForMe, HOME_DASHBOARD_PERMISSION_CODES } from "./home-dashboard.mjs";
 import { sanitizeQuery, groupResults, debounce } from "./search.mjs";
@@ -409,6 +433,8 @@ async function loadAllModules() {
   workOrdersPanel.reset();
   pmPlansPanel.reset();
   schedulePanel.reset();
+  mySchedulePanel.reset();
+  approvalsPanel.reset();
   commsPanel.reset();
 
   // P-3: quick actions render synchronously (permission-driven, no fetch of
@@ -426,6 +452,8 @@ async function loadAllModules() {
       loadReports(),
       loadReportInbox(),
       schedulePanel.load(),
+      mySchedulePanel.load(),
+      approvalsPanel.load(),
       incidentsPanel.load(),
       workOrdersPanel.load(),
       pmPlansPanel.load(),
@@ -2179,6 +2207,9 @@ const schedulePanel = (function () {
     if (badges.conflict) badgeRow.append(badge("Double-booked", "danger"));
     if (badges.certBlocking) badgeRow.append(badge("Missing cert", "danger"));
     if (badges.certWarning) badgeRow.append(badge("Cert warning", "warning"));
+    const workforce = deriveWorkforceBadges(shift.id, readiness || {});
+    if (workforce.timeOff) badgeRow.append(badge("Time off", workforce.timeOff === "blocking" ? "danger" : "warning"));
+    if (workforce.unavailable) badgeRow.append(badge("Availability", "warning"));
     if (badgeRow.childNodes.length > 0) card.append(badgeRow);
 
     const assignments = state.assignmentsByShiftId.get(shift.id) || [];
@@ -2307,6 +2338,634 @@ const schedulePanel = (function () {
       board.append(column);
     }
     host.append(board);
+  }
+
+  return { load, reset };
+})();
+
+// --- Scheduling self-service: My schedule + manager approvals (SC-14..SC-16) ---
+// Both panels follow the same shell: a persistent aria-live status line that
+// is never re-created (so a screen reader announces each change) above a
+// content area that render() rebuilds. All DOM is built with el()/textContent
+// -- request notes and employee names are user-supplied text. The server is
+// the authority on every action (self-scoping, approver permissions, the
+// atomic decide_* RPCs); this code only decides what to RENDER.
+function createStatusShell(host, label) {
+  host.textContent = "";
+  host.setAttribute("aria-busy", "false");
+  const status = el("p", { class: "item-subtitle", role: "status", "aria-live": "polite" });
+  const content = el("div", { class: "module-workspace", "aria-label": label });
+  host.append(status, content);
+  return { status, content };
+}
+
+// A request-failure message plus the plain-language blockers a 409 carries
+// (the pre-validation body has them at the top level, the RPC's under
+// `details`).
+function describeRequestFailure(error) {
+  const body = (error && error.details) || {};
+  const issues = body.blocking || (body.details && body.details.blocking) || [];
+  const lines = issues.map((issue) => describeIssue(issue));
+  return lines.length > 0 ? `${error.message} (${lines.join("; ")})` : (error && error.message) || "Request failed.";
+}
+
+const mySchedulePanel = (function () {
+  const state = {
+    weekStartDate: null,
+    view: null,
+    availabilityRows: null,
+    availabilityOpen: false,
+    availabilityErrors: {},
+    form: null,
+    formErrors: {},
+    swapFields: { mode: "drop", offeredAssignmentId: "", requestedAssignmentId: "", targetEmployeeId: "", reason: "" },
+    colleagueShifts: [],
+    colleagues: [],
+    timeOffFields: { startDate: "", endDate: "", requestType: "vacation", reason: "" },
+    busy: false,
+    shell: null
+  };
+
+  function container() {
+    return document.getElementById("my-schedule-workspace");
+  }
+
+  function today() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function say(message, isError = false) {
+    if (!state.shell) return;
+    state.shell.status.textContent = message || "";
+    state.shell.status.className = isError ? "item-subtitle rr-error" : "item-subtitle";
+  }
+
+  function reset() {
+    state.view = null;
+    state.availabilityRows = null;
+    state.availabilityOpen = false;
+    state.form = null;
+    state.formErrors = {};
+    state.availabilityErrors = {};
+    state.colleagueShifts = [];
+    state.colleagues = [];
+    state.busy = false;
+    state.shell = null;
+    const host = container();
+    if (host) host.textContent = "";
+  }
+
+  async function load() {
+    const host = container();
+    if (!host || !currentFacility) return;
+    if (!state.weekStartDate) state.weekStartDate = shiftWeek(today(), 0);
+    setLoading(host, true);
+    try {
+      state.shell = createStatusShell(host, "My schedule");
+      await refresh();
+    } catch (error) {
+      renderInlineError(host, error);
+      state.shell = null;
+    } finally {
+      host.setAttribute("aria-busy", "false");
+    }
+  }
+
+  async function refresh() {
+    const facilityQuery = `facilityId=${encodeURIComponent(currentFacility)}`;
+    const [view, availability] = await Promise.all([
+      apiFetch(`/me/schedule?${facilityQuery}&week_start=${state.weekStartDate}`),
+      apiFetch(`/me/availability?${facilityQuery}`).catch(() => null)
+    ]);
+    state.view = view;
+    if (availability && !state.availabilityOpen) state.availabilityRows = availabilityRowsFromApi(availability);
+    render();
+  }
+
+  // Runs one write: guards double submits, reports success/failure in the
+  // live region, then reloads the week.
+  async function perform(successMessage, action) {
+    if (state.busy) return false;
+    state.busy = true;
+    say("Working…");
+    try {
+      await action();
+      say(successMessage);
+      state.busy = false;
+      await refresh();
+      return true;
+    } catch (error) {
+      state.busy = false;
+      say(describeRequestFailure(error), true);
+      return false;
+    }
+  }
+
+  function changeWeek(weeks) {
+    state.weekStartDate = shiftWeek(state.weekStartDate, weeks);
+    refresh().catch((error) => say(error.message, true));
+  }
+
+  function claim(openShift) {
+    return perform("Claim submitted. A manager will review it.", () =>
+      apiFetch(`/facilities/${currentFacility}/open-shift-claims`, { method: "POST", body: { shiftId: openShift.shift.id } })
+    );
+  }
+
+  const CANCEL_PATHS = {
+    claim: (id) => `open-shift-claims/${id}/withdraw`,
+    swap: (id) => `shift-swaps/${id}/cancel`,
+    time_off: (id) => `time-off-requests/${id}/cancel`
+  };
+
+  function cancelRequest(kind, id) {
+    return perform("Request cancelled.", () =>
+      apiFetch(`/facilities/${currentFacility}/${CANCEL_PATHS[kind](id)}`, { method: "POST" })
+    );
+  }
+
+  async function openSwapForm(entry) {
+    state.form = "swap";
+    state.formErrors = {};
+    state.swapFields = { mode: "drop", offeredAssignmentId: entry.assignment.id, requestedAssignmentId: "", targetEmployeeId: "", reason: "" };
+    state.colleagueShifts = [];
+    state.colleagues = [];
+    render();
+    // Colleague pickers need roster/assignment reads (schedule.read); a
+    // plain staff member can still offer a shift up for pickup.
+    if (hasPerm("schedule.read")) {
+      try {
+        const periodId = entry.shift.schedule_period_id;
+        const [employees, assignments, shifts] = await Promise.all([
+          apiFetch(`/facilities/${currentFacility}/employees`),
+          apiFetch(`/facilities/${currentFacility}/shift-assignments?period_id=${periodId}`),
+          apiFetch(`/facilities/${currentFacility}/shifts?period_id=${periodId}`)
+        ]);
+        const myId = state.view && state.view.employeeId;
+        state.colleagues = (employees || []).filter((employee) => employee.id !== myId && employee.status === "active");
+        const shiftsById = new Map((shifts || []).map((shift) => [shift.id, shift]));
+        const nowMs = Date.now();
+        // Only future shifts of colleagues can be traded for.
+        state.colleagueShifts = (assignments || [])
+          .filter((assignment) => assignment.employee_id !== myId && shiftsById.has(assignment.shift_id))
+          .filter((assignment) => new Date(shiftsById.get(assignment.shift_id).starts_at).getTime() > nowMs)
+          .map((assignment) => {
+            const colleague = state.colleagues.find((employee) => employee.id === assignment.employee_id);
+            const who = colleague ? `${colleague.first_name} ${colleague.last_name}` : "Colleague";
+            return { assignmentId: assignment.id, label: `${who}: ${describeShift(shiftsById.get(assignment.shift_id))}` };
+          });
+        render();
+      } catch {
+        // Leave the pickers empty; 'drop' still works.
+      }
+    }
+  }
+
+  function submitSwap() {
+    const validation = validateSwapForm(state.swapFields);
+    state.formErrors = validation.errors;
+    if (!validation.valid) return render();
+    return perform("Swap request sent. A manager will review it.", () =>
+      apiFetch(`/facilities/${currentFacility}/shift-swaps`, { method: "POST", body: buildSwapPayload(state.swapFields) })
+    ).then((ok) => {
+      if (ok) state.form = null;
+      render();
+    });
+  }
+
+  function submitTimeOff() {
+    const validation = validateTimeOffForm(state.timeOffFields);
+    state.formErrors = validation.errors;
+    if (!validation.valid) return render();
+    return perform("Time-off request sent. A manager will review it.", () =>
+      apiFetch(`/facilities/${currentFacility}/time-off-requests`, { method: "POST", body: buildTimeOffPayload(state.timeOffFields) })
+    ).then((ok) => {
+      if (ok) {
+        state.form = null;
+        state.timeOffFields = { startDate: "", endDate: "", requestType: "vacation", reason: "" };
+      }
+      render();
+    });
+  }
+
+  function saveAvailability() {
+    const validation = validateAvailabilityForm(state.availabilityRows);
+    state.availabilityErrors = validation.errors;
+    if (!validation.valid) return render();
+    return perform("Availability saved.", () =>
+      apiFetch(`/me/availability?facilityId=${encodeURIComponent(currentFacility)}`, {
+        method: "PUT",
+        body: buildAvailabilityPayload(state.availabilityRows, today())
+      })
+    ).then((ok) => {
+      if (ok) state.availabilityOpen = false;
+      render();
+    });
+  }
+
+  function textField(labelText, value, onInput, { type = "text", error = null, required = false } = {}) {
+    const input = el("input", { type, value: value || "" });
+    input.addEventListener("input", () => onInput(input.value));
+    return labeledField(labelText, input, { required, error });
+  }
+
+  function selectField(labelText, value, options, onChange, { error = null, required = false } = {}) {
+    const select = document.createElement("select");
+    for (const [optionValue, optionLabel] of options) {
+      const option = el("option", { value: optionValue }, optionLabel);
+      if (optionValue === value) option.selected = true;
+      select.append(option);
+    }
+    select.addEventListener("change", () => onChange(select.value));
+    return labeledField(labelText, select, { required, error });
+  }
+
+  function buildSwapForm() {
+    const fields = state.swapFields;
+    const errors = state.formErrors;
+    const form = el("div", { class: "inline-form" });
+    form.append(el("h4", {}, "Swap or drop a shift"));
+    const offered = ((state.view && state.view.assignments) || []).map((item) => [item.assignment.id, describeShift(item.shift)]);
+    form.append(selectField("Shift to give up", fields.offeredAssignmentId, [["", "Choose a shift"], ...offered], (value) => (fields.offeredAssignmentId = value), { error: errors.offeredAssignmentId, required: true }));
+    const modes = [["drop", "Offer it up for pickup"]];
+    if (state.colleagueShifts.length > 0) modes.push(["direct", "Trade for a colleague's shift"]);
+    form.append(
+      selectField("How", fields.mode, modes, (value) => {
+        fields.mode = value;
+        render();
+      }, { error: errors.mode, required: true })
+    );
+    if (fields.mode === "direct") {
+      const options = state.colleagueShifts.map((entry) => [entry.assignmentId, entry.label]);
+      form.append(selectField("Colleague's shift", fields.requestedAssignmentId, [["", "Choose a shift"], ...options], (value) => (fields.requestedAssignmentId = value), { error: errors.requestedAssignmentId, required: true }));
+    } else if (state.colleagues.length > 0) {
+      form.append(
+        selectField("Hand it to (optional)", fields.targetEmployeeId, [["", "Anyone (open shift)"], ...state.colleagues.map((employee) => [employee.id, `${employee.first_name} ${employee.last_name}`])], (value) => (fields.targetEmployeeId = value))
+      );
+    }
+    form.append(textField("Note (optional)", fields.reason, (value) => (fields.reason = value), { error: errors.reason }));
+    const submit = el("button", { type: "button", class: "primary" }, "Send swap request");
+    submit.addEventListener("click", () => submitSwap());
+    const cancel = el("button", { type: "button" }, "Cancel");
+    cancel.addEventListener("click", () => {
+      state.form = null;
+      render();
+    });
+    form.append(el("div", { class: "detail-actions" }, [submit, cancel]));
+    return form;
+  }
+
+  function buildTimeOffForm() {
+    const fields = state.timeOffFields;
+    const errors = state.formErrors;
+    const form = el("div", { class: "inline-form" });
+    form.append(el("h4", {}, "Request time off"));
+    form.append(textField("First day off", fields.startDate, (value) => (fields.startDate = value), { type: "date", error: errors.startDate, required: true }));
+    form.append(textField("Last day off", fields.endDate, (value) => (fields.endDate = value), { type: "date", error: errors.endDate, required: true }));
+    form.append(
+      selectField("Type", fields.requestType, TIME_OFF_TYPES.map((type) => [type, type.charAt(0).toUpperCase() + type.slice(1)]), (value) => (fields.requestType = value), { error: errors.requestType })
+    );
+    form.append(textField("Note (optional)", fields.reason, (value) => (fields.reason = value), { error: errors.reason }));
+    const submit = el("button", { type: "button", class: "primary" }, "Send request");
+    submit.addEventListener("click", () => submitTimeOff());
+    const cancel = el("button", { type: "button" }, "Cancel");
+    cancel.addEventListener("click", () => {
+      state.form = null;
+      render();
+    });
+    form.append(el("div", { class: "detail-actions" }, [submit, cancel]));
+    return form;
+  }
+
+  function buildAvailabilityEditor() {
+    const wrap = el("div", { class: "inline-form" });
+    wrap.append(el("h4", {}, "Weekly availability"));
+    wrap.append(el("p", { class: "item-subtitle" }, "Managers see this as advice when scheduling; it never blocks a shift."));
+    for (const row of state.availabilityRows) {
+      const line = el("div", { class: "audience-row" });
+      line.append(
+        selectField(
+          WEEKDAY_NAMES[row.weekday],
+          row.mode,
+          [["any", "No restriction"], ["window", "Only between…"], ["unavailable", "Unavailable"]],
+          (value) => {
+            row.mode = value;
+            render();
+          }
+        )
+      );
+      if (row.mode === "window") {
+        line.append(textField(`${WEEKDAY_NAMES[row.weekday]} from`, row.start, (value) => (row.start = value), { type: "time" }));
+        line.append(textField(`${WEEKDAY_NAMES[row.weekday]} until`, row.end, (value) => (row.end = value), { type: "time" }));
+      }
+      wrap.append(line);
+      if (state.availabilityErrors[row.weekday]) wrap.append(el("div", { class: "field-error rr-error", role: "alert" }, state.availabilityErrors[row.weekday]));
+    }
+    const save = el("button", { type: "button", class: "primary" }, "Save availability");
+    save.addEventListener("click", () => saveAvailability());
+    const cancel = el("button", { type: "button" }, "Cancel");
+    cancel.addEventListener("click", () => {
+      state.availabilityOpen = false;
+      render();
+    });
+    wrap.append(el("div", { class: "detail-actions" }, [save, cancel]));
+    return wrap;
+  }
+
+  function requestRow(kind, request, summary) {
+    const badgeInfo = requestStatusBadge(kind === "claim" ? request.claim_status : request.status);
+    const row = el("div", { class: "module-item" });
+    row.append(el("strong", {}, summary), " ", badge(badgeInfo.text, badgeInfo.variant));
+    const decisionNote = request.decision_reason || request.decision_notes;
+    if (decisionNote) row.append(el("div", { class: "item-subtitle" }, `Manager note: ${decisionNote}`));
+    if (canCancelRequest(kind, kind === "claim" ? request.claim_status : request.status)) {
+      const label = kind === "claim" ? "Withdraw" : "Cancel request";
+      const button = el("button", { type: "button", "aria-label": `${label}: ${summary}` }, label);
+      button.addEventListener("click", () => cancelRequest(kind, request.id));
+      row.append(el("div", { class: "detail-actions" }, button));
+    }
+    return row;
+  }
+
+  function render() {
+    const host = container();
+    if (!host || !state.shell) return;
+    const view = state.view;
+    const content = state.shell.content;
+    content.textContent = "";
+
+    const picker = el("div", { class: "schedule-week-picker" });
+    const prev = el("button", { type: "button" }, "◀ Prev week");
+    prev.addEventListener("click", () => changeWeek(-1));
+    const next = el("button", { type: "button" }, "Next week ▶");
+    next.addEventListener("click", () => changeWeek(1));
+    const dateInput = el("input", { type: "date", value: state.weekStartDate });
+    dateInput.addEventListener("change", () => {
+      if (!dateInput.value) return;
+      state.weekStartDate = shiftWeek(dateInput.value, 0);
+      refresh().catch((error) => say(error.message, true));
+    });
+    picker.append(prev, el("label", {}, ["Week of", dateInput]), next);
+    content.append(picker);
+
+    if (!view || !view.employeeId) {
+      content.append(el("p", { class: "item-subtitle" }, "You have no employee record at this facility, so there is no personal schedule to show."));
+      return;
+    }
+
+    // My shifts, grouped by day.
+    const shiftsSection = el("section", { "aria-label": "My shifts" });
+    shiftsSection.append(el("h3", {}, "My shifts"));
+    const days = groupAssignmentsByDay(view.assignments, view.weekStartDate);
+    if (view.assignments.length === 0) {
+      shiftsSection.append(el("p", { class: "item-subtitle" }, "Nothing published for you this week."));
+    }
+    for (const day of days) {
+      for (const entry of day.entries) {
+        const row = el("div", { class: "module-item" });
+        row.append(el("strong", {}, describeShift(entry.shift)));
+        const swapButton = el("button", { type: "button", "aria-label": `Swap or drop: ${describeShift(entry.shift)}` }, "Swap or drop");
+        swapButton.addEventListener("click", () => openSwapForm(entry));
+        row.append(el("div", { class: "detail-actions" }, swapButton));
+        shiftsSection.append(row);
+      }
+    }
+    content.append(shiftsSection);
+
+    // Open shifts.
+    const openSection = el("section", { "aria-label": "Open shifts" });
+    openSection.append(el("h3", {}, "Open shifts"));
+    if (view.openShifts.length === 0) openSection.append(el("p", { class: "item-subtitle" }, "No open shifts this week."));
+    for (const openShift of view.openShifts) {
+      const action = claimActionState(openShift);
+      const row = el("div", { class: "module-item" });
+      row.append(el("strong", {}, describeShift(openShift.shift)));
+      const button = el("button", { type: "button", class: "primary", "aria-label": `${action.label}: ${describeShift(openShift.shift)}` }, action.label);
+      button.disabled = action.disabled || state.busy;
+      button.addEventListener("click", () => claim(openShift));
+      row.append(el("div", { class: "detail-actions" }, button));
+      openSection.append(row);
+    }
+    content.append(openSection);
+
+    // Forms + actions.
+    const actions = el("div", { class: "detail-actions" });
+    const timeOffButton = el("button", { type: "button" }, state.form === "time-off" ? "Close time-off form" : "Request time off");
+    timeOffButton.addEventListener("click", () => {
+      state.form = state.form === "time-off" ? null : "time-off";
+      state.formErrors = {};
+      render();
+    });
+    const availabilityButton = el("button", { type: "button" }, state.availabilityOpen ? "Close availability" : "Edit availability");
+    availabilityButton.addEventListener("click", () => {
+      state.availabilityOpen = !state.availabilityOpen;
+      if (!state.availabilityRows) state.availabilityRows = availabilityRowsFromApi([]);
+      state.availabilityErrors = {};
+      render();
+    });
+    actions.append(timeOffButton, availabilityButton);
+    content.append(actions);
+    if (state.form === "swap") content.append(buildSwapForm());
+    if (state.form === "time-off") content.append(buildTimeOffForm());
+    if (state.availabilityOpen && state.availabilityRows) content.append(buildAvailabilityEditor());
+
+    // My requests.
+    const requests = el("section", { "aria-label": "My requests" });
+    requests.append(el("h3", {}, "My requests"));
+    const shiftLabel = (shiftId) => {
+      const known = view.openShifts.find((entry) => entry.shift.id === shiftId) || view.assignments.find((entry) => entry.shift.id === shiftId);
+      return known ? describeShift(known.shift) : "a shift";
+    };
+    for (const claimRow of view.claims) requests.append(requestRow("claim", claimRow, `Claim: ${shiftLabel(claimRow.shift_id)}`));
+    for (const swap of view.swaps) {
+      requests.append(requestRow("swap", swap, swap.swap_type === "direct" ? "Swap with a colleague" : "Shift drop / pickup"));
+    }
+    for (const off of view.timeOff) {
+      requests.append(requestRow("time_off", off, `Time off ${String(off.starts_at).slice(0, 10)} to ${String(off.ends_at).slice(0, 10)}`));
+    }
+    if (view.claims.length + view.swaps.length + view.timeOff.length === 0) {
+      requests.append(el("p", { class: "item-subtitle" }, "You have no requests."));
+    }
+    content.append(requests);
+  }
+
+  return { load, reset };
+})();
+
+const approvalsPanel = (function () {
+  const state = {
+    tab: null,
+    status: "pending",
+    items: [],
+    denyingId: null,
+    denyReason: "",
+    denyError: null,
+    busy: false,
+    shell: null
+  };
+
+  function container() {
+    return document.getElementById("approvals-workspace");
+  }
+
+  function panel() {
+    return document.getElementById("panel-approvals");
+  }
+
+  function tabs() {
+    return approvalTabsFor((currentFacilityRecord() || {}).permissions, { isPlatformAdmin: platformAdmin });
+  }
+
+  function say(message, isError = false) {
+    if (!state.shell) return;
+    state.shell.status.textContent = message || "";
+    state.shell.status.className = isError ? "item-subtitle rr-error" : "item-subtitle";
+  }
+
+  function reset() {
+    state.tab = null;
+    state.items = [];
+    state.denyingId = null;
+    state.denyReason = "";
+    state.denyError = null;
+    state.busy = false;
+    state.shell = null;
+    const host = container();
+    if (host) host.textContent = "";
+    const section = panel();
+    if (section) section.hidden = true;
+  }
+
+  async function load() {
+    const host = container();
+    const section = panel();
+    if (!host || !section || !currentFacility) return;
+    const available = tabs();
+    // Nothing to approve here without an approver code -- the whole panel
+    // stays out of the page rather than rendering an empty shell.
+    section.hidden = available.length === 0;
+    if (available.length === 0) return;
+    if (!state.tab || !available.some((tab) => tab.type === state.tab)) state.tab = available[0].type;
+    setLoading(host, true);
+    try {
+      state.shell = createStatusShell(host, "Approvals");
+      await refresh();
+    } catch (error) {
+      renderInlineError(host, error);
+      state.shell = null;
+    } finally {
+      host.setAttribute("aria-busy", "false");
+    }
+  }
+
+  async function refresh() {
+    const response = await apiFetch(
+      `/facilities/${currentFacility}/approvals?type=${encodeURIComponent(state.tab)}&status=${encodeURIComponent(state.status)}`
+    );
+    state.items = (response && response.items) || [];
+    render();
+  }
+
+  async function decide(item, action, reason) {
+    if (state.busy) return;
+    const path = approvalDecisionPath(currentFacility, item, action);
+    if (!path) return;
+    state.busy = true;
+    say("Working…");
+    try {
+      const result = await apiFetch(path, { method: "POST", body: reason ? { reason } : {} });
+      state.busy = false;
+      state.denyingId = null;
+      state.denyReason = "";
+      state.denyError = null;
+      await refresh();
+      say(summarizeDecisionResult(result, action));
+    } catch (error) {
+      state.busy = false;
+      say(describeRequestFailure(error), true);
+      render();
+    }
+  }
+
+  function buildItem(item) {
+    const description = describeApprovalItem(item);
+    const row = el("div", { class: "module-item" });
+    const badgeInfo = requestStatusBadge(item.status);
+    row.append(el("strong", {}, description.title), " ", badge(badgeInfo.text, badgeInfo.variant));
+    for (const line of description.details) row.append(el("div", { class: "item-subtitle" }, line));
+    if (item.decisionReason) row.append(el("div", { class: "item-subtitle" }, `Decision note: ${item.decisionReason}`));
+    if (item.status !== "pending") return row;
+
+    const actions = el("div", { class: "detail-actions" });
+    const approve = el("button", { type: "button", class: "primary", "aria-label": `Approve: ${description.title}` }, "Approve");
+    approve.disabled = state.busy;
+    approve.addEventListener("click", () => decide(item, "approve", null));
+    const deny = el("button", { type: "button", "aria-label": `Deny: ${description.title}` }, "Deny…");
+    deny.addEventListener("click", () => {
+      state.denyingId = state.denyingId === item.id ? null : item.id;
+      state.denyReason = "";
+      state.denyError = null;
+      render();
+    });
+    actions.append(approve, deny);
+    row.append(actions);
+
+    if (state.denyingId === item.id) {
+      const form = el("div", { class: "inline-form" });
+      const reason = el("textarea", { rows: "2" });
+      reason.value = state.denyReason;
+      reason.addEventListener("input", () => (state.denyReason = reason.value));
+      form.append(labeledField("Reason for denying (required)", reason, { required: true, error: state.denyError }));
+      const confirm = el("button", { type: "button", class: "primary" }, "Confirm denial");
+      confirm.addEventListener("click", () => {
+        const validation = validateDenial(state.denyReason);
+        if (!validation.valid) {
+          state.denyError = validation.error;
+          return render();
+        }
+        decide(item, "deny", validation.reason);
+      });
+      form.append(el("div", { class: "detail-actions" }, confirm));
+      row.append(form);
+    }
+    return row;
+  }
+
+  function render() {
+    const host = container();
+    if (!host || !state.shell) return;
+    const content = state.shell.content;
+    content.textContent = "";
+
+    const tabRow = el("div", { class: "detail-actions", role: "group", "aria-label": "Request type" });
+    for (const tab of tabs()) {
+      const button = el("button", { type: "button", "aria-pressed": tab.type === state.tab ? "true" : "false" }, tab.label);
+      button.addEventListener("click", () => {
+        state.tab = tab.type;
+        state.denyingId = null;
+        refresh().catch((error) => say(error.message, true));
+      });
+      tabRow.append(button);
+    }
+    content.append(tabRow);
+
+    const statusSelect = document.createElement("select");
+    for (const [value, label] of [["pending", "Pending"], ["all", "All"], ["approved", "Approved"], ["denied", "Denied"]]) {
+      const option = el("option", { value }, label);
+      if (value === state.status) option.selected = true;
+      statusSelect.append(option);
+    }
+    statusSelect.addEventListener("change", () => {
+      state.status = statusSelect.value;
+      refresh().catch((error) => say(error.message, true));
+    });
+    content.append(labeledField("Show", statusSelect));
+
+    if (state.items.length === 0) {
+      content.append(el("p", { class: "item-subtitle" }, "Nothing to show."));
+      return;
+    }
+    for (const item of state.items) content.append(buildItem(item));
   }
 
   return { load, reset };

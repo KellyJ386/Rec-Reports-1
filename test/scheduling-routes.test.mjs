@@ -1854,3 +1854,95 @@ test("POST publish on an already-published period republishes: skips the transit
   assert.equal(periodPatch.body.publish_version, 4);
   assert.equal(periodPatch.body.status, undefined);
 });
+
+// --- Wave 3 3D (SC-13/SC-14): availability + time-off feed the validate payload ---
+
+test("POST schedule/validate adds availabilityConflicts as non-blocking warnings (facility timezone applied)", async (t) => {
+  // SHIFT is 2026-07-18 (a Saturday = weekday 6) 08:00Z-16:00Z. In
+  // America/New_York (UTC-4) that is 04:00-12:00, outside a 08:00-18:00 rule.
+  const captured = stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments") return [ASSIGNMENT];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [{ ...FACILITY_ROW, timezone: "America/New_York" }];
+    if (table === "employee_availability") {
+      return [
+        {
+          id: "av-1",
+          employee_id: "emp-1",
+          weekday: 6,
+          unavailable: false,
+          available_start_local: "08:00:00",
+          available_end_local: "18:00:00",
+          effective_from: "2026-01-01",
+          effective_to: null
+        }
+      ];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.availabilityConflicts.length, 1);
+  assert.equal(result.payload.availabilityConflicts[0].reason, "outside_window");
+  assert.equal(result.payload.canPublish, true);
+  const availabilityQuery = captured.find((entry) => entry.table === "employee_availability");
+  assert.equal(availabilityQuery.url.searchParams.get("facility_id"), "eq.fac-1");
+  assert.equal(availabilityQuery.url.searchParams.get("deleted_at"), "is.null");
+});
+
+test("POST schedule/validate surfaces approved time off per scheduling.timeOffConflictMode", async (t) => {
+  const timeOff = {
+    id: "to-1",
+    employee_id: "emp-1",
+    starts_at: "2026-07-18T00:00:00Z",
+    ends_at: "2026-07-19T00:00:00Z",
+    request_type: "vacation",
+    status: "approved"
+  };
+  const responder = (mode) => (table) => {
+    if (table === "schedule_shifts") return [SHIFT];
+    if (table === "shift_assignments") return [ASSIGNMENT];
+    if (table === "time_off_requests") return [timeOff];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    if (table === "facility_module_overrides" && mode) return [facilityOverride({ "scheduling.timeOffConflictMode": mode })];
+    return [];
+  };
+  stubFetch(t, responder(null));
+  const byDefault = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(byDefault.payload.timeOffConflicts.length, 1);
+  assert.equal(byDefault.payload.timeOffConflicts[0].severity, "warning");
+  assert.equal(byDefault.payload.canPublish, true);
+
+  stubFetch(t, responder("hard-block"));
+  const hard = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(hard.payload.timeOffConflicts[0].severity, "blocking");
+  assert.equal(hard.payload.canPublish, false);
+});
+
+test("POST schedule/validate ignores cancelled assignments (e.g. the old leg of an approved swap)", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT_OVERLAP_A, SHIFT_OVERLAP_B];
+    if (table === "shift_assignments") return [ASSIGNMENT_OVERLAP_A, { ...ASSIGNMENT_OVERLAP_B, status: "cancelled" }];
+    if (table === "modules") return [MODULE_SCHEDULING];
+    if (table === "facilities") return [FACILITY_ROW];
+    return [];
+  });
+  const result = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.doubleBookings.length, 0);
+  assert.equal(result.payload.canPublish, true);
+});
+
+test("POST schedule/validate: a cancelled assignment's missing cert no longer blocks publishing", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "schedule_shifts") return [SHIFT_REQUIRES_CERT];
+    if (table === "shift_assignments") return [{ ...ASSIGNMENT_MISSING_CERT, status: "cancelled" }];
+    if (table === "certification_types") return [CERT_TYPE];
+    return [];
+  });
+  const result = await mount({ memberships: READER }).call("POST", "/facilities/fac-1/schedule/validate");
+  assert.equal(result.payload.missingCertifications.length, 0);
+  assert.equal(result.payload.canPublish, true);
+});
