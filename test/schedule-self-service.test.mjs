@@ -11,6 +11,7 @@ import {
   canCancelRequest,
   claimActionState,
   describeApprovalItem,
+  describeIncomingSwap,
   describeIssue,
   describeShift,
   deriveWorkforceBadges,
@@ -20,6 +21,8 @@ import {
   requestStatusBadge,
   shiftWeek,
   summarizeDecisionResult,
+  summarizeSwapAnswer,
+  swapAnswerPath,
   validateAvailabilityForm,
   validateDenial,
   validateSwapForm,
@@ -277,4 +280,45 @@ test("deriveWorkforceBadges flags time off (blocking beats warning) and availabi
   assert.deepEqual(deriveWorkforceBadges("s2", readiness), { timeOff: "warning", unavailable: true });
   assert.deepEqual(deriveWorkforceBadges("s3", readiness), { timeOff: null, unavailable: false });
   assert.deepEqual(deriveWorkforceBadges("s1"), { timeOff: null, unavailable: false });
+});
+
+// --- the colleague's answer to a swap / named pickup -----------------------------
+
+test("swapAnswerPath builds the accept/decline path and refuses anything else", () => {
+  assert.equal(swapAnswerPath("fac 1", { id: "sw/1" }, "accept"), "/facilities/fac%201/shift-swaps/sw%2F1/accept");
+  assert.equal(swapAnswerPath("fac-1", { id: "sw-1" }, "decline"), "/facilities/fac-1/shift-swaps/sw-1/decline");
+  assert.equal(swapAnswerPath("fac-1", { id: "sw-1" }, "approve"), null);
+  assert.equal(swapAnswerPath("fac-1", {}, "accept"), null);
+  assert.equal(swapAnswerPath("fac-1", null, "accept"), null);
+});
+
+test("describeIncomingSwap names the requester and distinguishes a swap from a pickup", () => {
+  assert.equal(
+    describeIncomingSwap({ swap_type: "direct", requester_name: "Sam Lee", reason: "family event" }),
+    "Sam Lee asks to swap shifts with you. Note: family event"
+  );
+  assert.equal(describeIncomingSwap({ swap_type: "drop_pickup", requester_name: "Sam Lee" }), "Sam Lee asks you to take over a shift.");
+  assert.equal(describeIncomingSwap({ swap_type: "drop_pickup" }), "A colleague asks you to take over a shift.");
+});
+
+test("summarizeSwapAnswer says what happens next and flags a replay", () => {
+  assert.match(summarizeSwapAnswer({ replay: false }, "accept"), /manager still has to approve/);
+  assert.match(summarizeSwapAnswer({ replay: false }, "decline"), /closed/);
+  assert.match(summarizeSwapAnswer({ replay: true }, "accept"), /already answered/);
+  assert.equal(summarizeSwapAnswer(null, "accept"), "");
+});
+
+test("describeApprovalItem tells a manager when a swap still waits for the named colleague", () => {
+  const item = {
+    type: "swaps",
+    swapType: "direct",
+    employeeName: "Alex Rivera",
+    targetEmployeeName: "Sam Lee",
+    awaitingTarget: true,
+    shift: null,
+    requestedShift: null,
+    reason: null
+  };
+  assert.ok(describeApprovalItem(item).details.some((line) => /Waiting for Sam Lee to accept/.test(line)));
+  assert.ok(!describeApprovalItem({ ...item, awaitingTarget: false }).details.some((line) => /Waiting for/.test(line)));
 });

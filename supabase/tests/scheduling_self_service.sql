@@ -21,7 +21,20 @@
 --  7. opened_at is server-owned; fn_notification_job_dedupe_key is NOT
 --     redefined (schedule jobs are written with a null dedupe_key, so no
 --     caller-influenced key exists).
+--  8. Review fixes: published periods are readable by plain members (and only
+--     published ones); an approver cannot decide a request they are party to;
+--     a swap naming a colleague needs that colleague's acceptance (only the
+--     named employee can give it); facility settings resolve for plain
+--     members through the definer layers function and hard-block time off is
+--     enforced on shift_assignments for every writer; employee row locks and
+--     permission-before-lock ordering in every decision function; one publish
+--     fan-out per period + version, never for a direct publication insert;
+--     every SECURITY DEFINER function pins search_path = public, pg_temp;
+--     free-text columns are length-capped; claim approval re-checks the period
+--     is published, the claim was filed inside the window and the shift is
+--     still unassigned.
 --
+
 -- Fixtures live in the 62xxxxxx uuid namespace; everything runs inside
 -- begin/rollback.
 begin;
@@ -100,12 +113,29 @@ insert into memberships (id, user_id, facility_id, role_id, status) values
   ('62000000-0000-0000-0000-0000000000e8', '62000000-0000-0000-0000-0000000000a8', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000d6', 'active')
 on conflict (id) do nothing;
 
--- Employees: Alice/Bob have logins (their own rows are the self-service
--- keys); Carol has none; Eve belongs to facility B.
+-- Carol now has a login too (a swap that names her needs HER acceptance), and
+-- "Dana" is an employee who ALSO holds every approver code (the self-approval
+-- scenarios).
+insert into auth.users (id, email) values
+  ('62000000-0000-0000-0000-0000000000a9', 'sss-carol@test'),
+  ('62000000-0000-0000-0000-0000000000aa', 'sss-dana@test')
+on conflict (id) do nothing;
+insert into app_users (id, full_name, email) values
+  ('62000000-0000-0000-0000-0000000000a9', 'SSS Carol', 'sss-carol@test'),
+  ('62000000-0000-0000-0000-0000000000aa', 'SSS Dana', 'sss-dana@test')
+on conflict (id) do nothing;
+insert into memberships (id, user_id, facility_id, role_id, status) values
+  ('62000000-0000-0000-0000-0000000000e9', '62000000-0000-0000-0000-0000000000a9', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000d1', 'active'),
+  ('62000000-0000-0000-0000-0000000000ea', '62000000-0000-0000-0000-0000000000aa', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000d2', 'active')
+on conflict (id) do nothing;
+
+-- Employees: Alice/Bob/Carol have logins (their own rows are the self-service
+-- keys); Dana is an approver with an employee row; Eve belongs to facility B.
 insert into employees (id, facility_id, user_id, first_name, last_name, status) values
   ('62e00000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000a1', 'Alice', 'SSS', 'active'),
   ('62e00000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000a2', 'Bob', 'SSS', 'active'),
-  ('62e00000-0000-0000-0000-000000000003', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', null, 'Carol', 'SSS', 'active'),
+  ('62e00000-0000-0000-0000-000000000003', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000a9', 'Carol', 'SSS', 'active'),
+  ('62e00000-0000-0000-0000-000000000004', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62000000-0000-0000-0000-0000000000aa', 'Dana', 'SSS', 'active'),
   ('62e00000-0000-0000-0000-0000000000b1', '62bbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', null, 'Eve', 'SSS', 'active')
 on conflict (id) do nothing;
 
@@ -173,8 +203,19 @@ begin
      or not has_function_privilege('authenticated', 'public.decide_time_off_request(uuid,text,text)', 'execute')
      or not has_function_privilege('authenticated', 'internal.decide_open_shift_claim(uuid,text,text)', 'execute')
      or not has_function_privilege('authenticated', 'internal.decide_shift_swap(uuid,text,text)', 'execute')
-     or not has_function_privilege('authenticated', 'internal.decide_time_off_request(uuid,text,text)', 'execute') then
-    raise exception 'SSS FAIL (1): authenticated cannot execute a decide_* RPC';
+     or not has_function_privilege('authenticated', 'internal.decide_time_off_request(uuid,text,text)', 'execute')
+     or not has_function_privilege('authenticated', 'public.respond_to_shift_swap(uuid,text)', 'execute')
+     or not has_function_privilege('authenticated', 'internal.respond_to_shift_swap(uuid,text)', 'execute')
+     or not has_function_privilege('authenticated', 'public.get_scheduling_config_layers(uuid)', 'execute')
+     or not has_function_privilege('authenticated', 'internal.get_scheduling_config_layers(uuid)', 'execute') then
+    raise exception 'SSS FAIL (1): authenticated cannot execute a decide_* / respond / settings-layers RPC';
+  end if;
+  -- ...and PUBLIC cannot (the revokes are not a no-op).
+  if has_function_privilege('public', 'internal.respond_to_shift_swap(uuid,text)', 'execute')
+     or has_function_privilege('public', 'internal.get_scheduling_config_layers(uuid)', 'execute')
+     or has_function_privilege('public', 'public.respond_to_shift_swap(uuid,text)', 'execute')
+     or has_function_privilege('public', 'public.get_scheduling_config_layers(uuid)', 'execute') then
+    raise exception 'SSS FAIL (1): PUBLIC can execute a new 0062 RPC';
   end if;
   if has_function_privilege('authenticated', 'internal.fn_assignment_blockers(uuid,uuid,uuid[])', 'execute')
      or has_function_privilege('authenticated', 'internal.fn_assign_employee_to_shift(uuid,uuid,uuid,text,uuid)', 'execute')
@@ -185,7 +226,8 @@ begin
      or has_function_privilege('authenticated', 'public.fn_shift_swap_guard()', 'execute')
      or has_function_privilege('authenticated', 'public.fn_time_off_request_guard()', 'execute')
      or has_function_privilege('authenticated', 'public.fn_employee_availability_guard()', 'execute')
-     or has_function_privilege('authenticated', 'public.fn_schedule_publication_notify()', 'execute')
+     or has_function_privilege('authenticated', 'public.fn_schedule_period_publish_notify()', 'execute')
+     or has_function_privilege('authenticated', 'public.fn_shift_assignment_time_off_guard()', 'execute')
      or has_function_privilege('authenticated', 'public.fn_schedule_shift_opened_at()', 'execute') then
     raise exception 'SSS FAIL (1): authenticated can execute an internal helper / guard / trigger function';
   end if;
@@ -276,6 +318,106 @@ begin
 end;
 $$;
 
+-- 2b. L2: every SECURITY DEFINER function 0062 created pins EXACTLY
+-- `search_path = public, pg_temp` (pg_temp last: a temp table can never shadow
+-- a real one). The function list is the set of 0062's own definers, so a new
+-- definer without the setting fails here.
+do $$
+declare
+  r record;
+  v_seen integer := 0;
+begin
+  for r in
+    select n.nspname, p.proname, p.proconfig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where p.prosecdef
+      and ((n.nspname = 'internal' and p.proname in (
+              'fn_scheduling_setting', 'fn_scheduling_setting_int', 'get_scheduling_config_layers',
+              'fn_shift_period_published', 'fn_enqueue_schedule_notification', 'fn_assignment_blockers',
+              'fn_assign_employee_to_shift', 'decide_open_shift_claim', 'decide_shift_swap',
+              'decide_time_off_request', 'respond_to_shift_swap'))
+        or (n.nspname = 'public' and p.proname in (
+              'fn_open_shift_claim_guard', 'fn_shift_swap_guard', 'fn_time_off_request_guard',
+              'fn_employee_availability_guard', 'fn_schedule_period_publish_notify',
+              'fn_shift_assignment_time_off_guard')))
+  loop
+    v_seen := v_seen + 1;
+    if r.proconfig is distinct from array['search_path=public, pg_temp'] then
+      raise exception 'SSS FAIL (2b): %.% has proconfig % (expected search_path=public, pg_temp)', r.nspname, r.proname, r.proconfig;
+    end if;
+  end loop;
+  if v_seen <> 17 then
+    raise exception 'SSS FAIL (2b): expected 17 SECURITY DEFINER functions from 0062, saw %', v_seen;
+  end if;
+end;
+$$;
+
+-- 2c. F1 policy shape: the additive published-period read is a SELECT policy,
+-- scoped to the caller's facilities, soft-delete aware and published-only.
+do $$
+declare
+  v_qual text;
+  v_cmd "char";
+begin
+  select pg_get_expr(p.polqual, p.polrelid), p.polcmd into v_qual, v_cmd
+  from pg_policy p where p.polrelid = 'schedule_periods'::regclass and p.polname = 'members can read published schedule periods';
+  if v_qual is null or v_cmd <> 'r'
+     or v_qual not like '%current_facility_ids%' or v_qual not like '%deleted_at IS NULL%' or v_qual not like '%published%' then
+    raise exception 'SSS FAIL (2c): the published-periods policy is missing a guard: % / %', v_cmd, v_qual;
+  end if;
+  -- The pre-existing period policies are untouched (still present, schedule.read gated).
+  if not exists (select 1 from pg_policy p where p.polrelid = 'schedule_periods'::regclass and p.polname = 'schedule readers can read periods'
+                   and pg_get_expr(p.polqual, p.polrelid) like '%schedule.read%')
+     or not exists (select 1 from pg_policy p where p.polrelid = 'schedule_periods'::regclass and p.polname = 'schedule managers can manage periods') then
+    raise exception 'SSS FAIL (2c): an existing schedule_periods policy was altered or dropped';
+  end if;
+  -- The assigned-shifts policy carries its own published/facility predicates.
+  select pg_get_expr(p.polqual, p.polrelid) into v_qual
+  from pg_policy p where p.polrelid = 'schedule_shifts'::regclass and p.polname = 'employees can read shifts they are assigned to';
+  if v_qual not like '%fn_shift_period_published%' or v_qual not like '%a.deleted_at IS NULL%' or v_qual not like '%e.facility_id = schedule_shifts.facility_id%' then
+    raise exception 'SSS FAIL (2c): the assigned-shifts policy lost an explicit predicate: %', v_qual;
+  end if;
+end;
+$$;
+
+-- 2d. L3/M3 structural: in every decision function the permission check comes
+-- BEFORE the first row lock, and the employee lock comes BEFORE the shift/request
+-- locks (so the order is employee -> shift -> request everywhere).
+do $$
+declare
+  r record;
+  v_src text;
+  v_perm integer;
+  v_lock integer;
+  v_emp integer;
+  v_shift integer;
+begin
+  for r in select unnest(array['decide_open_shift_claim', 'decide_shift_swap', 'decide_time_off_request']) as fname loop
+    select p.prosrc into v_src from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'internal' and p.proname = r.fname;
+    v_perm := strpos(v_src, 'internal.has_permission');
+    v_lock := strpos(v_src, 'for update');
+    v_emp := strpos(v_src, 'from employees');
+    if v_perm = 0 or v_lock = 0 or v_perm > v_lock then
+      raise exception 'SSS FAIL (2d): % takes a row lock before its permission check (perm@%, lock@%)', r.fname, v_perm, v_lock;
+    end if;
+    if v_src not like '%from employees%order by id for update%' then
+      raise exception 'SSS FAIL (2d): % does not lock the employee row(s) in id order', r.fname;
+    end if;
+    v_emp := strpos(v_src, 'order by id for update');
+    v_shift := strpos(v_src, 'from schedule_shifts');
+    if r.fname <> 'decide_time_off_request' and v_emp > strpos(v_src, 'from schedule_shifts where id') then
+      raise exception 'SSS FAIL (2d): % locks a shift before the employee rows', r.fname;
+    end if;
+  end loop;
+  select p.prosrc into v_src from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'internal' and p.proname = 'fn_assign_employee_to_shift';
+  if v_src not like '%from employees where id = p_employee_id order by id for update%' then
+    raise exception 'SSS FAIL (2d): fn_assign_employee_to_shift does not lock the employee row';
+  end if;
+end;
+$$;
+
 -- ===========================================================================
 -- 3. opened_at is server-owned.
 -- ===========================================================================
@@ -298,13 +440,37 @@ end;
 $$;
 
 -- ===========================================================================
--- 4. Publish notifications: one job per assigned employee per publication.
--- (Run BEFORE any approval changes the assignment set.)
+-- 4. Publish notifications: one job per assigned employee per period + version.
+-- (Run BEFORE any approval changes the assignment set.) The fan-out fires when
+-- the PERIOD becomes published at a version that has its publication row --
+-- never for a bare publication insert (L1).
 -- ===========================================================================
 select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
 set local role authenticated;
 insert into schedule_publications (id, facility_id, schedule_period_id, publish_version, published_by) values
   ('62b00000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 1, '62000000-0000-0000-0000-0000000000a3');
+-- L1: direct publication inserts -- many versions, including for a DRAFT period
+-- -- announce nothing.
+insert into schedule_publications (facility_id, schedule_period_id, publish_version, published_by)
+select '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000002', g, '62000000-0000-0000-0000-0000000000a3'
+from generate_series(1, 20) g;
+insert into schedule_publications (facility_id, schedule_period_id, publish_version, published_by)
+select '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', g, '62000000-0000-0000-0000-0000000000a3'
+from generate_series(1001, 1010) g;
+reset role;
+
+do $$
+begin
+  if exists (select 1 from notification_jobs where event_type = 'schedule.published') then
+    raise exception 'SSS FAIL (4): a bare schedule_publications insert fanned out publish notifications';
+  end if;
+end;
+$$;
+
+-- The route's second step: the period moves to the published version.
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+update schedule_periods set publish_version = 1, updated_at = now() where id = '62f00000-0000-0000-0000-000000000001';
 reset role;
 
 do $$
@@ -335,6 +501,44 @@ begin
   ) then
     raise exception 'SSS FAIL (4): a facility B employee was notified of a facility A publication';
   end if;
+end;
+$$;
+
+-- L1: the same period + version is never announced twice (re-touching the
+-- period, or setting the version to its own value, adds nothing); a version
+-- WITHOUT a publication row announces nothing; the next real version does.
+do $$
+declare
+  v_before integer;
+begin
+  select count(*) into v_before from notification_jobs where event_type = 'schedule.published';
+  update schedule_periods set publish_version = 1, status = 'review' where id = '62f00000-0000-0000-0000-000000000001';
+  update schedule_periods set status = 'published' where id = '62f00000-0000-0000-0000-000000000001';
+  if (select count(*) from notification_jobs where event_type = 'schedule.published') <> v_before then
+    raise exception 'SSS FAIL (4): republishing the same period + version fanned out again';
+  end if;
+  update schedule_periods set publish_version = 77 where id = '62f00000-0000-0000-0000-000000000001';
+  if (select count(*) from notification_jobs where event_type = 'schedule.published') <> v_before then
+    raise exception 'SSS FAIL (4): a version with no publication row fanned out';
+  end if;
+  update schedule_periods set publish_version = 1 where id = '62f00000-0000-0000-0000-000000000001';
+  -- Draft period: bumping its version never announces (status is not published).
+  update schedule_periods set publish_version = 5 where id = '62f00000-0000-0000-0000-000000000002';
+  if (select count(*) from notification_jobs where event_type = 'schedule.published') <> v_before then
+    raise exception 'SSS FAIL (4): a draft period fanned out publish notifications';
+  end if;
+  -- Non-vacuous: a real second version DOES fan out (3 recipients).
+  update schedule_periods set publish_version = 1001 where id = '62f00000-0000-0000-0000-000000000001';
+  if (select count(*) from notification_jobs where event_type = 'schedule.published') <> v_before + 3 then
+    raise exception 'SSS FAIL (4): the next real publish version did not fan out';
+  end if;
+  update schedule_periods set publish_version = 1 where id = '62f00000-0000-0000-0000-000000000001';
+  update schedule_periods set publish_version = 1001 where id = '62f00000-0000-0000-0000-000000000001';
+  if (select count(*) from notification_jobs where event_type = 'schedule.published') <> v_before + 3 then
+    raise exception 'SSS FAIL (4): flipping back to an announced version fanned out again';
+  end if;
+  update schedule_periods set publish_version = 1 where id = '62f00000-0000-0000-0000-000000000001';
+  update schedule_periods set status = 'draft' where id = '62f00000-0000-0000-0000-000000000002';
 end;
 $$;
 
@@ -392,6 +596,27 @@ begin
   if exists (select 1 from schedule_shifts where id = '62500000-0000-0000-0000-0000000000b1') then
     raise exception 'SSS FAIL (5a): Alice can read facility B''s open shift';
   end if;
+  -- F1: a plain member (no schedule.read at all) reads her facility's PUBLISHED
+  -- period row -- the self-service routes key their week lookup on it -- and
+  -- neither the draft period nor another facility's.
+  if not exists (select 1 from schedule_periods where id = '62f00000-0000-0000-0000-000000000001') then
+    raise exception 'SSS FAIL (5a/F1): a plain member cannot read the published schedule period';
+  end if;
+  if exists (select 1 from schedule_periods where id = '62f00000-0000-0000-0000-000000000002') then
+    raise exception 'SSS FAIL (5a/F1): a plain member can read a DRAFT schedule period';
+  end if;
+  if exists (select 1 from schedule_periods where id = '62f00000-0000-0000-0000-0000000000b1') then
+    raise exception 'SSS FAIL (5a/F1): a plain member can read another facility''s published period';
+  end if;
+  if (select count(*) from schedule_periods) <> 1 then
+    raise exception 'SSS FAIL (5a/F1): a plain member sees % period rows (expected exactly the published one)', (select count(*) from schedule_periods);
+  end if;
+  -- She cannot write one.
+  begin
+    update schedule_periods set status = 'archived' where id = '62f00000-0000-0000-0000-000000000001';
+    if found then raise exception 'SSS FAIL (5a/F1): a plain member updated a schedule period'; end if;
+  exception when insufficient_privilege then null;
+  end;
 end;
 $$;
 
@@ -598,8 +823,16 @@ begin
   if exists (select 1 from open_shift_claims where id = '62d00000-0000-0000-0000-000000000001') then
     raise exception 'SSS FAIL (6): Bob can read Alice''s claim';
   end if;
-  if exists (select 1 from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000001') then
-    raise exception 'SSS FAIL (6): Bob (target) can read Alice''s swap request';
+  -- M1: the named colleague reads the requests addressed to HIM -- and only
+  -- those (not the pickups addressed to Carol, nor the open-pool drop).
+  if not exists (select 1 from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000001')
+     or not exists (select 1 from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000005') then
+    raise exception 'SSS FAIL (6): Bob (target) cannot read the swap requests that name him';
+  end if;
+  if exists (select 1 from shift_swap_requests where id in (
+       '62d10000-0000-0000-0000-000000000003', '62d10000-0000-0000-0000-000000000004',
+       '62d10000-0000-0000-0000-000000000007', '62d10000-0000-0000-0000-000000000008')) then
+    raise exception 'SSS FAIL (6): Bob can read swap requests that do not name him';
   end if;
   if exists (select 1 from time_off_requests where id = '62d20000-0000-0000-0000-000000000001') then
     raise exception 'SSS FAIL (6): Bob can read Alice''s time off';
@@ -833,17 +1066,59 @@ begin
   begin
     perform public.decide_open_shift_claim('62d00000-0000-0000-0000-000000000005', 'approve', null);
     raise exception 'SSS FAIL (8): a facility B manager decided a facility A claim';
-  exception when insufficient_privilege then null;
+  exception when no_data_found then null;
   end;
   begin
     perform public.decide_shift_swap('62d10000-0000-0000-0000-000000000003', 'approve', null);
     raise exception 'SSS FAIL (8): a facility B manager decided a facility A swap';
-  exception when insufficient_privilege then null;
+  exception when no_data_found then null;
   end;
   begin
     perform public.decide_time_off_request('62d20000-0000-0000-0000-000000000002', 'approve', null);
     raise exception 'SSS FAIL (8): a facility B manager decided facility A time off';
-  exception when insufficient_privilege then null;
+  exception when no_data_found then null;
+  end;
+  -- L3: a cross-tenant id and a nonexistent id are indistinguishable (same
+  -- SQLSTATE and the same message).
+  declare
+    v_cross text;
+    v_missing text;
+  begin
+    begin
+      perform public.decide_time_off_request('62d20000-0000-0000-0000-000000000002', 'approve', null);
+    exception when others then v_cross := sqlstate || ':' || sqlerrm;
+    end;
+    begin
+      perform public.decide_time_off_request('62d20000-0000-0000-0000-0000000000ff', 'approve', null);
+    exception when others then v_missing := sqlstate || ':' || sqlerrm;
+    end;
+    if v_cross is null or v_cross is distinct from v_missing then
+      raise exception 'SSS FAIL (8/L3): cross-tenant (%) and missing (%) ids answer differently', v_cross, v_missing;
+    end if;
+    v_cross := null; v_missing := null;
+    begin
+      perform public.decide_open_shift_claim('62d00000-0000-0000-0000-000000000005', 'approve', null);
+    exception when others then v_cross := sqlstate || ':' || sqlerrm;
+    end;
+    begin
+      perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000ff', 'approve', null);
+    exception when others then v_missing := sqlstate || ':' || sqlerrm;
+    end;
+    if v_cross is null or v_cross is distinct from v_missing then
+      raise exception 'SSS FAIL (8/L3): claim cross-tenant (%) and missing (%) ids answer differently', v_cross, v_missing;
+    end if;
+    v_cross := null; v_missing := null;
+    begin
+      perform public.decide_shift_swap('62d10000-0000-0000-0000-000000000003', 'approve', null);
+    exception when others then v_cross := sqlstate || ':' || sqlerrm;
+    end;
+    begin
+      perform public.decide_shift_swap('62d10000-0000-0000-0000-0000000000ff', 'approve', null);
+    exception when others then v_missing := sqlstate || ':' || sqlerrm;
+    end;
+    if v_cross is null or v_cross is distinct from v_missing then
+      raise exception 'SSS FAIL (8/L3): swap cross-tenant (%) and missing (%) ids answer differently', v_cross, v_missing;
+    end if;
   end;
 end;
 $$;
@@ -1078,6 +1353,123 @@ $$;
 reset role;
 
 -- ===========================================================================
+-- 10-pre. The named colleague's consent (M1b). A swap / named pickup cannot be
+-- approved before the colleague accepted; only that colleague can answer.
+-- ===========================================================================
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a4","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-000000000001', 'approve', null);
+    raise exception 'SSS FAIL (10-pre): a direct swap was approved before the colleague accepted';
+  exception when sqlstate 'PT409' then
+    if sqlerrm not like '%has not accepted%' then
+      raise exception 'SSS FAIL (10-pre): approval was refused for the wrong reason: %', sqlerrm;
+    end if;
+  end;
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-000000000003', 'approve', null);
+    raise exception 'SSS FAIL (10-pre): a named pickup was approved before the colleague accepted';
+  exception when sqlstate 'PT409' then null;
+  end;
+  -- A denial never waits for the colleague (checked on a request denied later).
+  -- The manager cannot answer on the colleague's behalf either.
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000001', 'accept');
+    raise exception 'SSS FAIL (10-pre): the swaps approver answered for the colleague';
+  exception when no_data_found then null;
+  end;
+end;
+$$;
+reset role;
+
+-- Alice (the requester) cannot accept her own request, nor can Carol accept the
+-- request that names Bob; neither can write the column directly.
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a1","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000001', 'accept');
+    raise exception 'SSS FAIL (10-pre): the requester accepted her own swap';
+  exception when no_data_found then null;
+  end;
+  begin
+    update shift_swap_requests set target_accepted_at = now() where id = '62d10000-0000-0000-0000-000000000001';
+    raise exception 'SSS FAIL (10-pre): the requester stamped target_accepted_at directly';
+  exception when check_violation then null;
+  end;
+  begin
+    update shift_swap_requests set status = 'cancelled', target_accepted_at = now() where id = '62d10000-0000-0000-0000-000000000001';
+    raise exception 'SSS FAIL (10-pre): the requester stamped target_accepted_at while cancelling';
+  exception when check_violation then null;
+  end;
+  begin
+    insert into shift_swap_requests (facility_id, offered_assignment_id, requester_employee_id, swap_type, target_accepted_at)
+    values ('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a00000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000001', 'drop_pickup', now());
+    raise exception 'SSS FAIL (10-pre): a swap was created pre-accepted';
+  exception when check_violation or insufficient_privilege then null;
+  end;
+end;
+$$;
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a9","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000001', 'accept');
+    raise exception 'SSS FAIL (10-pre): a colleague who is not the target accepted';
+  exception when no_data_found then null;
+  end;
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000003', 'maybe');
+    raise exception 'SSS FAIL (10-pre): an unknown response was accepted';
+  exception when invalid_parameter_value then null;
+  end;
+  perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000003', 'accept');
+  perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000008', 'accept');
+  if (public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000003', 'accept') ->> 'replay') <> 'true' then
+    raise exception 'SSS FAIL (10-pre): accepting twice was not a replay';
+  end if;
+end;
+$$;
+reset role;
+-- Bob accepts both direct swaps that name him; the requester is notified.
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a2","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000001', 'accept');
+  perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000005', 'accept');
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-000000000001', 'decline');
+    raise exception 'SSS FAIL (10-pre): an accepted request was declined afterwards';
+  exception when sqlstate 'PT409' then null;
+  end;
+end;
+$$;
+reset role;
+do $$
+begin
+  if (select target_accepted_at from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000001') is null
+     or (select target_accepted_at from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000005') is null
+     or (select target_accepted_at from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000003') is null then
+    raise exception 'SSS FAIL (10-pre): an acceptance was not recorded';
+  end if;
+  if (select status from shift_swap_requests where id = '62d10000-0000-0000-0000-000000000001') <> 'pending' then
+    raise exception 'SSS FAIL (10-pre): an acceptance moved the request out of pending';
+  end if;
+  if (select count(*) from notification_jobs where event_type = 'schedule.swap_decided'
+        and payload_jsonb ->> 'sourceId' = '62d10000-0000-0000-0000-000000000001'
+        and payload_jsonb ->> 'decision' = 'accepted') <> 1 then
+    raise exception 'SSS FAIL (10-pre): the requester was not told once about the acceptance';
+  end if;
+end;
+$$;
+
+-- ===========================================================================
 -- 10. Swap approval (SC-12) as the swaps-only approver.
 -- ===========================================================================
 select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a4","role":"authenticated"}', true);
@@ -1158,7 +1550,8 @@ begin
   end if;
   -- Notifications: requester + target on 10a (2), requester on 10c (1) + target (1) + 10d (1).
   if (select count(*) from notification_jobs where event_type = 'schedule.swap_decided'
-        and payload_jsonb ->> 'sourceId' = '62d10000-0000-0000-0000-000000000001') <> 2 then
+        and payload_jsonb ->> 'sourceId' = '62d10000-0000-0000-0000-000000000001'
+        and payload_jsonb ->> 'decision' = 'approved') <> 2 then
     raise exception 'SSS FAIL (10): the direct swap did not notify both parties exactly once';
   end if;
 end;
@@ -1263,6 +1656,484 @@ begin
   if not exists (select 1 from jsonb_array_elements(v_res -> 'warnings') w where w ->> 'code' = 'outside_availability') then
     raise exception 'SSS FAIL (12): no outside_availability warning: %', v_res;
   end if;
+end;
+$$;
+
+
+-- ===========================================================================
+-- 13. M1a: a decider cannot decide a request they are party to. Dana holds
+-- every approver code AND is an employee; each request below names her.
+-- Fixtures first (run as the table owner).
+-- ===========================================================================
+set local request.jwt.claims = '';
+insert into schedule_shifts (id, facility_id, schedule_period_id, role_code, shift_date, starts_at, ends_at, status) values
+  ('62520000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-20', '2035-03-20T09:00:00Z', '2035-03-20T17:00:00Z', 'open'),
+  ('62520000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-21', '2035-03-21T09:00:00Z', '2035-03-21T13:00:00Z', 'assigned'),
+  ('62520000-0000-0000-0000-000000000003', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-22', '2035-03-22T09:00:00Z', '2035-03-22T13:00:00Z', 'assigned'),
+  ('62520000-0000-0000-0000-000000000004', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-22', '2035-03-22T14:00:00Z', '2035-03-22T18:00:00Z', 'assigned'),
+  ('62520000-0000-0000-0000-000000000005', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-23', '2035-03-23T09:00:00Z', '2035-03-23T13:00:00Z', 'assigned'),
+  ('62520000-0000-0000-0000-000000000006', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-03-24', '2035-03-24T09:00:00Z', '2035-03-24T13:00:00Z', 'assigned');
+insert into shift_assignments (id, facility_id, shift_id, employee_id, status) values
+  ('62a10000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000004', 'approved'),
+  ('62a10000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000003', '62e00000-0000-0000-0000-000000000004', 'approved'),
+  ('62a10000-0000-0000-0000-000000000003', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000004', '62e00000-0000-0000-0000-000000000002', 'approved'),
+  ('62a10000-0000-0000-0000-000000000004', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000005', '62e00000-0000-0000-0000-000000000001', 'approved'),
+  ('62a10000-0000-0000-0000-000000000005', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000006', '62e00000-0000-0000-0000-000000000001', 'approved');
+
+-- Dana files her own time off, claim and drop; Bob files a direct swap that
+-- names Dana as the target (Dana answers it, then tries to approve it).
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000aa","role":"authenticated"}', true);
+set local role authenticated;
+insert into time_off_requests (id, facility_id, employee_id, starts_at, ends_at, request_type, reason) values
+  ('62d20000-0000-0000-0000-0000000000d1', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62e00000-0000-0000-0000-000000000004', '2035-08-01T00:00:00Z', '2035-08-03T00:00:00Z', 'vacation', 'self');
+insert into open_shift_claims (id, facility_id, shift_id, claimant_employee_id) values
+  ('62d00000-0000-0000-0000-0000000000d1', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62520000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000004');
+insert into shift_swap_requests (id, facility_id, offered_assignment_id, requester_employee_id, swap_type) values
+  ('62d10000-0000-0000-0000-0000000000d1', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a10000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000004', 'drop_pickup');
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a2","role":"authenticated"}', true);
+set local role authenticated;
+insert into shift_swap_requests (id, facility_id, offered_assignment_id, requested_assignment_id, requester_employee_id, target_employee_id, swap_type) values
+  ('62d10000-0000-0000-0000-0000000000d2', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a10000-0000-0000-0000-000000000003', '62a10000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000004', 'direct');
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000aa","role":"authenticated"}', true);
+set local role authenticated;
+select public.respond_to_shift_swap('62d10000-0000-0000-0000-0000000000d2', 'accept');
+
+do $$
+declare
+  v_msg text;
+begin
+  -- Every decision on a request that names Dana is refused, approve AND deny,
+  -- for each of the three request kinds -- and the refusal is the party check
+  -- (Dana holds every approver code, so nothing else could raise 42501).
+  begin
+    perform public.decide_time_off_request('62d20000-0000-0000-0000-0000000000d1', 'approve', null);
+    raise exception 'SSS FAIL (13): Dana approved her own time off';
+  exception when insufficient_privilege then
+    get stacked diagnostics v_msg = message_text;
+    if v_msg not like '%party%' then raise exception 'SSS FAIL (13): wrong refusal: %', v_msg; end if;
+  end;
+  begin
+    perform public.decide_time_off_request('62d20000-0000-0000-0000-0000000000d1', 'deny', 'no');
+    raise exception 'SSS FAIL (13): Dana denied her own time off';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000d1', 'approve', null);
+    raise exception 'SSS FAIL (13): Dana approved her own claim';
+  exception when insufficient_privilege then
+    get stacked diagnostics v_msg = message_text;
+    if v_msg not like '%party%' then raise exception 'SSS FAIL (13): wrong refusal: %', v_msg; end if;
+  end;
+  begin
+    perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000d1', 'deny', 'no');
+    raise exception 'SSS FAIL (13): Dana denied her own claim';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d1', 'approve', null);
+    raise exception 'SSS FAIL (13): Dana approved her own drop';
+  exception when insufficient_privilege then
+    get stacked diagnostics v_msg = message_text;
+    if v_msg not like '%party%' then raise exception 'SSS FAIL (13): wrong refusal: %', v_msg; end if;
+  end;
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d2', 'approve', null);
+    raise exception 'SSS FAIL (13): Dana approved a swap that names her as the target';
+  exception when insufficient_privilege then
+    get stacked diagnostics v_msg = message_text;
+    if v_msg not like '%party%' then raise exception 'SSS FAIL (13): wrong refusal: %', v_msg; end if;
+  end;
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d2', 'deny', 'no');
+    raise exception 'SSS FAIL (13): Dana denied a swap that names her as the target';
+  exception when insufficient_privilege then null;
+  end;
+end;
+$$;
+reset role;
+do $$
+begin
+  if (select status from time_off_requests where id = '62d20000-0000-0000-0000-0000000000d1') <> 'pending'
+     or (select claim_status from open_shift_claims where id = '62d00000-0000-0000-0000-0000000000d1') <> 'pending'
+     or (select status from shift_swap_requests where id in ('62d10000-0000-0000-0000-0000000000d1')) <> 'pending'
+     or (select status from shift_swap_requests where id = '62d10000-0000-0000-0000-0000000000d2') <> 'pending' then
+    raise exception 'SSS FAIL (13): a refused self-decision changed a request';
+  end if;
+end;
+$$;
+
+-- Non-vacuous: the SAME requests are decidable by a different approver.
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  if (public.decide_time_off_request('62d20000-0000-0000-0000-0000000000d1', 'approve', null) ->> 'decided') <> 'true'
+     or (public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000d1', 'approve', null) ->> 'decided') <> 'true'
+     or (public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d1', 'approve', null) ->> 'decided') <> 'true'
+     or (public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d2', 'approve', null) ->> 'decided') <> 'true' then
+    raise exception 'SSS FAIL (13): another approver could not decide the same requests';
+  end if;
+end;
+$$;
+reset role;
+
+-- 13b. The colleague can DECLINE: the request ends, nothing is reassigned, and
+-- a later answer or approval is a 409. Alice offers AL2 to Carol.
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a1","role":"authenticated"}', true);
+set local role authenticated;
+insert into shift_swap_requests (id, facility_id, offered_assignment_id, requester_employee_id, target_employee_id, swap_type) values
+  ('62d10000-0000-0000-0000-0000000000d3', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a10000-0000-0000-0000-000000000005', '62e00000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000003', 'drop_pickup');
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a9","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v_res jsonb;
+begin
+  v_res := public.respond_to_shift_swap('62d10000-0000-0000-0000-0000000000d3', 'decline');
+  if (v_res -> 'request' ->> 'status') <> 'cancelled' or (v_res -> 'request' ->> 'target_declined_at') is null then
+    raise exception 'SSS FAIL (13b): decline returned %', v_res;
+  end if;
+  if (public.respond_to_shift_swap('62d10000-0000-0000-0000-0000000000d3', 'decline') ->> 'replay') <> 'true' then
+    raise exception 'SSS FAIL (13b): declining twice was not a replay';
+  end if;
+  begin
+    perform public.respond_to_shift_swap('62d10000-0000-0000-0000-0000000000d3', 'accept');
+    raise exception 'SSS FAIL (13b): a declined request was accepted';
+  exception when sqlstate 'PT409' then null;
+  end;
+end;
+$$;
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a4","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.decide_shift_swap('62d10000-0000-0000-0000-0000000000d3', 'approve', null);
+    raise exception 'SSS FAIL (13b): a declined request was approved';
+  exception when sqlstate 'PT409' then null;
+  end;
+end;
+$$;
+reset role;
+do $$
+begin
+  if (select status from shift_assignments where id = '62a10000-0000-0000-0000-000000000005') <> 'approved'
+     or exists (select 1 from shift_assignments where shift_id = '62520000-0000-0000-0000-000000000006' and employee_id = '62e00000-0000-0000-0000-000000000003') then
+    raise exception 'SSS FAIL (13b): a declined pickup moved an assignment';
+  end if;
+  if (select count(*) from notification_jobs where event_type = 'schedule.swap_decided'
+        and payload_jsonb ->> 'sourceId' = '62d10000-0000-0000-0000-0000000000d3' and payload_jsonb ->> 'decision' = 'declined') <> 1 then
+    raise exception 'SSS FAIL (13b): the requester was not notified once of the decline';
+  end if;
+end;
+$$;
+
+-- ===========================================================================
+-- 14. M2: settings resolve for plain members; hard-block time off is enforced
+-- on shift_assignments for every writer.
+-- ===========================================================================
+insert into organization_module_settings (organization_id, module_id, enabled, config_jsonb)
+select '62000000-0000-0000-0000-0000000000b0', m.id, true,
+       '{"scheduling.certEnforcementMode":"warning","communications.org":"org-secret"}'::jsonb
+from modules m where m.code = 'scheduling'
+on conflict (organization_id, module_id) do update set config_jsonb = excluded.config_jsonb;
+insert into facility_module_overrides (facility_id, module_id, config_patch_jsonb)
+select '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', m.id,
+       '{"scheduling.timeOffConflictMode":"hard-block","communications.secret":"fac-secret"}'::jsonb
+from modules m where m.code = 'scheduling'
+on conflict (facility_id, module_id) do update set config_patch_jsonb = excluded.config_patch_jsonb;
+
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a1","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v jsonb;
+begin
+  -- The raw tables stay admin-only (this is WHY the definer function exists)...
+  if exists (select 1 from facility_module_overrides) or exists (select 1 from organization_module_settings) then
+    raise exception 'SSS FAIL (14): a plain member can read the settings tables directly';
+  end if;
+  -- ...but the layers function serves the scheduling keys, and only those.
+  v := public.get_scheduling_config_layers('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+  if (v -> 'facilityLayer' ->> 'scheduling.timeOffConflictMode') is distinct from 'hard-block'
+     or (v -> 'orgLayer' ->> 'scheduling.certEnforcementMode') is distinct from 'warning' then
+    raise exception 'SSS FAIL (14): the scheduling layers did not resolve for a plain member: %', v;
+  end if;
+  if (v -> 'facilityLayer') ? 'communications.secret' or (v -> 'orgLayer') ? 'communications.org'
+     or v::text like '%secret%' then
+    raise exception 'SSS FAIL (14): the layers function leaked a non-scheduling key: %', v;
+  end if;
+end;
+$$;
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a7","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+declare
+  v jsonb;
+begin
+  v := public.get_scheduling_config_layers('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+  if v <> '{"orgLayer": {}, "facilityLayer": {}}'::jsonb then
+    raise exception 'SSS FAIL (14): a non-member read another facility''s settings: %', v;
+  end if;
+end;
+$$;
+reset role;
+
+-- Alice has APPROVED time off 2035-09-01..02 (filed by her, decided by the
+-- time-off approver); Bob has only a PENDING one over the same days.
+insert into schedule_shifts (id, facility_id, schedule_period_id, role_code, shift_date, starts_at, ends_at, status) values
+  ('62530000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-09-01', '2035-09-01T09:00:00Z', '2035-09-01T17:00:00Z', 'open'),
+  ('62530000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-09-03', '2035-09-03T09:00:00Z', '2035-09-03T17:00:00Z', 'open');
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a1","role":"authenticated"}', true);
+set local role authenticated;
+insert into time_off_requests (id, facility_id, employee_id, starts_at, ends_at, request_type) values
+  ('62d20000-0000-0000-0000-0000000000e1', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62e00000-0000-0000-0000-000000000001', '2035-09-01T00:00:00Z', '2035-09-02T00:00:00Z', 'vacation');
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a2","role":"authenticated"}', true);
+set local role authenticated;
+insert into time_off_requests (id, facility_id, employee_id, starts_at, ends_at, request_type) values
+  ('62d20000-0000-0000-0000-0000000000e2', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62e00000-0000-0000-0000-000000000002', '2035-09-01T00:00:00Z', '2035-09-02T00:00:00Z', 'vacation');
+reset role;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a6","role":"authenticated"}', true);
+set local role authenticated;
+select public.decide_time_off_request('62d20000-0000-0000-0000-0000000000e1', 'approve', null);
+reset role;
+
+do $$
+declare
+  v_state text;
+begin
+  -- (a) Owner (RLS bypassed, as the service role is): refused.
+  begin
+    insert into shift_assignments (facility_id, shift_id, employee_id, status)
+    values ('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62530000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000001', 'approved');
+    raise exception 'SSS FAIL (14): hard-block did not stop an owner-path assignment over approved time off';
+  exception when sqlstate 'PT409' then null;
+  end;
+  -- (b) The definer assignment path: refused.
+  begin
+    perform internal.fn_assign_employee_to_shift('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62530000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000001', 'primary', null);
+    raise exception 'SSS FAIL (14): hard-block did not stop fn_assign_employee_to_shift';
+  exception when sqlstate 'PT409' then null;
+  end;
+  -- (c) Only APPROVED time off blocks: Bob's pending request does not.
+  insert into shift_assignments (id, facility_id, shift_id, employee_id, status)
+  values ('62a20000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62530000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000002', 'approved');
+  -- (d) A non-overlapping shift is fine for Alice.
+  insert into shift_assignments (id, facility_id, shift_id, employee_id, status)
+  values ('62a20000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62530000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000001', 'approved');
+  -- (e) Moving that assignment onto the overlapping shift is refused.
+  begin
+    update shift_assignments set shift_id = '62530000-0000-0000-0000-000000000001' where id = '62a20000-0000-0000-0000-000000000002';
+    raise exception 'SSS FAIL (14): hard-block did not stop re-pointing an assignment onto an overlapping shift';
+  exception when sqlstate 'PT409' then null;
+  end;
+  -- (f) Cancelling is never blocked; reviving a cancelled one is.
+  update shift_assignments set status = 'cancelled' where id = '62a20000-0000-0000-0000-000000000002';
+  update shift_assignments set shift_id = '62530000-0000-0000-0000-000000000002', status = 'approved' where id = '62a20000-0000-0000-0000-000000000002';
+  update shift_assignments set status = 'cancelled' where id = '62a20000-0000-0000-0000-000000000002';
+  update shift_assignments set shift_id = '62530000-0000-0000-0000-000000000001' where id = '62a20000-0000-0000-0000-000000000002';
+  begin
+    update shift_assignments set status = 'approved' where id = '62a20000-0000-0000-0000-000000000002';
+    raise exception 'SSS FAIL (14): hard-block did not stop reviving a cancelled assignment over approved time off';
+  exception when sqlstate 'PT409' then null;
+  end;
+  -- (g) Non-vacuous: with the mode back at the default the same insert works.
+  update facility_module_overrides set config_patch_jsonb = '{"scheduling.timeOffConflictMode":"warning"}'::jsonb
+   where facility_id = '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  update shift_assignments set status = 'approved' where id = '62a20000-0000-0000-0000-000000000002';
+  select status into v_state from shift_assignments where id = '62a20000-0000-0000-0000-000000000002';
+  if v_state <> 'approved' then
+    raise exception 'SSS FAIL (14): warning mode blocked an assignment over approved time off';
+  end if;
+  update shift_assignments set status = 'cancelled' where id = '62a20000-0000-0000-0000-000000000002';
+  update facility_module_overrides set config_patch_jsonb = '{"scheduling.timeOffConflictMode":"hard-block"}'::jsonb
+   where facility_id = '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+end;
+$$;
+
+-- (h) A schedule.manage holder WITHOUT any time-off read right is stopped too
+-- (the trigger reads the time-off rows and the setting as the definer).
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a5","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  if exists (select 1 from facility_module_overrides) then
+    raise exception 'SSS FAIL (14): the manager unexpectedly reads the settings table (test premise)';
+  end if;
+  begin
+    insert into shift_assignments (facility_id, shift_id, employee_id, status, assigned_by)
+    values ('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62530000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000001', 'approved', '62000000-0000-0000-0000-0000000000a5');
+    raise exception 'SSS FAIL (14): a manager assigned an employee over approved time off in hard-block mode';
+  exception when sqlstate 'PT409' then null;
+  end;
+end;
+$$;
+reset role;
+
+-- ===========================================================================
+-- 15. Claim approval re-checks (Info): period still published, claim filed
+-- inside the window, shift still unassigned. Each scenario fails for exactly
+-- one reason and succeeds once that reason is removed.
+-- ===========================================================================
+delete from facility_module_overrides where facility_id = '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+delete from organization_module_settings where organization_id = '62000000-0000-0000-0000-0000000000b0';
+insert into schedule_shifts (id, facility_id, schedule_period_id, role_code, shift_date, starts_at, ends_at, status) values
+  ('62540000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-10-01', '2035-10-01T09:00:00Z', '2035-10-01T17:00:00Z', 'open'),
+  ('62540000-0000-0000-0000-000000000002', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-10-02', '2035-10-02T09:00:00Z', '2035-10-02T17:00:00Z', 'open'),
+  ('62540000-0000-0000-0000-000000000003', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62f00000-0000-0000-0000-000000000001', 'guard', '2035-10-03', '2035-10-03T09:00:00Z', '2035-10-03T17:00:00Z', 'open');
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a1","role":"authenticated"}', true);
+set local role authenticated;
+insert into open_shift_claims (id, facility_id, shift_id, claimant_employee_id) values
+  ('62d00000-0000-0000-0000-0000000000f1', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62540000-0000-0000-0000-000000000001', '62e00000-0000-0000-0000-000000000001'),
+  ('62d00000-0000-0000-0000-0000000000f2', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62540000-0000-0000-0000-000000000002', '62e00000-0000-0000-0000-000000000001'),
+  ('62d00000-0000-0000-0000-0000000000f3', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62540000-0000-0000-0000-000000000003', '62e00000-0000-0000-0000-000000000001');
+reset role;
+
+-- (a) period moved out of 'published' after the claim was filed.
+update schedule_periods set status = 'review' where id = '62f00000-0000-0000-0000-000000000001';
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f1', 'approve', null);
+    raise exception 'SSS FAIL (15a): a claim in an un-published period was approved';
+  exception when sqlstate 'PT409' then
+    if sqlerrm not like '%published%' then raise exception 'SSS FAIL (15a): refused for the wrong reason: %', sqlerrm; end if;
+  end;
+end;
+$$;
+reset role;
+update schedule_periods set status = 'published' where id = '62f00000-0000-0000-0000-000000000001';
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+select public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f1', 'approve', null);
+reset role;
+
+-- (b) the shift became claimable long before the claim: the claim is outside
+-- the (current) window.
+alter table schedule_shifts disable trigger schedule_shifts_opened_at;
+update schedule_shifts set opened_at = now() - interval '72 hours' where id = '62540000-0000-0000-0000-000000000002';
+alter table schedule_shifts enable trigger schedule_shifts_opened_at;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f2', 'approve', null);
+    raise exception 'SSS FAIL (15b): a claim filed outside the claim window was approved';
+  exception when sqlstate 'PT409' then
+    if sqlerrm not like '%claim window%' then raise exception 'SSS FAIL (15b): refused for the wrong reason: %', sqlerrm; end if;
+  end;
+end;
+$$;
+reset role;
+alter table schedule_shifts disable trigger schedule_shifts_opened_at;
+update schedule_shifts set opened_at = now() - interval '1 hour' where id = '62540000-0000-0000-0000-000000000002';
+alter table schedule_shifts enable trigger schedule_shifts_opened_at;
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+select public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f2', 'approve', null);
+reset role;
+
+-- (c) another live assignment already sits on the (still 'open') shift.
+insert into shift_assignments (id, facility_id, shift_id, employee_id, status)
+values ('62a30000-0000-0000-0000-000000000001', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62540000-0000-0000-0000-000000000003', '62e00000-0000-0000-0000-000000000002', 'approved');
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+do $$
+begin
+  begin
+    perform public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f3', 'approve', null);
+    raise exception 'SSS FAIL (15c): a claim on an already-assigned shift was approved';
+  exception when sqlstate 'PT409' then
+    if sqlerrm not like '%already has an assignment%' then raise exception 'SSS FAIL (15c): refused for the wrong reason: %', sqlerrm; end if;
+  end;
+end;
+$$;
+reset role;
+update shift_assignments set status = 'cancelled' where id = '62a30000-0000-0000-0000-000000000001';
+select set_config('request.jwt.claims', '{"sub":"62000000-0000-0000-0000-0000000000a3","role":"authenticated"}', true);
+set local role authenticated;
+select public.decide_open_shift_claim('62d00000-0000-0000-0000-0000000000f3', 'approve', null);
+reset role;
+do $$
+begin
+  if (select count(*) from open_shift_claims where id in ('62d00000-0000-0000-0000-0000000000f1', '62d00000-0000-0000-0000-0000000000f2', '62d00000-0000-0000-0000-0000000000f3') and claim_status = 'approved') <> 3 then
+    raise exception 'SSS FAIL (15): a re-check scenario did not end with the claim approved';
+  end if;
+end;
+$$;
+
+-- ===========================================================================
+-- 16. L4: free-text columns are length-capped in the database (2000 chars).
+-- The marker is stamped for the decision-column cases so the constraint -- not
+-- the guard -- is what is under test; each case names the constraint.
+-- ===========================================================================
+do $$
+declare
+  v_constraint text;
+begin
+  -- Limit accepted, limit + 1 refused: time_off_requests.reason.
+  insert into time_off_requests (id, facility_id, employee_id, starts_at, ends_at, request_type, reason)
+  values ('62d20000-0000-0000-0000-0000000000f0', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62e00000-0000-0000-0000-000000000001', '2036-01-01', '2036-01-02', 'other', repeat('x', 2000));
+  begin
+    insert into time_off_requests (facility_id, employee_id, starts_at, ends_at, request_type, reason)
+    values ('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62e00000-0000-0000-0000-000000000001', '2036-01-01', '2036-01-02', 'other', repeat('x', 2001));
+    raise exception 'SSS FAIL (16): a 2001-char time-off reason was stored';
+  exception when check_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    if v_constraint is distinct from 'time_off_requests_text_length' then raise exception 'SSS FAIL (16): wrong constraint %', v_constraint; end if;
+  end;
+  perform set_config('rr.schedule_decision', '62d20000-0000-0000-0000-0000000000f0', true);
+  begin
+    update time_off_requests set decision_notes = repeat('x', 2001) where id = '62d20000-0000-0000-0000-0000000000f0';
+    raise exception 'SSS FAIL (16): a 2001-char decision note was stored';
+  exception when check_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    if v_constraint is distinct from 'time_off_requests_text_length' then raise exception 'SSS FAIL (16): wrong constraint %', v_constraint; end if;
+  end;
+  update time_off_requests set decision_notes = repeat('x', 2000) where id = '62d20000-0000-0000-0000-0000000000f0';
+  perform set_config('rr.schedule_decision', '', true);
+
+  -- open_shift_claims.decision_reason.
+  perform set_config('rr.schedule_decision', '62d00000-0000-0000-0000-0000000000b3', true);
+  begin
+    update open_shift_claims set decision_reason = repeat('y', 2001) where id = '62d00000-0000-0000-0000-0000000000b3';
+    raise exception 'SSS FAIL (16): a 2001-char claim decision reason was stored';
+  exception when check_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    if v_constraint is distinct from 'open_shift_claims_text_length' then raise exception 'SSS FAIL (16): wrong constraint %', v_constraint; end if;
+  end;
+  update open_shift_claims set decision_reason = repeat('y', 2000) where id = '62d00000-0000-0000-0000-0000000000b3';
+  perform set_config('rr.schedule_decision', '', true);
+
+  -- shift_swap_requests.reason (insert) and decision_reason (marker).
+  begin
+    insert into shift_swap_requests (facility_id, offered_assignment_id, requester_employee_id, swap_type, reason)
+    values ('62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a10000-0000-0000-0000-000000000004', '62e00000-0000-0000-0000-000000000001', 'drop_pickup', repeat('z', 2001));
+    raise exception 'SSS FAIL (16): a 2001-char swap reason was stored';
+  exception when check_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    if v_constraint is distinct from 'shift_swap_requests_text_length' then raise exception 'SSS FAIL (16): wrong constraint %', v_constraint; end if;
+  end;
+  insert into shift_swap_requests (id, facility_id, offered_assignment_id, requester_employee_id, swap_type, reason)
+  values ('62d10000-0000-0000-0000-0000000000f0', '62aaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '62a10000-0000-0000-0000-000000000004', '62e00000-0000-0000-0000-000000000001', 'drop_pickup', repeat('z', 2000));
+  perform set_config('rr.schedule_decision', '62d10000-0000-0000-0000-0000000000f0', true);
+  begin
+    update shift_swap_requests set decision_reason = repeat('z', 2001) where id = '62d10000-0000-0000-0000-0000000000f0';
+    raise exception 'SSS FAIL (16): a 2001-char swap decision reason was stored';
+  exception when check_violation then
+    get stacked diagnostics v_constraint = constraint_name;
+    if v_constraint is distinct from 'shift_swap_requests_text_length' then raise exception 'SSS FAIL (16): wrong constraint %', v_constraint; end if;
+  end;
+  perform set_config('rr.schedule_decision', '', true);
 end;
 $$;
 

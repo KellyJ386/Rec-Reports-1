@@ -994,6 +994,7 @@ export function buildMySchedule({
   assignments = [],
   claims = [],
   swaps = [],
+  incomingSwaps = [],
   timeOff = [],
   now = new Date(),
   claimWindowHours = 48
@@ -1044,6 +1045,16 @@ export function buildMySchedule({
     openShifts,
     claims: myClaims,
     swaps: swaps.filter((swap) => swap.requester_employee_id === employeeId && !swap.deleted_at),
+    // Requests that NAME this employee and still wait for their answer.
+    incomingSwaps: incomingSwaps.filter(
+      (swap) =>
+        swap.target_employee_id === employeeId &&
+        swap.requester_employee_id !== employeeId &&
+        swap.status === "pending" &&
+        !swap.deleted_at &&
+        !swap.target_accepted_at &&
+        !swap.target_declined_at
+    ),
     timeOff: timeOff.filter((request) => request.employee_id === employeeId && !request.deleted_at)
   };
 }
@@ -1094,6 +1105,8 @@ export function buildApprovalItems({ claims = [], swaps = [], timeOff = [], empl
       employeeName: nameOf(swap.requester_employee_id),
       targetEmployeeId: swap.target_employee_id ?? null,
       targetEmployeeName: swap.target_employee_id ? nameOf(swap.target_employee_id) : null,
+      targetAcceptedAt: swap.target_accepted_at ?? null,
+      awaitingTarget: Boolean(swap.target_employee_id) && !swap.target_accepted_at && swap.status === "pending",
       shift: shiftSummary(offered ? shiftById.get(offered.shift_id) : null),
       requestedShift: shiftSummary(requested ? shiftById.get(requested.shift_id) : null),
       reason: swap.reason ?? null,

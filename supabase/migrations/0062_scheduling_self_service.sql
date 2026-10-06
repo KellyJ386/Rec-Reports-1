@@ -39,27 +39,48 @@
 --    client inputs are the request id, 'approve'|'deny' and a free-text
 --    reason), re-validates certifications / overlap / time-off /
 --    availability at decision time against the SERVER-READ facility
---    settings, locks shifts before requests (so competing approvals
---    serialise and never deadlock), writes the assignment change and the
---    decision in ONE transaction, and is idempotent on replay (the same
---    decision again returns the stored row with replay=true; the opposite
---    decision is a 409). Auditing goes through the existing
---    fn_audit_admin_change trigger path (attached to all four tables).
+--    settings, and writes the assignment change and the decision in ONE
+--    transaction. Each one: checks the caller's permission (against the facility
+--    of an unlocked read of the row) BEFORE taking any lock; answers a missing
+--    id and an id outside the caller's facilities identically (not found);
+--    refuses a decider who is themself a party to the request (requester,
+--    swap target, claimant); then locks the affected employee rows (ascending
+--    id), then the shifts, then the request (always employee -> shift ->
+--    request, so competing approvals serialise per employee and per shift and
+--    never deadlock). It is idempotent on replay (the same decision again
+--    returns the stored row with replay=true; the opposite decision is a 409).
+--    Auditing goes through the existing fn_audit_admin_change trigger path
+--    (attached to all four tables).
+--    A shift swap that names a colleague also needs that colleague's consent:
+--    internal.respond_to_shift_swap lets ONLY the named employee accept or
+--    decline, and decide_shift_swap refuses to approve before acceptance.
 --
 -- 4. Notifications (SC-17): no authenticated notification_jobs write path is
 --    added and 0058's incident-scoped INSERT policy is untouched. Decision
 --    notifications are enqueued by the definer RPCs; publish notifications
---    by an AFTER INSERT definer trigger on schedule_publications, so they are
---    atomic with the publish. fn_notification_job_dedupe_key (0058, re-created
+--    by an AFTER UPDATE definer trigger on schedule_periods that fires when a
+--    period becomes (or is re-) published at a version that has its
+--    schedule_publications row, once per period + version.
+--    fn_notification_job_dedupe_key (0058, re-created
 --    by the communications slice) is deliberately NOT redefined here: its
 --    non-message branch builds the key from payload.incidentId, which would
 --    collapse every schedule job for one recipient onto one key. These jobs
 --    are therefore written with dedupe_key NULL (the trigger leaves a null key
 --    untouched, so no caller-influenced key exists at all) and are exactly-once
---    by construction: a publication row is inserted once and a request leaves
---    'pending' once, both under a row lock, each firing its notification in
---    that same transaction. An idempotent replay of a decision returns before
---    any notification is written.
+--    by construction: a request leaves 'pending' once, under a row lock, firing
+--    its notification in that same transaction, and the publish trigger checks
+--    for an existing job of the same period + version. An idempotent replay of
+--    a decision returns before any notification is written.
+--
+-- 5. Hard-block time off (scheduling.timeOffConflictMode = 'hard-block') is
+--    enforced in the database as well as in the decision RPCs: a BEFORE
+--    trigger on shift_assignments refuses a live assignment for an employee
+--    who has approved time off overlapping the shift, for every writer
+--    including the service role and the definer paths. The facility settings
+--    are served to ordinary members through a definer function limited to
+--    `scheduling.*` keys, so the BFF resolves them the same way for every caller.
+--
+-- 6. Every SECURITY DEFINER function here pins search_path = public, pg_temp.
 -- ===========================================================================
 
 -- ---------------------------------------------------------------------------
@@ -104,7 +125,7 @@ returns text
 language sql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select coalesce(
     (
@@ -128,13 +149,51 @@ returns integer
 language sql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select case
     when v ~ '^[0-9]{1,6}$' then v::integer
     else p_default
   end
   from (select internal.fn_scheduling_setting(p_facility_id, p_key) as v) s;
+$$;
+
+-- The same two layers, as data, for the BFF: ordinary facility members hold
+-- neither settings table's SELECT (admin.manage only), so the BFF could not
+-- resolve the mode switches through the caller's own client. Members of the
+-- facility get ONLY the `scheduling.*` keys of each layer (never another
+-- module's settings); anyone else gets empty layers. The BFF folds the layers
+-- through settings-registry's effectiveConfig, exactly as before.
+create or replace function internal.get_scheduling_config_layers(p_facility_id uuid)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select jsonb_build_object(
+    'orgLayer',
+    case when p_facility_id in (select internal.current_facility_ids()) then coalesce((
+      select jsonb_object_agg(e.key, e.value)
+      from organization_module_settings oms
+      join modules m on m.id = oms.module_id
+      join facilities f on f.organization_id = oms.organization_id
+      cross join lateral jsonb_each(
+        case when jsonb_typeof(oms.config_jsonb) = 'object' then oms.config_jsonb else '{}'::jsonb end
+      ) as e(key, value)
+      where f.id = p_facility_id and m.code = 'scheduling' and e.key like 'scheduling.%'
+    ), '{}'::jsonb) else '{}'::jsonb end,
+    'facilityLayer',
+    case when p_facility_id in (select internal.current_facility_ids()) then coalesce((
+      select jsonb_object_agg(e.key, e.value)
+      from facility_module_overrides fo
+      join modules m on m.id = fo.module_id
+      cross join lateral jsonb_each(
+        case when jsonb_typeof(fo.config_patch_jsonb) = 'object' then fo.config_patch_jsonb else '{}'::jsonb end
+      ) as e(key, value)
+      where fo.facility_id = p_facility_id and m.code = 'scheduling' and e.key like 'scheduling.%'
+    ), '{}'::jsonb) else '{}'::jsonb end
+  );
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -147,7 +206,7 @@ alter table schedule_shifts add column if not exists opened_at timestamptz;
 create or replace function fn_schedule_shift_opened_at()
 returns trigger
 language plpgsql
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   if new.status = 'open' then
@@ -190,7 +249,9 @@ create table if not exists open_shift_claims (
   updated_at timestamptz not null default now(),
   deleted_at timestamptz,
   constraint open_shift_claims_decision_shape
-    check ((claim_status in ('approved', 'denied')) = (decided_at is not null))
+    check ((claim_status in ('approved', 'denied')) = (decided_at is not null)),
+  constraint open_shift_claims_text_length
+    check (char_length(decision_reason) <= 2000)
 );
 
 create table if not exists shift_swap_requests (
@@ -207,6 +268,10 @@ create table if not exists shift_swap_requests (
   manager_id uuid references app_users(id),
   decided_at timestamptz,
   decision_reason text,
+  -- The named colleague's answer (set only by internal.respond_to_shift_swap):
+  -- a swap or named pickup cannot be approved before target_accepted_at.
+  target_accepted_at timestamptz,
+  target_declined_at timestamptz,
   created_by uuid references app_users(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -216,7 +281,13 @@ create table if not exists shift_swap_requests (
     or (swap_type = 'drop_pickup' and requested_assignment_id is null)
   ),
   constraint shift_swap_requests_decision_shape
-    check ((status in ('approved', 'denied')) = (decided_at is not null))
+    check ((status in ('approved', 'denied')) = (decided_at is not null)),
+  constraint shift_swap_requests_target_response_shape check (
+    (target_accepted_at is null or target_declined_at is null)
+    and ((target_accepted_at is null and target_declined_at is null) or target_employee_id is not null)
+  ),
+  constraint shift_swap_requests_text_length
+    check (char_length(reason) <= 2000 and char_length(decision_reason) <= 2000)
 );
 
 create table if not exists time_off_requests (
@@ -240,7 +311,9 @@ create table if not exists time_off_requests (
   -- One-directional: an approved request the employee later cancels keeps its
   -- decided_at as the record of the original decision.
   constraint time_off_requests_decision_shape
-    check (status not in ('approved', 'denied') or decided_at is not null)
+    check (status not in ('approved', 'denied') or decided_at is not null),
+  constraint time_off_requests_text_length
+    check (char_length(reason) <= 2000 and char_length(decision_notes) <= 2000)
 );
 
 create table if not exists employee_availability (
@@ -313,7 +386,7 @@ returns boolean
 language sql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select exists (
     select 1
@@ -358,14 +431,31 @@ create policy "employees can read shifts they are assigned to" on schedule_shift
   for select
   using (
     deleted_at is null
+    and internal.fn_shift_period_published(id)
     and exists (
       select 1
       from shift_assignments a
       join employees e on e.id = a.employee_id
       where a.shift_id = schedule_shifts.id
         and a.status in ('pending', 'approved')
+        and a.deleted_at is null
+        and e.facility_id = schedule_shifts.facility_id
         and e.user_id = (select auth.uid())
     )
+  );
+
+-- Facility members read PUBLISHED periods (the week header the self-service
+-- lists key on) and nothing else about the planning table: draft, review and
+-- archived periods stay behind schedule.read / schedule.manage. Additive: the
+-- existing "schedule readers can read periods" and manage policies are
+-- untouched.
+drop policy if exists "members can read published schedule periods" on schedule_periods;
+create policy "members can read published schedule periods" on schedule_periods
+  for select
+  using (
+    facility_id in (select internal.current_facility_ids())
+    and deleted_at is null
+    and status = 'published'
   );
 
 -- ---------------------------------------------------------------------------
@@ -452,6 +542,23 @@ create policy "requesters can read their own swap requests" on shift_swap_reques
     and exists (
       select 1 from employees e
       where e.id = shift_swap_requests.requester_employee_id
+        and e.facility_id = shift_swap_requests.facility_id
+        and e.user_id = (select auth.uid())
+    )
+  );
+
+-- The named colleague reads the requests addressed to them (they cannot
+-- answer a request they cannot see); answering goes through
+-- internal.respond_to_shift_swap, not a table write.
+drop policy if exists "targets can read swap requests addressed to them" on shift_swap_requests;
+create policy "targets can read swap requests addressed to them" on shift_swap_requests
+  for select
+  using (
+    deleted_at is null
+    and target_employee_id is not null
+    and exists (
+      select 1 from employees e
+      where e.id = shift_swap_requests.target_employee_id
         and e.facility_id = shift_swap_requests.facility_id
         and e.user_id = (select auth.uid())
     )
@@ -653,7 +760,7 @@ create policy "employees can update their own availability" on employee_availabi
 
 -- ---------------------------------------------------------------------------
 -- 7. Guard triggers. SECURITY DEFINER (they read shifts/assignments the
--- requesting employee cannot see through RLS), search_path = public, execute
+-- requesting employee cannot see through RLS), search_path = public, pg_temp, execute
 -- revoked from public/authenticated below (EXECUTE is checked at CREATE
 -- TRIGGER only). The decision marker: the decide_* RPCs stamp the
 -- transaction-local setting rr.schedule_decision with the id of the row they
@@ -666,7 +773,7 @@ create or replace function fn_open_shift_claim_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_shift schedule_shifts%rowtype;
@@ -809,7 +916,7 @@ create or replace function fn_shift_swap_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_requester employees%rowtype;
@@ -822,7 +929,8 @@ begin
   if tg_op = 'INSERT' then
     -- Guard 1: created pending with no decision data.
     if new.status <> 'pending' or new.manager_id is not null
-       or new.decided_at is not null or new.decision_reason is not null then
+       or new.decided_at is not null or new.decision_reason is not null
+       or new.target_accepted_at is not null or new.target_declined_at is not null then
       raise exception 'shift_swap_requests: a swap request must be created pending with no decision data.'
         using errcode = 'check_violation';
     end if;
@@ -914,13 +1022,17 @@ begin
 
   -- Guard 7: approved/denied/expired and every decision column are reachable
   -- only through internal.decide_shift_swap (or a future server-side expiry
-  -- job that stamps the same marker).
+  -- job that stamps the same marker); the named colleague's answer
+  -- (target_accepted_at / target_declined_at) only through
+  -- internal.respond_to_shift_swap, which stamps the same marker.
   if (new.status in ('approved', 'denied', 'expired') and new.status is distinct from old.status)
      or new.manager_id is distinct from old.manager_id
      or new.decided_at is distinct from old.decided_at
-     or new.decision_reason is distinct from old.decision_reason then
+     or new.decision_reason is distinct from old.decision_reason
+     or new.target_accepted_at is distinct from old.target_accepted_at
+     or new.target_declined_at is distinct from old.target_declined_at then
     if not v_decided_by_rpc then
-      raise exception 'shift_swap_requests %: a swap can only be decided through decide_shift_swap.', old.id
+      raise exception 'shift_swap_requests %: a swap can only be decided through decide_shift_swap (and answered through respond_to_shift_swap).', old.id
         using errcode = 'check_violation';
     end if;
   end if;
@@ -931,8 +1043,9 @@ begin
       using errcode = 'check_violation';
   end if;
 
-  -- Guard 9: cancellation is the requester's own act.
-  if new.status = 'cancelled' and old.status <> 'cancelled' then
+  -- Guard 9: cancellation is the requester's own act (or the named
+  -- colleague's recorded decline, which respond_to_shift_swap stamps).
+  if new.status = 'cancelled' and old.status <> 'cancelled' and not v_decided_by_rpc then
     if auth.uid() is null or not exists (
       select 1 from employees e where e.id = old.requester_employee_id and e.user_id = auth.uid()
     ) then
@@ -956,7 +1069,7 @@ create or replace function fn_time_off_request_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_employee employees%rowtype;
@@ -1069,7 +1182,7 @@ create or replace function fn_employee_availability_guard()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_employee employees%rowtype;
@@ -1173,7 +1286,7 @@ create or replace function internal.fn_enqueue_schedule_notification(
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   if p_employee_id is null then
@@ -1197,18 +1310,43 @@ end;
 $$;
 
 -- 9c. Publish notifications: one job per employee holding a live assignment
--- in the published period, enqueued in the SAME transaction as the
--- schedule_publications insert; one publication row fires this once.
-create or replace function fn_schedule_publication_notify()
+-- in the published period, enqueued in the SAME transaction that makes the
+-- period published at a version. It runs when the PERIOD row becomes (or is
+-- re-) published, not when a publication row is inserted, so it can only ever
+-- announce the period's current published version, and only a version that has
+-- its schedule_publications row. A period + version that already has a
+-- 'schedule.published' job is never announced again.
+create or replace function fn_schedule_period_publish_notify()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
-  v_week_start date;
+  v_publication_id uuid;
 begin
-  select week_start_date into v_week_start from schedule_periods where id = new.schedule_period_id;
+  if new.status <> 'published' or new.deleted_at is not null or coalesce(new.publish_version, 0) <= 0 then
+    return new;
+  end if;
+
+  select p.id into v_publication_id
+  from schedule_publications p
+  where p.schedule_period_id = new.id
+    and p.facility_id = new.facility_id
+    and p.publish_version = new.publish_version;
+  if not found then
+    return new;
+  end if;
+
+  if exists (
+    select 1 from notification_jobs j
+    where j.facility_id = new.facility_id
+      and j.event_type = 'schedule.published'
+      and j.payload_jsonb ->> 'periodId' = new.id::text
+      and j.payload_jsonb ->> 'publishVersion' = new.publish_version::text
+  ) then
+    return new;
+  end if;
 
   insert into notification_jobs (facility_id, event_type, status, dedupe_key, payload_jsonb)
   select
@@ -1217,13 +1355,13 @@ begin
     'pending',
     null,
     jsonb_build_object(
-      'sourceId', new.id,
-      'periodId', new.schedule_period_id,
+      'sourceId', v_publication_id,
+      'periodId', new.id,
       'publishVersion', new.publish_version,
       'recipients', jsonb_build_array(r.employee_id::text),
       'channels', jsonb_build_array('in_app'),
       'title', 'Schedule published',
-      'body', 'The schedule for the week of ' || coalesce(v_week_start::text, 'this period')
+      'body', 'The schedule for the week of ' || new.week_start_date::text
         || ' was published (version ' || new.publish_version::text || '). Check your shifts.'
     )
   from (
@@ -1231,7 +1369,7 @@ begin
     from shift_assignments a
     join schedule_shifts s on s.id = a.shift_id
     join employees e on e.id = a.employee_id
-    where s.schedule_period_id = new.schedule_period_id
+    where s.schedule_period_id = new.id
       and s.facility_id = new.facility_id
       and a.facility_id = new.facility_id
       and a.status in ('pending', 'approved')
@@ -1245,18 +1383,21 @@ begin
 end;
 $$;
 
-drop trigger if exists schedule_publications_notify on schedule_publications;
-create trigger schedule_publications_notify
-  after insert on schedule_publications
-  for each row execute function fn_schedule_publication_notify();
+drop trigger if exists schedule_periods_publish_notify on schedule_periods;
+create trigger schedule_periods_publish_notify
+  after update of status, publish_version on schedule_periods
+  for each row
+  when (new.status = 'published'
+        and (old.status is distinct from new.status or old.publish_version is distinct from new.publish_version))
+  execute function fn_schedule_period_publish_notify();
 
-revoke execute on function fn_schedule_publication_notify() from public, authenticated;
+revoke execute on function fn_schedule_period_publish_notify() from public, authenticated;
 revoke execute on function internal.fn_enqueue_schedule_notification(uuid, text, uuid, uuid, text, text, jsonb) from public, authenticated;
 
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
-    revoke execute on function fn_schedule_publication_notify() from anon;
+    revoke execute on function fn_schedule_period_publish_notify() from anon;
     revoke execute on function internal.fn_enqueue_schedule_notification(uuid, text, uuid, uuid, text, text, jsonb) from anon;
   end if;
 end
@@ -1288,7 +1429,7 @@ returns jsonb
 language plpgsql
 stable
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_shift schedule_shifts%rowtype;
@@ -1438,11 +1579,15 @@ create or replace function internal.fn_assign_employee_to_shift(
 returns uuid
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_id uuid;
 begin
+  -- Serialise every assignment of one employee (the decision RPCs already hold
+  -- this lock; taking it again in the same transaction is free).
+  perform 1 from employees where id = p_employee_id order by id for update;
+
   insert into shift_assignments (facility_id, shift_id, employee_id, assignment_type, status, assigned_by)
   values (
     p_facility_id, p_shift_id, p_employee_id, p_assignment_type, 'approved',
@@ -1458,6 +1603,75 @@ begin
 end;
 $$;
 
+-- Hard-block time off, enforced for EVERY writer of shift_assignments (the
+-- service role and the definer paths included): while the facility's
+-- scheduling.timeOffConflictMode is 'hard-block', a live assignment cannot be
+-- created -- or revived, or moved to another shift or employee -- for an
+-- employee who has approved time off overlapping the shift. SECURITY DEFINER
+-- because the writer (a schedule.manage holder without schedule.approve.time_off)
+-- cannot read time_off_requests, and the mode lives in tables only
+-- admin.manage can read. The employee row is locked first, the same lock the
+-- decision RPCs take before approving time off, so an approval and an
+-- assignment for one employee never interleave unseen.
+create or replace function fn_shift_assignment_time_off_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_shift schedule_shifts%rowtype;
+  v_mode text;
+  v_time_off uuid;
+begin
+  if new.deleted_at is not null or new.status not in ('pending', 'approved') then
+    return new;
+  end if;
+  if tg_op = 'UPDATE'
+     and old.deleted_at is null
+     and old.status in ('pending', 'approved')
+     and old.shift_id = new.shift_id
+     and old.employee_id = new.employee_id then
+    return new;
+  end if;
+
+  perform 1 from employees where id = new.employee_id order by id for update;
+
+  select * into v_shift from schedule_shifts where id = new.shift_id;
+  if not found or v_shift.deleted_at is not null or v_shift.status = 'cancelled' then
+    return new;
+  end if;
+
+  v_mode := coalesce(internal.fn_scheduling_setting(v_shift.facility_id, 'scheduling.timeOffConflictMode'), 'warning');
+  if v_mode <> 'hard-block' then
+    return new;
+  end if;
+
+  select t.id into v_time_off
+  from time_off_requests t
+  where t.employee_id = new.employee_id
+    and t.facility_id = v_shift.facility_id
+    and t.status = 'approved'
+    and t.deleted_at is null
+    and t.starts_at < v_shift.ends_at
+    and v_shift.starts_at < t.ends_at
+  limit 1;
+  if found then
+    raise exception 'shift_assignments: the employee has approved time off during this shift (scheduling.timeOffConflictMode is hard-block).'
+      using errcode = 'PT409', detail = jsonb_build_object('code', 'time_off', 'timeOffRequestId', v_time_off)::text;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists shift_assignments_time_off_guard on shift_assignments;
+create trigger shift_assignments_time_off_guard
+  before insert or update on shift_assignments
+  for each row execute function fn_shift_assignment_time_off_guard();
+
+revoke execute on function fn_shift_assignment_time_off_guard() from public, authenticated;
+revoke execute on function internal.get_scheduling_config_layers(uuid) from public;
+grant execute on function internal.get_scheduling_config_layers(uuid) to authenticated;
 revoke execute on function internal.fn_assignment_blockers(uuid, uuid, uuid[]) from public, authenticated;
 revoke execute on function internal.fn_assign_employee_to_shift(uuid, uuid, uuid, text, uuid) from public, authenticated;
 revoke execute on function internal.fn_scheduling_setting(uuid, text) from public, authenticated;
@@ -1466,6 +1680,8 @@ revoke execute on function internal.fn_scheduling_setting_int(uuid, text, intege
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke execute on function fn_shift_assignment_time_off_guard() from anon;
+    revoke execute on function internal.get_scheduling_config_layers(uuid) from anon;
     revoke execute on function internal.fn_assignment_blockers(uuid, uuid, uuid[]) from anon;
     revoke execute on function internal.fn_assign_employee_to_shift(uuid, uuid, uuid, text, uuid) from anon;
     revoke execute on function internal.fn_scheduling_setting(uuid, text) from anon;
@@ -1477,11 +1693,18 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- 11. internal.decide_open_shift_claim (SC-11).
--- Deny needs a reason. Approve re-validates, in this order, under the shift's
--- row lock: the shift is still open, unstarted and unfilled; the claimant is
--- still eligible (certifications, overlap, time off, availability); then in
--- ONE transaction creates the assignment, marks the shift assigned, decides
--- the claim and auto-denies every competing pending claim on that shift.
+-- Deny needs a reason. Approve re-validates, in this order, under the
+-- claimant's and the shift's row locks: the shift is still open, unstarted,
+-- unfilled and in a published period; the claim was filed inside the claim
+-- window; the claimant is still eligible (certifications, overlap, time off,
+-- availability); then in ONE transaction creates the assignment, marks the
+-- shift assigned, decides the claim and auto-denies every competing pending
+-- claim on that shift.
+-- The claim window is a limit on WHEN a claim may be filed (the insert guard
+-- enforces it against the server-owned opened_at); a manager may legitimately
+-- decide after the window has closed, so approval re-checks that the claim
+-- itself was filed inside the window as the facility's setting reads now, not
+-- that the window is still open at decision time.
 -- ---------------------------------------------------------------------------
 create or replace function internal.decide_open_shift_claim(
   p_request_id uuid,
@@ -1491,7 +1714,7 @@ create or replace function internal.decide_open_shift_claim(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1501,12 +1724,14 @@ declare
   v_shift schedule_shifts%rowtype;
   v_shift_id uuid;
   v_facility_id uuid;
+  v_claimant_id uuid;
   v_blockers jsonb;
   v_assignment_id uuid;
   v_actor_user uuid;
   v_sibling record;
   v_denied jsonb := '[]'::jsonb;
   v_target_status text;
+  v_window integer;
 begin
   if v_actor is null then
     raise exception 'decide_open_shift_claim: authentication required' using errcode = '28000';
@@ -1519,17 +1744,16 @@ begin
   end if;
   v_target_status := case v_decision when 'approve' then 'approved' else 'denied' end;
 
-  -- Unlocked read to learn the shift, then lock the shift FIRST (every
-  -- decision path locks shift -> request, so competing approvals serialise
-  -- and cannot deadlock), then lock and re-read the request.
-  select shift_id, facility_id into v_shift_id, v_facility_id
+  -- Unlocked read to learn the facility, shift and claimant. A missing id and
+  -- an id outside the caller's facilities answer identically.
+  select shift_id, facility_id, claimant_employee_id into v_shift_id, v_facility_id, v_claimant_id
   from open_shift_claims where id = p_request_id and deleted_at is null;
-  if not found then
-    raise exception 'decide_open_shift_claim: claim % not found', p_request_id using errcode = 'P0002';
+  if not found or v_facility_id not in (select internal.current_facility_ids()) then
+    raise exception 'decide_open_shift_claim: request not found' using errcode = 'P0002';
   end if;
 
   -- The permission is checked BEFORE any lock is taken, so an unauthorised
-  -- caller can neither hold a shift/claim lock nor learn anything else.
+  -- caller can neither hold a lock nor learn anything else.
   if not (
     internal.has_permission(v_actor, v_facility_id, 'schedule.manage.open_shifts')
     or internal.has_permission(v_actor, v_facility_id, 'schedule.manage')
@@ -1537,10 +1761,20 @@ begin
     raise exception 'decide_open_shift_claim: missing permission: schedule.manage.open_shifts' using errcode = '42501';
   end if;
 
+  -- A decider cannot be the claimant.
+  if exists (
+    select 1 from employees e
+    where e.id = v_claimant_id and e.facility_id = v_facility_id and e.user_id = v_actor
+  ) then
+    raise exception 'decide_open_shift_claim: you cannot decide a request you are a party to' using errcode = '42501';
+  end if;
+
+  -- Lock order everywhere: employee -> shift -> request.
+  perform 1 from employees where id = v_claimant_id order by id for update;
   select * into v_shift from schedule_shifts where id = v_shift_id for update;
   select * into v_claim from open_shift_claims where id = p_request_id and deleted_at is null for update;
   if not found then
-    raise exception 'decide_open_shift_claim: claim % not found', p_request_id using errcode = 'P0002';
+    raise exception 'decide_open_shift_claim: request not found' using errcode = 'P0002';
   end if;
 
   -- Idempotent replay: the same decision again returns the stored row.
@@ -1578,6 +1812,19 @@ begin
   end if;
   if v_shift.starts_at <= now() then
     raise exception 'decide_open_shift_claim: the shift has already started' using errcode = 'PT409';
+  end if;
+  if not internal.fn_shift_period_published(v_shift.id) then
+    raise exception 'decide_open_shift_claim: the shift is no longer in a published schedule period' using errcode = 'PT409';
+  end if;
+  v_window := internal.fn_scheduling_setting_int(v_claim.facility_id, 'scheduling.openShiftClaimWindowHours', 48);
+  if v_claim.created_at > coalesce(v_shift.opened_at, v_shift.updated_at) + make_interval(hours => v_window) then
+    raise exception 'decide_open_shift_claim: the claim was filed after the claim window for this shift closed' using errcode = 'PT409';
+  end if;
+  if exists (
+    select 1 from shift_assignments a
+    where a.shift_id = v_shift.id and a.status in ('pending', 'approved') and a.deleted_at is null
+  ) then
+    raise exception 'decide_open_shift_claim: the shift already has an assignment' using errcode = 'PT409';
   end if;
 
   v_blockers := internal.fn_assignment_blockers(v_claim.claimant_employee_id, v_shift.id, '{}'::uuid[]);
@@ -1629,10 +1876,12 @@ $$;
 -- 12. internal.decide_shift_swap (SC-12).
 -- direct: requester's offered assignment <-> target's requested assignment.
 -- drop_pickup: the offered assignment moves to the named target, or, with no
--- target, is cancelled and the shift reopened. Approval re-validates that
--- both assignments are STILL the live assignments the request named (a
--- reassigned or cancelled one makes the swap stale -> 409), then
--- certifications / overlap / time off / availability for BOTH incoming
+-- target, is cancelled and the shift reopened. A request that names a
+-- colleague cannot be APPROVED before that colleague accepted it
+-- (internal.respond_to_shift_swap); a denial never waits for them. Approval
+-- re-validates that both assignments are STILL the live assignments the
+-- request named (a reassigned or cancelled one makes the swap stale -> 409),
+-- then certifications / overlap / time off / availability for BOTH incoming
 -- employees, ignoring the two assignments the swap itself removes.
 -- ---------------------------------------------------------------------------
 create or replace function internal.decide_shift_swap(
@@ -1643,7 +1892,7 @@ create or replace function internal.decide_shift_swap(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
@@ -1676,8 +1925,8 @@ begin
   v_target_status := case v_decision when 'approve' then 'approved' else 'denied' end;
 
   select * into v_swap from shift_swap_requests where id = p_request_id and deleted_at is null;
-  if not found then
-    raise exception 'decide_shift_swap: swap request % not found', p_request_id using errcode = 'P0002';
+  if not found or v_swap.facility_id not in (select internal.current_facility_ids()) then
+    raise exception 'decide_shift_swap: request not found' using errcode = 'P0002';
   end if;
 
   if not (
@@ -1687,13 +1936,29 @@ begin
     raise exception 'decide_shift_swap: missing permission: schedule.approve.swaps' using errcode = '42501';
   end if;
 
-  -- Lock the shifts the swap touches (ascending id), then the request.
+  -- A decider cannot be either party to the swap.
+  if exists (
+    select 1 from employees e
+    where e.facility_id = v_swap.facility_id and e.user_id = v_actor
+      and e.id in (v_swap.requester_employee_id, coalesce(v_swap.target_employee_id, v_swap.requester_employee_id))
+  ) then
+    raise exception 'decide_shift_swap: you cannot decide a request you are a party to' using errcode = '42501';
+  end if;
+
+  -- Lock order everywhere: employees (ascending id) -> shifts (ascending id)
+  -- -> request.
+  perform 1 from employees
+    where id = any (array_remove(array[v_swap.requester_employee_id, v_swap.target_employee_id], null))
+    order by id for update;
   select array_agg(distinct a.shift_id order by a.shift_id) into v_shift_ids
   from shift_assignments a
   where a.id in (v_swap.offered_assignment_id, coalesce(v_swap.requested_assignment_id, v_swap.offered_assignment_id));
   perform 1 from schedule_shifts where id = any (coalesce(v_shift_ids, '{}'::uuid[])) order by id for update;
 
   select * into v_swap from shift_swap_requests where id = p_request_id and deleted_at is null for update;
+  if not found then
+    raise exception 'decide_shift_swap: request not found' using errcode = 'P0002';
+  end if;
 
   if v_swap.status = v_target_status then
     return jsonb_build_object('request', to_jsonb(v_swap), 'decided', false, 'replay', true,
@@ -1701,6 +1966,9 @@ begin
   end if;
   if v_swap.status <> 'pending' then
     raise exception 'decide_shift_swap: swap request is already %', v_swap.status using errcode = 'PT409';
+  end if;
+  if v_decision = 'approve' and v_swap.target_employee_id is not null and v_swap.target_accepted_at is null then
+    raise exception 'decide_shift_swap: the colleague named in this request has not accepted it yet' using errcode = 'PT409';
   end if;
 
   select u.id into v_actor_user from app_users u where u.id = v_actor;
@@ -1801,11 +2069,94 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 12b. internal.respond_to_shift_swap: the named colleague's consent. ONLY the
+-- employee a pending request names as its target can call it (anyone else,
+-- the requester included, gets the same not-found as a missing id).
+-- 'accept' stamps target_accepted_at (decide_shift_swap needs it before an
+-- approval); 'decline' stamps target_declined_at and ends the request
+-- (status 'cancelled'). Repeating the same answer is a replay; the opposite
+-- answer, or any answer to a request that is no longer pending, is a 409.
+-- ---------------------------------------------------------------------------
+create or replace function internal.respond_to_shift_swap(
+  p_request_id uuid,
+  p_response text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := auth.uid();
+  v_response text := lower(btrim(coalesce(p_response, '')));
+  v_swap shift_swap_requests%rowtype;
+begin
+  if v_actor is null then
+    raise exception 'respond_to_shift_swap: authentication required' using errcode = '28000';
+  end if;
+  if v_response not in ('accept', 'decline') then
+    raise exception 'respond_to_shift_swap: response must be accept or decline' using errcode = '22023';
+  end if;
+
+  select * into v_swap from shift_swap_requests where id = p_request_id and deleted_at is null;
+  if not found or v_swap.target_employee_id is null or not exists (
+    select 1 from employees e
+    where e.id = v_swap.target_employee_id and e.facility_id = v_swap.facility_id
+      and e.user_id = v_actor and e.deleted_at is null and e.status = 'active'
+  ) then
+    raise exception 'respond_to_shift_swap: request not found' using errcode = 'P0002';
+  end if;
+
+  select * into v_swap from shift_swap_requests where id = p_request_id and deleted_at is null for update;
+  if not found then
+    raise exception 'respond_to_shift_swap: request not found' using errcode = 'P0002';
+  end if;
+
+  if v_response = 'accept' and v_swap.target_accepted_at is not null then
+    return jsonb_build_object('request', to_jsonb(v_swap), 'replay', true);
+  end if;
+  if v_response = 'decline' and v_swap.target_declined_at is not null then
+    return jsonb_build_object('request', to_jsonb(v_swap), 'replay', true);
+  end if;
+  if v_swap.status <> 'pending' or v_swap.target_accepted_at is not null or v_swap.target_declined_at is not null then
+    raise exception 'respond_to_shift_swap: this request can no longer be answered' using errcode = 'PT409';
+  end if;
+  if v_swap.swap_type = 'direct' and v_response = 'accept' and not exists (
+    select 1 from shift_assignments a
+    where a.id = v_swap.requested_assignment_id and a.employee_id = v_swap.target_employee_id
+      and a.status in ('pending', 'approved') and a.deleted_at is null
+  ) then
+    raise exception 'respond_to_shift_swap: your assignment named in this request has changed' using errcode = 'PT409';
+  end if;
+
+  perform set_config('rr.schedule_decision', v_swap.id::text, true);
+  if v_response = 'accept' then
+    update shift_swap_requests set target_accepted_at = now() where id = v_swap.id returning * into v_swap;
+  else
+    update shift_swap_requests set target_declined_at = now(), status = 'cancelled' where id = v_swap.id returning * into v_swap;
+  end if;
+  perform set_config('rr.schedule_decision', '', true);
+
+  perform internal.fn_enqueue_schedule_notification(
+    v_swap.facility_id, 'schedule.swap_decided', v_swap.id, v_swap.requester_employee_id,
+    case v_response when 'accept' then 'Shift swap accepted' else 'Shift swap declined' end,
+    case v_response
+      when 'accept' then 'Your colleague accepted your shift swap request; it now awaits manager approval.'
+      else 'Your colleague declined your shift swap request.'
+    end,
+    jsonb_build_object('requestType', 'shift_swap', 'decision', case v_response when 'accept' then 'accepted' else 'declined' end));
+
+  return jsonb_build_object('request', to_jsonb(v_swap), 'replay', false);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 13. internal.decide_time_off_request (SC-13). Needs the dedicated
--- schedule.approve.time_off code (schedule.manage does NOT satisfy it). The
--- employee's own live assignments overlapping the window are returned as
--- warnings -- or, when scheduling.timeOffConflictMode is 'hard-block', block
--- the approval until a manager has reassigned them.
+-- schedule.approve.time_off code (schedule.manage does NOT satisfy it) and a
+-- decider who is not the requesting employee. The employee's own live
+-- assignments overlapping the window are returned as warnings -- or, when
+-- scheduling.timeOffConflictMode is 'hard-block', block the approval until a
+-- manager has reassigned them.
 -- ---------------------------------------------------------------------------
 create or replace function internal.decide_time_off_request(
   p_request_id uuid,
@@ -1815,13 +2166,15 @@ create or replace function internal.decide_time_off_request(
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   v_actor uuid := auth.uid();
   v_decision text := lower(btrim(coalesce(p_decision, '')));
   v_reason text := nullif(btrim(coalesce(p_reason, '')), '');
   v_request time_off_requests%rowtype;
+  v_facility_id uuid;
+  v_employee_id uuid;
   v_employee employees%rowtype;
   v_actor_user uuid;
   v_mode text;
@@ -1839,13 +2192,30 @@ begin
   end if;
   v_target_status := case v_decision when 'approve' then 'approved' else 'denied' end;
 
-  select * into v_request from time_off_requests where id = p_request_id and deleted_at is null for update;
-  if not found then
-    raise exception 'decide_time_off_request: request % not found', p_request_id using errcode = 'P0002';
+  -- Unlocked read, then the permission check, BEFORE any lock.
+  select facility_id, employee_id into v_facility_id, v_employee_id
+  from time_off_requests where id = p_request_id and deleted_at is null;
+  if not found or v_facility_id not in (select internal.current_facility_ids()) then
+    raise exception 'decide_time_off_request: request not found' using errcode = 'P0002';
   end if;
 
-  if not internal.has_permission(v_actor, v_request.facility_id, 'schedule.approve.time_off') then
+  if not internal.has_permission(v_actor, v_facility_id, 'schedule.approve.time_off') then
     raise exception 'decide_time_off_request: missing permission: schedule.approve.time_off' using errcode = '42501';
+  end if;
+
+  -- A decider cannot approve or deny their own time off.
+  if exists (
+    select 1 from employees e
+    where e.id = v_employee_id and e.facility_id = v_facility_id and e.user_id = v_actor
+  ) then
+    raise exception 'decide_time_off_request: you cannot decide a request you are a party to' using errcode = '42501';
+  end if;
+
+  -- Lock order everywhere: employee -> shift -> request.
+  perform 1 from employees where id = v_employee_id order by id for update;
+  select * into v_request from time_off_requests where id = p_request_id and deleted_at is null for update;
+  if not found then
+    raise exception 'decide_time_off_request: request not found' using errcode = 'P0002';
   end if;
 
   if v_request.status = v_target_status then
@@ -1931,6 +2301,8 @@ revoke execute on function internal.decide_shift_swap(uuid, text, text) from pub
 grant execute on function internal.decide_shift_swap(uuid, text, text) to authenticated;
 revoke execute on function internal.decide_time_off_request(uuid, text, text) from public;
 grant execute on function internal.decide_time_off_request(uuid, text, text) to authenticated;
+revoke execute on function internal.respond_to_shift_swap(uuid, text) from public;
+grant execute on function internal.respond_to_shift_swap(uuid, text) to authenticated;
 
 do $$
 begin
@@ -1938,11 +2310,14 @@ begin
     revoke execute on function internal.decide_open_shift_claim(uuid, text, text) from anon;
     revoke execute on function internal.decide_shift_swap(uuid, text, text) from anon;
     revoke execute on function internal.decide_time_off_request(uuid, text, text) from anon;
+    revoke execute on function internal.respond_to_shift_swap(uuid, text) from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function internal.decide_open_shift_claim(uuid, text, text) to service_role;
     grant execute on function internal.decide_shift_swap(uuid, text, text) to service_role;
     grant execute on function internal.decide_time_off_request(uuid, text, text) to service_role;
+    grant execute on function internal.respond_to_shift_swap(uuid, text) to service_role;
+    grant execute on function internal.get_scheduling_config_layers(uuid) to service_role;
   end if;
 end
 $$;
@@ -1955,7 +2330,7 @@ create or replace function public.decide_open_shift_claim(
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.decide_open_shift_claim(p_request_id, p_decision, p_reason);
 $$;
@@ -1968,7 +2343,7 @@ create or replace function public.decide_shift_swap(
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.decide_shift_swap(p_request_id, p_decision, p_reason);
 $$;
@@ -1981,9 +2356,31 @@ create or replace function public.decide_time_off_request(
 returns jsonb
 language sql
 security invoker
-set search_path = public
+set search_path = public, pg_temp
 as $$
   select internal.decide_time_off_request(p_request_id, p_decision, p_reason);
+$$;
+
+create or replace function public.respond_to_shift_swap(
+  p_request_id uuid,
+  p_response text
+)
+returns jsonb
+language sql
+security invoker
+set search_path = public, pg_temp
+as $$
+  select internal.respond_to_shift_swap(p_request_id, p_response);
+$$;
+
+create or replace function public.get_scheduling_config_layers(p_facility_id uuid)
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  select internal.get_scheduling_config_layers(p_facility_id);
 $$;
 
 revoke execute on function public.decide_open_shift_claim(uuid, text, text) from public;
@@ -1992,6 +2389,10 @@ revoke execute on function public.decide_shift_swap(uuid, text, text) from publi
 grant execute on function public.decide_shift_swap(uuid, text, text) to authenticated;
 revoke execute on function public.decide_time_off_request(uuid, text, text) from public;
 grant execute on function public.decide_time_off_request(uuid, text, text) to authenticated;
+revoke execute on function public.respond_to_shift_swap(uuid, text) from public;
+grant execute on function public.respond_to_shift_swap(uuid, text) to authenticated;
+revoke execute on function public.get_scheduling_config_layers(uuid) from public;
+grant execute on function public.get_scheduling_config_layers(uuid) to authenticated;
 
 do $$
 begin
@@ -1999,11 +2400,15 @@ begin
     revoke execute on function public.decide_open_shift_claim(uuid, text, text) from anon;
     revoke execute on function public.decide_shift_swap(uuid, text, text) from anon;
     revoke execute on function public.decide_time_off_request(uuid, text, text) from anon;
+    revoke execute on function public.respond_to_shift_swap(uuid, text) from anon;
+    revoke execute on function public.get_scheduling_config_layers(uuid) from anon;
   end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function public.decide_open_shift_claim(uuid, text, text) to service_role;
     grant execute on function public.decide_shift_swap(uuid, text, text) to service_role;
     grant execute on function public.decide_time_off_request(uuid, text, text) to service_role;
+    grant execute on function public.respond_to_shift_swap(uuid, text) to service_role;
+    grant execute on function public.get_scheduling_config_layers(uuid) to service_role;
   end if;
 end
 $$;

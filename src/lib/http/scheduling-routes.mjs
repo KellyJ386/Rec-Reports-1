@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate, PostgrestError } from "../supabase-rest.mjs";
+import { pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { makeGuards } from "./guard.mjs";
 import {
   summarizeScheduleReadiness,
@@ -59,15 +59,6 @@ const SCHEDULING_SETTING_DEFINITIONS = settingsForModule(SCHEDULING_MODULE_CODE)
 // facility_module_overrides, facility overrides winning over org winning
 // over the registry default). Module scope (and exported) since Wave 3 3D so
 // scheduling-self-service-routes.mjs reads the same live settings. ----------
-async function loadModuleByCode(client, code) {
-  const rows = await pgSelect(client, "modules", {
-    filters: { code },
-    select: "id,code",
-    limit: 1
-  });
-  return (rows ?? [])[0] ?? null;
-}
-
 // Selects timezone alongside organization_id so the SC-03 generate route can
 // reuse this same lookup for expandTemplates' DST-safe local->UTC conversion
 // instead of issuing a second facilities query.
@@ -82,32 +73,20 @@ export async function loadFacilityOrgId(client, facilityId) {
 
 // Resolve the facility's effective scheduling config (flat key -> value map,
 // registry defaults filled in) so summarizeScheduleReadiness's
-// conflictCheckEnabled/certEnforcementMode reflect live admin settings
-// instead of the hard-coded defaults. Any lookup failure (module row
-// missing, facility missing) degrades to {} -- summarizeScheduleReadiness's
-// configValue() already falls back to registry defaults for an empty map, so
-// this stays backward compatible rather than failing the request.
+// conflictCheckEnabled/certEnforcementMode and the 3D time-off / claim-window
+// modes reflect live admin settings instead of the hard-coded defaults.
+//
+// The two layers come from get_scheduling_config_layers (0062), a definer
+// function that serves ONLY the `scheduling.*` keys to any member of the
+// facility. Reading organization_module_settings / facility_module_overrides
+// through the caller's own client would return nothing for everyone without
+// admin.manage, silently turning a hard-block mode into its default. An RPC
+// failure is NOT swallowed (it propagates like any other failed read), so a
+// broken lookup can never quietly fall back to the permissive defaults.
 export async function loadSchedulingConfig(client, facilityId) {
-  const module = await loadModuleByCode(client, SCHEDULING_MODULE_CODE);
-  if (!module) return {};
-  const facility = await loadFacilityOrgId(client, facilityId);
-
-  let orgLayer = {};
-  if (facility?.organization_id) {
-    const orgRows = await pgSelect(client, "organization_module_settings", {
-      filters: { organization_id: facility.organization_id, module_id: module.id },
-      select: "config_jsonb",
-      limit: 1
-    });
-    orgLayer = (orgRows ?? [])[0]?.config_jsonb ?? {};
-  }
-  const facRows = await pgSelect(client, "facility_module_overrides", {
-    filters: { facility_id: facilityId, module_id: module.id },
-    select: "config_patch_jsonb",
-    limit: 1
-  });
-  const facilityLayer = (facRows ?? [])[0]?.config_patch_jsonb ?? {};
-
+  const layers = await pgRpc(client, "get_scheduling_config_layers", { p_facility_id: facilityId });
+  const orgLayer = layers && typeof layers.orgLayer === "object" && layers.orgLayer ? layers.orgLayer : {};
+  const facilityLayer = layers && typeof layers.facilityLayer === "object" && layers.facilityLayer ? layers.facilityLayer : {};
   return effectiveConfig({ orgLayer, facilityLayer, definitions: SCHEDULING_SETTING_DEFINITIONS });
 }
 
@@ -966,6 +945,11 @@ export function registerSchedulingRoutes(router, { authenticate, sendJson, readB
           return sendJson(response, 201, (rows ?? [])[0] ?? null);
         } catch (err) {
           if (err instanceof PostgrestError && err.status === 409) {
+            // PT409 is the database's own conflict rule (e.g. approved time
+            // off in hard-block mode); anything else is the unique key.
+            if (String(err.body?.code ?? "") === "PT409" && typeof err.body?.message === "string") {
+              return sendJson(response, 409, { error: err.body.message });
+            }
             return sendJson(response, 409, {
               error: "employee is already assigned to this shift with this assignment type"
             });

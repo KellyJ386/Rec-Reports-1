@@ -55,7 +55,7 @@ const PERIOD_COLUMNS = "id,facility_id,week_start_date,week_end_date,status,publ
 const CLAIM_COLUMNS =
   "id,facility_id,shift_id,claimant_employee_id,claim_status,manager_id,decided_at,decision_reason,created_at,updated_at,deleted_at";
 const SWAP_COLUMNS =
-  "id,facility_id,offered_assignment_id,requested_assignment_id,requester_employee_id,target_employee_id,swap_type,status,reason,manager_id,decided_at,decision_reason,created_at,updated_at,deleted_at";
+  "id,facility_id,offered_assignment_id,requested_assignment_id,requester_employee_id,target_employee_id,swap_type,status,reason,manager_id,decided_at,decision_reason,target_accepted_at,target_declined_at,created_at,updated_at,deleted_at";
 const TIME_OFF_COLUMNS =
   "id,facility_id,employee_id,starts_at,ends_at,request_type,status,reason,manager_id,decided_at,decision_notes,created_at,updated_at,deleted_at";
 const AVAILABILITY_COLUMNS =
@@ -67,6 +67,9 @@ const LIVE_ASSIGNMENT_STATUSES = ["pending", "approved"];
 
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
+// The approvals queue merges three tables in memory, so the page window
+// (limit + offset) is bounded.
+const MAX_LIST_OFFSET = 1000;
 const OPEN_SHIFT_LIST_LIMIT = 200;
 
 // One entry per request kind: the REST path segment, table, status column,
@@ -104,6 +107,8 @@ const KINDS = Object.freeze({
     statuses: ["pending", "approved", "denied", "cancelled"]
   }
 });
+
+const SWAP_RESPONSES = Object.freeze(["accept", "decline"]);
 
 const ALL_APPROVAL_STATUSES = [...new Set(Object.values(KINDS).flatMap((kind) => kind.statuses))];
 
@@ -316,7 +321,7 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
           })
         : [];
 
-      const [assignments, claims, swaps, timeOff, config] = await Promise.all([
+      const [assignments, claims, swaps, incomingSwapRows, timeOff, config] = await Promise.all([
         // Scoped to the caller's own employee row IN THE QUERY (and again in
         // buildMySchedule), so a schedule.read holder never receives a
         // colleague's assignment from this route.
@@ -337,6 +342,15 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
           order: "created_at.desc",
           limit: MAX_LIST_LIMIT
         }),
+        // Requests that NAME the caller as the colleague who must accept
+        // (RLS lets the named employee read exactly these).
+        pgSelect(auth.client, "shift_swap_requests", {
+          filters: { facility_id: facilityId, target_employee_id: employeeId, status: "pending" },
+          select: SWAP_COLUMNS,
+          extra: { deleted_at: "is.null" },
+          order: "created_at.desc",
+          limit: MAX_LIST_LIMIT
+        }),
         pgSelect(auth.client, "time_off_requests", {
           filters: { facility_id: facilityId, employee_id: employeeId },
           select: TIME_OFF_COLUMNS,
@@ -345,6 +359,17 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
         }),
         loadSchedulingConfig(auth.client, facilityId)
       ]);
+
+      // Who is asking, by name (employee names are readable by every member).
+      const incomingSwaps = incomingSwapRows ?? [];
+      let requesterNames = new Map();
+      if (incomingSwaps.length > 0) {
+        const requesters = await pgSelect(auth.client, "employees", {
+          filters: { facility_id: facilityId, id: { in: [...new Set(incomingSwaps.map((swap) => swap.requester_employee_id))] } },
+          select: EMPLOYEE_NAME_COLUMNS
+        });
+        requesterNames = new Map((requesters ?? []).map((row) => [row.id, `${row.first_name} ${row.last_name}`.trim()]));
+      }
 
       return sendJson(
         response,
@@ -357,6 +382,10 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
           assignments: assignments ?? [],
           claims: claims ?? [],
           swaps: swaps ?? [],
+          incomingSwaps: incomingSwaps.map((swap) => ({
+            ...swap,
+            requester_name: requesterNames.get(swap.requester_employee_id) ?? null
+          })),
           timeOff: timeOff ?? [],
           claimWindowHours: configValue(config, "scheduling.openShiftClaimWindowHours")
         })
@@ -690,6 +719,32 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
     );
   }
 
+  // The colleague a swap or named pickup NAMES answers it: POST
+  // .../shift-swaps/:requestId/{accept|decline}, no body. Only the named
+  // employee can (the RPC answers anyone else with the same 404 as a missing
+  // id); a request must be accepted before a manager can approve it.
+  for (const answer of SWAP_RESPONSES) {
+    router.register("POST", `/facilities/:facilityId/shift-swaps/:requestId/${answer}`, (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        if (!requireMember(auth, params.facilityId, response)) return;
+        const row = await loadOne(auth.client, KINDS.swaps.table, "id,facility_id", {
+          id: params.requestId,
+          facility_id: params.facilityId
+        });
+        if (!row) return sendJson(response, 404, { error: "request not found" });
+        let result;
+        try {
+          result = await pgRpc(auth.client, "respond_to_shift_swap", { p_request_id: row.id, p_response: answer });
+        } catch (error) {
+          const mapped = requestErrorResponse(error);
+          if (mapped) return sendJson(response, mapped.status, mapped.body);
+          throw error;
+        }
+        return sendJson(response, 200, result);
+      })
+    );
+  }
+
   // =================================================================================
   // Manager side
   // =================================================================================
@@ -711,6 +766,9 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
       }
       const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIST_LIMIT, maxLimit: MAX_LIST_LIMIT });
       if (!paging.ok) return sendJson(response, 400, { error: paging.error });
+      if (paging.offset > MAX_LIST_OFFSET) {
+        return sendJson(response, 400, { error: `offset must be at most ${MAX_LIST_OFFSET}` });
+      }
 
       const permitted = Object.values(KINDS).filter((kind) => hasAny(auth, params.facilityId, kind.approverCodes));
       let selected = permitted;
@@ -896,6 +954,22 @@ export function registerSchedulingSelfServiceRoutes(router, { authenticate, send
             facility_id: params.facilityId
           });
           if (!row) return sendJson(response, 404, { error: "request not found" });
+
+          // A swap that names a colleague waits for that colleague's answer
+          // (the RPC enforces the same rule; this gives the caller the
+          // structured 409 first).
+          if (
+            decision === "approve" &&
+            kind.key === "swaps" &&
+            row.status === "pending" &&
+            row.target_employee_id &&
+            !row.target_accepted_at
+          ) {
+            return sendJson(response, 409, {
+              error: "the colleague named in this request has not accepted it yet",
+              awaitingTarget: true
+            });
+          }
 
           if (decision === "approve" && row[kind.statusColumn] === "pending") {
             const blocked = await preflightApproval(auth, kind, row);

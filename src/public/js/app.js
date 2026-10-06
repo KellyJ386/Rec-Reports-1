@@ -90,6 +90,7 @@ import {
   canCancelRequest,
   claimActionState,
   describeApprovalItem,
+  describeIncomingSwap,
   describeIssue,
   deriveWorkforceBadges,
   describeShift,
@@ -97,6 +98,8 @@ import {
   requestStatusBadge,
   shiftWeek,
   summarizeDecisionResult,
+  summarizeSwapAnswer,
+  swapAnswerPath,
   validateAvailabilityForm,
   validateDenial,
   validateSwapForm,
@@ -2478,6 +2481,26 @@ const mySchedulePanel = (function () {
     time_off: (id) => `time-off-requests/${id}/cancel`
   };
 
+  // The colleague a swap names answers it (accept / decline); the server
+  // only lets that employee do so.
+  async function answerSwap(swap, answer) {
+    const path = swapAnswerPath(currentFacility, swap, answer);
+    if (!path || state.busy) return false;
+    state.busy = true;
+    say("Working…");
+    try {
+      const result = await apiFetch(path, { method: "POST" });
+      state.busy = false;
+      await refresh();
+      say(summarizeSwapAnswer(result, answer));
+      return true;
+    } catch (error) {
+      state.busy = false;
+      say(describeRequestFailure(error), true);
+      return false;
+    }
+  }
+
   function cancelRequest(kind, id) {
     return perform("Request cancelled.", () =>
       apiFetch(`/facilities/${currentFacility}/${CANCEL_PATHS[kind](id)}`, { method: "POST" })
@@ -2769,6 +2792,27 @@ const mySchedulePanel = (function () {
     if (state.form === "time-off") content.append(buildTimeOffForm());
     if (state.availabilityOpen && state.availabilityRows) content.append(buildAvailabilityEditor());
 
+    // Requests that name me: the colleague has to answer before a manager can act.
+    const incoming = view.incomingSwaps || [];
+    if (incoming.length > 0) {
+      const forYou = el("section", { "aria-label": "Requests waiting for your answer" });
+      forYou.append(el("h3", {}, "Waiting for your answer"));
+      for (const swap of incoming) {
+        const row = el("div", { class: "module-item" });
+        const description = describeIncomingSwap(swap);
+        row.append(el("strong", {}, description));
+        const accept = el("button", { type: "button", class: "primary", "aria-label": `Accept: ${description}` }, "Accept");
+        const decline = el("button", { type: "button", "aria-label": `Decline: ${description}` }, "Decline");
+        accept.disabled = state.busy;
+        decline.disabled = state.busy;
+        accept.addEventListener("click", () => answerSwap(swap, "accept"));
+        decline.addEventListener("click", () => answerSwap(swap, "decline"));
+        row.append(el("div", { class: "detail-actions" }, accept, decline));
+        forYou.append(row);
+      }
+      content.append(forYou);
+    }
+
     // My requests.
     const requests = el("section", { "aria-label": "My requests" });
     requests.append(el("h3", {}, "My requests"));
@@ -2898,7 +2942,8 @@ const approvalsPanel = (function () {
 
     const actions = el("div", { class: "detail-actions" });
     const approve = el("button", { type: "button", class: "primary", "aria-label": `Approve: ${description.title}` }, "Approve");
-    approve.disabled = state.busy;
+    approve.disabled = state.busy || Boolean(item.awaitingTarget);
+    if (item.awaitingTarget) approve.title = "The named colleague has not accepted yet.";
     approve.addEventListener("click", () => decide(item, "approve", null));
     const deny = el("button", { type: "button", "aria-label": `Deny: ${description.title}` }, "Deny…");
     deny.addEventListener("click", () => {

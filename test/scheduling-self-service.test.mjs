@@ -665,3 +665,53 @@ test("summarizeScheduleReadiness without the new options keeps its prior shape a
   assert.deepEqual(summary.availabilityConflicts, []);
   assert.equal(summary.canPublish, true);
 });
+
+// --- buildMySchedule: requests that name the caller ----------------------------------------------
+
+test("buildMySchedule returns only PENDING, unanswered requests that name the caller as incomingSwaps", () => {
+  const base = {
+    id: "sw",
+    requester_employee_id: "emp-2",
+    target_employee_id: "emp-1",
+    status: "pending",
+    target_accepted_at: null,
+    target_declined_at: null,
+    deleted_at: null
+  };
+  const view = buildMySchedule({
+    employeeId: "emp-1",
+    weekStartDate: "2026-08-03",
+    incomingSwaps: [
+      { ...base, id: "ok" },
+      { ...base, id: "answered", target_accepted_at: "2026-08-01T00:00:00Z" },
+      { ...base, id: "declined", target_declined_at: "2026-08-01T00:00:00Z" },
+      { ...base, id: "closed", status: "cancelled" },
+      { ...base, id: "deleted", deleted_at: "2026-08-01T00:00:00Z" },
+      { ...base, id: "someone-else", target_employee_id: "emp-3" },
+      { ...base, id: "own", requester_employee_id: "emp-1" }
+    ]
+  });
+  assert.deepEqual(view.incomingSwaps.map((swap) => swap.id), ["ok"]);
+  assert.deepEqual(buildMySchedule({ employeeId: "emp-1", weekStartDate: "2026-08-03" }).incomingSwaps, []);
+});
+
+test("buildApprovalItems flags a swap that still waits for its named colleague", () => {
+  const swap = {
+    id: "s1",
+    status: "pending",
+    swap_type: "direct",
+    requester_employee_id: "e1",
+    target_employee_id: "e2",
+    offered_assignment_id: "a1",
+    requested_assignment_id: "a2",
+    created_at: "2026-08-01T00:00:00Z"
+  };
+  const items = buildApprovalItems({
+    swaps: [swap, { ...swap, id: "s2", target_accepted_at: "2026-08-02T00:00:00Z" }, { ...swap, id: "s3", target_employee_id: null, swap_type: "drop_pickup", requested_assignment_id: null }]
+  });
+  const byId = Object.fromEntries(items.map((item) => [item.id, item]));
+  assert.equal(byId.s1.awaitingTarget, true);
+  assert.equal(byId.s2.awaitingTarget, false);
+  assert.equal(byId.s2.targetAcceptedAt, "2026-08-02T00:00:00Z");
+  assert.equal(byId.s3.awaitingTarget, false);
+});

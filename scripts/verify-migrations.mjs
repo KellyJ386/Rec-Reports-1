@@ -139,7 +139,11 @@ for (const helper of [
   "internal.decide_shift_swap",
   "public.decide_shift_swap",
   "internal.decide_time_off_request",
-  "public.decide_time_off_request"
+  "public.decide_time_off_request",
+  "internal.respond_to_shift_swap",
+  "public.respond_to_shift_swap",
+  "internal.get_scheduling_config_layers",
+  "public.get_scheduling_config_layers"
 ]) {
   if (!combinedSql.includes(`function ${helper}`)) {
     throw new Error(`Migrations do not define ${helper}.`);

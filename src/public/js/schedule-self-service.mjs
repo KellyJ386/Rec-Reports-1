@@ -230,6 +230,35 @@ export function buildAvailabilityPayload(rows, effectiveFrom) {
   };
 }
 
+// --- The colleague's answer (swap / named pickup) ------------------------------
+
+export const SWAP_ANSWERS = Object.freeze(["accept", "decline"]);
+
+// POST path for answering a request that NAMES the caller:
+// /facilities/:id/shift-swaps/:requestId/<accept|decline>.
+export function swapAnswerPath(facilityId, swap, answer) {
+  if (!swap?.id || !SWAP_ANSWERS.includes(answer)) return null;
+  return `/facilities/${encodeURIComponent(facilityId)}/shift-swaps/${encodeURIComponent(swap.id)}/${answer}`;
+}
+
+// One line for a request waiting on the caller (GET /me/schedule's
+// incomingSwaps rows, which carry requester_name).
+export function describeIncomingSwap(swap) {
+  const who = swap?.requester_name ?? "A colleague";
+  const note = swap?.reason ? ` Note: ${swap.reason}` : "";
+  if (swap?.swap_type === "direct") return `${who} asks to swap shifts with you.${note}`;
+  return `${who} asks you to take over a shift.${note}`;
+}
+
+// Status line after answering.
+export function summarizeSwapAnswer(result, answer) {
+  if (!result) return "";
+  if (result.replay) return "You already answered this request; nothing changed.";
+  return answer === "accept"
+    ? "Accepted. A manager still has to approve the change."
+    : "Declined. The request has been closed.";
+}
+
 // --- Approvals (manager) --------------------------------------------------------
 
 export const APPROVAL_TAB_DEFS = Object.freeze([
@@ -269,6 +298,9 @@ export function describeApprovalItem(item, options) {
   }
   if (item.type === "swaps") {
     const details = [`Gives up: ${describeShiftSummary(item.shift, options)}`];
+    if (item.awaitingTarget) {
+      details.push(`Waiting for ${item.targetEmployeeName ?? "the colleague"} to accept before it can be approved.`);
+    }
     if (item.swapType === "direct") {
       details.push(`Takes: ${describeShiftSummary(item.requestedShift, options)}`);
       return { title: `${who} wants to swap with ${item.targetEmployeeName ?? "a colleague"}`, details: withReason(details, item.reason) };

@@ -72,7 +72,25 @@ function stubFetch(t, respond) {
     const method = init.method;
     const body = init.body ? JSON.parse(init.body) : null;
     captured.push({ table, method, url: parsed, body });
-    const data = respond(table, method, parsed, body) ?? [];
+    // The settings tables are admin.manage-only (an ordinary caller's direct
+    // read returns ZERO rows); the BFF resolves them through the
+    // get_scheduling_config_layers definer RPC, emulated here from the
+    // fixtures a test registers under those table names.
+    let data;
+    if (table === "rpc/get_scheduling_config_layers") {
+      const onlyScheduling = (layer) =>
+        Object.fromEntries(Object.entries(layer ?? {}).filter(([key]) => key.startsWith("scheduling.")));
+      const orgRows = respond("organization_module_settings", "GET", parsed, null) ?? [];
+      const facilityRows = respond("facility_module_overrides", "GET", parsed, null) ?? [];
+      data = {
+        orgLayer: onlyScheduling(orgRows[0]?.config_jsonb),
+        facilityLayer: onlyScheduling(facilityRows[0]?.config_patch_jsonb)
+      };
+    } else if (table === "organization_module_settings" || table === "facility_module_overrides") {
+      data = [];
+    } else {
+      data = respond(table, method, parsed, body) ?? [];
+    }
     if (data && data.__http) {
       return { ok: false, status: data.__http.status, text: async () => JSON.stringify(data.__http.body) };
     }
@@ -115,7 +133,9 @@ function world(tables = {}) {
   };
 }
 
-const writes = (captured) => captured.filter((entry) => entry.method !== "GET");
+// get_scheduling_config_layers is a read-only definer RPC (a POST on the wire).
+const writes = (captured) =>
+  captured.filter((entry) => entry.method !== "GET" && entry.table !== "rpc/get_scheduling_config_layers");
 
 // ============================================================================
 // GET /me/schedule
@@ -594,6 +614,8 @@ const SWAP_ROW = {
   requested_assignment_id: "asg-2",
   requester_employee_id: "emp-1",
   target_employee_id: "emp-2",
+  target_accepted_at: "2035-01-02T06:00:00Z",
+  target_declined_at: null,
   swap_type: "direct",
   status: "pending",
   reason: null,
@@ -923,4 +945,239 @@ test("an unexpected RPC failure (500) is not swallowed into a 4xx", async (t) =>
   const kind = DECISION_KINDS[2];
   stubFetch(t, decisionWorld(kind, { extra: { [`rpc/${kind.rpc}`]: http(500, { code: "XX000", message: "boom" }) } }));
   await assert.rejects(() => mount({ memberships: FULL }).call("POST", "/facilities/fac-1/time-off-requests/req-1/approve", {}));
+});
+
+// ============================================================================
+// Review fixes: RLS-honest reads for plain members (F1), settings through the
+// definer RPC (M2), the colleague's consent on swaps (M1), the approvals
+// offset cap (L4).
+// ============================================================================
+
+const PUBLISHED_PERIOD = {
+  id: "per-1",
+  facility_id: "fac-1",
+  status: "published",
+  publish_version: 1,
+  week_start_date: "2035-03-05",
+  week_end_date: "2035-03-11",
+  deleted_at: null
+};
+const DRAFT_PERIOD = { ...PUBLISHED_PERIOD, id: "per-draft", status: "draft", publish_version: 0 };
+
+// Wraps a world so it answers the way the database does for a caller holding
+// `permissions`: without schedule.read/schedule.manage, schedule_periods
+// returns only PUBLISHED rows (the 0062 "members can read published schedule
+// periods" policy) -- a mock that hands a plain member the draft row, or that
+// returns periods the real policy would not, hides a defect. The two settings
+// tables answer with zero rows unless the caller holds admin.manage.
+function rlsFor(permissions, tables) {
+  const inner = world(tables);
+  const isReader = permissions.includes("schedule.read") || permissions.includes("schedule.manage");
+  return (table, method, url, body) => {
+    const rows = inner(table, method, url, body);
+    if (table === "schedule_periods" && !isReader) {
+      return (rows ?? []).filter((row) => row.status === "published" && !row.deleted_at);
+    }
+    return rows;
+  };
+}
+
+test("GET /me/schedule works for a plain member (no schedule.read): published period rows are readable, draft ones are not, settings come from the RPC", async (t) => {
+  const captured = stubFetch(
+    t,
+    rlsFor([], {
+      schedule_periods: [DRAFT_PERIOD, PUBLISHED_PERIOD],
+      schedule_shifts: [SHIFT_1_ASSIGNED, { ...SHIFT_2, schedule_period_id: "per-draft", id: "shift-draft" }],
+      shift_assignments: [ASSIGNMENT_1]
+    })
+  );
+  const result = await mount({ memberships: STAFF }).call("GET", "/me/schedule?facilityId=fac-1&week_start=2035-03-05");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.assignments.map((entry) => entry.assignment.id), ["asg-1"]);
+  assert.deepEqual(result.payload.assignments.map((entry) => entry.shift.id), ["shift-1"]);
+  // The route reads only the published period (the draft row is excluded both
+  // by the filter it sends and by the policy it relies on).
+  const periodQuery = captured.find((entry) => entry.table === "schedule_periods");
+  assert.equal(periodQuery.url.searchParams.get("status"), "eq.published");
+  // Settings: through the RPC, never a direct read of the admin-only tables.
+  assert.ok(captured.some((entry) => entry.table === "rpc/get_scheduling_config_layers" && entry.body.p_facility_id === "fac-1"));
+  for (const entry of captured) {
+    assert.ok(!["facility_module_overrides", "organization_module_settings", "modules"].includes(entry.table), `read ${entry.table} directly`);
+  }
+  assert.deepEqual(writes(captured), []);
+});
+
+test("GET open-shifts works for a plain member and applies the facility's claim window from the RPC-served settings", async (t) => {
+  stubFetch(
+    t,
+    rlsFor([], {
+      schedule_periods: [DRAFT_PERIOD, PUBLISHED_PERIOD],
+      schedule_shifts: [{ ...OPEN_SHIFT, opened_at: new Date(Date.now() - 72 * 3600 * 1000).toISOString() }],
+      facility_module_overrides: [{ config_patch_jsonb: { "scheduling.openShiftClaimWindowHours": 168, "communications.x": "ignored" } }]
+    })
+  );
+  const result = await mount({ memberships: STAFF }).call("GET", "/facilities/fac-1/open-shifts");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 1);
+  // 72h old: closed under the 48h default, open under the facility's 168h.
+  assert.equal(result.payload[0].claim_window_open, true);
+});
+
+test("POST open-shift-claims: a hard-block time-off mode set by an admin binds a plain member's pre-validation (the setting is not lost to RLS)", async (t) => {
+  const timeOff = {
+    id: "to-1",
+    facility_id: "fac-1",
+    employee_id: "emp-1",
+    starts_at: "2035-03-04T00:00:00Z",
+    ends_at: "2035-03-06T00:00:00Z",
+    status: "approved",
+    deleted_at: null
+  };
+  const base = {
+    schedule_shifts: [OPEN_SHIFT],
+    time_off_requests: [timeOff],
+    open_shift_claims: (method, url, body) => (method === "POST" ? body.map((row, index) => ({ id: `claim-${index}`, ...row })) : [])
+  };
+  const blockedCaptured = stubFetch(
+    t,
+    rlsFor([], { ...base, facility_module_overrides: [{ config_patch_jsonb: { "scheduling.timeOffConflictMode": "hard-block" } }] })
+  );
+  const blocked = await mount({ memberships: STAFF }).call("POST", "/facilities/fac-1/open-shift-claims", { shiftId: "shift-1" });
+  assert.equal(blocked.status, 409);
+  assert.ok(blocked.payload.blocking.some((entry) => entry.code === "time_off"));
+  assert.deepEqual(writes(blockedCaptured), []);
+  // Non-vacuous: the registry default (warning) lets the same claim through.
+  stubFetch(t, rlsFor([], base));
+  const allowed = await mount({ memberships: STAFF }).call("POST", "/facilities/fac-1/open-shift-claims", { shiftId: "shift-1" });
+  assert.equal(allowed.status, 201);
+  assert.ok(allowed.payload.warnings.some((entry) => entry.code === "time_off"));
+});
+
+test("GET /me/schedule lists the swap requests that NAME the caller and still await an answer, with the requester's name", async (t) => {
+  const incoming = { ...SWAP_ROW, id: "swap-in", requester_employee_id: "emp-2", target_employee_id: "emp-1", target_accepted_at: null };
+  const captured = stubFetch(
+    t,
+    rlsFor([], {
+      schedule_periods: [PUBLISHED_PERIOD],
+      shift_swap_requests: (method, url) =>
+        url.searchParams.get("target_employee_id") === "eq.emp-1" ? [incoming] : [],
+      employees: (method, url) =>
+        url.searchParams.get("id")?.startsWith("in.")
+          ? [{ id: "emp-2", first_name: "Sam", last_name: "Lee" }]
+          : [{ id: "emp-1", status: "active", first_name: "Alex", last_name: "Rivera" }]
+    })
+  );
+  const result = await mount({ memberships: STAFF }).call("GET", "/me/schedule?facilityId=fac-1&week_start=2035-03-05");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.payload.incomingSwaps.map((swap) => [swap.id, swap.requester_name]), [["swap-in", "Sam Lee"]]);
+  const incomingQuery = captured.find(
+    (entry) => entry.table === "shift_swap_requests" && entry.url.searchParams.get("target_employee_id") === "eq.emp-1"
+  );
+  assert.equal(incomingQuery.url.searchParams.get("status"), "eq.pending");
+  // Requests already answered never show up as "awaiting".
+  stubFetch(
+    t,
+    rlsFor([], {
+      schedule_periods: [PUBLISHED_PERIOD],
+      shift_swap_requests: (method, url) =>
+        url.searchParams.get("target_employee_id") === "eq.emp-1"
+          ? [{ ...incoming, target_accepted_at: "2035-01-01T00:00:00Z" }]
+          : []
+    })
+  );
+  const answered = await mount({ memberships: STAFF }).call("GET", "/me/schedule?facilityId=fac-1&week_start=2035-03-05");
+  assert.deepEqual(answered.payload.incomingSwaps, []);
+});
+
+for (const answer of ["accept", "decline"]) {
+  test(`POST shift-swaps/:id/${answer}: member only, scoped to the path's facility, exactly one RPC with the request id and the answer`, async (t) => {
+    const path = `/facilities/fac-1/shift-swaps/req-1/${answer}`;
+    const rpcBody = { replay: false, request: { id: "req-1" } };
+    const captured = stubFetch(
+      t,
+      world({ shift_swap_requests: [{ id: "req-1", facility_id: "fac-1" }], "rpc/respond_to_shift_swap": rpcBody })
+    );
+    // A non-member is refused before anything is read.
+    assert.equal((await mount({ memberships: OUTSIDER }).call("POST", path, {})).status, 403);
+    assert.equal(captured.length, 0);
+    // A plain member (no schedule permission at all) can answer.
+    const ok = await mount({ memberships: STAFF }).call("POST", path, { response: "other", status: "approved", p_response: "evil" });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.payload, rpcBody);
+    const issued = writes(captured);
+    assert.equal(issued.length, 1);
+    assert.equal(issued[0].table, "rpc/respond_to_shift_swap");
+    // Only the id (from the loaded row) and the route's own answer cross the boundary.
+    assert.deepEqual(issued[0].body, { p_request_id: "req-1", p_response: answer });
+    const load = captured.find((entry) => entry.table === "shift_swap_requests");
+    assert.equal(load.url.searchParams.get("id"), "eq.req-1");
+    assert.equal(load.url.searchParams.get("facility_id"), "eq.fac-1");
+  });
+}
+
+test("POST shift-swaps/:id/accept: an unknown / other-facility request is a 404 (no RPC); RPC failures map to 404 / 409 / 400", async (t) => {
+  const path = "/facilities/fac-1/shift-swaps/req-1/accept";
+  const missing = stubFetch(t, world({ shift_swap_requests: [] }));
+  assert.equal((await mount({ memberships: STAFF }).call("POST", path, {})).status, 404);
+  assert.deepEqual(writes(missing), []);
+  const failWith = (status, body) =>
+    world({ shift_swap_requests: [{ id: "req-1", facility_id: "fac-1" }], "rpc/respond_to_shift_swap": http(status, body) });
+  stubFetch(t, failWith(404, { code: "P0002", message: "respond_to_shift_swap: request not found" }));
+  assert.equal((await mount({ memberships: STAFF }).call("POST", path, {})).status, 404);
+  stubFetch(t, failWith(409, { code: "PT409", message: "respond_to_shift_swap: this request can no longer be answered" }));
+  assert.equal((await mount({ memberships: STAFF }).call("POST", path, {})).status, 409);
+  stubFetch(t, failWith(400, { code: "22023", message: "respond_to_shift_swap: response must be accept or decline" }));
+  assert.equal((await mount({ memberships: STAFF }).call("POST", path, {})).status, 400);
+  stubFetch(t, failWith(500, { code: "XX000", message: "boom" }));
+  await assert.rejects(() => mount({ memberships: STAFF }).call("POST", path, {}));
+});
+
+test("approving a swap whose named colleague has not accepted is a 409 (awaitingTarget) and never reaches the RPC; denying does not wait", async (t) => {
+  const kind = DECISION_KINDS[1];
+  const awaiting = { ...SWAP_ROW, target_accepted_at: null };
+  const captured = stubFetch(t, decisionWorld(kind, { row: awaiting }));
+  const blocked = await mount({ memberships: FULL }).call("POST", "/facilities/fac-1/shift-swaps/req-1/approve", {});
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.payload.awaitingTarget, true);
+  assert.deepEqual(writes(captured), []);
+  // Non-vacuous: the same request, once accepted, goes through; and a deny never waits.
+  stubFetch(t, decisionWorld(kind, { row: SWAP_ROW }));
+  assert.equal((await mount({ memberships: FULL }).call("POST", "/facilities/fac-1/shift-swaps/req-1/approve", {})).status, 200);
+  const denied = stubFetch(t, decisionWorld(kind, { row: awaiting }));
+  const denial = await mount({ memberships: FULL }).call("POST", "/facilities/fac-1/shift-swaps/req-1/deny", { reason: "no" });
+  assert.equal(denial.status, 200);
+  assert.equal(writes(denied).length, 1);
+  // A pickup with no named colleague needs no acceptance.
+  stubFetch(t, decisionWorld(kind, { row: { ...awaiting, swap_type: "drop_pickup", requested_assignment_id: null, target_employee_id: null } }));
+  assert.equal((await mount({ memberships: FULL }).call("POST", "/facilities/fac-1/shift-swaps/req-1/approve", {})).status, 200);
+});
+
+test("GET approvals caps offset (and limit): a runaway window is a 400 before any table is read", async (t) => {
+  const captured = stubFetch(t, approvalsWorld());
+  const { call } = mount({ memberships: FULL });
+  assert.equal((await call("GET", "/facilities/fac-1/approvals?offset=1001")).status, 400);
+  assert.equal((await call("GET", "/facilities/fac-1/approvals?offset=99999999")).status, 400);
+  assert.equal(captured.length, 0);
+  assert.equal((await call("GET", "/facilities/fac-1/approvals?offset=1000")).status, 200);
+  // limit is still clamped to the page maximum in the query it sends.
+  const limited = stubFetch(t, approvalsWorld());
+  await mount({ memberships: FULL }).call("GET", "/facilities/fac-1/approvals?limit=100000&offset=5");
+  const query = limited.find((entry) => entry.table === "open_shift_claims");
+  assert.equal(query.url.searchParams.get("limit"), "205");
+});
+
+test("GET approvals exposes whether a swap still awaits its named colleague", async (t) => {
+  stubFetch(
+    t,
+    world({
+      shift_swap_requests: [{ ...SWAP_ROW, target_accepted_at: null }, { ...SWAP_ROW, id: "req-2", target_accepted_at: "2035-01-02T06:00:00Z" }],
+      shift_assignments: [ASSIGNMENT_1, ASSIGNMENT_2],
+      schedule_shifts: [OPEN_SHIFT, SHIFT_2]
+    })
+  );
+  const result = await mount({ memberships: SWAP_APPROVER }).call("GET", "/facilities/fac-1/approvals?type=swaps");
+  assert.equal(result.status, 200);
+  const byId = Object.fromEntries(result.payload.items.map((item) => [item.id, item]));
+  assert.equal(byId["req-1"].awaitingTarget, true);
+  assert.equal(byId["req-2"].awaitingTarget, false);
 });
