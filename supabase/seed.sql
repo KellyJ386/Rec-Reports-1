@@ -6,6 +6,9 @@ insert into permissions (code, description) values
   ('schedule.read', 'Read schedules'),
   ('schedule.manage', 'Manage schedules'),
   ('schedule.publish', 'Publish schedule periods'),
+  ('schedule.approve.swaps', 'Approve or deny shift swap requests'),
+  ('schedule.approve.time_off', 'Approve or deny time-off requests'),
+  ('schedule.manage.open_shifts', 'Approve or deny open-shift claims'),
   ('training.read', 'Read training and certifications'),
   ('training.manage', 'Manage training and certifications'),
   ('incidents.read', 'Read incidents'),
@@ -38,7 +41,7 @@ on conflict (id) do nothing;
 
 
 -- System roles: shared, deletion-protected scaffolding (is_system_role=true).
--- Tenant Owner holds the full 26-code catalog; Compliance Admin owns
+-- Tenant Owner holds the full 29-code catalog; Compliance Admin owns
 -- reporting/incident/training/comms governance plus admin.manage -- both are
 -- facility/ops admin tier and so also hold all nine DR-05/IN-01 governance
 -- codes (reports.publish/workflow.manage/distribution.manage,
@@ -68,6 +71,9 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003201', 'schedule.read'),
   ('00000000-0000-0000-0000-000000003201', 'schedule.manage'),
   ('00000000-0000-0000-0000-000000003201', 'schedule.publish'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.approve.swaps'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.approve.time_off'),
+  ('00000000-0000-0000-0000-000000003201', 'schedule.manage.open_shifts'),
   ('00000000-0000-0000-0000-000000003201', 'training.read'),
   ('00000000-0000-0000-0000-000000003201', 'training.manage'),
   ('00000000-0000-0000-0000-000000003201', 'incidents.read'),
@@ -113,6 +119,9 @@ insert into role_permissions (role_id, permission_code) values
   ('00000000-0000-0000-0000-000000003203', 'schedule.read'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.manage'),
   ('00000000-0000-0000-0000-000000003203', 'schedule.publish'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.approve.swaps'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.approve.time_off'),
+  ('00000000-0000-0000-0000-000000003203', 'schedule.manage.open_shifts'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.read'),
   ('00000000-0000-0000-0000-000000003203', 'work_orders.manage'),
   ('00000000-0000-0000-0000-000000003203', 'incidents.read'),
@@ -312,7 +321,10 @@ insert into notification_events (id, code, severity, module_code, default_channe
   ('00000000-0000-0000-0000-000000003306', 'message.ack_overdue', 'warning', 'communications', '["in_app","email","sms"]'::jsonb),
   ('00000000-0000-0000-0000-000000003307', 'training.assignment_due', 'info', 'training', '["in_app"]'::jsonb),
   ('00000000-0000-0000-0000-000000003308', 'incident.submitted', 'info', 'incidents', '["in_app"]'::jsonb),
-  ('00000000-0000-0000-0000-000000003309', 'incident.sla_breached', 'critical', 'incidents', '["in_app","email"]'::jsonb)
+  ('00000000-0000-0000-0000-000000003309', 'incident.sla_breached', 'critical', 'incidents', '["in_app","email"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003361', 'schedule.claim_decided', 'info', 'scheduling', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003362', 'schedule.swap_decided', 'info', 'scheduling', '["in_app"]'::jsonb),
+  ('00000000-0000-0000-0000-000000003363', 'schedule.time_off_decided', 'info', 'scheduling', '["in_app"]'::jsonb)
 on conflict (code) do nothing;
 
 -- Subscription plans (0018). feature_entitlements_jsonb names the entitlement

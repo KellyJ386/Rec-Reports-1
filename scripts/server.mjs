@@ -25,6 +25,7 @@ import { registerIncidentComplianceRoutes } from "../src/lib/http/incidents-comp
 import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
 import { registerPmPlanRoutes } from "../src/lib/http/pm-plans-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
+import { registerSchedulingSelfServiceRoutes } from "../src/lib/http/scheduling-self-service-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerSearchRoutes } from "../src/lib/http/search-routes.mjs";
@@ -334,6 +335,9 @@ registerWorkOrderRoutes(userRouter, { authenticate, sendJson, readBody });
 registerPmPlanRoutes(userRouter, { authenticate, sendJson, readBody });
 // Scheduling: periods, shifts, and publish-readiness/conflict validation.
 registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Scheduling self-service (SC-11..SC-16): open-shift claims, swaps, time off,
+// availability, /me/schedule and the manager approvals queue.
+registerSchedulingSelfServiceRoutes(userRouter, { authenticate, sendJson, readBody });
 // Communications: messages + acknowledgements (communications.read / .publish).
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).
