@@ -289,3 +289,109 @@ test("actionEventType composes type:index", () => {
   assert.equal(actionEventType({ type: "notify" }, 3), "notify:3");
   assert.equal(actionEventType(undefined, 1), "unknown:1");
 });
+
+test("actionEventType honors an action's own eventType over type:index", () => {
+  assert.equal(actionEventType({ type: "create_work_order", eventType: "create_work_order:gate_broken" }, 5), "create_work_order:gate_broken");
+  assert.equal(actionEventType({ type: "create_work_order", eventType: "  " }, 2), "create_work_order:2"); // blank -> falls back
+});
+
+// --- WO-21: report-defect auto-creation ---------------------------------
+
+const defectSchema = {
+  sections: [
+    {
+      title: "Pool checks",
+      fields: [
+        { key: "gate_broken", label: "Gate broken", type: "checkbox", isDefect: true },
+        {
+          key: "chemical_level",
+          label: "Chemical level",
+          type: "select",
+          isDefect: true,
+          defectWhen: "critical",
+          options: ["ok", "low", "critical"]
+        }
+      ]
+    }
+  ]
+};
+
+test("evaluateWorkflow emits no defect actions when workOrders.autoCreateFromReportDefects is off (the default)", () => {
+  const result = evaluateWorkflow({
+    version: { schema_json: defectSchema, workflow_json: {} },
+    payload: { gate_broken: true, chemical_level: "critical" },
+    now: NOW
+    // no config -- configValue falls back to the registry default (false)
+  });
+  assert.deepEqual(result.actions, []);
+});
+
+test("evaluateWorkflow emits no defect actions when the setting is explicitly off, even with defects present", () => {
+  const result = evaluateWorkflow({
+    version: { schema_json: defectSchema, workflow_json: {} },
+    payload: { gate_broken: true, chemical_level: "critical" },
+    now: NOW,
+    config: { "workOrders.autoCreateFromReportDefects": false }
+  });
+  assert.deepEqual(result.actions, []);
+});
+
+test("evaluateWorkflow emits one create_work_order action per extracted defect when the setting is on", () => {
+  const result = evaluateWorkflow({
+    version: { schema_json: defectSchema, workflow_json: {} },
+    payload: { gate_broken: true, chemical_level: "critical" },
+    now: NOW,
+    config: { "workOrders.autoCreateFromReportDefects": true }
+  });
+  assert.equal(result.actions.length, 2);
+  assert.equal(result.actions[0].type, "create_work_order");
+  // L-1 (security review, wave3-slice-3c): namespaced create_work_order:defect:<fieldKey>
+  // -- distinguishable from the default `${type}:${index}` composition
+  // (e.g. "create_work_order:0"), which is the point (see
+  // report-workflow.mjs's own comment on buildDefectWorkOrderAction).
+  assert.equal(result.actions[0].eventType, "create_work_order:defect:gate_broken");
+  assert.equal(result.actions[0].params.sourceDefectKey, "gate_broken");
+  assert.equal(result.actions[0].params.title, "Defect: Gate broken");
+  assert.equal(result.actions[1].eventType, "create_work_order:defect:chemical_level");
+  assert.equal(result.actions[1].params.sourceDefectKey, "chemical_level");
+  assert.equal(result.actions[1].params.title, "Defect: Chemical level");
+});
+
+test("evaluateWorkflow derives defect work order priority/SLA through the configured default priority", () => {
+  const result = evaluateWorkflow({
+    version: { schema_json: defectSchema, workflow_json: {} },
+    payload: { gate_broken: true, chemical_level: "ok" },
+    now: NOW,
+    config: { "workOrders.autoCreateFromReportDefects": true, "workOrders.defaultPriority": "high" }
+  });
+  assert.equal(result.actions.length, 1);
+  assert.equal(result.actions[0].params.priority, "high");
+  assert.equal(result.actions[0].params.slaHours, 24); // workOrders.slaHoursUrgent (high maps to the urgent bucket)
+  assert.equal(result.actions[0].params.dueAt, new Date(NOW.getTime() + 24 * 60 * 60 * 1000).toISOString());
+});
+
+test("evaluateWorkflow emits no defect actions when nothing in the payload actually fires", () => {
+  const result = evaluateWorkflow({
+    version: { schema_json: defectSchema, workflow_json: {} },
+    payload: { gate_broken: false, chemical_level: "ok" },
+    now: NOW,
+    config: { "workOrders.autoCreateFromReportDefects": true }
+  });
+  assert.deepEqual(result.actions, []);
+});
+
+test("evaluateWorkflow appends defect actions AFTER rule-authored actions, preserving both orders", () => {
+  const result = evaluateWorkflow({
+    version: {
+      schema_json: defectSchema,
+      workflow_json: { on_submit: [{ type: "queue_pdf" }, { type: "notify" }] }
+    },
+    payload: { gate_broken: true, chemical_level: "ok" },
+    now: NOW,
+    config: { "workOrders.autoCreateFromReportDefects": true }
+  });
+  assert.deepEqual(
+    result.actions.map((a) => a.type),
+    ["queue_pdf", "notify", "create_work_order"]
+  );
+});

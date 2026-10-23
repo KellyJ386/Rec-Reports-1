@@ -500,3 +500,46 @@ test("resolveManagerRecipients returns [] with no facility memberships (no queri
   assert.deepEqual(recipients, []);
   assert.ok(!captured.some((c) => c.table === "role_permissions"));
 });
+
+// --- WO-21: per-defect create_work_order events (multiple per submission) --
+
+test("two per-defect create_work_order events for the same submission each independently call the mint RPC with their own sourceDefectKey", async (t) => {
+  const eventA = baseEvent({
+    id: "evt-a",
+    event_type: "create_work_order:gate_broken",
+    action: { type: "create_work_order", params: { priority: "medium", sourceDefectKey: "gate_broken" } }
+  });
+  const eventB = baseEvent({
+    id: "evt-b",
+    event_type: "create_work_order:chemical_level",
+    action: { type: "create_work_order", params: { priority: "medium", sourceDefectKey: "chemical_level" } }
+  });
+  const byId = { "evt-a": eventA, "evt-b": eventB };
+  const captured = stubFetch(t, (table, method, url, body) => {
+    if (table === "report_workflow_events" && method === "GET") return [eventA, eventB];
+    if (table === "report_workflow_events" && method === "PATCH") {
+      const idFilter = url.searchParams.get("id") ?? ""; // "eq.evt-a"
+      const target = byId[idFilter.replace(/^eq\./, "")];
+      if (url.searchParams.get("status") === "eq.pending") return [{ ...target, status: "processing" }];
+      return [{ ...target, ...body }];
+    }
+    if (table === "rpc/mint_workflow_work_order" && method === "POST") {
+      return { work_order: { id: `wo-${body.p_action.params.sourceDefectKey}` }, created: true };
+    }
+    return [];
+  });
+
+  const summary = await executeReportWorkflowEvents(client(), { now: NOW, limit: 25 });
+  assert.equal(summary.processed, 2);
+  assert.equal(summary.failed, 0);
+
+  const rpcCalls = captured.filter((c) => c.table === "rpc/mint_workflow_work_order" && c.method === "POST");
+  assert.equal(rpcCalls.length, 2, "each defect event should call the mint RPC independently");
+  assert.deepEqual(
+    rpcCalls.map((c) => c.body.p_action.params.sourceDefectKey).sort(),
+    ["chemical_level", "gate_broken"]
+  );
+  // Distinct submission-scoped p_submission_id on both -- the executor never
+  // collapses per-defect events into a single RPC call.
+  assert.ok(rpcCalls.every((c) => c.body.p_submission_id === "sub-1"));
+});

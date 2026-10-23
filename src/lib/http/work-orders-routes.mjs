@@ -1,4 +1,4 @@
-import { pgSelect, pgInsert, pgUpdate } from "../supabase-rest.mjs";
+import { createClient, pgSelect, pgInsert, pgUpdate, pgRpc, PostgrestError } from "../supabase-rest.mjs";
 import { requireAuthPermission, makeGuards } from "./guard.mjs";
 import { loadModuleConfig } from "./module-config.mjs";
 import {
@@ -6,10 +6,14 @@ import {
   WORK_ORDER_PRIORITIES,
   WORK_ORDER_SOURCE_TYPES,
   OPEN_STATUSES,
+  ASSET_STATUSES,
+  ASSET_CRITICALITY_LEVELS,
   canTransition,
   applyStatusChange,
   createWorkOrderFromIncident,
-  workOrderDueAt
+  workOrderDueAt,
+  isResolvingStatus,
+  slaState
 } from "../work-orders.mjs";
 
 const READ = "work_orders.read";
@@ -17,7 +21,110 @@ const MANAGE = "work_orders.manage";
 const INCIDENT_READ = "incidents.read";
 
 const WORK_ORDER_COLUMNS =
-  "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status,assigned_to_employee_id,due_at,completed_at,created_by,created_at,updated_at";
+  "id,facility_id,department_id,asset_id,source_type,source_id,title,description,priority,status," +
+  "assigned_to_employee_id,due_at,completed_at,sla_due_at,first_response_at,sla_breached_at,resolved_at," +
+  "created_by,created_at,updated_at";
+
+// WO-15: server-authoritative SLA fields -- a client can never set any of
+// these directly on create or through a PATCH. sla_due_at is always derived
+// from the facility's resolved workOrders.slaHours* config (never the
+// request body); first_response_at/resolved_at are stamped by this route
+// layer itself off other request fields (a status transition, a posted
+// comment), never taken verbatim from the body; sla_breached_at is stamped
+// ONLY by the SLA scan (src/lib/work-order-sla-scan.mjs). This list is the
+// route-layer REJECTION of a client-supplied value for all four (a 400
+// before any fetch); the actual write boundary is the DB layer -- see the
+// next comment.
+const CLIENT_IMMUTABLE_SLA_FIELDS = ["sla_due_at", "first_response_at", "sla_breached_at", "resolved_at"];
+
+function rejectedSlaFields(payload) {
+  return CLIENT_IMMUTABLE_SLA_FIELDS.filter((field) => payload[field] !== undefined);
+}
+
+// M-1 (security review, wave3-slice-3c): 0060's DB trigger now rejects an
+// `authenticated` session's write to ANY of sla_due_at/first_response_at/
+// resolved_at/sla_breached_at, on both INSERT and UPDATE -- not just
+// sla_breached_at, which is all it covered before this fix (a
+// work_orders.manage holder could otherwise PATCH sla_due_at out to evade
+// WO-16's overdue scan, or forge first_response_at/resolved_at directly
+// through PostgREST with their own JWT; CLIENT_IMMUTABLE_SLA_FIELDS above
+// was route-layer-only and never the actual boundary, exactly what 0038
+// concluded for department_id/assigned_to_employee_id). The three
+// legitimate route-layer stamps below (create-time sla_due_at,
+// first_response_at, resolved_at) now go through
+// internal.set_work_order_sla_fields, a service-role-only SECURITY DEFINER
+// RPC (0060) called via a dedicated service-role client -- same
+// buildServiceClient shape internal-routes.mjs's drain and
+// work-order-sla-scan.mjs's claimBreach already use for a service-role
+// write -- AFTER this route's own permission/facility-ref checks have
+// already run under the caller's own client, exactly as before. This adds
+// no new authorization surface: it only relocates WHERE the already-decided
+// write physically lands, so the DB trigger can reject the same column from
+// every other path.
+function buildServiceClient(env) {
+  if (!env?.SUPABASE_URL || !env?.SUPABASE_SERVICE_ROLE_KEY) return null;
+  return createClient({ url: env.SUPABASE_URL, key: env.SUPABASE_SERVICE_ROLE_KEY });
+}
+
+async function stampWorkOrderSlaFields(serviceClient, workOrderId, fields) {
+  return pgRpc(serviceClient, "set_work_order_sla_fields", { p_work_order_id: workOrderId, p_fields: fields });
+}
+
+// Maps one DB-shaped work_orders row (snake_case) to slaState's camelCase
+// input shape and attaches the result as `sla` on a shallow copy of the row
+// -- used by both the list and detail responses so the two never drift.
+function withSla(row, now) {
+  return {
+    ...row,
+    sla: slaState({ slaDueAt: row.sla_due_at, slaBreachedAt: row.sla_breached_at, createdAt: row.created_at }, {}, now)
+  };
+}
+
+// WO-12: the assets registry (WO-11/0059) lives in this same file, not a
+// dedicated assets-routes.mjs module. It shares this file's permission
+// codes (see the header comment above the asset route registrations below
+// for the full "why work_orders.read/.manage, not a new assets.* code"
+// rationale), its resolveFacilityRefs/FACILITY_REF_TABLES helper for
+// department_id, and its PostgrestError-409-on-unique-violation convention
+// -- keeping it here avoids re-deriving all of that in a second file for a
+// table that has been part of this module's schema (0005) since day one.
+const ASSET_COLUMNS =
+  "id,facility_id,department_id,asset_tag,name,location_text,status,category,criticality,metadata,install_date,warranty_expires_at,created_at,updated_at";
+const ASSET_STATUS_SET = new Set(ASSET_STATUSES);
+const ASSET_CRITICALITY_SET = new Set(ASSET_CRITICALITY_LEVELS);
+
+// Same [\p{L}\p{N}_\s-] sanitizer and 2-64 length bound as
+// search-routes.mjs's sanitizeSearchQuery (that file's own comment gives
+// the full PostgREST-filter-grammar rationale for the character class).
+// Duplicated rather than imported: this module deliberately never imports
+// from a sibling route module (see the INCIDENT_FOR_WORK_ORDER_COLUMNS
+// comment above), so every route file stays independently readable/
+// testable without cross-module coupling.
+const ASSET_QUERY_MIN_LENGTH = 2;
+const ASSET_QUERY_MAX_LENGTH = 64;
+
+function sanitizeAssetQuery(raw) {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  const stripped = trimmed.replace(/[^\p{L}\p{N}_\s-]/gu, "");
+  if (stripped.length < ASSET_QUERY_MIN_LENGTH || stripped.length > ASSET_QUERY_MAX_LENGTH) return null;
+  return stripped;
+}
+
+// Builds `(name.ilike.*q*,asset_tag.ilike.*q*)` -- q has already passed
+// through sanitizeAssetQuery by the only call site below.
+function assetQueryOrFilter(q) {
+  return `(name.ilike.*${q}*,asset_tag.ilike.*${q}*)`;
+}
+
+// A generous but bounded cap on how many of an asset's OPEN work orders are
+// fetched to compute open_work_order_count (below) -- a plain row count, not
+// pgSelect's `count` option (unused/unwired: supabase-rest.mjs's `request()`
+// never surfaces the Content-Range header a count=exact Prefer would need,
+// and wiring that through is out of scope for this migration/route slice).
+// No real facility's open-work-order backlog against a single asset is
+// expected to approach this, so `.length` against a capped id-only fetch is
+// an exact count in practice while keeping the request itself bounded.
+const OPEN_WORK_ORDER_COUNT_CAP = 1000;
 
 // Minimal incident projection needed to derive a work order (WO-03). Kept
 // separate from incidents-routes.mjs's INCIDENT_COLUMNS on purpose -- this
@@ -75,6 +182,31 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       limit: 1
     });
     return (rows ?? [])[0] ?? null;
+  }
+
+  async function loadAsset(client, assetId) {
+    const rows = await pgSelect(client, "assets", {
+      filters: { id: assetId },
+      select: ASSET_COLUMNS,
+      limit: 1
+    });
+    return (rows ?? [])[0] ?? null;
+  }
+
+  // WO-12: "Detail response includes open_work_order_count" -- counts the
+  // asset's OPEN work orders only (OPEN_STATUSES, imported above; the same
+  // set the work-orders list route's ?overdue=true filter uses), under the
+  // SAME caller-scoped client every other query in this route file uses, so
+  // it is naturally bounded by RLS (a caller who can read this asset via
+  // work_orders.read can, by construction, also read work_orders on the same
+  // facility -- both policies key off the identical permission code).
+  async function countOpenWorkOrders(client, assetId) {
+    const rows = await pgSelect(client, "work_orders", {
+      filters: { asset_id: assetId, status: { in: OPEN_STATUSES } },
+      select: "id",
+      limit: OPEN_WORK_ORDER_COUNT_CAP
+    });
+    return (rows ?? []).length;
   }
 
   // --- WO-09: facility-scope resolution for body-supplied foreign keys ------
@@ -162,6 +294,25 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       errors.push(`unknown overdue value: ${overdue}`);
     }
 
+    // WO-15: ?sla=breached|at_risk. 'breached' is a plain SQL predicate on
+    // the durable sla_breached_at stamp, applied server-side like every
+    // other filter here. 'at_risk' is NOT a stored column -- it is derived
+    // per-row from slaState -- so it cannot be expressed as a PostgREST
+    // predicate; the route handler below over-fetches open, unbreached,
+    // due-dated candidates and applies slaState/limit/offset in JS instead
+    // (see its own comment for the documented pagination caveat that
+    // implies).
+    let sla = null;
+    const slaParam = qp.get("sla");
+    if (slaParam !== null) {
+      if (slaParam !== "breached" && slaParam !== "at_risk") {
+        errors.push(`unknown sla value: ${slaParam}`);
+      } else {
+        sla = slaParam;
+        if (sla === "at_risk" && !filters.status) filters.status = { in: OPEN_STATUSES };
+      }
+    }
+
     let order = DEFAULT_ORDER;
     const orderParam = qp.get("order");
     if (orderParam) {
@@ -183,7 +334,81 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT });
     if (!paging.ok) return { ok: false, body: { error: paging.error } };
 
-    return { ok: true, filters, order, limit: paging.limit, offset: paging.offset };
+    return { ok: true, filters, order, limit: paging.limit, offset: paging.offset, sla };
+  }
+
+  // WO-12: parses ?status=/?category=/?q=/?limit=/?offset= for the assets
+  // list route, entirely from the URL (no I/O) -- mirrors parseListQuery
+  // above's validate-shape-first shape: an unknown status or an out-of-
+  // bounds q/limit/offset 400s before any fetch. category has no DB
+  // check-constraint enum (free-text, unlike status) so any non-empty value
+  // is accepted as a plain eq filter.
+  function parseAssetListQuery(qp, facilityId) {
+    const errors = [];
+    const filters = { facility_id: facilityId };
+    const extra = {};
+
+    const status = qp.get("status");
+    if (status) {
+      if (!ASSET_STATUS_SET.has(status)) errors.push(`unknown status: ${status}`);
+      else filters.status = status;
+    }
+
+    const category = qp.get("category");
+    if (category) filters.category = category;
+
+    const rawQ = qp.get("q");
+    if (rawQ !== null) {
+      const q = sanitizeAssetQuery(rawQ);
+      if (!q) {
+        errors.push(
+          `q must be ${ASSET_QUERY_MIN_LENGTH}-${ASSET_QUERY_MAX_LENGTH} characters (letters, digits, spaces, hyphens) after sanitizing`
+        );
+      } else {
+        extra.or = assetQueryOrFilter(q);
+      }
+    }
+
+    if (errors.length > 0) return { ok: false, body: { errors } };
+
+    const paging = parseListLimitOffset(qp, { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT });
+    if (!paging.ok) return { ok: false, body: { error: paging.error } };
+
+    return { ok: true, filters, extra, limit: paging.limit, offset: paging.offset };
+  }
+
+  // WO-12: shape-validates the fields an asset create/update body may carry
+  // (all optional on PATCH; name is additionally required on POST, checked
+  // by each route's own caller). Never touches the network -- every route
+  // below runs this before its permission guard, same convention as
+  // parseListQuery/the work-order create-body checks above.
+  function validateAssetFields(payload, { requireName }) {
+    const errors = [];
+    if (requireName && (!payload.name || typeof payload.name !== "string" || !payload.name.trim())) {
+      errors.push("name is required");
+    } else if (payload.name !== undefined && (typeof payload.name !== "string" || !payload.name.trim())) {
+      errors.push("name must be a non-empty string");
+    }
+    if (payload.status !== undefined && !ASSET_STATUS_SET.has(payload.status)) {
+      errors.push(`unknown status: ${payload.status}`);
+    }
+    if (payload.criticality !== undefined && payload.criticality !== null && !ASSET_CRITICALITY_SET.has(payload.criticality)) {
+      errors.push(`unknown criticality: ${payload.criticality}`);
+    }
+    if (
+      payload.metadata !== undefined &&
+      payload.metadata !== null &&
+      (typeof payload.metadata !== "object" || Array.isArray(payload.metadata))
+    ) {
+      errors.push("metadata must be an object");
+    }
+    for (const field of ["install_date", "warranty_expires_at"]) {
+      const value = payload[field];
+      if (value !== undefined && value !== null && (typeof value !== "string" || Number.isNaN(new Date(value).getTime()))) {
+        errors.push(`${field} must be a valid date string`);
+      }
+    }
+    return errors;
   }
 
   // --- Work Orders -----------------------------------------------------------
@@ -198,17 +423,45 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
     (request, response, { env, params }) =>
       withAuth(request, response, env, async (auth) => {
         const qp = queryParams(request);
-        const query = parseListQuery(qp, params.facilityId, new Date());
+        const now = new Date();
+        const query = parseListQuery(qp, params.facilityId, now);
         if (!query.ok) return sendJson(response, 400, query.body);
         if (!requireRead(auth, params.facilityId, response)) return;
+
+        // WO-15: ?sla=at_risk has no stored column to filter/paginate on in
+        // SQL -- over-fetch every open, unbreached, due-dated candidate (up
+        // to MAX_LIMIT, not the caller's own ?limit=) and apply slaState +
+        // the caller's requested limit/offset in JS below. ?sla=breached, by
+        // contrast, is a plain predicate on the durable sla_breached_at
+        // column and keeps normal SQL-side pagination.
+        const extra = {};
+        let fetchLimit = query.limit;
+        let fetchOffset = query.offset;
+        if (query.sla === "breached") {
+          extra.sla_breached_at = "not.is.null";
+        } else if (query.sla === "at_risk") {
+          extra.sla_breached_at = "is.null";
+          extra.sla_due_at = "not.is.null";
+          fetchLimit = MAX_LIMIT;
+          fetchOffset = 0;
+        }
+
         const rows = await pgSelect(auth.client, "work_orders", {
           filters: query.filters,
           select: WORK_ORDER_COLUMNS,
           order: query.order,
-          limit: query.limit,
-          offset: query.offset
+          limit: fetchLimit,
+          offset: fetchOffset,
+          extra: Object.keys(extra).length > 0 ? extra : undefined
         });
-        return sendJson(response, 200, rows ?? []);
+
+        let shaped = (rows ?? []).map((row) => withSla(row, now));
+        if (query.sla === "at_risk") {
+          shaped = shaped
+            .filter((row) => row.sla.state === "at_risk")
+            .slice(query.offset, query.offset + query.limit);
+        }
+        return sendJson(response, 200, shaped);
       })
   );
 
@@ -245,6 +498,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (dueAt !== undefined && (typeof dueAt !== "string" || Number.isNaN(new Date(dueAt).getTime()))) {
           shape.push("dueAt must be a valid ISO date string");
         }
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          shape.push(`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`);
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
 
         const incident = await loadIncidentForWorkOrder(auth.client, params.id);
@@ -259,6 +516,14 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           return sendJson(response, 403, {
             error: !readGuard.allowed ? readGuard.reason : manageGuard.reason
           });
+        }
+
+        // M-1: fail before any write if the service-role client this route
+        // needs to stamp sla_due_at is unavailable -- never insert a work
+        // order and then discover the stamp can't be applied.
+        const serviceClient = buildServiceClient(env);
+        if (!serviceClient) {
+          return sendJson(response, 503, { error: "work order creation is disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
         }
 
         const refCheck = await resolveFacilityRefs(auth.client, incident.facility_id, {
@@ -289,8 +554,18 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         );
 
         const now = new Date();
-        const resolvedDueAt = dueAt ?? workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+        // WO-15: sla_due_at is ALWAYS the config-derived deadline, even when
+        // the caller overrides dueAt (the human target) -- the two are
+        // independent columns from here on. due_at keeps its pre-WO-15
+        // fallback behavior (the same config-derived value) when the caller
+        // supplies no override.
+        const slaDueAt = workOrderDueAt({ priority: created.priority }, config, now).toISOString();
+        const resolvedDueAt = dueAt ?? slaDueAt;
 
+        // M-1: sla_due_at is no longer part of this INSERT -- 0060's DB
+        // trigger rejects an authenticated session's write to it, so it is
+        // stamped in a second call, through the service-role RPC, right
+        // after this row is created.
         const row = {
           facility_id: created.facilityId,
           department_id: null,
@@ -306,7 +581,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
-        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        const inserted = (rows ?? [])[0] ?? null;
+        if (!inserted) return sendJson(response, 201, null);
+        const stamped = await stampWorkOrderSlaFields(serviceClient, inserted.id, { sla_due_at: slaDueAt });
+        return sendJson(response, 201, stamped);
       })
   );
 
@@ -319,7 +597,7 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         const workOrder = await loadWorkOrder(auth.client, params.id);
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requireRead(auth, workOrder.facility_id, response)) return;
-        return sendJson(response, 200, workOrder);
+        return sendJson(response, 200, withSla(workOrder, new Date()));
       })
   );
 
@@ -348,8 +626,19 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (sourceType !== undefined && sourceType !== null && !SOURCE_TYPE_SET.has(sourceType)) {
           shape.push(`unknown source_type: ${sourceType}`);
         }
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          shape.push(`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`);
+        }
         if (shape.length > 0) return sendJson(response, 400, { errors: shape });
         if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        // M-1: fail before any write if the service-role client this route
+        // needs to stamp sla_due_at is unavailable.
+        const serviceClient = buildServiceClient(env);
+        if (!serviceClient) {
+          return sendJson(response, 503, { error: "work order creation is disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+        }
 
         const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
           asset_id: body.payload.asset_id,
@@ -358,6 +647,17 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         });
         if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
 
+        // WO-15: sla_due_at is always the facility's resolved
+        // workOrders.slaHours* deadline -- never the client-supplied due_at
+        // (which stays the human target, unchanged).
+        const config = await loadModuleConfig({ client: auth.client, facilityId: params.facilityId, moduleCode: "work_orders" });
+        const now = new Date();
+        const slaDueAt = workOrderDueAt({ priority }, config, now).toISOString();
+
+        // M-1: sla_due_at is no longer part of this INSERT -- 0060's DB
+        // trigger rejects an authenticated session's write to it, so it is
+        // stamped in a second call, through the service-role RPC, right
+        // after this row is created.
         const row = {
           facility_id: params.facilityId,
           department_id: body.payload.department_id ?? null,
@@ -373,7 +673,10 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_orders", [row], { returning: true });
-        return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        const inserted = (rows ?? [])[0] ?? null;
+        if (!inserted) return sendJson(response, 201, null);
+        const stamped = await stampWorkOrderSlaFields(serviceClient, inserted.id, { sla_due_at: slaDueAt });
+        return sendJson(response, 201, stamped);
       })
   );
 
@@ -389,6 +692,17 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
       withAuth(request, response, env, async (auth) => {
         const body = await parseJsonBody(request);
         if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+
+        // WO-15: an SLA field in the body 400s before even the
+        // "nothing to update" shape check below, so the response always
+        // names the offending field(s) rather than "nothing to update" when
+        // that is the ONLY thing the caller sent.
+        const rejectedSla = rejectedSlaFields(body.payload);
+        if (rejectedSla.length > 0) {
+          return sendJson(response, 400, {
+            errors: [`these fields are server-computed and cannot be set directly: ${rejectedSla.join(", ")}`]
+          });
+        }
 
         const { status: nextStatus, priority: nextPriority, assigned_to_employee_id: nextAssignee } = body.payload;
         if (nextStatus === undefined && nextPriority === undefined && nextAssignee === undefined) {
@@ -419,12 +733,41 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           return sendJson(response, 409, { error: `illegal status transition: ${workOrder.status} -> ${nextStatus}` });
         }
 
+        // M-1: a status transition always sets resolved_at (and sometimes
+        // first_response_at) below -- both are DB-trigger-guarded columns
+        // now, so a service-role client is required whenever nextStatus is
+        // present. priority-only / assignee-only PATCHes never touch either
+        // column and are completely unaffected -- no service client needed,
+        // no behavior change from before this fix.
+        let serviceClient = null;
+        if (nextStatus !== undefined) {
+          serviceClient = buildServiceClient(env);
+          if (!serviceClient) {
+            return sendJson(response, 503, { error: "work order status updates are disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+          }
+        }
+
         const now = new Date();
         const patch = {};
+        const slaPatch = {};
         const history = [];
 
         if (nextStatus !== undefined) {
           Object.assign(patch, applyStatusChange(workOrder, nextStatus, now));
+          // WO-15: resolved_at stamps once on entering resolved/closed and
+          // keeps its original timestamp through a resolved -> closed
+          // transition (isResolvingStatus is true for both); it clears on
+          // any transition OUT of that pair (e.g. a resolved -> in_progress
+          // reopen), mirroring completed_at's own reopen-clears behavior
+          // above. first_response_at stamps once, the first time a work
+          // order moves off 'open' -- never re-stamped or cleared after.
+          // M-1: both now go through slaPatch/stampWorkOrderSlaFields, NOT
+          // the `patch` object below -- 0060's DB trigger rejects an
+          // authenticated write to either.
+          slaPatch.resolved_at = isResolvingStatus(nextStatus) ? workOrder.resolved_at ?? now.toISOString() : null;
+          if (workOrder.status === "open" && !workOrder.first_response_at) {
+            slaPatch.first_response_at = now.toISOString();
+          }
           history.push({
             update_type: "status_change",
             previous_value: workOrder.status ?? null,
@@ -470,7 +813,11 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           );
         }
 
-        return sendJson(response, 200, (rows ?? [])[0] ?? null);
+        let updated = (rows ?? [])[0] ?? null;
+        if (updated && Object.keys(slaPatch).length > 0) {
+          updated = await stampWorkOrderSlaFields(serviceClient, params.id, slaPatch);
+        }
+        return sendJson(response, 200, updated ? withSla(updated, now) : null);
       })
   );
 
@@ -513,6 +860,18 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
         if (!workOrder) return sendJson(response, 404, { error: "work order not found" });
         if (!requirePerm(auth, workOrder.facility_id, MANAGE, response)) return;
 
+        // M-1: fail before any write if a first_response_at stamp will be
+        // needed and the service-role client for it is unavailable -- never
+        // post the comment and then discover the stamp can't be applied.
+        const needsFirstResponseStamp = !workOrder.first_response_at;
+        let serviceClient = null;
+        if (needsFirstResponseStamp) {
+          serviceClient = buildServiceClient(env);
+          if (!serviceClient) {
+            return sendJson(response, 503, { error: "work order updates are disabled: SUPABASE_SERVICE_ROLE_KEY is not configured" });
+          }
+        }
+
         const row = {
           facility_id: workOrder.facility_id,
           work_order_id: workOrder.id,
@@ -523,7 +882,239 @@ export function registerWorkOrderRoutes(router, { authenticate, sendJson, readBo
           created_by: auth.claims.sub
         };
         const rows = await pgInsert(auth.client, "work_order_updates", [row], { returning: true });
+
+        // WO-15: a comment is a "first response" exactly like a status
+        // change off open is (see the PATCH route above) -- stamp it once,
+        // only when nothing has stamped it yet, never overwrite it. M-1:
+        // this now goes through the service-role RPC -- 0060's DB trigger
+        // rejects an authenticated write to first_response_at.
+        if (needsFirstResponseStamp) {
+          await stampWorkOrderSlaFields(serviceClient, workOrder.id, { first_response_at: new Date().toISOString() });
+        }
+
         return sendJson(response, 201, (rows ?? [])[0] ?? null);
+      })
+  );
+
+  // --- Assets registry (WO-12) -------------------------------------------
+  // Permission decision (escalated per the plan, decided here): stays on
+  // `work_orders.read` / `work_orders.manage` rather than adding a new
+  // `assets.*` code. Reasons:
+  //   1. Assets are this module's own equipment registry (0005_work_orders.sql
+  //      created `assets` in the SAME migration as `work_orders`, and it has
+  //      carried the work_orders.read/.manage RLS policies -- never a
+  //      dedicated pair -- since day one; WO-11/0059 only added columns, it
+  //      did not touch that boundary).
+  //   2. No pilot requirement on file asks for an asset-registry-specific
+  //      role (e.g. "a technician who can edit assets but not work orders,
+  //      or vice versa") -- the plan's own WO-12 note frames this as "stay
+  //      on the existing pair unless the pilot demands otherwise", and
+  //      nothing demands otherwise yet.
+  //   3. S-5 (plans/WAVES_1_4_IMPLEMENTATION_PLAN.md): any BFF-enforced
+  //      permission code with no `has_permission()` occurrence in RLS is a
+  //      known gap the plan is actively closing (see the eight codes listed
+  //      there). Introducing a brand-new `assets.manage` code here would add
+  //      a NINTH unless it were also wired into 0059's RLS policies -- extra
+  //      migration surface this slice's own scope (purely additive columns
+  //      plus routes) does not call for. Reusing work_orders.read/.manage
+  //      keeps every asset route backed by the SAME RLS boundary the SQL
+  //      suite below (assets_registry.sql) already proves, with zero new
+  //      policy surface.
+  // If a pilot facility later needs assets and work orders split apart by
+  // role, that is a follow-up migration (new code + 0059-style policy
+  // rewrite on `assets`), not a retrofit of this decision.
+
+  // Lists an facility's assets. Supports ?status=, ?category=, ?q= (ilike on
+  // name/asset_tag, same sanitizer rules as search-routes.mjs's global
+  // search -- see sanitizeAssetQuery above), ?limit=, ?offset=. Shape
+  // validated from the URL alone before the permission guard, matching this
+  // file's work-orders list route.
+  router.register(
+    "GET",
+    "/facilities/:facilityId/assets",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const qp = queryParams(request);
+        const query = parseAssetListQuery(qp, params.facilityId);
+        if (!query.ok) return sendJson(response, 400, query.body);
+        if (!requireRead(auth, params.facilityId, response)) return;
+        const rows = await pgSelect(auth.client, "assets", {
+          filters: query.filters,
+          extra: query.extra,
+          select: ASSET_COLUMNS,
+          order: "name.asc",
+          limit: query.limit,
+          offset: query.offset
+        });
+        return sendJson(response, 200, rows ?? []);
+      })
+  );
+
+  // Creates an asset. Requires `name`; every other field is optional. A
+  // body-supplied facility_id is never read -- it always comes from the
+  // :facilityId path param. department_id is resolved against that facility
+  // (WO-09's resolveFacilityRefs, reused as-is) before insert. A
+  // `(facility_id, asset_tag)` unique violation (0005's constraint,
+  // unchanged by 0059) is caught and answered 409, never left to surface as
+  // an uncaught PostgrestError -> 500 -- mirrors training-routes.mjs's
+  // course-code conflict handling exactly.
+  router.register(
+    "POST",
+    "/facilities/:facilityId/assets",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const shape = validateAssetFields(body.payload, { requireName: true });
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+        if (!requirePerm(auth, params.facilityId, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, params.facilityId, {
+          department_id: body.payload.department_id
+        });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        const row = {
+          facility_id: params.facilityId,
+          department_id: body.payload.department_id ?? null,
+          asset_tag: body.payload.asset_tag ?? null,
+          name: body.payload.name.trim(),
+          location_text: body.payload.location_text ?? null,
+          status: body.payload.status ?? "active",
+          category: body.payload.category ?? null,
+          criticality: body.payload.criticality ?? null,
+          metadata: body.payload.metadata ?? {},
+          install_date: body.payload.install_date ?? null,
+          warranty_expires_at: body.payload.warranty_expires_at ?? null
+        };
+        try {
+          const rows = await pgInsert(auth.client, "assets", [row], { returning: true });
+          return sendJson(response, 201, (rows ?? [])[0] ?? null);
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, { error: "an asset with this tag already exists for this facility" });
+          }
+          throw err;
+        }
+      })
+  );
+
+  // Returns a single asset, plus its open work order count (WO-12's
+  // acceptance criterion). facility_id is always taken from the loaded row
+  // -- a caller cannot steer the guard by URL alone -- so a wrong/foreign id
+  // 404s before any permission is even evaluated.
+  router.register(
+    "GET",
+    "/assets/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requireRead(auth, asset.facility_id, response)) return;
+        const openWorkOrderCount = await countOpenWorkOrders(auth.client, asset.id);
+        return sendJson(response, 200, { ...asset, open_work_order_count: openWorkOrderCount });
+      })
+  );
+
+  // Updates an asset's fields (name, tag, location, department, category,
+  // criticality, metadata, lifecycle dates, and/or status). Loads the row
+  // first and guards on ITS facility (never a body-supplied one), matching
+  // every other PATCH :id route in this file. A tag collision 409s the same
+  // way the create route does.
+  router.register(
+    "PATCH",
+    "/assets/:id",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const body = await parseJsonBody(request);
+        if (!body.ok) return sendJson(response, 400, { error: "invalid JSON body" });
+        const {
+          name,
+          asset_tag: assetTag,
+          location_text: locationText,
+          department_id: departmentId,
+          category,
+          criticality,
+          metadata,
+          install_date: installDate,
+          warranty_expires_at: warrantyExpiresAt,
+          status
+        } = body.payload;
+        if (
+          [name, assetTag, locationText, departmentId, category, criticality, metadata, installDate, warrantyExpiresAt, status].every(
+            (value) => value === undefined
+          )
+        ) {
+          return sendJson(response, 400, { error: "nothing to update" });
+        }
+        const shape = validateAssetFields(body.payload, { requireName: false });
+        if (shape.length > 0) return sendJson(response, 400, { errors: shape });
+
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requirePerm(auth, asset.facility_id, MANAGE, response)) return;
+
+        const refCheck = await resolveFacilityRefs(auth.client, asset.facility_id, { department_id: departmentId });
+        if (!refCheck.ok) return sendJson(response, refCheck.status, { error: refCheck.error });
+
+        const patch = { updated_at: new Date().toISOString() };
+        if (name !== undefined) patch.name = name.trim();
+        if (assetTag !== undefined) patch.asset_tag = assetTag;
+        if (locationText !== undefined) patch.location_text = locationText;
+        if (departmentId !== undefined) patch.department_id = departmentId;
+        if (category !== undefined) patch.category = category;
+        if (criticality !== undefined) patch.criticality = criticality;
+        if (metadata !== undefined) patch.metadata = metadata;
+        if (installDate !== undefined) patch.install_date = installDate;
+        if (warrantyExpiresAt !== undefined) patch.warranty_expires_at = warrantyExpiresAt;
+        if (status !== undefined) patch.status = status;
+
+        try {
+          const rows = await pgUpdate(auth.client, "assets", { id: params.id }, patch, { returning: true });
+          const updated = (rows ?? [])[0] ?? null;
+          if (!updated) return sendJson(response, 200, updated);
+          const openWorkOrderCount = await countOpenWorkOrders(auth.client, updated.id);
+          return sendJson(response, 200, { ...updated, open_work_order_count: openWorkOrderCount });
+        } catch (err) {
+          if (err instanceof PostgrestError && err.status === 409) {
+            return sendJson(response, 409, { error: "an asset with this tag already exists for this facility" });
+          }
+          throw err;
+        }
+      })
+  );
+
+  // Retires an asset (status -> 'retired'). Deliberately touches ONLY the
+  // `assets` row -- no work_orders write of any kind, so any work order
+  // still referencing this asset (open or closed) is completely unaffected;
+  // supabase/tests/assets_registry.sql and test/assets-routes.test.mjs both
+  // assert this explicitly (WO-12's "retire does not cascade-delete work
+  // orders" acceptance criterion). Idempotent-but-not-silent: retiring an
+  // already-retired asset 409s, matching
+  // incidents-people-routes.mjs's "person already removed" convention for a
+  // repeated terminal state transition, rather than silently no-op
+  // succeeding a second time.
+  router.register(
+    "POST",
+    "/assets/:id/retire",
+    (request, response, { env, params }) =>
+      withAuth(request, response, env, async (auth) => {
+        const asset = await loadAsset(auth.client, params.id);
+        if (!asset) return sendJson(response, 404, { error: "asset not found" });
+        if (!requirePerm(auth, asset.facility_id, MANAGE, response)) return;
+        if (asset.status === "retired") return sendJson(response, 409, { error: "asset already retired" });
+
+        const rows = await pgUpdate(
+          auth.client,
+          "assets",
+          { id: params.id },
+          { status: "retired", updated_at: new Date().toISOString() },
+          { returning: true }
+        );
+        const updated = (rows ?? [])[0] ?? null;
+        if (!updated) return sendJson(response, 200, updated);
+        const openWorkOrderCount = await countOpenWorkOrders(auth.client, updated.id);
+        return sendJson(response, 200, { ...updated, open_work_order_count: openWorkOrderCount });
       })
   );
 

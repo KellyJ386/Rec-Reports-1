@@ -256,3 +256,49 @@ Mostly Haiku with Sonnet review; Opus on retention/legal hold.
   other stacked branches without shared history; they were rebased (content-identical) rather than merged.
 - **Next:** Wave 3, Slice 3A (reports workflow and distribution: DR-16 … DR-26, migrations 0052–0054) once
   #19 merges; 3B–3F follow per the table above with numbering shifted by two.
+
+## Execution status (2026-09-08) — Wave 3 Slices 3A–3C built, open as three PRs
+
+- **Landed:** Slice 3A (reports workflow and distribution) on PR #25, `claude/wave3-slice-3a`, migrations
+  0052–0055 (0052 signatures, 0053 workflow events, 0054 distribution, 0055 lifecycle/lock-revise/template
+  governance) — DR-16 field types/validation/visibility, DR-17 signatures, DR-18/19/20 workflow rule
+  engine + event ledger + server-side execution (`src/lib/report-workflow-executor.mjs`, mint RPCs
+  service-role only), DR-21/22 distribution lists and deliveries through the Slice 2C email adapter,
+  DR-23 PDF snapshots, DR-24 lock/revise, DR-26 two-step template publish governance. Slice 3B (incidents
+  legal core) on PR #26, `claude/wave3-slice-3b`, migrations 0056–0058 — IN-13 signatures, IN-14 OSHA
+  decision tree (`incidents.oshaDecisionTree`), IN-15 compliance checks + closure gate, IN-16 legal hold +
+  retention (child-row guards including re-point protection), IN-17 cross-module work order creation via
+  a definer RPC, IN-18 legal packet PDF, IN-19 review workspace, IN-20 notification jobs with dedupe,
+  IN-21 SLA sweep. Slice 3C (work orders assets/SLA/PM) on PR #27, `claude/wave3-slice-3c`, migrations
+  0059–0061 — WO-11/12/13 assets registry, WO-15 SLA tracking + WO-16 overdue scan (service-role-only SLA
+  stamps via `set_work_order_sla_fields`), WO-17/18/19/20 preventive maintenance (`pm_plans`,
+  `pm_plan_occurrences`, cadence rules, generation job, routes, UI), WO-21 report-defect work orders
+  (`isDefect` fields, `create_work_order:defect:<key>` actions, facility-scoped idempotent mint). WO-14
+  was excluded — already delivered generically in Wave 1.
+- **Heads:** 3A and 3B are each merged into 3C's branch; 3C's own head (and the branch this status is
+  written from) is `claude/wave3-slice-3c` @ `dfa9570`. Gate on that head: 2444 unit tests, 41 RLS suites,
+  61-migration replay.
+- **Reviews:** 3A — an independent review of DR-20's server-side privilege elevation; findings closed
+  (server-side workflow evaluation, a bounded-backtracking regex grammar for the new validation rules, and
+  DB-enforced template-publish governance) and re-proved; final verdict safe to merge. 3B — two review
+  rounds; findings closed at `f111a52` (re-pointing held child rows, pre-seeding submitted-event jobs);
+  final verdict safe to merge. 3C — three review rounds: round one found 2 High / 4 Medium / 3 Low, fixed at
+  `f58dafb` (SLA-field write path, defect-work-order idempotency, preventive-maintenance review findings);
+  round two found that the re-created work_orders policy had dropped 0058's follow-up guard (High) plus
+  three recovery-path items, fixed at `9f3959c`; round three closed everything — final verdict safe to
+  merge. All three slices are signed off in `plans/SECURITY_REVIEW_2026-09_WAVE3.md`.
+- **Lesson:** a builder worktree cut before a review fix landed re-created a definer RPC signature
+  (`internal.enqueue_report_workflow(uuid, jsonb)`) that the fix had already dropped in favor of
+  `internal.enqueue_report_workflow(uuid)`; caught only at merge time, not by CI. Rule for every future
+  slice: cut builder worktrees from the post-review head, and grep every new migration for
+  `create or replace function internal.` against the review's closure notes before merging.
+- **Known follow-ups (recorded, not fixed in this wave):** the work-order overdue scan
+  (`src/lib/work-order-sla-scan.mjs`) still dedupes via `payload_jsonb->>dedupeKey` and should switch to
+  0058's `dedupe_key` column now that it exists; `test/seed-integrity.test.mjs` races the
+  verify-migrations fixture when `DATABASE_URL` is exported during `npm test` (test-harness issue, not a
+  product bug); from 3B, the `communications.publish` `FOR ALL` policy on `notification_jobs` ORs past the
+  incident-scoped clause, and two guard error messages could be worded more precisely; from 3A,
+  re-pointing `report_templates.active_version` needs only `template.manage`.
+- **Next:** Wave 3 Slices 3D–3G (scheduling self-service, communications escalation, training content and
+  automation, the platform realtime spike), migrations starting at 0062, once the #25 → #26 → #27 chain
+  merges; then Wave 4.

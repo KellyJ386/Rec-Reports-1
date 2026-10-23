@@ -147,3 +147,72 @@ export function verifyDbChain(rows) {
   }
   return { valid: true, brokenAt: null };
 }
+
+// --- incident_audit_events' OWN canonical formula (IN-18) -------------------
+// fn_audit_chain_link (0013_audit_chain.sql) implements TWO different
+// canonical-string formulas in one trigger, branching on tg_table_name:
+// audit_events' (entity_table/entity_id/organization_id -- computeDbRowHash/
+// verifyDbChain above) and incident_audit_events' OWN, narrower one
+// (incident_id in place of all three of those columns; incident_audit_events
+// carries no organization_id at all). Applying computeDbRowHash to an
+// incident_audit_events row recomputes the WRONG canonical string -- the
+// column sets genuinely differ, not just their nullability -- so a legal
+// packet's chain-verification block (incident-pdf.mjs's renderIncidentPacket)
+// needs this sibling pair, not the audit_events one.
+//
+// Canonical formula (must match fn_audit_chain_link's
+// `tg_table_name = 'incident_audit_events'` branch verbatim,
+// 0013_audit_chain.sql):
+//
+//   canonical =
+//     event_type || '|' ||
+//     incident_id::text || '|' ||
+//     coalesce(event_payload::text, '') || '|' ||
+//     facility_id::text || '|' ||
+//     coalesce(to_jsonb(created_at) #>> '{}', '')
+//
+//   row_hash = sha256hex(coalesce(prev_hash, '') || canonical)
+//
+// jsonbText (above) is reused verbatim for event_payload -- same reasoning
+// as computeDbRowHash: a DB-fetched row's jsonb key order must be replayed,
+// not re-derived, to match what the trigger hashed at insert time.
+export function computeIncidentAuditRowHash(row) {
+  const canonical = [
+    row.event_type ?? "",
+    row.incident_id != null ? String(row.incident_id) : "",
+    row.event_payload != null ? jsonbText(row.event_payload) : "",
+    row.facility_id != null ? String(row.facility_id) : "",
+    row.created_at != null ? String(row.created_at) : ""
+  ].join("|");
+  return createHash("sha256")
+    .update((row.prev_hash ?? "") + canonical)
+    .digest("hex");
+}
+
+// Walk a chain of DB-fetched incident_audit_events rows, ascending by
+// (created_at, id) -- fn_audit_chain_link's own predecessor lookup and
+// tiebreak (0013's header comment). The chain is partitioned per
+// facility_id, NOT per incident_id (0013: incident_audit_events "has no
+// organization_id column, so its partition key is simply facility_id") --
+// callers MUST pass every row for one facility, never a per-incident-
+// filtered subset, or a row whose true predecessor belongs to a different
+// incident will misreport as a broken link purely from the filtering, not
+// from any actual tampering. incidents-routes.mjs's GET .../packet.pdf runs
+// two separate queries for exactly this reason: an unfiltered, facility-wide
+// fetch for this verification, and a second, incident-filtered fetch for
+// what the packet actually displays.
+export function verifyIncidentAuditChain(rows) {
+  let previousHash = null;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const prevHash = row.prev_hash ?? null;
+    if (prevHash !== previousHash) {
+      return { valid: false, brokenAt: index };
+    }
+    if (computeIncidentAuditRowHash(row) !== row.row_hash) {
+      return { valid: false, brokenAt: index };
+    }
+    previousHash = row.row_hash;
+  }
+  return { valid: true, brokenAt: null };
+}

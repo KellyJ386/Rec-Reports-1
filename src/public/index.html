@@ -121,6 +121,30 @@
         </p>
         <div id="schedule-workspace" class="module-workspace" aria-label="Weekly schedule board"></div>
       </details>
+      <details class="panel" id="panel-my-schedule" open>
+        <summary>
+          <p class="eyebrow">Scheduling self-service</p>
+          <h2 id="my-schedule-heading">My schedule</h2>
+        </summary>
+        <p>
+          See your published shifts for the week, claim open shifts, ask to swap or drop a
+          shift, request time off, and set your weekly availability. Managers review every
+          request before it takes effect.
+        </p>
+        <div id="my-schedule-workspace" class="module-workspace" aria-label="My schedule"></div>
+      </details>
+      <details class="panel" id="panel-approvals" open hidden>
+        <summary>
+          <p class="eyebrow">Scheduling approvals</p>
+          <h2 id="approvals-heading">Schedule approvals</h2>
+        </summary>
+        <p>
+          Approve or deny open-shift claims, shift swaps and time-off requests. Approving a
+          claim or swap re-checks certifications and conflicts before it changes the
+          schedule; denying always needs a reason.
+        </p>
+        <div id="approvals-workspace" class="module-workspace" aria-label="Schedule approvals"></div>
+      </details>
       <details class="panel" id="panel-incidents" open>
         <summary>
           <p class="eyebrow">Incident workflow</p>
@@ -143,9 +167,18 @@
           Filter by open/mine/overdue/priority, create a work order, and open one to see its
           comment thread and change its status or assignee. Expand a work order's
           "Attachments" toggle to upload a photo or document, or download evidence already on
-          file.
+          file. Switch to the Assets tab for the facility's equipment registry — filter by
+          status/category/search, and open an asset to see its open work order count.
         </p>
         <div id="work-orders-workspace" class="module-workspace"></div>
+        <h3 id="pm-plans-heading">Preventive maintenance</h3>
+        <p>
+          Recurring maintenance plans generate their own work orders automatically. Set an
+          interval or seasonal cadence, an anchor date, and an optional lead time; the upcoming
+          strip below previews the next occurrences, whether or not a work order has been
+          generated for them yet.
+        </p>
+        <div id="pm-plans-workspace" class="module-workspace"></div>
       </details>
       <details class="panel" id="panel-communications" open>
         <summary>

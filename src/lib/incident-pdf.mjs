@@ -192,6 +192,32 @@ export function computeIncidentDocumentHash({
   });
 }
 
+// Shared cover/summary field block (IN-18: "cover + summary" is the packet's
+// first section, and it is exactly this same case-metadata block the
+// standalone summary PDF already opens with -- extracted so
+// renderIncidentPacket reuses it verbatim instead of a second copy, per this
+// module's "reuse its primitives; no second PDF writer" mandate). Pure;
+// callers append their own draft/amended status markers afterward.
+function incidentCoverFields({ incident, facilityName, departmentName }) {
+  return [
+    ["Incident No", incident?.incident_no],
+    ["Report Type", incident?.report_type],
+    ["Severity", incident?.severity],
+    ["Status", incident?.status],
+    ["Occurred At", incident?.occurred_at],
+    ["Reported At", incident?.reported_at],
+    ["Location", incident?.location_text],
+    ["Facility", facilityName ?? incident?.facility_id],
+    ["Department", departmentName ?? incident?.department_id],
+    ["Summary", incident?.summary],
+    ["Immediate Actions", incident?.immediate_actions],
+    ["OSHA Review Required", incident?.requires_osha_review],
+    ["Legal Hold", incident?.legal_hold],
+    ["Submitted By", incident?.submitted_by],
+    ["Submitted At", incident?.submitted_at]
+  ];
+}
+
 // Renders the incident case document (a Buffer of raw PDF bytes). All
 // inputs are plain, already-resolved values -- this module does no I/O; the
 // route layer (incidents-routes.mjs) resolves facility/department names and
@@ -218,23 +244,7 @@ export function renderIncidentPdf({
   const amendedTag = isAmended ? " [AMENDED]" : "";
   const title = `Incident Report ${incident?.incident_no ?? incident?.id ?? "(unnumbered)"}${statusTag}${amendedTag}`;
 
-  const header = [
-    ["Incident No", incident?.incident_no],
-    ["Report Type", incident?.report_type],
-    ["Severity", incident?.severity],
-    ["Status", incident?.status],
-    ["Occurred At", incident?.occurred_at],
-    ["Reported At", incident?.reported_at],
-    ["Location", incident?.location_text],
-    ["Facility", facilityName ?? incident?.facility_id],
-    ["Department", departmentName ?? incident?.department_id],
-    ["Summary", incident?.summary],
-    ["Immediate Actions", incident?.immediate_actions],
-    ["OSHA Review Required", incident?.requires_osha_review],
-    ["Legal Hold", incident?.legal_hold],
-    ["Submitted By", incident?.submitted_by],
-    ["Submitted At", incident?.submitted_at]
-  ];
+  const header = incidentCoverFields({ incident, facilityName, departmentName });
 
   // Explicit, always-present markers (in addition to the bold title tags
   // above) so a reader skimming only the body text -- not just the title --
@@ -334,6 +344,446 @@ export function buildIncidentPdfPackage(args = {}) {
   const document = renderIncidentPdf(args);
   const documentHash = computeIncidentDocumentHash(args);
   const filename = `incident-${args.incident?.incident_no ?? args.incident?.id ?? "export"}-${timestampSlug(args.generatedAt)}.pdf`;
+  return {
+    contentType: "application/pdf",
+    filename,
+    body: Buffer.from(document).toString("base64"),
+    encoding: "base64",
+    documentHash
+  };
+}
+
+// ===========================================================================
+// IN-18: the legal packet -- a superset of the summary PDF above, extending
+// it (design doc §5.1 "Legal Packet PDF bundle") with witness statement
+// history, signatures/compliance checks (when those tables' rows are
+// supplied -- both are owned by a sibling migration in this wave and may not
+// exist in every tree; the route layer reads them defensively and this
+// renderer treats an absent/empty array identically to "no rows yet"),
+// evidence index, and the FULL audit timeline with chain hashes, closing
+// with a packet-level integrity block. Reuses every primitive above
+// (buildRecord, displayOrDash, dedupeLabel, incidentCoverFields,
+// personFields, followupFields, escalationFields, amendmentFields,
+// computeRowHash via audit.mjs) rather than a second PDF writer, per this
+// module's header.
+// ===========================================================================
+
+function humanizeKey(key) {
+  return String(key)
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+// Flattens one row of an arbitrary-shaped table into `label: value` pairs,
+// `preferredOrder` first (only for keys the row actually carries) then every
+// other own key in whatever order Object.keys returns it. Used for
+// signatures/complianceChecks (0056, a sibling migration -- IN-18 must not
+// assume its exact column set) so this renderer degrades gracefully to
+// "print whatever the row has" instead of hard-coding a schema this tree may
+// not carry yet.
+function genericRowFields(row, index, sectionLabel, preferredOrder = []) {
+  const n = index + 1;
+  const seen = new Set();
+  const orderedKeys = [];
+  for (const key of preferredOrder) {
+    if (key in row && !seen.has(key)) {
+      orderedKeys.push(key);
+      seen.add(key);
+    }
+  }
+  for (const key of Object.keys(row)) {
+    if (!seen.has(key)) {
+      orderedKeys.push(key);
+      seen.add(key);
+    }
+  }
+  return orderedKeys.map((key) => [`${sectionLabel} ${n} ${humanizeKey(key)}`, row[key]]);
+}
+
+// One incident_witness_statements row -- every version, with its signed/
+// removed status explicit (IN-18: "every version, signed status"). Looks the
+// person's name up from `peopleById` (built once by the caller) so a reader
+// does not have to cross-reference a bare person_id.
+function statementFields(statement, index, peopleById) {
+  const n = index + 1;
+  const person = peopleById.get(statement.person_id);
+  return [
+    [`Statement ${n} Person`, person?.full_name ?? statement.person_id],
+    [`Statement ${n} Version`, statement.version_no],
+    [`Statement ${n} Submitted By`, statement.submitted_by],
+    [`Statement ${n} Submitted At`, statement.submitted_at],
+    [`Statement ${n} Signed`, statement.signed_at ? `Yes (${statement.signed_at})` : "No"],
+    [`Statement ${n} Removed`, statement.deleted_at ? `Yes (${statement.deleted_at})` : "No"],
+    [`Statement ${n} Text`, statement.statement_text]
+  ];
+}
+
+// One incident_attachments row for the evidence index. checksum_sha256 is a
+// nullable column (0004) -- IN-18 requires an explicit "checksum unavailable"
+// note rather than a bare dash when it is absent, since a missing checksum on
+// a legal-evidence index is a fact worth stating outright, not silently
+// blanking. The label itself is "SHA-256" (not "Checksum: sha256:<hex>") and
+// the value is the bare hex, no prefix -- a 64-char hex value plus a longer
+// label plus a "sha256:" prefix pushes the printed "label: value" line past
+// pdf.mjs's WRAP_WIDTH (88 chars), which would silently wrap this specific
+// field (and only this one, since every other hash in this document is
+// either shorter or on a narrower-labeled line) onto a second, indented
+// line -- correct either way, but avoided here for one consistent look
+// across the section. Byte size is read defensively from `metadata` (no
+// column exists to store it -- 0056 owns incident_attachments' schema, out
+// of this task's scope to extend) under any of a few plausible keys a
+// future upload path might use; "--" (via displayOrDash) when none are
+// present.
+function evidenceFields(attachment, index) {
+  const n = index + 1;
+  const checksum = attachment.checksum_sha256 ?? "checksum unavailable";
+  const metadata = attachment.metadata ?? {};
+  const byteSize = metadata.byte_size ?? metadata.size_bytes ?? metadata.size ?? metadata.bytes ?? null;
+  return [
+    [`Evidence ${n} Type`, attachment.attachment_type],
+    [`Evidence ${n} Storage Path`, attachment.storage_path],
+    [`Evidence ${n} Byte Size`, byteSize],
+    [`Evidence ${n} SHA-256`, checksum],
+    [`Evidence ${n} Captured At`, attachment.captured_at],
+    [`Evidence ${n} Captured By`, attachment.captured_by]
+  ];
+}
+
+// One incident_audit_events row for the full timeline, WITH its chain hashes
+// (IN-18: "full audit timeline with chain hashes") -- prev_hash/row_hash as
+// fetched back from PostgREST (0013_audit_chain.sql), not recomputed here;
+// `chainVerification` (a separate, facility-wide verifyIncidentAuditChain result the
+// caller computes and passes in) is what actually vouches for them, printed
+// in its own block below.
+function auditTimelineFields(event, index) {
+  const n = index + 1;
+  return [
+    [`Audit ${n} Type`, event.event_type],
+    [`Audit ${n} Actor`, event.actor_user_id],
+    [`Audit ${n} At`, event.created_at],
+    [`Audit ${n} Payload`, event.event_payload],
+    [`Audit ${n} Prev Hash`, event.prev_hash],
+    [`Audit ${n} Row Hash`, event.row_hash]
+  ];
+}
+
+// Canonical content fingerprint for the packet's closing Packet Integrity
+// block -- the sha-256 "over the section contents" (IN-18) of every input
+// this renderer actually prints, generatedAt included so two packets
+// generated from identical case data at different times still hash
+// differently (matching computeIncidentDocumentHash's own reasoning above).
+// Deliberately does NOT hash the rendered PDF bytes themselves (pagination/
+// font-layout is an implementation detail, not part of the document's legal
+// substance) -- same rationale as computeIncidentDocumentHash. signatures/
+// complianceChecks are spread as-is (their schema is a sibling migration's,
+// unknown here); canonicalize()'s deep key-sort (audit.mjs) makes that safe
+// regardless of what order their columns arrive in.
+export function computeIncidentPacketHash({
+  incident,
+  people = [],
+  statements = [],
+  attachments = [],
+  amendments = [],
+  auditEvents = [],
+  followups = [],
+  escalations = [],
+  signatures = [],
+  complianceChecks = [],
+  chainVerification,
+  generatedAt
+} = {}) {
+  return computeRowHash(null, {
+    incident: {
+      id: incident?.id ?? null,
+      incident_no: incident?.incident_no ?? null,
+      status: incident?.status ?? null,
+      severity: incident?.severity ?? null,
+      legal_hold: incident?.legal_hold ?? null,
+      requires_osha_review: incident?.requires_osha_review ?? null,
+      summary: incident?.summary ?? null,
+      immediate_actions: incident?.immediate_actions ?? null
+    },
+    people: (people ?? []).map((p) => ({
+      id: p.id ?? null,
+      person_role: p.person_role ?? null,
+      full_name: p.full_name ?? null,
+      contact_json: p.contact_json ?? null,
+      injury_json: p.injury_json ?? null,
+      statement_text: p.statement_text ?? null
+    })),
+    statements: (statements ?? []).map((s) => ({
+      id: s.id ?? null,
+      person_id: s.person_id ?? null,
+      version_no: s.version_no ?? null,
+      statement_text: s.statement_text ?? null,
+      submitted_by: s.submitted_by ?? null,
+      submitted_at: s.submitted_at ?? null,
+      signed_at: s.signed_at ?? null,
+      deleted_at: s.deleted_at ?? null
+    })),
+    attachments: (attachments ?? []).map((a) => ({
+      id: a.id ?? null,
+      attachment_type: a.attachment_type ?? null,
+      storage_path: a.storage_path ?? null,
+      checksum_sha256: a.checksum_sha256 ?? null,
+      metadata: a.metadata ?? null
+    })),
+    amendments: (amendments ?? []).map((a) => ({
+      id: a.id ?? null,
+      amendment_reason: a.amendment_reason ?? null,
+      amended_by: a.amended_by ?? null,
+      amended_at: a.amended_at ?? null,
+      before_snapshot: a.before_snapshot ?? null,
+      after_snapshot: a.after_snapshot ?? null
+    })),
+    auditEvents: (auditEvents ?? []).map((e) => ({
+      id: e.id ?? null,
+      event_type: e.event_type ?? null,
+      actor_user_id: e.actor_user_id ?? null,
+      event_payload: e.event_payload ?? null,
+      created_at: e.created_at ?? null,
+      prev_hash: e.prev_hash ?? null,
+      row_hash: e.row_hash ?? null
+    })),
+    followups: (followups ?? []).map((f) => ({
+      id: f.id ?? null,
+      action_type: f.action_type ?? null,
+      status: f.status ?? null,
+      due_at: f.due_at ?? null,
+      description: f.description ?? null,
+      completed_at: f.completed_at ?? null
+    })),
+    escalations: (escalations ?? []).map((e) => ({
+      id: e.id ?? null,
+      escalation_level: e.escalation_level ?? null,
+      reason_code: e.reason_code ?? null,
+      status: e.status ?? null,
+      due_at: e.due_at ?? null,
+      acknowledged_at: e.acknowledged_at ?? null
+    })),
+    signatures: (signatures ?? []).map((s) => ({ ...s })),
+    complianceChecks: (complianceChecks ?? []).map((c) => ({ ...c })),
+    chainVerification: chainVerification
+      ? {
+          valid: chainVerification.valid,
+          brokenAt: chainVerification.brokenAt,
+          truncated: chainVerification.truncated === true,
+          noRows: chainVerification.noRows === true
+        }
+      : null,
+    generatedAt: generatedAt ?? null
+  });
+}
+
+// Renders the full legal packet (a Buffer of raw PDF bytes). Pure -- no I/O,
+// no Date.now()/new Date() of its own, `generatedAt` REQUIRED (identical
+// contract to renderIncidentPdf above). `chainVerification` is REQUIRED too:
+// it is the {valid, brokenAt} result of running verifyIncidentAuditChain (audit.mjs)
+// over the incident's FACILITY's full incident_audit_events chain -- NOT
+// just this incident's own rows, since 0013_audit_chain.sql links
+// incident_audit_events' prev_hash/row_hash per-facility, not per-incident;
+// the route layer is what actually runs that verification (it needs a
+// second, unfiltered fetch to do it correctly) and passes the result in
+// here purely for display. `signatures`/`complianceChecks` are optional
+// (default []) and rendered ONLY when non-empty -- "when the rows exist"
+// (IN-18) -- rather than a "None recorded" placeholder, since an empty array
+// here means either "no rows yet" or "the table doesn't exist in this tree"
+// and this renderer cannot (and need not) tell those apart.
+export function renderIncidentPacket({
+  facilityName,
+  departmentName,
+  incident,
+  people = [],
+  statements = [],
+  attachments = [],
+  amendments = [],
+  auditEvents = [],
+  followups = [],
+  escalations = [],
+  signatures = [],
+  complianceChecks = [],
+  chainVerification,
+  generatedAt,
+  generatedBy
+} = {}) {
+  const isDraft = incident?.status === "draft";
+  const isAmended = (amendments ?? []).length > 0;
+
+  const statusTag = isDraft ? " [DRAFT - NOT SUBMITTED]" : "";
+  const amendedTag = isAmended ? " [AMENDED]" : "";
+  const title = `Incident Legal Packet ${incident?.incident_no ?? incident?.id ?? "(unnumbered)"}${statusTag}${amendedTag}`;
+
+  // Cover + summary (IN-18 §5.1's first section) -- the identical block
+  // renderIncidentPdf opens with, reused via incidentCoverFields.
+  const header = incidentCoverFields({ incident, facilityName, departmentName });
+  if (isDraft) {
+    header.push(["DOCUMENT STATUS", "DRAFT - THIS INCIDENT HAS NOT BEEN SUBMITTED"]);
+  }
+  if (isAmended) {
+    header.push([
+      "AMENDMENT STATUS",
+      `AMENDED - this report has been amended ${amendments.length} time(s) since submission; see Amendment History below`
+    ]);
+  }
+
+  const peopleById = new Map((people ?? []).map((p) => [p.id, p]));
+
+  const sections = [
+    {
+      title: "Involved People",
+      fields:
+        (people ?? []).length > 0
+          ? people.flatMap((person, index) => personFields(person, index))
+          : [["Involved People", "None recorded"]]
+    },
+    {
+      title: "Witness Statements",
+      fields:
+        (statements ?? []).length > 0
+          ? statements.flatMap((statement, index) => statementFields(statement, index, peopleById))
+          : [["Witness Statements", "None recorded"]]
+    },
+    {
+      title: "Follow-Up Actions",
+      fields:
+        (followups ?? []).length > 0
+          ? followups.flatMap((followup, index) => followupFields(followup, index))
+          : [["Follow-Up Actions", "None recorded"]]
+    },
+    {
+      title: "Escalation History",
+      fields:
+        (escalations ?? []).length > 0
+          ? escalations.flatMap((escalation, index) => escalationFields(escalation, index))
+          : [["Escalation History", "None recorded"]]
+    },
+    {
+      title: "Amendment History",
+      fields: isAmended
+        ? amendments.flatMap((amendment, index) => amendmentFields(amendment, index))
+        : [["Amendment History", "None (this report has not been amended)"]]
+    }
+  ];
+
+  // Signatures/compliance checks: included ONLY when rows exist (see this
+  // function's doc comment above) -- both tables belong to a sibling
+  // migration (0056) and may be entirely absent from this tree; the route
+  // layer reads them defensively and an empty array reaches here either way.
+  if ((signatures ?? []).length > 0) {
+    sections.push({
+      title: "Signatures",
+      fields: signatures.flatMap((signature, index) =>
+        genericRowFields(signature, index, "Signature", [
+          "role",
+          "signed_name",
+          "attestation_text",
+          "signed_at",
+          "signature_image_path"
+        ])
+      )
+    });
+  }
+  if ((complianceChecks ?? []).length > 0) {
+    sections.push({
+      title: "Compliance Checks",
+      fields: complianceChecks.flatMap((check, index) =>
+        genericRowFields(check, index, "Compliance Check", ["check_type", "result", "notes", "checked_by", "checked_at"])
+      )
+    });
+  }
+
+  sections.push({
+    title: "Evidence Index",
+    fields:
+      (attachments ?? []).length > 0
+        ? attachments.flatMap((attachment, index) => evidenceFields(attachment, index))
+        : [["Evidence Index", "None recorded"]]
+  });
+
+  sections.push({
+    title: "Audit Timeline",
+    fields:
+      (auditEvents ?? []).length > 0
+        ? auditEvents.flatMap((event, index) => auditTimelineFields(event, index))
+        : [["Audit Timeline", "None recorded"]]
+  });
+
+  // M1 (security review): "Chain Valid: true" must never be printed over a
+  // chain the packet could not actually verify. verifyIncidentAuditChain
+  // (audit.mjs) reports an EMPTY input as vacuously valid -- correct for
+  // that function in isolation, wrong to surface verbatim here, since
+  // "empty" can mean "this facility genuinely has zero audit events" (fine)
+  // or "this caller's own permissions filtered the read to zero rows"
+  // (a false attestation over nothing) -- the route layer cannot always
+  // distinguish those either, so `verified: false` is required alongside
+  // `valid` whenever the route marks the read as not-authoritative
+  // (chainVerification.truncated or chainVerification.noRows, both set by
+  // incidents-routes.mjs, never by this pure renderer). "Chain Valid" prints
+  // that combined verified-and-valid state; "Chain Verification Note" names
+  // WHY when it does not, so the printed document itself carries the
+  // caveat rather than only the API envelope.
+  const chainNotVerified = chainVerification?.truncated === true || chainVerification?.noRows === true;
+  sections.push({
+    title: "Audit Chain Verification",
+    fields: [
+      ["Chain Valid", !chainNotVerified && chainVerification?.valid === true],
+      ["Chain Broken At", chainVerification?.brokenAt],
+      [
+        "Chain Verification Note",
+        chainVerification?.truncated === true
+          ? "NOT FULLY VERIFIED -- the facility's audit chain exceeds the 10,000-row verification window; only a prefix was checked."
+          : chainVerification?.noRows === true
+            ? "NOT VERIFIED -- no audit rows were readable for this facility."
+            : null
+      ]
+    ]
+  });
+
+  const packetHash = computeIncidentPacketHash({
+    incident,
+    people,
+    statements,
+    attachments,
+    amendments,
+    auditEvents,
+    followups,
+    escalations,
+    signatures,
+    complianceChecks,
+    chainVerification,
+    generatedAt
+  });
+
+  // Packet Integrity is deliberately the LAST section pushed (IN-18: "a
+  // packet-level sha256 ... printed on the last page") -- "sha256:<hex>"
+  // (rather than a separate "(SHA-256)" suffix) keeps the whole line under
+  // pdf.mjs's WRAP_WIDTH, matching the summary PDF's own Integrity block.
+  sections.push({
+    title: "Packet Integrity",
+    fields: [
+      ["Packet Hash", `sha256:${packetHash}`],
+      ["Generated At", generatedAt],
+      ["Generated By", generatedBy]
+    ]
+  });
+
+  const normalize = (fields) => fields.map(([label, value]) => [label, displayOrDash(value)]);
+  const { columns, row } = buildRecord({
+    header: normalize(header),
+    sections: sections.map((s) => ({ title: s.title, fields: normalize(s.fields) })),
+    footer: []
+  });
+
+  return renderPdfDocument({ title, columns, rows: [row] });
+}
+
+// Shapes the standard export envelope, matching buildIncidentPdfPackage
+// above exactly (same {contentType, filename, body, encoding, documentHash}
+// shape every export route in this codebase already returns).
+export function buildIncidentPacketPackage(args = {}) {
+  const document = renderIncidentPacket(args);
+  const documentHash = computeIncidentPacketHash(args);
+  const filename = `incident-${args.incident?.incident_no ?? args.incident?.id ?? "export"}-packet-${timestampSlug(args.generatedAt)}.pdf`;
   return {
     contentType: "application/pdf",
     filename,

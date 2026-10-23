@@ -104,8 +104,10 @@ function computeBackoffMs(attempts) {
 // Loads a facility's active routes for one event code and resolves the
 // highest-priority one (see resolveRoute in admin/notifications.mjs). Shared
 // by job recipient re-resolution (below) and outbox event translation
-// (drainOutboxOnce), so both paths pick the identical live route.
-async function loadActiveRoute({ client, facilityId, eventCode }) {
+// (drainOutboxOnce), so both paths pick the identical live route. Exported
+// (IN-20) so incidents-routes.mjs and incident-sla-sweep.mjs can resolve the
+// same live route at write time, instead of duplicating this query.
+export async function loadActiveRoute({ client, facilityId, eventCode }) {
   const routes = await pgSelect(client, "notification_routes", {
     filters: { facility_id: facilityId, event_code: eventCode, active: true },
     select: "id,facility_id,event_code,priority,route_jsonb,active"
@@ -116,8 +118,9 @@ async function loadActiveRoute({ client, facilityId, eventCode }) {
 // Expands a route's target distribution list against CURRENT membership into
 // a deduped array of employee ids. Returns [] when the route has no
 // distributionListId (nothing to expand). Shared by job recipient
-// re-resolution and outbox event translation.
-async function expandRouteRecipients({ client, facilityId, route, config }) {
+// re-resolution and outbox event translation; exported (IN-20) for the same
+// reason as loadActiveRoute above.
+export async function expandRouteRecipients({ client, facilityId, route, config }) {
   const listId = route?.route_jsonb?.distributionListId ?? null;
   if (!route || !listId) return [];
 

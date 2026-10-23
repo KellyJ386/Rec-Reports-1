@@ -207,6 +207,31 @@ test("assertPathInFacility rejects the exact cross-facility traversal string fro
   );
 });
 
+// L1 (security review, Wave 3 Slice 3B): the optional 4th `recordId`
+// argument tightens the prefix to facilities/{facilityId}/{module}/
+// {recordId}/ -- without it, a path was only bound to the right facility
+// and module, not the specific record (e.g. incident) it claims to belong
+// to.
+test("assertPathInFacility accepts a path under the given facility/module/recordId when recordId is passed", () => {
+  const path = `facilities/${FACILITY_ID}/incidents/${RECORD_ID}/uuid-photo.jpg`;
+  assert.equal(assertPathInFacility(path, FACILITY_ID, "incidents", RECORD_ID), path);
+});
+
+test("assertPathInFacility rejects a path under the right facility/module but a DIFFERENT record id when recordId is passed", () => {
+  const otherRecordId = "33333333-3333-3333-3333-333333333333";
+  const path = `facilities/${FACILITY_ID}/incidents/${otherRecordId}/uuid-photo.jpg`;
+  assert.throws(
+    () => assertPathInFacility(path, FACILITY_ID, "incidents", RECORD_ID),
+    (error) => error instanceof StorageValidationError && error.code === "path_outside_facility"
+  );
+});
+
+test("assertPathInFacility omitting recordId keeps the prior module-only binding (backward compatible)", () => {
+  const otherRecordId = "33333333-3333-3333-3333-333333333333";
+  const path = `facilities/${FACILITY_ID}/incidents/${otherRecordId}/uuid-photo.jpg`;
+  assert.equal(assertPathInFacility(path, FACILITY_ID, "incidents"), path);
+});
+
 test("sanitizeFilename rejects traversal attempts outright rather than cleaning them", () => {
   assert.throws(() => sanitizeFilename("../../etc/passwd"), StorageValidationError);
   assert.throws(() => sanitizeFilename("a/../b.png"), StorageValidationError);

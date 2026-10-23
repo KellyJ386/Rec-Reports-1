@@ -36,7 +36,13 @@ test("expandDistributionList dedupes employees and expands roles", () => {
     { role_id: "role-a", employee_id: "emp-1" },
     { role_id: "role-b", employee_id: "emp-3" }
   ];
-  const result = expandDistributionList(list, members, { roleAssignments });
+  // L-2: the result is always filtered against the roster -- pass every
+  // employee this test expects to see through, matching how every real
+  // caller supplies a genuine facility-scoped roster (never omits it).
+  const result = expandDistributionList(list, members, {
+    employees: [{ id: "emp-1" }, { id: "emp-2" }],
+    roleAssignments
+  });
   assert.deepEqual(result, ["emp-1", "emp-2"]);
 });
 
@@ -48,6 +54,25 @@ test("expandDistributionList filters to a known employee roster when provided", 
   ];
   const result = expandDistributionList(list, members, { employees: [{ id: "emp-1" }] });
   assert.deepEqual(result, ["emp-1"]);
+});
+
+// L-2 (security review, wave3-slice-3c): an empty roster (a facility with
+// zero employees, or a caller that omits `employees` entirely) must resolve
+// to ZERO recipients -- never "no filtering", which would otherwise let a
+// distribution_list_members row whose member_ref_id names a DIFFERENT
+// facility's employee (a mis-set member_ref_id -- members are otherwise
+// already facility_id-filtered before reaching this function) pass straight
+// through.
+test("expandDistributionList resolves to zero recipients when the employees roster is empty, never passing raw ids through unfiltered", () => {
+  const list = { id: "list-1" };
+  const members = [
+    { distribution_list_id: "list-1", member_type: "employee", member_ref_id: "emp-1" },
+    { distribution_list_id: "list-1", member_type: "employee", member_ref_id: "foreign-facility-emp" }
+  ];
+  assert.deepEqual(expandDistributionList(list, members, { employees: [] }), []);
+  // Omitting `employees` entirely defaults to the same empty roster --
+  // there is no "opt out of filtering" shape any more.
+  assert.deepEqual(expandDistributionList(list, members), []);
 });
 
 test("isWithinQuietHours handles a same-day window", () => {

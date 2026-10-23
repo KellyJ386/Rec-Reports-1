@@ -21,8 +21,11 @@ import { registerReportRoutes } from "../src/lib/http/reports-routes.mjs";
 import { registerReportDistributionRoutes } from "../src/lib/http/report-distribution-routes.mjs";
 import { registerIncidentRoutes } from "../src/lib/http/incidents-routes.mjs";
 import { registerIncidentPeopleRoutes } from "../src/lib/http/incidents-people-routes.mjs";
+import { registerIncidentComplianceRoutes } from "../src/lib/http/incidents-compliance-routes.mjs";
 import { registerWorkOrderRoutes } from "../src/lib/http/work-orders-routes.mjs";
+import { registerPmPlanRoutes } from "../src/lib/http/pm-plans-routes.mjs";
 import { registerSchedulingRoutes } from "../src/lib/http/scheduling-routes.mjs";
+import { registerSchedulingSelfServiceRoutes } from "../src/lib/http/scheduling-self-service-routes.mjs";
 import { registerCommunicationRoutes } from "../src/lib/http/communications-routes.mjs";
 import { registerTrainingRoutes } from "../src/lib/http/training-routes.mjs";
 import { registerSearchRoutes } from "../src/lib/http/search-routes.mjs";
@@ -323,10 +326,18 @@ registerIncidentRoutes(userRouter, { authenticate, sendJson, readBody });
 // Incidents: people involved + witness statements (IN-12, incidents.read /
 // incidents.manage or incidents.review).
 registerIncidentPeopleRoutes(userRouter, { authenticate, sendJson, readBody });
+// Incidents: signatures, compliance checks, OSHA decision-tree evaluation
+// (IN-13/IN-14/IN-15, incidents.read / incidents.manage or incidents.review).
+registerIncidentComplianceRoutes(userRouter, { authenticate, sendJson, readBody });
 // Work orders: dashboard list, create (incl. from incidents), status updates.
 registerWorkOrderRoutes(userRouter, { authenticate, sendJson, readBody });
+// Preventive maintenance plans (WO-20): plan CRUD + stored/preview occurrences.
+registerPmPlanRoutes(userRouter, { authenticate, sendJson, readBody });
 // Scheduling: periods, shifts, and publish-readiness/conflict validation.
 registerSchedulingRoutes(userRouter, { authenticate, sendJson, readBody });
+// Scheduling self-service (SC-11..SC-16): open-shift claims, swaps, time off,
+// availability, /me/schedule and the manager approvals queue.
+registerSchedulingSelfServiceRoutes(userRouter, { authenticate, sendJson, readBody });
 // Communications: messages + acknowledgements (communications.read / .publish).
 registerCommunicationRoutes(userRouter, { authenticate, sendJson, readBody });
 // Training: courses, assignments, and completions (training.read / .manage).

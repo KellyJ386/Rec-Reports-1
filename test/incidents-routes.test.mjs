@@ -25,8 +25,33 @@ const TASK_CREATOR = [
 const EXPORTER = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.export.pdf"] }
 ];
+// M1 (security review): the legal packet route requires incidents.export.pdf
+// AND one of incidents.audit.view/manage/review -- EXPORTER above (export.pdf
+// alone) is now the "denied" fixture for that route; this is the "allowed"
+// one.
+const EXPORTER_WITH_AUDIT = [
+  {
+    facilityId: "fac-1",
+    status: "active",
+    permissions: ["incidents.read", "incidents.export.pdf", "incidents.audit.view"]
+  }
+];
 const ESCALATOR = [
   { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.escalate"] }
+];
+// IN-17 permission fixtures: CREATOR (incidents.manage, no work_orders.manage)
+// and REVIEWER (incidents.review, no work_orders.manage/training.manage)
+// are reused for the RPC-elevation path; these add work_orders.manage /
+// training.manage on top of the same incidents.manage/review base for the
+// direct-insert path.
+const MANAGE_WITH_WORK_ORDERS = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.manage", "work_orders.manage"] }
+];
+const REVIEW_WITH_WORK_ORDERS = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.review", "work_orders.manage"] }
+];
+const MANAGE_WITH_TRAINING = [
+  { facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.manage", "training.manage"] }
 ];
 
 const INCIDENT = {
@@ -156,6 +181,48 @@ test("GET incident by id returns the incident for a reader", async (t) => {
   const result = await call("GET", "/incidents/inc-1");
   assert.equal(result.status, 200);
   assert.equal(result.payload.id, "inc-1");
+});
+
+// --- GET /incidents/:id: retention_eligible_at (IN-16b) ----------------------
+
+test("GET incident by id includes a computed retention_eligible_at using the registry default (no facility config)", async (t) => {
+  // "modules" resolves to [] here (no explicit stub), so loadModuleConfig
+  // returns {} early -- configValue falls back to the registry default,
+  // exactly the "unconfigured facility" case.
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  assert.equal(result.status, 200);
+  // INCIDENT: occurred_at 2026-07-18T10:00:00Z, severity high, no OSHA
+  // review, report_type incident -- "standard" class, default 2555 days.
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 2555 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
+});
+
+test("GET incident by id computes an OSHA-class retention date when requires_osha_review is true", async (t) => {
+  const oshaIncident = { ...INCIDENT, requires_osha_review: true };
+  stubFetch(t, (table) => (table === "incident_reports" ? [oshaIncident] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 1825 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
+});
+
+test("GET incident by id honors a facility-configured retention override", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "modules") return [{ id: "mod-incidents", code: "incidents" }];
+    if (table === "facilities") return [{ id: "fac-1", organization_id: "org-1" }];
+    if (table === "organization_module_settings") return [];
+    if (table === "facility_module_overrides") {
+      return [{ config_patch_jsonb: { "incidents.retentionDaysStandard": 10 } }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1");
+  const expected = new Date(new Date(INCIDENT.occurred_at).getTime() + 10 * 86400000).toISOString();
+  assert.equal(result.payload.retention_eligible_at, expected);
 });
 
 test("POST incidents validates shape before guarding (400, no fetch)", async (t) => {
@@ -521,10 +588,16 @@ test("POST status closing an incident with open follow-ups is blocked (409) and 
   assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
 });
 
+// IN-15: ACTION_PENDING_INCIDENT is severity "high", so closing it now also
+// requires a passing (or waived) evidence_complete compliance check
+// (evaluateClosureGate) -- stubbed here as already recorded 'pass'.
 test("POST status closing succeeds once follow-ups are all closed", async (t) => {
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
     if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "pass" }];
+    }
     if (table === "incident_reports" && method === "PATCH") return [{ ...ACTION_PENDING_INCIDENT, status: "closed" }];
     if (table === "incident_audit_events" && method === "POST") return [];
     return [];
@@ -534,6 +607,104 @@ test("POST status closing succeeds once follow-ups are all closed", async (t) =>
   assert.equal(result.status, 200);
   assert.equal(result.payload.status, "closed");
   assert.ok(captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// IN-15: closing a high/critical incident with NO recorded evidence_complete
+// check is blocked, independent of (and checked after) the follow-ups/
+// legal-hold gate -- the closure-gate rejection names the blocking check.
+test("POST status closing a high-severity incident with no evidence_complete compliance check is blocked (409)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /evidence_complete/);
+  assert.equal(result.payload.blockingCheck, "evidence_complete");
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// IN-15: a FAILING evidence_complete check blocks the close the same way a
+// missing one does.
+test("POST status closing a high-severity incident with a failing evidence_complete compliance check is blocked (409)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "fail" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /evidence_complete/);
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// IN-15: a WAIVED evidence_complete check passes the gate, and the waiver
+// is recorded in the status-change audit event's payload.
+test("POST status closing a high-severity incident with a waived evidence_complete compliance check succeeds and records the waiver in the audit payload", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "waived" }];
+    }
+    if (table === "incident_reports" && method === "PATCH") return [{ ...ACTION_PENDING_INCIDENT, status: "closed" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 200);
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.deepEqual(auditInsert.body[0].event_payload.waivedChecks, ["evidence_complete"]);
+});
+
+// IN-15: an incident flagged requires_osha_review additionally needs a
+// passing/waived supervisor_signoff check, independent of severity.
+test("POST status closing a requires_osha_review incident with no supervisor_signoff compliance check is blocked (409)", async (t) => {
+  const OSHA_INCIDENT = { ...ACTION_PENDING_INCIDENT, severity: "low", requires_osha_review: true };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [OSHA_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /supervisor_signoff/);
+  assert.equal(result.payload.blockingCheck, "supervisor_signoff");
+  assert.ok(!captured.some((c) => c.table === "incident_reports" && c.method === "PATCH"));
+});
+
+// L5 (security review): the route's own pre-check must filter soft-deleted
+// compliance checks the same way DB guard 2.5 does (0056/0057's `and
+// deleted_at is null`) -- otherwise a soft-deleted 'pass' row lets this
+// pre-check allow a close the trigger then rejects, surfacing a raw
+// check_violation/409 instead of the friendly {error, blockingCheck} body.
+test("POST status: the compliance-checks pre-check query filters out soft-deleted rows (deleted_at is.null)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_INCIDENT];
+    if (table === "incident_followup_actions" && method === "GET") return [];
+    // A soft-deleted 'pass' row would satisfy an UNFILTERED closure gate --
+    // returning it here would make the test below fail if the route ever
+    // stopped sending the deleted_at=is.null filter, since a real Postgres
+    // instance would have excluded it from this query already.
+    if (table === "incident_compliance_checks" && method === "GET") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/incidents/inc-1/status", { to: "closed" });
+  assert.equal(result.status, 409); // no live evidence_complete check -> still blocked
+  const complianceQuery = captured.find((c) => c.table === "incident_compliance_checks" && c.method === "GET");
+  assert.ok(complianceQuery, "expected a compliance-checks GET");
+  assert.equal(complianceQuery.url.searchParams.get("deleted_at"), "is.null");
 });
 
 test("POST status closing a legal-hold incident without incidents.legal_hold.manage is blocked (409)", async (t) => {
@@ -553,6 +724,9 @@ test("POST status closing a legal-hold incident succeeds with incidents.legal_ho
   const captured = stubFetch(t, (table, method) => {
     if (table === "incident_reports" && method === "GET") return [ACTION_PENDING_LEGAL_HOLD_INCIDENT];
     if (table === "incident_followup_actions" && method === "GET") return [];
+    if (table === "incident_compliance_checks" && method === "GET") {
+      return [{ check_key: "evidence_complete", status: "pass" }];
+    }
     if (table === "incident_reports" && method === "PATCH") {
       return [{ ...ACTION_PENDING_LEGAL_HOLD_INCIDENT, status: "closed" }];
     }
@@ -615,6 +789,68 @@ test("PATCH legal-hold happy path flips legal_hold and writes an audit event", a
   const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
   assert.ok(auditInsert, "expected an incident_audit_events insert");
   assert.equal(auditInsert.body[0].event_type, "incident.legal_hold_changed");
+});
+
+// --- GET /incidents/:id/legal-hold (IN-16c: history) -------------------------
+
+test("GET legal-hold history 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: LEGAL_HOLD_MANAGER });
+  const result = await call("GET", "/incidents/nope/legal-hold");
+  assert.equal(result.status, 404);
+});
+
+test("GET legal-hold history denies a caller with none of audit.view/manage/review", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({
+    memberships: [{ facilityId: "fac-1", status: "active", permissions: ["incidents.read", "incidents.legal_hold.manage"] }]
+  });
+  const result = await call("GET", "/incidents/inc-1/legal-hold");
+  assert.equal(result.status, 403);
+});
+
+test("GET legal-hold history returns the ordered toggle history for a manager", async (t) => {
+  const HISTORY_ROWS = [
+    {
+      id: 1,
+      actor_user_id: "user-3",
+      event_payload: { actor: "user-3", from: false, to: true },
+      created_at: "2026-07-19T00:00:00Z"
+    },
+    {
+      id: 2,
+      actor_user_id: "user-4",
+      event_payload: { actor: "user-4", from: true, to: false },
+      created_at: "2026-07-20T00:00:00Z"
+    }
+  ];
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports") return [{ ...INCIDENT, legal_hold: false }];
+    if (table === "incident_audit_events" && method === "GET") return HISTORY_ROWS;
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage
+  const result = await call("GET", "/incidents/inc-1/legal-hold");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.legalHold, false);
+  assert.equal(result.payload.history.length, 2);
+  assert.deepEqual(result.payload.history[0], {
+    id: 1,
+    actorUserId: "user-3",
+    from: false,
+    to: true,
+    changedAt: "2026-07-19T00:00:00Z"
+  });
+  assert.deepEqual(result.payload.history[1], {
+    id: 2,
+    actorUserId: "user-4",
+    from: true,
+    to: false,
+    changedAt: "2026-07-20T00:00:00Z"
+  });
+
+  const auditGet = captured.find((c) => c.table === "incident_audit_events" && c.method === "GET");
+  assert.match(auditGet.url.search, /event_type=eq\.incident\.legal_hold_changed/);
 });
 
 // --- POST /incidents/:id/submit: suggestedFollowUps (IN-05) -----------------
@@ -812,6 +1048,37 @@ test("GET amendments returns the amendment history for a reader", async (t) => {
   const result = await call("GET", "/incidents/inc-1/amendments");
   assert.equal(result.status, 200);
   assert.equal(result.payload.length, 2);
+});
+
+// --- GET /incidents/:id/audit-events (IN-19 timeline reader) ----------------
+
+test("GET audit-events 404s when the incident is missing and denies a non-reader", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: CREATOR });
+  const missing = await call("GET", "/incidents/nope/audit-events");
+  assert.equal(missing.status, 404);
+});
+
+test("GET audit-events denies a non-reader with 403", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [SUBMITTED_INCIDENT] : []));
+  const { call } = mount({ memberships: OUTSIDER });
+  const result = await call("GET", "/incidents/inc-1/audit-events");
+  assert.equal(result.status, 403);
+});
+
+test("GET audit-events returns the ledger oldest-first for a reader", async (t) => {
+  const captured = stubFetch(t, (table) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "incident_audit_events") return [{ id: 1, event_type: "incident.created" }, { id: 2, event_type: "incident.submitted" }];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/audit-events");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.length, 2);
+  const query = captured.find((c) => c.table === "incident_audit_events" && c.method === "GET");
+  assert.equal(query.url.searchParams.get("order"), "id.asc");
+  assert.equal(query.url.searchParams.get("incident_id"), "eq.inc-1");
 });
 
 // --- Follow-up actions CRUD + permission matrix (IN-05) ----------------------
@@ -1205,6 +1472,289 @@ test("GET export.pdf marks an amended incident's audit event and lists amendment
   assert.match(bytes, /\(Amendment 1 Reason: corrected the location\) Tj/);
 });
 
+// --- GET /incidents/:id/packet.pdf (IN-18) -----------------------------------
+
+// M1 (security review): a submitted-or-later incident's own audit-scoped
+// read must never come back empty (the route now 409s when it does -- see
+// "GET packet.pdf 409s when no incident-scoped audit events are readable"
+// below), so every fixture below defaults to at least this one row unless a
+// test explicitly overrides it to [] to exercise that new rejection.
+const DEFAULT_AUDIT_EVENT = {
+  id: "audit-1",
+  incident_id: "inc-1",
+  event_type: "incident.submitted",
+  actor_user_id: "user-1",
+  event_payload: {},
+  created_at: "2026-07-18T10:00:00Z",
+  prev_hash: null,
+  row_hash: "0".repeat(64)
+};
+
+function respondPacket(overrides = {}) {
+  return (table, method, parsed) => {
+    if (table === "incident_reports") return [SUBMITTED_INCIDENT];
+    if (table === "facilities") return [{ id: "fac-1", name: "Riverside Rec Center" }];
+    if (table === "incident_people") return overrides.people ?? [];
+    if (table === "incident_witness_statements") return overrides.statements ?? [];
+    if (table === "incident_attachments") return overrides.attachments ?? [];
+    if (table === "incident_followup_actions") return overrides.followups ?? [FOLLOWUP];
+    if (table === "incident_escalations") return overrides.escalations ?? [ESCALATION];
+    if (table === "incident_amendments") return overrides.amendments ?? [];
+    if (table === "incident_signatures") return overrides.signatures ?? [];
+    if (table === "incident_compliance_checks") return overrides.complianceChecks ?? [];
+    if (table === "incident_audit_events" && method === "GET") {
+      // Two distinct queries hit this table: one filtered by incident_id
+      // (display), one by facility_id (chain verification) -- distinguish
+      // them by which filter the query actually carries.
+      if (parsed.searchParams.get("incident_id")) return overrides.auditEvents ?? [DEFAULT_AUDIT_EVENT];
+      if (parsed.searchParams.get("facility_id")) return overrides.chainRows ?? [];
+    }
+    return [];
+  };
+}
+
+test("GET packet.pdf denies a reader without incidents.export.pdf with 403 and writes nothing", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: READER });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// M1 (security review): incidents.export.pdf alone used to be sufficient --
+// but incident_audit_events' own SELECT policy requires incidents.audit.view
+// (or manage/review), so an export-only caller's own audit read was silently
+// RLS-filtered to zero rows and the packet printed "Chain Valid: true" over
+// nothing. The route now requires the audit permission too.
+test("GET packet.pdf denies an export-only caller (no audit permission) with 403 and writes nothing", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+  assert.match(result.payload.error, /incidents\.audit\.view/);
+  assert.ok(!captured.some((c) => c.table === "incident_people"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+test("GET packet.pdf 404s when the incident is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
+  const result = await call("GET", "/incidents/nope/packet.pdf");
+  assert.equal(result.status, 404);
+});
+
+test("GET packet.pdf 409s while the incident is a draft, before any child table is queried", async (t) => {
+  const captured = stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : [])); // INCIDENT is a draft
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /submitted-or-later/i);
+  assert.ok(!captured.some((c) => c.table === "incident_people"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// M1: a submitted-or-later incident whose incident-scoped audit read comes
+// back empty (distinct from the facility-wide chain fetch, which the next
+// test covers) is refused rather than rendered with a fabricated-looking
+// empty timeline over an unearned "valid" chain stamp.
+test("GET packet.pdf 409s when no incident-scoped audit events are readable", async (t) => {
+  const captured = stubFetch(t, respondPacket({ auditEvents: [] }));
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 409);
+  assert.match(result.payload.error, /audit trail/i);
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events" && c.method === "POST"));
+});
+
+// M1: hitting the facility-wide chain fetch's row cap means only a PREFIX
+// of the real chain was checked -- that must downgrade the result rather
+// than report "valid" the way a genuinely short, complete chain would.
+test("GET packet.pdf marks the chain truncated (not valid) when the facility-wide fetch hits its row cap", async (t) => {
+  const chainRows = Array.from({ length: 10000 }, (_, index) => ({
+    id: `chain-${index}`,
+    event_type: "incident.submitted",
+    incident_id: "inc-1",
+    facility_id: "fac-1",
+    event_payload: {},
+    created_at: "2026-07-18T10:00:00Z",
+    prev_hash: null,
+    row_hash: "0".repeat(64)
+  }));
+  const captured = stubFetch(t, respondPacket({ chainRows }));
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.equal(auditInsert.body[0].event_payload.chainTruncated, true);
+  assert.equal(auditInsert.body[0].event_payload.chainValid, false);
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.match(bytes, /NOT FULLY VERIFIED/);
+});
+
+test("GET packet.pdf happy path returns a packet envelope containing every section", async (t) => {
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const PERSON = {
+    id: "person-1",
+    person_role: "injured_party",
+    full_name: "Jane Doe",
+    contact_json: {},
+    injury_json: {},
+    statement_text: null
+  };
+  stubFetch(
+    t,
+    respondPacket({
+      people: [PERSON],
+      statements: [
+        {
+          id: "stmt-1",
+          person_id: "person-1",
+          version_no: 1,
+          statement_text: "I saw it happen.",
+          submitted_by: "user-1",
+          submitted_at: "2026-07-18T11:00:00Z",
+          signed_at: "2026-07-18T11:30:00Z",
+          deleted_at: null
+        }
+      ],
+      attachments: [
+        {
+          id: "att-1",
+          attachment_type: "photo",
+          storage_path: "facilities/fac-1/incidents/inc-1/x.jpg",
+          checksum_sha256: null,
+          metadata: {},
+          captured_at: null,
+          captured_by: null
+        }
+      ]
+    })
+  );
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.contentType, "application/pdf");
+  assert.match(result.payload.filename, /^incident-INC-2026-001-packet-.+\.pdf$/);
+  assert.match(result.payload.contentDisposition, /^attachment; filename="incident-INC-2026-001-packet-.+\.pdf"$/);
+  assert.equal(result.payload.documentHash, undefined); // internal only, not part of the wire envelope
+
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.ok(bytes.startsWith("%PDF-1.4\n"));
+  assert.match(bytes, /== Involved People ==/);
+  assert.match(bytes, /== Witness Statements ==/);
+  assert.match(bytes, /\(Statement 1 Version: 1\) Tj/);
+  assert.match(bytes, /== Evidence Index ==/);
+  assert.match(bytes, /== Audit Timeline ==/);
+  assert.match(bytes, /== Audit Chain Verification ==/);
+  assert.match(bytes, /== Packet Integrity ==/);
+  assert.match(bytes, /\(Packet Hash: sha256:[0-9a-f]{64}\) Tj/);
+});
+
+test("GET packet.pdf writes an incident.packet_exported audit event carrying the packet hash and chain result", async (t) => {
+  const captured = stubFetch(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert on packet export");
+  const event = auditInsert.body[0];
+  assert.equal(event.facility_id, "fac-1");
+  assert.equal(event.incident_id, "inc-1");
+  assert.equal(event.actor_user_id, "user-8");
+  assert.equal(event.event_type, "incident.packet_exported");
+  assert.match(event.event_payload.documentHash, /^[0-9a-f]{64}$/);
+  // M1 (security review): an empty chainRows fixture (no facility-wide rows
+  // fetched) is a "noRows" state, not a verified chain -- the route no
+  // longer stamps chainValid: true over that emptiness the way
+  // verifyIncidentAuditChain's own vacuous-chain "valid: true" would read in
+  // isolation.
+  assert.equal(event.event_payload.chainValid, false);
+  assert.equal(event.event_payload.chainBrokenAt, null);
+  assert.equal(event.event_payload.chainNoRows, true);
+  assert.equal(event.event_payload.chainTruncated, false);
+});
+
+test("GET packet.pdf omits the Signatures/Compliance Checks sections when those tables don't exist in this tree (defensive absence)", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_signatures" || table === "incident_compliance_checks") {
+      // Simulates PostgREST's "relation does not exist" response for a
+      // sibling migration's table this tree doesn't carry yet.
+      // L4 (security review): tryOptionalSelect now only swallows the
+      // missing-relation CODE (PGRST205/42P01), not every PostgrestError --
+      // so this fixture must carry the code real PostgREST actually sends
+      // for "could not find the table/view in the schema cache", not just a
+      // free-text message.
+      return {
+        ok: false,
+        status: 404,
+        text: async () => JSON.stringify({ code: "PGRST205", message: "relation not found" })
+      };
+    }
+    const data = respondPacket()(table, init.method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 200);
+  const bytes = Buffer.from(result.payload.body, "base64").toString("latin1");
+  assert.doesNotMatch(bytes, /== Signatures ==/);
+  assert.doesNotMatch(bytes, /== Compliance Checks ==/);
+  // The rest of the packet still renders fine.
+  assert.match(bytes, /== Evidence Index ==/);
+  assert.match(bytes, /== Packet Integrity ==/);
+});
+
+// L4 (security review): tryOptionalSelect must rethrow anything OTHER than
+// a missing-relation PostgrestError -- a 403 (RLS denied these specific
+// rows, not "the table doesn't exist") must never silently degrade to [],
+// which would let a legal packet omit its Signatures/Compliance Checks
+// sections with no indication anywhere that the omission was an
+// authorization failure rather than "this incident genuinely has none".
+test("GET packet.pdf propagates (does not swallow) a non-missing-relation PostgrestError from a tryOptionalSelect table", async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    if (table === "incident_signatures") {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => JSON.stringify({ code: "42501", message: "permission denied" })
+      };
+    }
+    const data = respondPacket()(table, init.method, parsed) ?? [];
+    return { ok: true, status: 200, text: async () => JSON.stringify(data) };
+  };
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  // withAuth's own PostgrestError->HTTP translation (guard.mjs) turns the
+  // rethrown 403 into a 403 response rather than a 200 with a silently
+  // omitted section -- the fix under test is that tryOptionalSelect no
+  // longer swallows this into [] itself; guard.mjs's existing translation
+  // layer is what turns the rethrow into a client-visible status.
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 403);
+});
+
+test("GET packet.pdf: a failing audit write returns 500 instead of the packet envelope", async (t) => {
+  const captured = stubFetchAuditFailure(t, respondPacket());
+  const { call } = mount({ memberships: EXPORTER_WITH_AUDIT, userId: "user-8" });
+  const result = await call("GET", "/incidents/inc-1/packet.pdf");
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.payload, { error: "audit write failed", entity_id: "inc-1" });
+  assert.equal(result.payload.body, undefined);
+  const auditAttempt = captured.postgrest.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditAttempt, "expected the (failed) audit insert to have been attempted");
+});
+
 // --- Audit write failure handling (IN-22 interim, see writeAuditEvent) ------
 // The domain write and the incident_audit_events write are two separate REST
 // calls; these tests simulate the audit write itself failing (PostgREST
@@ -1326,4 +1876,423 @@ test("A failing audit write with no OBSERVABILITY_DSN configured still logs loca
   assert.equal(calls.length, 1, "expected exactly one console.error call for the failed audit write");
   assert.match(calls[0][0], /incidents\.audit_write\/incident\.escalated/);
   assert.match(calls[0][0], /inc-1/);
+});
+
+// =============================================================================
+// IN-20: notification emission on submit / escalate
+// =============================================================================
+
+const SUBMITTED_ROUTE = {
+  id: "route-sub",
+  facility_id: "fac-1",
+  event_code: "incident.submitted",
+  priority: 1,
+  route_jsonb: { channels: ["in_app"], distributionListId: "list-1" },
+  active: true
+};
+
+const ESCALATED_ROUTE = {
+  id: "route-esc",
+  facility_id: "fac-1",
+  event_code: "incident.escalated",
+  priority: 1,
+  route_jsonb: { channels: ["in_app", "email"], distributionListId: "list-1" },
+  active: true
+};
+
+function stubDistributionList(table, method) {
+  if (table === "distribution_lists" && method === "GET") {
+    return [{ id: "list-1", facility_id: "fac-1", active: true }];
+  }
+  if (table === "distribution_list_members" && method === "GET") {
+    return [{ distribution_list_id: "list-1", member_type: "employee", member_ref_id: "emp-route-1" }];
+  }
+  if (table === "employees" && method === "GET") return [{ id: "emp-route-1" }];
+  return undefined;
+}
+
+test("POST submit emits an incident.submitted notification job when a route is configured", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT]; // severity: high
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return [SUBMITTED_ROUTE];
+    const dist = stubDistributionList(table, method);
+    if (dist !== undefined) return dist;
+    if (table === "notification_jobs" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+
+  const jobsInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.ok(jobsInsert, "expected a notification_jobs insert");
+  assert.match(jobsInsert.url.search, /on_conflict=dedupe_key/);
+  assert.equal(jobsInsert.body.length, 1);
+  // M3: incident.submitted carries no escalation id, so the discriminator
+  // segment is the literal "n/a" (buildIncidentNotificationJobs' default).
+  assert.equal(jobsInsert.body[0].dedupe_key, "inc-1:incident.submitted:n/a:emp-route-1");
+  assert.equal(jobsInsert.body[0].event_type, "incident.submitted");
+  assert.equal(jobsInsert.body[0].payload_jsonb.quietHoursBypass, true); // INCIDENT.severity === 'high'
+});
+
+test("POST submit inserts no notification_jobs row when no active route is configured", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_reports" && method === "PATCH") return [{ ...INCIDENT, status: "submitted" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return []; // no route
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/incidents/inc-1/submit");
+  assert.equal(result.status, 200);
+  assert.ok(!captured.some((c) => c.table === "notification_jobs"));
+});
+
+test("POST escalate emits an incident.escalated notification job that folds in the escalation's own target_user_id", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-9" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") return [ESCALATED_ROUTE];
+    const dist = stubDistributionList(table, method);
+    if (dist !== undefined) return dist;
+    if (table === "notification_jobs" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-6" });
+  const result = await call("POST", "/incidents/inc-1/escalate", { targetUserId: "emp-target" });
+  assert.equal(result.status, 201);
+
+  const jobsInsert = captured.find((c) => c.table === "notification_jobs" && c.method === "POST");
+  assert.ok(jobsInsert, "expected a notification_jobs insert");
+  // M3: the freshly-created escalation's own id ("esc-9", per the
+  // incident_escalations POST stub above) is now the dedupe-key
+  // discriminator, so a later escalation on the same incident/recipient
+  // gets a different key instead of colliding with this one's.
+  const dedupeKeys = jobsInsert.body.map((job) => job.dedupe_key).sort();
+  assert.deepEqual(dedupeKeys, [
+    "inc-1:incident.escalated:esc-9:emp-route-1",
+    "inc-1:incident.escalated:esc-9:emp-target"
+  ]);
+  for (const job of jobsInsert.body) {
+    assert.equal(job.payload_jsonb.escalationId, "esc-9");
+  }
+});
+
+test("POST escalate: a failed notification emission does not fail the response (best-effort)", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "incident_escalations" && method === "POST") return [{ id: "esc-10" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "notification_routes" && method === "GET") throw new Error("network blip");
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR, userId: "user-6" });
+  const result = await call("POST", "/incidents/inc-1/escalate", {});
+  assert.equal(result.status, 201, "escalation still succeeds even though notification emission threw");
+});
+
+// =============================================================================
+// IN-17: cross-module creation -- work order from a follow-up
+// =============================================================================
+
+test("POST followups/:followupId/work-order 404s when the follow-up is missing", async (t) => {
+  stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/nope/work-order");
+  assert.equal(result.status, 404);
+});
+
+test("POST followups/:followupId/work-order 404s when the follow-up belongs to a different incident", async (t) => {
+  stubFetch(t, (table) => (table === "incident_followup_actions" ? [{ ...FOLLOWUP, incident_id: "inc-other" }] : []));
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 404);
+});
+
+test("POST followups/:followupId/work-order denies a caller with neither incidents.manage nor incidents.review", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_followup_actions") return [FOLLOWUP];
+    if (table === "incident_reports") return [INCIDENT];
+    return [];
+  });
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 403);
+});
+
+test("POST followups/:followupId/work-order: caller WITH work_orders.manage inserts directly (no RPC call)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return []; // no existing row -- not idempotent yet
+    if (table === "work_orders" && method === "POST") {
+      return [{ id: "wo-1", source_type: "incident", source_id: "inc-1", source_followup_id: "fu-1" }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.created, true);
+  assert.equal(result.payload.workOrder.id, "wo-1");
+
+  assert.ok(!captured.some((c) => c.table === "rpc/create_work_order_from_incident"), "must not call the RPC");
+  const insert = captured.find((c) => c.table === "work_orders" && c.method === "POST");
+  assert.equal(insert.body[0].facility_id, "fac-1");
+  assert.equal(insert.body[0].source_type, "incident");
+  assert.equal(insert.body[0].source_id, "inc-1");
+  assert.equal(insert.body[0].source_followup_id, "fu-1");
+  assert.match(insert.body[0].title, /INC-2026-001/);
+
+  const auditInsert = captured.find((c) => c.table === "incident_audit_events" && c.method === "POST");
+  assert.ok(auditInsert, "expected an incident_audit_events insert");
+  assert.equal(auditInsert.body[0].event_type, "incident.work_order_created");
+  assert.equal(auditInsert.body[0].event_payload.source, "incident_followup");
+  assert.equal(auditInsert.body[0].event_payload.followup_id, "fu-1");
+});
+
+test("POST followups/:followupId/work-order: direct-insert path is idempotent -- a repeat call returns the existing row with created:false and inserts nothing", async (t) => {
+  const EXISTING = { id: "wo-1", source_type: "incident", source_id: "inc-1", source_followup_id: "fu-1" };
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return [EXISTING];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.created, false);
+  assert.equal(result.payload.workOrder.id, "wo-1");
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "POST"));
+  assert.ok(!captured.some((c) => c.table === "incident_audit_events"));
+});
+
+test("POST followups/:followupId/work-order: caller WITHOUT work_orders.manage (incidents.manage only) goes through the RPC", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-2", source_followup_id: "fu-1" }, created: true };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage, no work_orders.manage
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.created, true);
+  assert.equal(result.payload.workOrder.id, "wo-2");
+
+  const rpcCall = captured.find((c) => c.table === "rpc/create_work_order_from_incident");
+  assert.ok(rpcCall, "expected the RPC to be called");
+  assert.equal(rpcCall.body.followup_id, "fu-1");
+  // The direct-insert path's own work_orders POST must never fire here.
+  assert.ok(!captured.some((c) => c.table === "work_orders" && c.method === "POST"));
+});
+
+test("POST followups/:followupId/work-order: a reviewer who ALSO holds work_orders.manage inserts directly (no RPC call)", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "work_orders" && method === "GET") return [];
+    if (table === "work_orders" && method === "POST") return [{ id: "wo-4", source_followup_id: "fu-1" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEW_WITH_WORK_ORDERS });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  assert.ok(!captured.some((c) => c.table === "rpc/create_work_order_from_incident"));
+});
+
+test("POST followups/:followupId/work-order: caller with incidents.review only (no work_orders.manage) also goes through the RPC", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-3" }, created: true };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: REVIEWER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 201);
+  const rpcCall = captured.find((c) => c.table === "rpc/create_work_order_from_incident");
+  assert.ok(rpcCall, "expected the RPC to be called for a review-only caller");
+});
+
+test("POST followups/:followupId/work-order: the RPC path is idempotent -- created:false from the RPC returns 200", async (t) => {
+  stubFetch(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return [FOLLOWUP];
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { work_order: { id: "wo-2" }, created: false };
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 200);
+  assert.equal(result.payload.created, false);
+});
+
+test("POST followups/:followupId/work-order: an RPC 403 (e.g. permission re-check failed server-side) surfaces as a 403", async (t) => {
+  stubFetchStatus(t, (table, method) => {
+    if (table === "incident_followup_actions" && method === "GET") return { status: 200, data: [FOLLOWUP] };
+    if (table === "incident_reports" && method === "GET") return { status: 200, data: [INCIDENT] };
+    if (table === "rpc/create_work_order_from_incident" && method === "POST") {
+      return { status: 403, data: { message: "missing permission: incidents.manage or incidents.review" } };
+    }
+    return { status: 200, data: [] };
+  });
+  const { call } = mount({ memberships: CREATOR });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/followups/fu-1/work-order");
+  assert.equal(result.status, 403);
+});
+
+// A second stub-fetch helper: like stubFetch, but `respond` returns
+// { status, data } so a test can simulate a non-2xx PostgREST response
+// (needed for the RPC-rejection test above -- the plain stubFetch always
+// returns ok:true/status:200).
+function stubFetchStatus(t, respond) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const parsed = new URL(url);
+    const table = parsed.pathname.replace("/rest/v1/", "");
+    const method = init.method;
+    const { status, data } = respond(table, method, parsed);
+    return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(data) };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+}
+
+// =============================================================================
+// IN-17: cross-module creation -- training triggers
+// =============================================================================
+
+test("POST training-triggers validates shape before guarding (400, no fetch)", async (t) => {
+  const captured = stubFetch(t, () => []);
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", { employeeId: "emp-1" });
+  assert.equal(result.status, 400);
+  assert.equal(captured.length, 0);
+});
+
+test("POST training-triggers rejects both certificationTypeId and trainingModuleId set together", async (t) => {
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    certificationTypeId: "cert-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 400);
+});
+
+test("POST training-triggers denies a caller with neither incidents.manage nor incidents.review", async (t) => {
+  stubFetch(t, (table) => (table === "incident_reports" ? [INCIDENT] : []));
+  const { call } = mount({ memberships: READER });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 403);
+});
+
+test("POST training-triggers 404s when the employee does not belong to this facility", async (t) => {
+  stubFetch(t, (table) => {
+    if (table === "incident_reports") return [INCIDENT];
+    if (table === "employees") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "gap found"
+  });
+  assert.equal(result.status, 404);
+});
+
+test("POST training-triggers: caller WITH training.manage and a resolvable trainingModuleId creates trigger + assignment", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") {
+      return [{ id: "trig-1", employee_id: "emp-1", target: { trainingModuleId: "mod-1" } }];
+    }
+    if (table === "incident_audit_events" && method === "POST") return [];
+    if (table === "course_modules" && method === "GET") return [{ id: "mod-1", course_id: "course-1", facility_id: "fac-1" }];
+    if (table === "training_assignments" && method === "POST") {
+      return [{ id: "assign-1", employee_id: "emp-1", course_id: "course-1" }];
+    }
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "near miss follow-up"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.trigger.id, "trig-1");
+  assert.equal(result.payload.assignment.id, "assign-1");
+  assert.equal(result.payload.assignmentSkipped, null);
+
+  const triggerInsert = captured.find((c) => c.table === "incident_training_triggers" && c.method === "POST");
+  assert.deepEqual(triggerInsert.body[0].target, { trainingModuleId: "mod-1" });
+
+  const assignmentInsert = captured.find((c) => c.table === "training_assignments" && c.method === "POST");
+  assert.equal(assignmentInsert.body[0].course_id, "course-1");
+  assert.equal(assignmentInsert.body[0].source_type, "incident_rule");
+  assert.equal(assignmentInsert.body[0].source_ref_id, "trig-1");
+});
+
+test("POST training-triggers: caller WITHOUT training.manage creates only the trigger row", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") return [{ id: "trig-2" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: CREATOR }); // incidents.manage, no training.manage
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    trainingModuleId: "mod-1",
+    reason: "near miss follow-up"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.trigger.id, "trig-2");
+  assert.equal(result.payload.assignment, null);
+  assert.match(result.payload.assignmentSkipped, /training\.manage/);
+  assert.ok(!captured.some((c) => c.table === "training_assignments"));
+});
+
+test("POST training-triggers: certificationTypeId never creates a training_assignments row, even with training.manage", async (t) => {
+  const captured = stubFetch(t, (table, method) => {
+    if (table === "incident_reports" && method === "GET") return [INCIDENT];
+    if (table === "employees" && method === "GET") return [{ id: "emp-1" }];
+    if (table === "incident_training_triggers" && method === "POST") return [{ id: "trig-3" }];
+    if (table === "incident_audit_events" && method === "POST") return [];
+    return [];
+  });
+  const { call } = mount({ memberships: MANAGE_WITH_TRAINING });
+  const result = await call("POST", "/facilities/fac-1/incidents/inc-1/training-triggers", {
+    employeeId: "emp-1",
+    certificationTypeId: "cert-1",
+    reason: "cert gap"
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.payload.assignment, null);
+  assert.match(result.payload.assignmentSkipped, /certificationTypeId/);
+  assert.ok(!captured.some((c) => c.table === "training_assignments"));
 });

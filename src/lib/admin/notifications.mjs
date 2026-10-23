@@ -31,9 +31,25 @@ function normalizeRoleAssignment(assignment) {
 
 // Expands a distribution list into a deduped array of employee ids. 'employee'
 // members contribute their ref directly; 'role' members expand through
-// roleAssignments (role -> employee). When a non-empty `employees` roster is
-// supplied, the result is filtered to ids present in it (so stale references
-// drop out); with no roster, ids pass through unfiltered.
+// roleAssignments (role -> employee). The result is always filtered to ids
+// present in the supplied `employees` roster (so a stale or, per L-2 below,
+// cross-facility member_ref_id can never pass through).
+//
+// L-2 (security review, wave3-slice-3c): this used to short-circuit ("no
+// filtering") whenever `employees` was empty -- indistinguishable, with a
+// bare default parameter, from "the caller genuinely has zero employees at
+// this facility" vs. "the caller passed no roster at all". Every real
+// caller (work-order-sla-scan.mjs, notifications/worker.mjs's
+// expandRouteRecipients, report-distribution.mjs's resolveReportRecipients)
+// always fetches and passes a genuine facility-scoped employees roster, so
+// an empty roster is exactly the case that most needs filtering: a facility
+// with zero `employees` rows should resolve to zero recipients, not to
+// every raw member_ref_id passed through unfiltered (including one that
+// names a DIFFERENT
+// facility's employee, reachable only via a mis-set distribution_list_members
+// row -- members are otherwise already facility_id-filtered before this
+// function ever sees them). An empty roster is now simply an empty roster:
+// nothing passes.
 export function expandDistributionList(list, members = [], { employees = [], roleAssignments = [] } = {}) {
   const listId = list?.id ?? null;
   const knownEmployeeIds = new Set((employees ?? []).map((employee) => employee?.id ?? employee));
@@ -49,7 +65,7 @@ export function expandDistributionList(list, members = [], { employees = [], rol
   const seen = new Set();
   const push = (employeeId) => {
     if (!employeeId || seen.has(employeeId)) return;
-    if (knownEmployeeIds.size > 0 && !knownEmployeeIds.has(employeeId)) return;
+    if (!knownEmployeeIds.has(employeeId)) return;
     seen.add(employeeId);
     result.push(employeeId);
   };
